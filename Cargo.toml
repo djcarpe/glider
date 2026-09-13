@@ -1,0 +1,32 @@
+[package]
+name = "glider"
+version = "0.1.0"
+edition = "2021"
+description = "An embeddable, single-binary property-graph database with built-in graph algorithms"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "glider"
+path = "src/lib.rs"
+# rlib for Rust callers, staticlib for iOS, cdylib for Android/desktop FFI.
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[[bin]]
+name = "glider"
+path = "src/main.rs"
+
+[[bin]]
+name = "glider-stream"
+path = "src/bin/glider-stream.rs"
+
+# No dependencies. std only. That is the whole portability story:
+# anything rustc targets, this builds for, with no C toolchain.
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+# NOT panic = "abort": the C ABI layer catches panics and returns them as
+# errors, which needs unwinding. A database bug must not kill the host app.
+strip = true

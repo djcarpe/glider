@@ -1,0 +1,21 @@
+[package]
+name = "glider-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Benchmark harness for glider: LDBC-style graph generator and HTTP load generator."
+
+# Same rule as glider itself: std only. The harness must not drag in crates the
+# thing under test refuses to use.
+[dependencies]
+
+[[bin]]
+name = "ldbc-gen"
+path = "src/bin/ldbc-gen.rs"
+
+[[bin]]
+name = "loadgen"
+path = "src/bin/loadgen.rs"
+
+[profile.release]
+opt-level = 3
