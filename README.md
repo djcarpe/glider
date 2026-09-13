@@ -23,6 +23,7 @@ glider social.gldb                     # interactive shell
 glider social.gldb -c "MATCH (n) RETURN n LIMIT 5"
 glider social.gldb -f schema.gql       # run a script
 glider social.gldb serve               # HTTP on 127.0.0.1:7878, plus a browser console
+glider social.gldb browser             # same, and open the console in your browser
 glider :memory:                        # throwaway graph, nothing hits disk
 ```
 
@@ -59,6 +60,7 @@ Three layers, each independently usable:
 | `algo` | algorithms over the CSR view — all iterative, no recursion |
 | `query` | lexer, parser, pattern matcher, expression evaluator |
 | `server` | ~150 lines of `std::net` HTTP |
+| `api` | typed JSON for the console and the wasm bindings |
 
 The graph is **memory-resident**; the file is the write-ahead log and the
 persistent form at once. Reads never touch disk, which is what makes whole-graph
@@ -116,6 +118,52 @@ The planner uses it when a pattern supplies a literal for an indexed property,
 and falls back to a label scan, then a full scan. Indexes are maintained through
 property updates, label changes and deletes, and are recorded in the log so they
 survive reopen.
+
+## Browser console
+
+`glider <db> browser` opens a React console in the shape Neo4j Browser
+established: a query editor, stacked result frames, and a force-directed graph
+view with click-to-expand, alongside table and JSON tabs and a live schema
+sidebar.
+
+It is compiled into the binary — one file, nothing to serve, nothing to
+install. `glider <db> serve` hosts the same console without opening a browser.
+
+```
+glider social.gldb browser                    # opens a browser
+glider social.gldb browser --no-open          # headless box: just print the URL
+glider social.gldb serve --addr 0.0.0.0:7878  # bind elsewhere
+```
+
+The console talks to `/api/*`, which differs from `/query` in one important
+way: nodes and relationships come back as real JSON objects plus a
+deduplicated `graph:{nodes,edges}` payload. `/query` renders entities to JSON
+*strings*, which a client cannot reliably tell apart from a text property that
+happens to look like an object — so it cannot be drawn from. `/query` is
+unchanged for existing callers.
+
+Source and build instructions: `ui/README.md`.
+
+## TypeScript and WebAssembly
+
+The same engine compiles to `wasm32-unknown-unknown` and runs in a browser,
+Node, Deno, Bun or a Worker.
+
+```ts
+import { loadGlider } from '@glider/wasm'
+
+const glider = await loadGlider()
+const db = glider.open()
+db.run(`CREATE (a:Person {name:"Ada"})-[:KNOWS]->(b:Person {name:"Bob"})`)
+const r = db.query('MATCH (a)-[r]->(b) RETURN a, r, b')
+```
+
+The module imports **nothing** — no WASI, no `wasm-bindgen` glue. That falls
+straight out of the zero-dependency rule: there is nothing in glider that wants
+an operating system. 459 KB, 135 KB brotli, for the entire database.
+
+Under wasm there is no filesystem, so graphs are in-memory; persist with
+`exportJsonl()` / `importJsonl()`. Details and the full API: `ts/README.md`.
 
 ## Algorithms
 
@@ -196,8 +244,17 @@ server does.
 POST /query    body is the query text   -> {"columns":[...],"rows":[...],"message":"..."}
 GET  /stats
 GET  /health
-GET  /                                  -> a small browser console
+GET  /                                  -> the browser console
+
+POST /api/query                         -> typed result + graph:{nodes,edges}
+GET  /api/schema                        -> labels, rel types, indexes with counts
+GET  /api/expand?id=N&limit=K           -> neighbours of one node
 ```
+
+`/query` returns entities as JSON *strings*; `/api/query` returns them as
+objects tagged `"_e":"node"` / `"_e":"rel"` and adds the drawable graph
+payload. Use `/api/*` for anything that renders a graph, `/query` for anything
+already written against it.
 
 ## Import / export
 

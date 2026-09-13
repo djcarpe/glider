@@ -282,6 +282,96 @@ pub extern "C" fn glider_version() -> *const c_char {
     V.get_or_init(|| CString::new(crate::VERSION).unwrap()).as_ptr()
 }
 
+
+// --------------------------------------------------------- typed JSON API
+
+/// Run a query and return the *typed* result used by the browser console and
+/// the TypeScript bindings.
+///
+/// Unlike `glider_query`, nodes and relationships come back as real JSON
+/// objects tagged `"_e":"node"` / `"_e":"rel"`, plus a deduplicated
+/// `graph:{nodes,edges}` payload ready to draw. See `api.rs` for why the flat
+/// form cannot be parsed reliably by a client.
+///
+/// # Safety
+/// `q` must be a NUL-terminated UTF-8 string. Free the result with
+/// `glider_free`.
+#[no_mangle]
+pub unsafe extern "C" fn glider_query_json(db: *mut GliderDb, q: *const c_char) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        let db = as_db(db)?;
+        let src = as_str(q, "query")?;
+        out_string(crate::api::query_json(&mut db.graph, src)?)
+    })
+}
+
+/// Labels, relationship types and indexes with counts, as JSON.
+///
+/// # Safety
+/// `db` must be a live handle. Free the result with `glider_free`.
+#[no_mangle]
+pub unsafe extern "C" fn glider_schema_json(db: *mut GliderDb) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        let db = as_db(db)?;
+        out_string(crate::api::schema_json(&mut db.graph)?)
+    })
+}
+
+/// Neighbours of one node as a drawable `{graph:{nodes,edges}}` payload.
+///
+/// # Safety
+/// `db` must be a live handle. Free the result with `glider_free`.
+#[no_mangle]
+pub unsafe extern "C" fn glider_expand_json(
+    db: *mut GliderDb,
+    id: u64,
+    limit: usize,
+) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        let db = as_db(db)?;
+        out_string(crate::api::expand_json(&db.graph, id, limit.min(10_000))?)
+    })
+}
+
+// ------------------------------------------------------- guest-side memory
+//
+// A C caller has malloc. A WebAssembly caller does not: JavaScript cannot put
+// a string into the module's linear memory without asking the module to
+// reserve the bytes first. These two exports are that mechanism.
+//
+// They are a *separate* allocation channel from `glider_free`. Buffers from
+// `glider_alloc` go back to `glider_dealloc` with the same length; strings
+// returned by glider functions go to `glider_free`. Crossing the two is
+// undefined behaviour, because the layouts differ.
+
+/// Reserve `len` bytes inside the module's memory and return a pointer.
+/// Returns NULL if `len` is 0 or the allocation fails.
+#[no_mangle]
+pub extern "C" fn glider_alloc(len: usize) -> *mut u8 {
+    if len == 0 {
+        return std::ptr::null_mut();
+    }
+    let mut buf = Vec::<u8>::new();
+    if buf.try_reserve_exact(len).is_err() {
+        return std::ptr::null_mut();
+    }
+    let ptr = buf.as_mut_ptr();
+    std::mem::forget(buf);
+    ptr
+}
+
+/// Release a buffer obtained from `glider_alloc`.
+///
+/// # Safety
+/// `ptr` must have come from `glider_alloc` with exactly this `len`, and must
+/// not be used afterwards.
+#[no_mangle]
+pub unsafe extern "C" fn glider_dealloc(ptr: *mut u8, len: usize) {
+    if !ptr.is_null() && len != 0 {
+        drop(Vec::from_raw_parts(ptr, 0, len));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

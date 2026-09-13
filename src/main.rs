@@ -16,6 +16,7 @@ usage:
   glider <db> -c "<query>"         run one query and exit
   glider <db> -f <file.gql>        run every statement in a file
   glider <db> serve [--addr HOST:PORT]
+  glider <db> browser [--addr HOST:PORT] [--no-open]
   glider <db> import <file.jsonl>
   glider <db> export [file.jsonl]
   glider <db> stats | compact | verify | bench [n]
@@ -32,7 +33,8 @@ options:
   --sync always|normal|off   durability (default normal)
   --force                    open despite a lock left by a dead writer
   --json                     print results as JSON instead of a table
-  --addr HOST:PORT           bind address for serve (default 127.0.0.1:7878)
+  --addr HOST:PORT           bind address for serve/browser (default 127.0.0.1:7878)
+  --no-open                  browser: start the server but do not open a browser
   -h, --help                 this text
   -V, --version              version
 
@@ -51,11 +53,15 @@ struct Options {
     bench: usize,
     /// Break a lock left behind by a writer that is definitely gone.
     force: bool,
+    /// `browser` only: skip launching the user's browser.
+    no_open: bool,
 }
 
 enum Mode {
     Shell,
     Serve,
+    /// Serve, and open the console in the user's browser.
+    Browser,
     Import(PathBuf),
     Export(Option<PathBuf>),
     Stats,
@@ -114,6 +120,7 @@ fn run() -> Result<(), String> {
 
     let mut opts = Options {
         force: false,
+        no_open: false,
         db: ":memory:".into(),
         command: None,
         file: None,
@@ -138,6 +145,7 @@ fn run() -> Result<(), String> {
                 opts.file = Some(PathBuf::from(args.get(i).ok_or("-f needs a path")?));
             }
             "--force" => opts.force = true,
+            "--no-open" => opts.no_open = true,
             "--sync" => {
                 i += 1;
                 opts.sync = match args.get(i).map(|s| s.as_str()) {
@@ -153,6 +161,7 @@ fn run() -> Result<(), String> {
             }
             "--json" => opts.json = true,
             "serve" => opts.mode = Mode::Serve,
+            "browser" | "ui" | "console" => opts.mode = Mode::Browser,
             "stats" => opts.mode = Mode::Stats,
             "compact" => opts.mode = Mode::Compact,
             "bench" => opts.mode = Mode::Bench,
@@ -197,6 +206,18 @@ fn run() -> Result<(), String> {
 
     match opts.mode {
         Mode::Serve => glider::server::serve(graph, &opts.addr).map_err(|e| e.to_string()),
+        Mode::Browser => {
+            // Bind first, then open the browser, so the page never races the
+            // listener and lands on a connection-refused error.
+            let listener = std::net::TcpListener::bind(&opts.addr)
+                .map_err(|e| format!("{}: {}", opts.addr, e))?;
+            let url = format!("http://{}/", listener.local_addr().map_err(|e| e.to_string())?);
+            if !opts.no_open {
+                open_browser(&url);
+            }
+            println!("glider browser at {}", url);
+            glider::server::serve_on(listener, graph).map_err(|e| e.to_string())
+        }
         Mode::Stats => run_script(&mut graph, "STATS", opts.json),
         Mode::Compact => run_script(&mut graph, "COMPACT", opts.json),
         Mode::Import(path) => {
@@ -492,6 +513,35 @@ fn truncate(s: &str, max: usize) -> String {
         let head: String = s.chars().take(max - 1).collect();
         format!("{}…", head.replace('\n', " "))
     }
+}
+
+// ------------------------------------------------------------------- browser
+
+/// Open a URL in the user's default browser, best effort.
+///
+/// Spawned detached and never waited on: if no browser is configured, or the
+/// machine is headless, the server must still come up. The URL is always
+/// printed so there is a path forward either way.
+fn open_browser(url: &str) {
+    let candidates: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
+        &[("open", &[])]
+    } else if cfg!(target_os = "windows") {
+        &[("cmd", &["/C", "start", ""])]
+    } else {
+        &[("xdg-open", &[]), ("gio", &["open"]), ("sensible-browser", &[])]
+    };
+
+    for (cmd, prefix) in candidates {
+        let mut c = std::process::Command::new(cmd);
+        c.args(prefix.iter())
+            .arg(url)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if c.spawn().is_ok() {
+            return;
+        }
+    }
+    eprintln!("could not open a browser automatically — open {} yourself", url);
 }
 
 // --------------------------------------------------------------------- bench

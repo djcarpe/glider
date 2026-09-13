@@ -1,0 +1,29 @@
+{
+  "name": "@glider/wasm",
+  "version": "0.1.0",
+  "description": "glider \u2014 an embeddable property-graph database, compiled to WebAssembly, for TypeScript and JavaScript.",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./glider.wasm": "./dist/glider.wasm"
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "./build.sh",
+    "test": "node --test test/*.test.mjs",
+    "build:ts": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "^26.5.1",
+    "typescript": "^5.9.3"
+  }
+}

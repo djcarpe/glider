@@ -18,6 +18,7 @@
 //! serve` for HTTP.
 
 pub mod algo;
+pub mod api;
 pub mod codec;
 pub mod ffi;
 pub mod graph;

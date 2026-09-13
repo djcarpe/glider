@@ -12,14 +12,21 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
+use crate::api;
 use crate::graph::Graph;
 use crate::query;
 use crate::value::write_json_string;
 
 pub fn serve(graph: Graph, addr: &str) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
-    let local = listener.local_addr()?;
-    eprintln!("glider listening on http://{}", local);
+    eprintln!("glider listening on http://{}", listener.local_addr()?);
+    serve_on(listener, graph)
+}
+
+/// Serve on an already-bound listener. `glider <db> browser` binds first so it
+/// can print and open the real URL — which matters when --addr asks for port 0
+/// — before any request can race the listener.
+pub fn serve_on(listener: TcpListener, graph: Graph) -> std::io::Result<()> {
     let shared = Arc::new(Mutex::new(graph));
 
     for stream in listener.incoming() {
@@ -84,6 +91,15 @@ fn handle(mut stream: TcpStream, graph: Arc<Mutex<Graph>>) -> std::io::Result<()
     stream.flush()
 }
 
+/// Take the graph lock, recovering from a poisoned mutex rather than
+/// propagating a panic from one request into every later one.
+fn lock(graph: &Arc<Mutex<Graph>>) -> std::sync::MutexGuard<'_, Graph> {
+    match graph.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    }
+}
+
 fn route(
     method: &str,
     path: &str,
@@ -93,16 +109,49 @@ fn route(
     let route = path.split('?').next().unwrap_or("/");
     match (method, route) {
         ("GET", "/health") => ("200 OK", "text/plain", "ok".to_string()),
-        ("GET", "/") => ("200 OK", "text/html; charset=utf-8", CONSOLE.to_string()),
+        ("GET", "/") | ("GET", "/index.html") => {
+            ("200 OK", "text/html; charset=utf-8", CONSOLE.to_string())
+        }
+
+        ("POST", "/api/query") => {
+            let src = body.trim();
+            if src.is_empty() {
+                return ("400 Bad Request", "application/json", error_json("empty query"));
+            }
+            let mut g = lock(graph);
+            match api::query_json(&mut g, src) {
+                Ok(j) => ("200 OK", "application/json", j),
+                Err(e) => ("400 Bad Request", "application/json", error_json(&e)),
+            }
+        }
+        ("GET", "/api/schema") => {
+            let mut g = lock(graph);
+            match api::schema_json(&mut g) {
+                Ok(j) => ("200 OK", "application/json", j),
+                Err(e) => ("500 Internal Server Error", "application/json", error_json(&e)),
+            }
+        }
+        ("GET", "/api/expand") => {
+            let id = api::query_param(path, "id").and_then(|v| v.parse::<u64>().ok());
+            let limit = api::query_param(path, "limit")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(50)
+                .min(1000);
+            let Some(id) = id else {
+                return ("400 Bad Request", "application/json", error_json("expand needs ?id=<node id>"));
+            };
+            let g = lock(graph);
+            match api::expand_json(&g, id, limit) {
+                Ok(j) => ("200 OK", "application/json", j),
+                Err(e) => ("404 Not Found", "application/json", error_json(&e)),
+            }
+        }
         ("GET", "/stats") | ("POST", "/query") => {
             let src = if route == "/stats" { "STATS" } else { body.trim() };
             if src.is_empty() {
                 return ("400 Bad Request", "application/json", error_json("empty query"));
             }
-            let mut g = match graph.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
+            let mut g = lock(graph);
             match query::execute(&mut g, src) {
                 Ok(r) => ("200 OK", "application/json", r.to_json()),
                 Err(e) => (
@@ -128,43 +177,8 @@ fn error_json(msg: &str) -> String {
     out
 }
 
-const CONSOLE: &str = r#"<!doctype html>
-<meta charset="utf-8"><title>glider</title>
-<style>
- body{font:14px ui-monospace,SFMono-Regular,Menlo,monospace;margin:0;background:#101215;color:#dfe3e8}
- header{padding:10px 16px;border-bottom:1px solid #23272e;color:#8b949e}
- main{padding:16px;display:flex;flex-direction:column;gap:12px;height:calc(100vh - 80px)}
- textarea{background:#171a1f;color:#dfe3e8;border:1px solid #2b313a;border-radius:6px;padding:10px;height:110px;resize:vertical;font:inherit}
- button{background:#2f6feb;color:#fff;border:0;border-radius:6px;padding:8px 14px;cursor:pointer;align-self:flex-start}
- #out{flex:1;overflow:auto;white-space:pre;background:#171a1f;border:1px solid #2b313a;border-radius:6px;padding:10px}
- table{border-collapse:collapse}td,th{border-bottom:1px solid #2b313a;padding:3px 14px 3px 0;text-align:left}
- th{color:#8b949e;font-weight:400}
-</style>
-<header>glider console &mdash; ctrl+enter to run</header>
-<main>
- <textarea id="q" placeholder="MATCH (n) RETURN n LIMIT 10"></textarea>
- <button onclick="run()">Run</button>
- <div id="out"></div>
-</main>
-<script>
-async function run(){
- const out=document.getElementById('out');
- out.textContent='running...';
- try{
-  const r=await fetch('/query',{method:'POST',body:document.getElementById('q').value});
-  const j=await r.json();
-  if(j.error){out.textContent='error: '+j.error;return}
-  let html='';
-  if(j.message)html+='<div style="color:#8b949e">'+esc(j.message)+'</div>';
-  if(j.columns.length){
-   html+='<table><tr>'+j.columns.map(c=>'<th>'+esc(c)+'</th>').join('')+'</tr>';
-   for(const row of j.rows)html+='<tr>'+row.map(v=>'<td>'+esc(String(v))+'</td>').join('')+'</tr>';
-   html+='</table><div style="color:#8b949e">'+j.rows.length+' rows</div>';
-  }
-  out.innerHTML=html||'ok';
- }catch(e){out.textContent=String(e)}
-}
-function esc(s){return s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
-document.addEventListener('keydown',e=>{if(e.ctrlKey&&e.key==='Enter')run()});
-</script>
-"#;
+/// The browser console, built from ui/ and committed as a single inlined
+/// HTML file. Embedding it keeps `glider serve` a single binary with no static
+/// file routing and no runtime dependency on Node — see ui/README.md for how to
+/// rebuild it.
+const CONSOLE: &str = include_str!("console.html");
