@@ -191,9 +191,15 @@ impl ExecBackend {
             .replace("{key}", key)
             .replace("{path}", &path.to_string_lossy());
         let output = if cfg!(windows) {
-            std::process::Command::new("cmd").arg("/C").arg(&cmd).output()
+            std::process::Command::new("cmd")
+                .arg("/C")
+                .arg(&cmd)
+                .output()
         } else {
-            std::process::Command::new("sh").arg("-c").arg(&cmd).output()
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&cmd)
+                .output()
         }?;
         if !output.status.success() {
             return Err(io::Error::other(format!(

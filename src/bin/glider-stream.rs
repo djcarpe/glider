@@ -83,7 +83,13 @@ fn has(args: &[String], name: &str) -> bool {
 /// Positional arguments, minus the subcommand and minus every `-flag value`.
 fn positionals(args: &[String]) -> Vec<String> {
     let takes_value = [
-        "-config", "-o", "-timestamp", "-generation", "-endpoint", "-region", "-addr",
+        "-config",
+        "-o",
+        "-timestamp",
+        "-generation",
+        "-endpoint",
+        "-region",
+        "-addr",
     ];
     let mut out = Vec::new();
     let mut i = 1;
@@ -160,7 +166,11 @@ fn run(args: &[String]) -> io::Result<()> {
                     let backend = config::open_backend(rc)?;
                     let mut r = Replicator::new(Path::new(&db.path), backend, rc.clone());
                     r.verbose = true;
-                    r.sync(true, has(args, "-force-snapshot"), has(args, "-enforce-retention"))?;
+                    r.sync(
+                        true,
+                        has(args, "-force-snapshot"),
+                        has(args, "-enforce-retention"),
+                    )?;
                 }
             }
             Ok(())

@@ -78,7 +78,10 @@ impl Interner {
     }
 
     pub fn name(&self, id: u32) -> &str {
-        self.list.get(id as usize).map(|s| s.as_str()).unwrap_or("?")
+        self.list
+            .get(id as usize)
+            .map(|s| s.as_str())
+            .unwrap_or("?")
     }
 
     pub fn len(&self) -> usize {
@@ -547,7 +550,10 @@ impl Graph {
                     .map(|(k, v)| (self.strings.intern(k), v.clone()))
                     .collect();
                 for l in &label_ids {
-                    self.label_index.entry(*l).or_insert_with(id_set).insert(*id);
+                    self.label_index
+                        .entry(*l)
+                        .or_insert_with(id_set)
+                        .insert(*id);
                 }
                 self.nodes.insert(
                     *id,
@@ -782,7 +788,11 @@ impl Graph {
     // -------------------------------------------------------------- lookups
 
     pub fn nodes_with_label(&self, label: &str) -> Vec<u64> {
-        match self.strings.lookup(label).and_then(|l| self.label_index.get(&l)) {
+        match self
+            .strings
+            .lookup(label)
+            .and_then(|l| self.label_index.get(&l))
+        {
             Some(set) => {
                 let mut v: Vec<u64> = set.iter().copied().collect();
                 v.sort_unstable();
@@ -793,7 +803,11 @@ impl Graph {
     }
 
     pub fn edges_with_type(&self, etype: &str) -> Vec<u64> {
-        match self.strings.lookup(etype).and_then(|t| self.type_index.get(&t)) {
+        match self
+            .strings
+            .lookup(etype)
+            .and_then(|t| self.type_index.get(&t))
+        {
             Some(set) => {
                 let mut v: Vec<u64> = set.iter().copied().collect();
                 v.sort_unstable();
@@ -1031,28 +1045,29 @@ impl Graph {
 
         for id in &ids {
             let node = &self.nodes[id];
-            let emit = |list: &Vec<Adj>, adj: &mut Vec<u32>, eids: &mut Vec<u64>, w: &mut Vec<f64>| {
-                for a in list {
-                    if let Some(t) = etype {
-                        if a.etype != t {
-                            continue;
+            let emit =
+                |list: &Vec<Adj>, adj: &mut Vec<u32>, eids: &mut Vec<u64>, w: &mut Vec<f64>| {
+                    for a in list {
+                        if let Some(t) = etype {
+                            if a.etype != t {
+                                continue;
+                            }
                         }
+                        let Some(p) = pos.get(&a.other) else { continue };
+                        adj.push(*p);
+                        eids.push(a.edge);
+                        let weight = match wkey {
+                            Some(k) => self
+                                .edges
+                                .get(&a.edge)
+                                .and_then(|e| get_prop(&e.props, k))
+                                .and_then(|v| v.as_f64())
+                                .unwrap_or(1.0),
+                            None => 1.0,
+                        };
+                        w.push(weight);
                     }
-                    let Some(p) = pos.get(&a.other) else { continue };
-                    adj.push(*p);
-                    eids.push(a.edge);
-                    let weight = match wkey {
-                        Some(k) => self
-                            .edges
-                            .get(&a.edge)
-                            .and_then(|e| get_prop(&e.props, k))
-                            .and_then(|v| v.as_f64())
-                            .unwrap_or(1.0),
-                        None => 1.0,
-                    };
-                    w.push(weight);
-                }
-            };
+                };
             match dir {
                 Dir::Out => emit(&node.out, &mut adj, &mut eids, &mut w),
                 Dir::In => emit(&node.inc, &mut adj, &mut eids, &mut w),

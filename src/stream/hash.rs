@@ -151,13 +151,34 @@ mod tests {
         // Lengths either side of the 56-byte padding boundary, where a naive
         // implementation adds a block too few or too many.
         let boundaries = [
-            (55usize, "d5e285683cd4efc02d021a5c62014694958901005d6f71e89e0989fac77e4072"),
-            (56, "04c26261370ee7541549d16dee320c723e3fd14671e66a099afe0a377c16888e"),
-            (63, "75220b47218278e656f2013bb8f0c455a25eaf01e86c64924e9d48d89776d6f2"),
-            (64, "7ce100971f64e7001e8fe5a51973ecdfe1ced42befe7ee8d5fd6219506b5393c"),
-            (65, "9537c5fdf120482f7d58d25e9ed583f52c02b4e304ea814db1633ad565aed7e9"),
-            (119, "000b48d4edf0fa7bee3c6236ecd2785baa5db4eeb8bb54341b029e0d9fa5fb0c"),
-            (120, "13f05a0b594787f5ecd315edc96141bd3243203d1b7d4f0836f37308b276ba98"),
+            (
+                55usize,
+                "d5e285683cd4efc02d021a5c62014694958901005d6f71e89e0989fac77e4072",
+            ),
+            (
+                56,
+                "04c26261370ee7541549d16dee320c723e3fd14671e66a099afe0a377c16888e",
+            ),
+            (
+                63,
+                "75220b47218278e656f2013bb8f0c455a25eaf01e86c64924e9d48d89776d6f2",
+            ),
+            (
+                64,
+                "7ce100971f64e7001e8fe5a51973ecdfe1ced42befe7ee8d5fd6219506b5393c",
+            ),
+            (
+                65,
+                "9537c5fdf120482f7d58d25e9ed583f52c02b4e304ea814db1633ad565aed7e9",
+            ),
+            (
+                119,
+                "000b48d4edf0fa7bee3c6236ecd2785baa5db4eeb8bb54341b029e0d9fa5fb0c",
+            ),
+            (
+                120,
+                "13f05a0b594787f5ecd315edc96141bd3243203d1b7d4f0836f37308b276ba98",
+            ),
         ];
         for (n, want) in boundaries {
             assert_eq!(hex(&sha256(&vec![b'x'; n])), want, "length {n}");

@@ -514,18 +514,15 @@ fn replay<F: FnMut(Op)>(file: &mut File, header_len: u64, apply: &mut F) -> io::
 
     while pos + 5 <= data.len() {
         let kind = data[pos];
-        let len = u32::from_le_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]]) as usize;
+        let len = u32::from_le_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]])
+            as usize;
         let end = match pos.checked_add(9).and_then(|v| v.checked_add(len)) {
             Some(e) if e <= data.len() => e,
             _ => break, // truncated tail
         };
         let body = &data[pos..pos + 5 + len];
-        let stored_crc = u32::from_le_bytes([
-            data[end - 4],
-            data[end - 3],
-            data[end - 2],
-            data[end - 1],
-        ]);
+        let stored_crc =
+            u32::from_le_bytes([data[end - 4], data[end - 3], data[end - 2], data[end - 1]]);
         if crc32(body) != stored_crc {
             break; // corrupt tail: stop here, everything before is still good
         }
@@ -693,13 +690,14 @@ pub fn scan_committed_end(path: &Path, from: u64) -> io::Result<u64> {
     let mut committed = from;
     while pos + 5 <= data.len() {
         let kind = data[pos];
-        let plen =
-            u32::from_le_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]]) as usize;
+        let plen = u32::from_le_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]])
+            as usize;
         let end = match pos.checked_add(9).and_then(|v| v.checked_add(plen)) {
             Some(e) if e <= data.len() => e,
             _ => break,
         };
-        let stored = u32::from_le_bytes([data[end - 4], data[end - 3], data[end - 2], data[end - 1]]);
+        let stored =
+            u32::from_le_bytes([data[end - 4], data[end - 3], data[end - 2], data[end - 1]]);
         if crc32(&data[pos..pos + 5 + plen]) != stored {
             break;
         }
@@ -727,7 +725,6 @@ impl Store {
         self.header_len
     }
 }
-
 
 // --------------------------------------------------------------- durability
 
@@ -880,8 +877,8 @@ pub fn verify(path: &Path) -> io::Result<VerifyReport> {
     while pos + 5 <= data.len() {
         let at = header.header_len + pos as u64;
         let kind = data[pos];
-        let len =
-            u32::from_le_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]]) as usize;
+        let len = u32::from_le_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]])
+            as usize;
         let end = match pos.checked_add(9).and_then(|v| v.checked_add(len)) {
             Some(e) if e <= data.len() => e,
             _ => {
@@ -889,7 +886,8 @@ pub fn verify(path: &Path) -> io::Result<VerifyReport> {
                 break;
             }
         };
-        let stored = u32::from_le_bytes([data[end - 4], data[end - 3], data[end - 2], data[end - 1]]);
+        let stored =
+            u32::from_le_bytes([data[end - 4], data[end - 3], data[end - 2], data[end - 1]]);
         if crc32(&data[pos..pos + 5 + len]) != stored {
             bad = Some(at);
             break;

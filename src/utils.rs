@@ -265,7 +265,8 @@ impl<'a> Digraph<'a> {
 
     /// Topological order, or `None` if the graph has a cycle.
     pub fn topsort(&self) -> Option<Vec<u64>> {
-        algo::topological_sort(&self.out).map(|idx| idx.into_iter().map(|i| self.out.ids[i]).collect())
+        algo::topological_sort(&self.out)
+            .map(|idx| idx.into_iter().map(|i| self.out.ids[i]).collect())
     }
 
     pub fn is_acyclic(&self) -> bool {
@@ -464,8 +465,11 @@ mod tests {
         let mut ids = Vec::new();
         for name in ["a", "b", "c", "d", "e", "f"] {
             ids.push(
-                g.add_node(&["V".into()], vec![("name".into(), Value::Text(name.into()))])
-                    .unwrap(),
+                g.add_node(
+                    &["V".into()],
+                    vec![("name".into(), Value::Text(name.into()))],
+                )
+                .unwrap(),
             );
         }
         g.add_edge(ids[0], ids[1], "E", vec![]).unwrap();
@@ -484,7 +488,10 @@ mod tests {
             vec![vec![id[0], id[1], id[2]], vec![id[3], id[4]], vec![id[5]]]
         );
         assert_eq!(d.strong_components().len(), 4); // {a,b,c}, {d}, {e}, {f}
-        assert_eq!(d.cyclic_strong_components(), vec![vec![id[0], id[1], id[2]]]);
+        assert_eq!(
+            d.cyclic_strong_components(),
+            vec![vec![id[0], id[1], id[2]]]
+        );
         assert!(!d.is_acyclic());
         assert_eq!(d.topsort(), None);
     }
@@ -497,10 +504,7 @@ mod tests {
         assert_eq!(d.reachable(&[id[3]]), vec![id[3], id[4]]);
         assert_eq!(d.reachable_neighbours(&[id[3]]), vec![id[4]]);
         // a is on a cycle, so it is its own neighbour.
-        assert_eq!(
-            d.reachable_neighbours(&[id[0]]),
-            vec![id[0], id[1], id[2]]
-        );
+        assert_eq!(d.reachable_neighbours(&[id[0]]), vec![id[0], id[1], id[2]]);
         assert_eq!(d.reaching(&[id[4]]), vec![id[3], id[4]]);
         assert_eq!(d.reaching_neighbours(&[id[4]]), vec![id[3]]);
         assert!(d.reachable(&[id[5]]) == vec![id[5]]);

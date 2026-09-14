@@ -20,9 +20,12 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 
-GLIDER=../target/release/glider
-GEN=target/release/ldbc-gen
-LOADGEN=target/release/loadgen
+# One workspace, one target directory: `cargo build --release --workspace` at
+# the repo root produces glider and both harness binaries side by side.
+TARGET=../target/release
+GLIDER=$TARGET/glider
+GEN=$TARGET/ldbc-gen
+LOADGEN=$TARGET/loadgen
 DATA=data
 OUT=results.jsonl
 PORT=7878

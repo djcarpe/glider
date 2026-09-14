@@ -36,7 +36,11 @@ struct Rng(u64);
 impl Rng {
     fn new(seed: u64) -> Self {
         // Guard the zero state, which xorshift cannot leave.
-        Rng(if seed == 0 { 0x2545_F491_4F6C_DD1D } else { seed })
+        Rng(if seed == 0 {
+            0x2545_F491_4F6C_DD1D
+        } else {
+            seed
+        })
     }
     fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
@@ -68,37 +72,127 @@ const FIRST: &[&str] = &[
 ];
 
 const LAST: &[&str] = &[
-    "Ahmed", "Berg", "Chen", "Diaz", "Eriksen", "Fontaine", "Garcia", "Haddad", "Ivanov", "Jensen",
-    "Kowalski", "Lindqvist", "Mensah", "Novak", "Okafor", "Petrov", "Rossi", "Silva", "Tanaka",
-    "Ueda", "Varga", "Watanabe", "Yilmaz", "Zhang",
+    "Ahmed",
+    "Berg",
+    "Chen",
+    "Diaz",
+    "Eriksen",
+    "Fontaine",
+    "Garcia",
+    "Haddad",
+    "Ivanov",
+    "Jensen",
+    "Kowalski",
+    "Lindqvist",
+    "Mensah",
+    "Novak",
+    "Okafor",
+    "Petrov",
+    "Rossi",
+    "Silva",
+    "Tanaka",
+    "Ueda",
+    "Varga",
+    "Watanabe",
+    "Yilmaz",
+    "Zhang",
 ];
 
 const CITIES: &[(&str, &str)] = &[
-    ("London", "GB"), ("Paris", "FR"), ("Berlin", "DE"), ("Madrid", "ES"),
-    ("Rome", "IT"), ("Lisbon", "PT"), ("Dublin", "IE"), ("Vienna", "AT"),
-    ("Prague", "CZ"), ("Warsaw", "PL"), ("Athens", "GR"), ("Oslo", "NO"),
-    ("Stockholm", "SE"), ("Helsinki", "FI"), ("Copenhagen", "DK"), ("Amsterdam", "NL"),
-    ("Brussels", "BE"), ("Zurich", "CH"), ("Budapest", "HU"), ("Bucharest", "RO"),
-    ("Tokyo", "JP"), ("Osaka", "JP"), ("Seoul", "KR"), ("Shanghai", "CN"),
-    ("Mumbai", "IN"), ("Delhi", "IN"), ("Singapore", "SG"), ("Sydney", "AU"),
-    ("Toronto", "CA"), ("Vancouver", "CA"), ("New York", "US"), ("Chicago", "US"),
-    ("Austin", "US"), ("Seattle", "US"), ("Denver", "US"), ("Boston", "US"),
-    ("Lagos", "NG"), ("Nairobi", "KE"), ("Cairo", "EG"), ("Cape Town", "ZA"),
-    ("Sao Paulo", "BR"), ("Buenos Aires", "AR"), ("Santiago", "CL"), ("Bogota", "CO"),
-    ("Mexico City", "MX"), ("Istanbul", "TR"), ("Tel Aviv", "IL"), ("Dubai", "AE"),
+    ("London", "GB"),
+    ("Paris", "FR"),
+    ("Berlin", "DE"),
+    ("Madrid", "ES"),
+    ("Rome", "IT"),
+    ("Lisbon", "PT"),
+    ("Dublin", "IE"),
+    ("Vienna", "AT"),
+    ("Prague", "CZ"),
+    ("Warsaw", "PL"),
+    ("Athens", "GR"),
+    ("Oslo", "NO"),
+    ("Stockholm", "SE"),
+    ("Helsinki", "FI"),
+    ("Copenhagen", "DK"),
+    ("Amsterdam", "NL"),
+    ("Brussels", "BE"),
+    ("Zurich", "CH"),
+    ("Budapest", "HU"),
+    ("Bucharest", "RO"),
+    ("Tokyo", "JP"),
+    ("Osaka", "JP"),
+    ("Seoul", "KR"),
+    ("Shanghai", "CN"),
+    ("Mumbai", "IN"),
+    ("Delhi", "IN"),
+    ("Singapore", "SG"),
+    ("Sydney", "AU"),
+    ("Toronto", "CA"),
+    ("Vancouver", "CA"),
+    ("New York", "US"),
+    ("Chicago", "US"),
+    ("Austin", "US"),
+    ("Seattle", "US"),
+    ("Denver", "US"),
+    ("Boston", "US"),
+    ("Lagos", "NG"),
+    ("Nairobi", "KE"),
+    ("Cairo", "EG"),
+    ("Cape Town", "ZA"),
+    ("Sao Paulo", "BR"),
+    ("Buenos Aires", "AR"),
+    ("Santiago", "CL"),
+    ("Bogota", "CO"),
+    ("Mexico City", "MX"),
+    ("Istanbul", "TR"),
+    ("Tel Aviv", "IL"),
+    ("Dubai", "AE"),
 ];
 
 const TAGS: &[&str] = &[
-    "graphs", "databases", "rust", "distributed-systems", "storage", "query-planning",
-    "compilers", "networking", "security", "cryptography", "machine-learning", "statistics",
-    "visualisation", "typography", "cycling", "climbing", "coffee", "baking", "jazz",
-    "photography", "gardening", "chess", "hiking", "woodworking", "sailing", "astronomy",
-    "linguistics", "history", "architecture", "ceramics",
+    "graphs",
+    "databases",
+    "rust",
+    "distributed-systems",
+    "storage",
+    "query-planning",
+    "compilers",
+    "networking",
+    "security",
+    "cryptography",
+    "machine-learning",
+    "statistics",
+    "visualisation",
+    "typography",
+    "cycling",
+    "climbing",
+    "coffee",
+    "baking",
+    "jazz",
+    "photography",
+    "gardening",
+    "chess",
+    "hiking",
+    "woodworking",
+    "sailing",
+    "astronomy",
+    "linguistics",
+    "history",
+    "architecture",
+    "ceramics",
 ];
 
 const TITLE_HEAD: &[&str] = &[
-    "Notes on", "Rethinking", "A short history of", "Against", "In praise of",
-    "Benchmarking", "Debugging", "What I learned about", "The trouble with", "Revisiting",
+    "Notes on",
+    "Rethinking",
+    "A short history of",
+    "Against",
+    "In praise of",
+    "Benchmarking",
+    "Debugging",
+    "What I learned about",
+    "The trouble with",
+    "Revisiting",
 ];
 
 // --------------------------------------------------------------- args
@@ -111,7 +205,12 @@ struct Args {
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut a = Args { scale: 100_000, seed: 42, out: None, avg_degree: 12 };
+    let mut a = Args {
+        scale: 100_000,
+        seed: 42,
+        out: None,
+        avg_degree: 12,
+    };
     let argv: Vec<String> = env::args().skip(1).collect();
     let mut i = 0;
     while i < argv.len() {
@@ -134,7 +233,9 @@ fn parse_args() -> Result<Args, String> {
                 i += 2;
             }
             "--avg-degree" | "-d" => {
-                a.avg_degree = need(i)?.parse().map_err(|_| "bad --avg-degree".to_string())?;
+                a.avg_degree = need(i)?
+                    .parse()
+                    .map_err(|_| "bad --avg-degree".to_string())?;
                 i += 2;
             }
             "-h" | "--help" => {
@@ -255,7 +356,15 @@ fn run(args: &Args) -> io::Result<()> {
         line.push_str(",\"email\":");
         // Unique per node, so INDEX ON :Person(email) is a genuine point lookup
         // rather than a scan that happens to stop early.
-        esc(&format!("{}.{}{}@example.com", first.to_lowercase(), last.to_lowercase(), i), &mut line);
+        esc(
+            &format!(
+                "{}.{}{}@example.com",
+                first.to_lowercase(),
+                last.to_lowercase(),
+                i
+            ),
+            &mut line,
+        );
         line.push_str(",\"age\":");
         line.push_str(&age.to_string());
         line.push_str(",\"city\":");

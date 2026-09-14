@@ -69,17 +69,16 @@ fn lex(src: &str) -> Result<Vec<Tok>> {
             || (c == '-'
                 && i + 1 < b.len()
                 && b[i + 1].is_ascii_digit()
-                && matches!(
-                    out.last(),
-                    None | Some(Tok::Sym(_))
-                ))
+                && matches!(out.last(), None | Some(Tok::Sym(_))))
         {
             let start = i;
             if b[i] == '-' {
                 i += 1;
             }
             let mut float = false;
-            while i < b.len() && (b[i].is_ascii_digit() || b[i] == '.' || b[i] == 'e' || b[i] == 'E') {
+            while i < b.len()
+                && (b[i].is_ascii_digit() || b[i] == '.' || b[i] == 'e' || b[i] == 'E')
+            {
                 if b[i] == '.' {
                     // `..` is a range operator, not a decimal point
                     if i + 1 < b.len() && b[i + 1] == '.' {
@@ -91,12 +90,16 @@ fn lex(src: &str) -> Result<Vec<Tok>> {
             }
             let text: String = b[start..i].iter().collect();
             if float {
-                out.push(Tok::Float(text.parse().map_err(|_| Error::Msg(format!("bad number {}", text)))?));
+                out.push(Tok::Float(
+                    text.parse()
+                        .map_err(|_| Error::Msg(format!("bad number {}", text)))?,
+                ));
             } else {
                 match text.parse::<i64>() {
                     Ok(v) => out.push(Tok::Int(v)),
                     Err(_) => out.push(Tok::Float(
-                        text.parse().map_err(|_| Error::Msg(format!("bad number {}", text)))?,
+                        text.parse()
+                            .map_err(|_| Error::Msg(format!("bad number {}", text)))?,
                     )),
                 }
             }
@@ -1096,10 +1099,16 @@ pub fn execute(g: &mut Graph, src: &str) -> Result<QueryResult> {
         Stmt::Index { label, key, drop } => {
             if drop {
                 g.drop_index(&label, &key)?;
-                Ok(QueryResult::message(format!("dropped index :{}({})", label, key)))
+                Ok(QueryResult::message(format!(
+                    "dropped index :{}({})",
+                    label, key
+                )))
             } else {
                 g.create_index(&label, &key)?;
-                Ok(QueryResult::message(format!("created index :{}({})", label, key)))
+                Ok(QueryResult::message(format!(
+                    "created index :{}({})",
+                    label, key
+                )))
             }
         }
         Stmt::Stats => {
@@ -1107,17 +1116,26 @@ pub fn execute(g: &mut Graph, src: &str) -> Result<QueryResult> {
             let rows = vec![
                 vec![Value::Text("nodes".into()), Value::Int(s.nodes as i64)],
                 vec![Value::Text("edges".into()), Value::Int(s.edges as i64)],
-                vec![Value::Text("labels".into()), Value::Int(s.labels.len() as i64)],
+                vec![
+                    Value::Text("labels".into()),
+                    Value::Int(s.labels.len() as i64),
+                ],
                 vec![
                     Value::Text("edge_types".into()),
                     Value::Int(s.edge_types.len() as i64),
                 ],
-                vec![Value::Text("indexes".into()), Value::Int(s.indexes.len() as i64)],
+                vec![
+                    Value::Text("indexes".into()),
+                    Value::Int(s.indexes.len() as i64),
+                ],
                 vec![
                     Value::Text("interned_strings".into()),
                     Value::Int(s.interned as i64),
                 ],
-                vec![Value::Text("file_bytes".into()), Value::Int(s.file_bytes as i64)],
+                vec![
+                    Value::Text("file_bytes".into()),
+                    Value::Int(s.file_bytes as i64),
+                ],
             ];
             Ok(QueryResult::table(
                 vec!["metric".into(), "value".into()],
@@ -1255,7 +1273,11 @@ fn explain(g: &Graph, stmt: &Stmt) -> Result<QueryResult> {
 
         for step in &plan.steps {
             let rel = &chain.rels[step.rel];
-            let dir = if step.reversed { flip(rel.dir) } else { rel.dir };
+            let dir = if step.reversed {
+                flip(rel.dir)
+            } else {
+                rel.dir
+            };
             let arrow = match dir {
                 Dir::Out => "->",
                 Dir::In => "<-",
@@ -1370,7 +1392,9 @@ fn exec_match(
                                     g.set_edge_prop(id, key, v)?;
                                     touched += 1;
                                 }
-                                None => return Err(Error::Msg(format!("unknown variable {}", var))),
+                                None => {
+                                    return Err(Error::Msg(format!("unknown variable {}", var)))
+                                }
                             }
                         }
                         SetItem::Label(var, label) => {
@@ -1459,10 +1483,8 @@ fn exec_match(
                 created_e += e;
             }
             g.commit()?;
-            let mut r = QueryResult::message(format!(
-                "created {} nodes, {} edges",
-                created_n, created_e
-            ));
+            let mut r =
+                QueryResult::message(format!("created {} nodes, {} edges", created_n, created_e));
             r.touched = created_n + created_e;
             Ok(r)
         }
@@ -1631,12 +1653,7 @@ fn match_chain_filtered(
 }
 
 /// Enumerate the anchor's candidate set, cheapest source first.
-fn anchor_candidates(
-    g: &Graph,
-    pat: &NodePat,
-    binds: &Binds,
-    pins: &[(String, u64)],
-) -> Vec<u64> {
+fn anchor_candidates(g: &Graph, pat: &NodePat, binds: &Binds, pins: &[(String, u64)]) -> Vec<u64> {
     if let Some(v) = &pat.var {
         if let Some(Bind::Node(id)) = lookup(binds, v) {
             return vec![id];
@@ -1669,7 +1686,11 @@ fn walk(
     let step = steps[i];
     let rel = &chain.rels[step.rel];
     let target_pat = &chain.nodes[step.to];
-    let dir = if step.reversed { flip(rel.dir) } else { rel.dir };
+    let dir = if step.reversed {
+        flip(rel.dir)
+    } else {
+        rel.dir
+    };
     let current = match bound[step.from] {
         Some(id) => id,
         None => return Ok(()),
@@ -1851,11 +1872,9 @@ fn create_chains(g: &mut Graph, chains: &[Chain], binds: &mut Binds) -> Result<(
                     "variable-length patterns can't be created".into(),
                 ));
             }
-            let etype = rel
-                .types
-                .first()
-                .cloned()
-                .ok_or_else(|| Error::Msg("CREATE needs a relationship type, e.g. -[:KNOWS]->".into()))?;
+            let etype = rel.types.first().cloned().ok_or_else(|| {
+                Error::Msg("CREATE needs a relationship type, e.g. -[:KNOWS]->".into())
+            })?;
             let props: Vec<(String, Value)> = rel
                 .props
                 .iter()
@@ -1963,10 +1982,9 @@ fn project(
             .iter()
             .map(|(e, desc)| {
                 let alias = e.alias();
-                let idx = columns
-                    .iter()
-                    .position(|c| *c == alias)
-                    .ok_or_else(|| Error::Msg(format!("ORDER BY {} is not a returned column", alias)))?;
+                let idx = columns.iter().position(|c| *c == alias).ok_or_else(|| {
+                    Error::Msg(format!("ORDER BY {} is not a returned column", alias))
+                })?;
                 Ok((idx, *desc))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -2133,12 +2151,9 @@ fn eval_func(g: &Graph, name: &str, args: &[Expr], binds: &Binds) -> Value {
             None => Value::Null,
         },
         "labels" => match arg_bind(0) {
-            Some(Bind::Node(id)) => Value::List(
-                g.node_labels(id)
-                    .into_iter()
-                    .map(Value::Text)
-                    .collect(),
-            ),
+            Some(Bind::Node(id)) => {
+                Value::List(g.node_labels(id).into_iter().map(Value::Text).collect())
+            }
             _ => Value::Null,
         },
         "type" => match arg_bind(0) {
@@ -2182,11 +2197,26 @@ fn eval_func(g: &Graph, name: &str, args: &[Expr], binds: &Binds) -> Value {
         "lower" | "tolower" => Value::Text(val(0).to_string().to_lowercase()),
         "upper" | "toupper" => Value::Text(val(0).to_string().to_uppercase()),
         "trim" => Value::Text(val(0).to_string().trim().to_string()),
-        "abs" => val(0).as_f64().map(|v| Value::Float(v.abs())).unwrap_or(Value::Null),
-        "round" => val(0).as_f64().map(|v| Value::Float(v.round())).unwrap_or(Value::Null),
-        "floor" => val(0).as_f64().map(|v| Value::Float(v.floor())).unwrap_or(Value::Null),
-        "ceil" => val(0).as_f64().map(|v| Value::Float(v.ceil())).unwrap_or(Value::Null),
-        "sqrt" => val(0).as_f64().map(|v| Value::Float(v.sqrt())).unwrap_or(Value::Null),
+        "abs" => val(0)
+            .as_f64()
+            .map(|v| Value::Float(v.abs()))
+            .unwrap_or(Value::Null),
+        "round" => val(0)
+            .as_f64()
+            .map(|v| Value::Float(v.round()))
+            .unwrap_or(Value::Null),
+        "floor" => val(0)
+            .as_f64()
+            .map(|v| Value::Float(v.floor()))
+            .unwrap_or(Value::Null),
+        "ceil" => val(0)
+            .as_f64()
+            .map(|v| Value::Float(v.ceil()))
+            .unwrap_or(Value::Null),
+        "sqrt" => val(0)
+            .as_f64()
+            .map(|v| Value::Float(v.sqrt()))
+            .unwrap_or(Value::Null),
         "toint" | "tointeger" => val(0).as_i64().map(Value::Int).unwrap_or(Value::Null),
         "tofloat" => val(0).as_f64().map(Value::Float).unwrap_or(Value::Null),
         "tostring" => Value::Text(val(0).to_string()),
@@ -2221,7 +2251,9 @@ impl<'a> Args<'a> {
             .unwrap_or(default)
     }
     fn u64(&self, key: &str) -> Option<u64> {
-        self.get(key).and_then(|v| v.as_i64()).map(|v| v.max(0) as u64)
+        self.get(key)
+            .and_then(|v| v.as_i64())
+            .map(|v| v.max(0) as u64)
     }
     fn str(&self, key: &str) -> Option<String> {
         self.get(key).map(|v| v.to_string())
@@ -2339,7 +2371,13 @@ fn call_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result
         "triangles" => {
             let both = g.csr(Dir::Both, etype, None);
             let (counts, total) = algo::triangles(&both);
-            let mut r = scalar(g, counts.iter().map(|c| *c as f64).collect(), "triangles", &a, true)?;
+            let mut r = scalar(
+                g,
+                counts.iter().map(|c| *c as f64).collect(),
+                "triangles",
+                &a,
+                true,
+            )?;
             r.message = Some(format!("{} triangles in total", total));
             Ok(r)
         }
@@ -2352,31 +2390,59 @@ fn call_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result
         "kcore" => {
             let both = g.csr(Dir::Both, etype, None);
             let cores = algo::core_numbers(&both);
-            scalar(g, cores.iter().map(|c| *c as f64).collect(), "core", &a, true)
+            scalar(
+                g,
+                cores.iter().map(|c| *c as f64).collect(),
+                "core",
+                &a,
+                true,
+            )
         }
         "components" | "wcc" => {
             let both = g.csr(Dir::Both, etype, None);
             let (comp, count) = algo::components(&both);
-            let mut r = scalar(g, comp.iter().map(|c| *c as f64).collect(), "component", &a, true)?;
+            let mut r = scalar(
+                g,
+                comp.iter().map(|c| *c as f64).collect(),
+                "component",
+                &a,
+                true,
+            )?;
             r.message = Some(format!("{} connected components", count));
             Ok(r)
         }
         "scc" => {
             let (comp, count) = algo::strongly_connected(&csr);
-            let mut r = scalar(g, comp.iter().map(|c| *c as f64).collect(), "component", &a, true)?;
+            let mut r = scalar(
+                g,
+                comp.iter().map(|c| *c as f64).collect(),
+                "component",
+                &a,
+                true,
+            )?;
             r.message = Some(format!("{} strongly connected components", count));
             Ok(r)
         }
         "communities" | "labelprop" => {
             let both = g.csr(Dir::Both, etype, None);
             let (labels, count) = algo::label_propagation(&both, a.u32("iterations", 20));
-            let mut r = scalar(g, labels.iter().map(|l| *l as f64).collect(), "community", &a, true)?;
+            let mut r = scalar(
+                g,
+                labels.iter().map(|l| *l as f64).collect(),
+                "community",
+                &a,
+                true,
+            )?;
             r.message = Some(format!("{} communities", count));
             Ok(r)
         }
         "shortestpath" | "path" => {
-            let from = a.u64("from").ok_or_else(|| Error::Msg("shortestpath needs from:".into()))?;
-            let to = a.u64("to").ok_or_else(|| Error::Msg("shortestpath needs to:".into()))?;
+            let from = a
+                .u64("from")
+                .ok_or_else(|| Error::Msg("shortestpath needs from:".into()))?;
+            let to = a
+                .u64("to")
+                .ok_or_else(|| Error::Msg("shortestpath needs to:".into()))?;
             let (Some(s), Some(t)) = (csr.index_of(from), csr.index_of(to)) else {
                 return Err(Error::Msg("from/to must be existing node ids".into()));
             };
@@ -2401,10 +2467,8 @@ fn call_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result
                             vec![Value::Int(i as i64), Value::Int(id as i64), label_of(g, id)]
                         })
                         .collect();
-                    let mut r = QueryResult::table(
-                        vec!["step".into(), "id".into(), "node".into()],
-                        rows,
-                    );
+                    let mut r =
+                        QueryResult::table(vec!["step".into(), "id".into(), "node".into()], rows);
                     r.message = Some(format!(
                         "{} hops, cost {}",
                         path.len().saturating_sub(1),
@@ -2415,7 +2479,9 @@ fn call_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result
             }
         }
         "sssp" | "distances" => {
-            let from = a.u64("from").ok_or_else(|| Error::Msg("sssp needs from:".into()))?;
+            let from = a
+                .u64("from")
+                .ok_or_else(|| Error::Msg("sssp needs from:".into()))?;
             let s = csr
                 .index_of(from)
                 .ok_or_else(|| Error::Msg("from: must be an existing node id".into()))?;
@@ -2449,7 +2515,9 @@ fn call_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result
             ))
         }
         "bfs" | "dfs" => {
-            let from = a.u64("from").ok_or_else(|| Error::Msg("traversal needs from:".into()))?;
+            let from = a
+                .u64("from")
+                .ok_or_else(|| Error::Msg("traversal needs from:".into()))?;
             let s = csr
                 .index_of(from)
                 .ok_or_else(|| Error::Msg("from: must be an existing node id".into()))?;
@@ -2480,9 +2548,19 @@ fn call_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result
             ))
         }
         "neighbors" | "neighbours" => {
-            let from = a.u64("from").ok_or_else(|| Error::Msg("neighbors needs from:".into()))?;
+            let from = a
+                .u64("from")
+                .ok_or_else(|| Error::Msg("neighbors needs from:".into()))?;
             let rows: Vec<Vec<Value>> = g
-                .neighbors(from, dir, if etype == Some(u32::MAX) { etype } else { etype })
+                .neighbors(
+                    from,
+                    dir,
+                    if etype == Some(u32::MAX) {
+                        etype
+                    } else {
+                        etype
+                    },
+                )
                 .into_iter()
                 .take(a.top())
                 .map(|adj| {
@@ -2500,7 +2578,9 @@ fn call_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result
             ))
         }
         "subgraph" => {
-            let from = a.u64("from").ok_or_else(|| Error::Msg("subgraph needs from:".into()))?;
+            let from = a
+                .u64("from")
+                .ok_or_else(|| Error::Msg("subgraph needs from:".into()))?;
             let s = csr
                 .index_of(from)
                 .ok_or_else(|| Error::Msg("from: must be an existing node id".into()))?;
@@ -2643,9 +2723,10 @@ pub fn import_jsonl(g: &mut Graph, text: &str) -> Result<(usize, usize)> {
             edges += 1;
         } else {
             let labels: Vec<String> = match j.get("labels") {
-                Some(crate::value::Json::Array(a)) => {
-                    a.iter().filter_map(|v| v.as_str().map(String::from)).collect()
-                }
+                Some(crate::value::Json::Array(a)) => a
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect(),
                 _ => j
                     .get("label")
                     .and_then(|v| v.as_str())

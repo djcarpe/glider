@@ -21,7 +21,7 @@ usage:
   glider <db> export [file.jsonl]
   glider <db> stats | compact | verify | bench [n]
 
-replication (see MOBILE.md / README for the full story):
+replication (see docs/MOBILE.md / README for the full story):
   glider <db> wal tail --to <dir> [--exec CMD] [--interval S] [--once]
   glider <db> wal status --to <dir>
   glider wal verify --from <dir>
@@ -200,7 +200,8 @@ fn run() -> Result<(), String> {
         return run_script(&mut graph, cmd, opts.json);
     }
     if let Some(path) = &opts.file {
-        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {}", path.display(), e))?;
+        let text =
+            std::fs::read_to_string(path).map_err(|e| format!("{}: {}", path.display(), e))?;
         return run_script(&mut graph, &text, opts.json);
     }
 
@@ -211,7 +212,10 @@ fn run() -> Result<(), String> {
             // listener and lands on a connection-refused error.
             let listener = std::net::TcpListener::bind(&opts.addr)
                 .map_err(|e| format!("{}: {}", opts.addr, e))?;
-            let url = format!("http://{}/", listener.local_addr().map_err(|e| e.to_string())?);
+            let url = format!(
+                "http://{}/",
+                listener.local_addr().map_err(|e| e.to_string())?
+            );
             if !opts.no_open {
                 open_browser(&url);
             }
@@ -221,7 +225,8 @@ fn run() -> Result<(), String> {
         Mode::Stats => run_script(&mut graph, "STATS", opts.json),
         Mode::Compact => run_script(&mut graph, "COMPACT", opts.json),
         Mode::Import(path) => {
-            let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {}", path.display(), e))?;
+            let text =
+                std::fs::read_to_string(&path).map_err(|e| format!("{}: {}", path.display(), e))?;
             let start = Instant::now();
             let (n, e) = query::import_jsonl(&mut graph, &text).map_err(|e| e.to_string())?;
             println!(
@@ -335,7 +340,12 @@ fn shell(mut graph: Graph, mut json: bool) -> Result<(), String> {
             let _ = std::io::stdout().flush();
         }
         let mut line = String::new();
-        if stdin.lock().read_line(&mut line).map_err(|e| e.to_string())? == 0 {
+        if stdin
+            .lock()
+            .read_line(&mut line)
+            .map_err(|e| e.to_string())?
+            == 0
+        {
             break;
         }
         let trimmed = line.trim();
@@ -528,7 +538,11 @@ fn open_browser(url: &str) {
     } else if cfg!(target_os = "windows") {
         &[("cmd", &["/C", "start", ""])]
     } else {
-        &[("xdg-open", &[]), ("gio", &["open"]), ("sensible-browser", &[])]
+        &[
+            ("xdg-open", &[]),
+            ("gio", &["open"]),
+            ("sensible-browser", &[]),
+        ]
     };
 
     for (cmd, prefix) in candidates {
@@ -541,7 +555,10 @@ fn open_browser(url: &str) {
             return;
         }
     }
-    eprintln!("could not open a browser automatically — open {} yourself", url);
+    eprintln!(
+        "could not open a browser automatically — open {} yourself",
+        url
+    );
 }
 
 // --------------------------------------------------------------------- bench
@@ -585,7 +602,12 @@ fn bench(graph: &mut Graph, n: usize) -> Result<(), String> {
             let to = ids[(state % ids.len() as u64) as usize];
             if to != from {
                 graph
-                    .add_edge(from, to, "LINKS", vec![("w".into(), Value::Int((state % 10) as i64))])
+                    .add_edge(
+                        from,
+                        to,
+                        "LINKS",
+                        vec![("w".into(), Value::Int((state % 10) as i64))],
+                    )
                     .map_err(|e| e.to_string())?;
                 edge_count += 1;
             }
@@ -617,8 +639,11 @@ fn bench(graph: &mut Graph, n: usize) -> Result<(), String> {
     }
 
     let start = Instant::now();
-    let r = query::execute(graph, "MATCH (a)-[:LINKS]->(b)-[:LINKS]->(c) RETURN count(c) AS paths")
-        .map_err(|e| e.to_string())?;
+    let r = query::execute(
+        graph,
+        "MATCH (a)-[:LINKS]->(b)-[:LINKS]->(c) RETURN count(c) AS paths",
+    )
+    .map_err(|e| e.to_string())?;
     println!(
         "  {:<40} {:.3}s  {} two-hop paths",
         "two-hop pattern match",
@@ -641,7 +666,10 @@ fn _unused(_: &dyn Read) {}
 // ------------------------------------------------------------- replication
 
 fn flag(args: &[String], name: &str) -> Option<String> {
-    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
 }
 
 fn has(args: &[String], name: &str) -> bool {
@@ -649,7 +677,11 @@ fn has(args: &[String], name: &str) -> bool {
 }
 
 fn run_wal(args: &[String], at: usize) -> Result<(), String> {
-    let db = if at > 0 { Some(args[at - 1].clone()) } else { None };
+    let db = if at > 0 {
+        Some(args[at - 1].clone())
+    } else {
+        None
+    };
     let sub = args.get(at + 1).map(|s| s.as_str()).unwrap_or("");
 
     match sub {
@@ -679,15 +711,26 @@ fn run_wal(args: &[String], at: usize) -> Result<(), String> {
                 .or_else(|| flag(args, "--from"))
                 .ok_or("wal status needs --to <dir>")?;
             let header = glider::store::read_header(Path::new(&db)).map_err(|e| e.to_string())?;
-            let local = glider::store::scan_committed_end(Path::new(&db), 0)
-                .map_err(|e| e.to_string())?;
+            let local =
+                glider::store::scan_committed_end(Path::new(&db), 0).map_err(|e| e.to_string())?;
             let gen = header.generation_hex();
             let segs = glider::wal::segments(Path::new(&dir), &gen).map_err(|e| e.to_string())?;
             let replicated = glider::wal::contiguous_end(&segs);
             println!("database    {}", db);
-            println!("generation  {}", if header.has_generation() { gen } else { "none (format v1 — run COMPACT to upgrade)".into() });
+            println!(
+                "generation  {}",
+                if header.has_generation() {
+                    gen
+                } else {
+                    "none (format v1 — run COMPACT to upgrade)".into()
+                }
+            );
             println!("committed   {} bytes", local);
-            println!("replicated  {} bytes in {} segments", replicated, segs.len());
+            println!(
+                "replicated  {} bytes in {} segments",
+                replicated,
+                segs.len()
+            );
             println!("lag         {} bytes", local.saturating_sub(replicated));
             if let Some(last) = segs.last() {
                 println!("last ship   {}", glider::wal::fmt_unix(last.ts));
@@ -748,7 +791,8 @@ fn run_wal(args: &[String], at: usize) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
 
             // A restore that does not open is not a restore.
-            let g = glider::Graph::open(Path::new(&out), Sync::Normal).map_err(|e| e.to_string())?;
+            let g =
+                glider::Graph::open(Path::new(&out), Sync::Normal).map_err(|e| e.to_string())?;
             println!(
                 "restored {} bytes from {} segments of generation {}",
                 report.bytes, report.segments, report.generation

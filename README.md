@@ -296,11 +296,31 @@ Honest limits, so you find them here rather than in production:
 cargo test
 ```
 
-18 integration tests covering reopen, torn-tail recovery, uncommitted-transaction
+26 integration tests and 37 unit tests covering reopen, torn-tail recovery,
+uncommitted-transaction
 rollback, compaction correctness, index maintenance through updates and deletes,
 each query form, algorithm results against hand-computed values, deep-chain
 recursion safety, and that malformed queries return errors instead of panicking.
 
+## Repository layout
+
+```
+src/            the library and both binaries
+src/stream/     replication: WAL shipping, S3 backend, config
+tests/          integration tests
+bench/          benchmark harness (workspace member; ./bench/run.sh)
+include/        glider.h, the C ABI header
+ts/             TypeScript/wasm bindings
+ui/             browser console (React + Vite)
+scripts/        cross-compilation helpers
+docs/           design notes: MOBILE, REPLICATION, STREAM, REVIEW, TODO
+```
+
 ## Licence
 
-MIT OR Apache-2.0.
+Dual-licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.

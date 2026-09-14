@@ -120,7 +120,10 @@ fn parse_block(lines: &[(usize, String)], pos: &mut usize, indent: usize) -> io:
 
     if lines[*pos].1.trim_start().starts_with("- ") || lines[*pos].1.trim() == "-" {
         let mut items = Vec::new();
-        while *pos < lines.len() && lines[*pos].0 == indent && lines[*pos].1.trim_start().starts_with('-') {
+        while *pos < lines.len()
+            && lines[*pos].0 == indent
+            && lines[*pos].1.trim_start().starts_with('-')
+        {
             let (item_indent, line) = &lines[*pos];
             let rest = line.trim_start().trim_start_matches('-').trim().to_string();
             *pos += 1;
@@ -145,7 +148,9 @@ fn parse_block(lines: &[(usize, String)], pos: &mut usize, indent: usize) -> io:
                 }
                 while *pos < lines.len() && lines[*pos].0 == key_col {
                     let line = lines[*pos].1.trim().to_string();
-                    let Some((k2, v2)) = split_pair(&line) else { break };
+                    let Some((k2, v2)) = split_pair(&line) else {
+                        break;
+                    };
                     *pos += 1;
                     if v2.is_empty() {
                         let child = lines.get(*pos).map(|(i, _)| *i).unwrap_or(key_col + 2);
@@ -176,12 +181,19 @@ fn parse_block(lines: &[(usize, String)], pos: &mut usize, indent: usize) -> io:
         }
         let line = lines[*pos].1.trim().to_string();
         let Some((k, v)) = split_pair(&line) else {
-            return Err(io::Error::other(format!("expected 'key: value' at: {line}")));
+            return Err(io::Error::other(format!(
+                "expected 'key: value' at: {line}"
+            )));
         };
         *pos += 1;
         if v.is_empty() {
             let child_indent = lines.get(*pos).map(|(i, _)| *i).unwrap_or(indent);
-            if child_indent > indent || lines.get(*pos).map(|(_, l)| l.trim_start().starts_with('-')).unwrap_or(false) {
+            if child_indent > indent
+                || lines
+                    .get(*pos)
+                    .map(|(_, l)| l.trim_start().starts_with('-'))
+                    .unwrap_or(false)
+            {
                 map.insert(k, parse_block(lines, pos, child_indent)?);
             } else {
                 map.insert(k, Node::Scalar(String::new()));
@@ -489,7 +501,7 @@ pub fn open_backend(rc: &ReplicaConfig) -> io::Result<Arc<dyn Backend>> {
             }
             return Err(io::Error::other(format!(
                 "{url} needs either a plaintext `endpoint:` (MinIO, Ceph, LocalStack) \
-                 or the aws CLI on PATH for TLS. glider has no TLS stack — see REPLICATION.md."
+                 or the aws CLI on PATH for TLS. glider has no TLS stack — see docs/REPLICATION.md."
             )));
         }
 
@@ -533,9 +545,7 @@ pub fn open_backend(rc: &ReplicaConfig) -> io::Result<Arc<dyn Backend>> {
 
 fn which(bin: &str) -> bool {
     std::env::var("PATH")
-        .map(|paths| {
-            std::env::split_paths(&paths).any(|dir| dir.join(bin).exists())
-        })
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(bin).exists()))
         .unwrap_or(false)
 }
 
@@ -569,11 +579,17 @@ dbs:
         assert_eq!(first.path, "/var/lib/app.gldb");
         assert_eq!(first.replicas.len(), 1);
         assert_eq!(first.replicas[0].url, "s3://graphs/app");
-        assert_eq!(first.replicas[0].endpoint.as_deref(), Some("http://minio:9000"));
+        assert_eq!(
+            first.replicas[0].endpoint.as_deref(),
+            Some("http://minio:9000")
+        );
         assert_eq!(first.replicas[0].sync_interval, Duration::from_secs(5));
         assert_eq!(first.replicas[0].retention, Duration::from_secs(72 * 3600));
         // Global snapshot settings reach every replica.
-        assert_eq!(first.replicas[0].snapshot_interval, Duration::from_secs(3600));
+        assert_eq!(
+            first.replicas[0].snapshot_interval,
+            Duration::from_secs(3600)
+        );
 
         assert_eq!(cfg.dbs[1].replicas[0].url, "/backups/other");
     }
@@ -588,7 +604,9 @@ dbs:
     #[test]
     fn comments_quotes_and_env() {
         std::env::set_var("GLIDER_TEST_KEY", "sekrit");
-        let text = expand_env("secret-access-key: $GLIDER_TEST_KEY  # from the environment\naddr: \"#notacomment\"\n");
+        let text = expand_env(
+            "secret-access-key: $GLIDER_TEST_KEY  # from the environment\naddr: \"#notacomment\"\n",
+        );
         let n = parse(&text).unwrap();
         assert_eq!(n.str("secret-access-key").unwrap(), "sekrit");
         assert_eq!(n.str("addr").unwrap(), "#notacomment");
