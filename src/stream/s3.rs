@@ -114,9 +114,7 @@ impl S3 {
             let xml = resp.text();
             for chunk in xml.split("<Contents>").skip(1) {
                 let key = tag(chunk, "Key").unwrap_or_default();
-                let size = tag(chunk, "Size")
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
+                let size = tag(chunk, "Size").and_then(|s| s.parse().ok()).unwrap_or(0);
                 let modified = tag(chunk, "LastModified").unwrap_or_default();
                 let stripped = if self.prefix.is_empty() {
                     key.clone()
@@ -193,7 +191,10 @@ impl S3 {
             hex(&sha256(canonical_request.as_bytes()))
         );
 
-        let k_date = hmac_sha256(format!("AWS4{}", self.secret_key).as_bytes(), date.as_bytes());
+        let k_date = hmac_sha256(
+            format!("AWS4{}", self.secret_key).as_bytes(),
+            date.as_bytes(),
+        );
         let k_region = hmac_sha256(&k_date, self.region.as_bytes());
         let k_service = hmac_sha256(&k_region, b"s3");
         let k_signing = hmac_sha256(&k_service, b"aws4_request");

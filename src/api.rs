@@ -367,14 +367,22 @@ mod tests {
         assert!(j.contains("\"_e\":\"node\""), "no node marker in {}", j);
         assert!(j.contains("\"_e\":\"rel\""), "no rel marker in {}", j);
         assert!(j.contains("\"since\":2019"));
-        assert!(!j.contains("\\\"labels\\\""), "entities were escaped as text: {}", j);
+        assert!(
+            !j.contains("\\\"labels\\\""),
+            "entities were escaped as text: {}",
+            j
+        );
     }
 
     #[test]
     fn graph_payload_is_deduplicated() {
         let mut g = fixture();
         // Ada appears in both rows; she must still be one node in the payload.
-        query::execute(&mut g, r#"MATCH (a:Person {name:"Ada"}) CREATE (a)-[:KNOWS]->(:Person {name:"Cai"})"#).unwrap();
+        query::execute(
+            &mut g,
+            r#"MATCH (a:Person {name:"Ada"}) CREATE (a)-[:KNOWS]->(:Person {name:"Cai"})"#,
+        )
+        .unwrap();
         let j = query_json(&mut g, "MATCH (a)-[r]->(b) RETURN a, r, b").unwrap();
         let graph = j.split("\"graph\":").nth(1).unwrap();
         assert_eq!(graph.matches("\"_e\":\"node\"").count(), 3, "{}", graph);
@@ -399,13 +407,21 @@ mod tests {
         let decoy = r#"{"id":0,"labels":["Person"],"props":{"name":"Mallory"}}"#;
         query::execute(
             &mut g,
-            &format!(r#"CREATE (:Decoy {{trap:"{}"}})"#, decoy.replace('"', "\\\"")),
+            &format!(
+                r#"CREATE (:Decoy {{trap:"{}"}})"#,
+                decoy.replace('"', "\\\"")
+            ),
         )
         .unwrap();
 
         let j = query_json(&mut g, "MATCH (d:Decoy) RETURN d.trap").unwrap();
         let graph = j.split("\"graph\":").nth(1).unwrap();
-        assert_eq!(graph.matches("\"_e\":\"node\"").count(), 0, "decoy was drawn: {}", graph);
+        assert_eq!(
+            graph.matches("\"_e\":\"node\"").count(),
+            0,
+            "decoy was drawn: {}",
+            graph
+        );
     }
 
     #[test]
@@ -442,8 +458,14 @@ mod tests {
 
     #[test]
     fn query_params_parse() {
-        assert_eq!(query_param("/api/expand?id=7&limit=3", "id").as_deref(), Some("7"));
-        assert_eq!(query_param("/api/expand?id=7&limit=3", "limit").as_deref(), Some("3"));
+        assert_eq!(
+            query_param("/api/expand?id=7&limit=3", "id").as_deref(),
+            Some("7")
+        );
+        assert_eq!(
+            query_param("/api/expand?id=7&limit=3", "limit").as_deref(),
+            Some("3")
+        );
         assert_eq!(query_param("/api/expand", "id"), None);
         assert_eq!(query_param("/api/expand?id=7", "missing"), None);
     }

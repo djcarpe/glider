@@ -141,9 +141,9 @@ impl PartialEq for Value {
             (Value::Text(a), Value::Text(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Int(a), Value::Int(b)) => a == b,
-            (Value::Int(_), Value::Float(_)) | (Value::Float(_), Value::Int(_)) | (Value::Float(_), Value::Float(_)) => {
-                self.as_f64() == other.as_f64()
-            }
+            (Value::Int(_), Value::Float(_))
+            | (Value::Float(_), Value::Int(_))
+            | (Value::Float(_), Value::Float(_)) => self.as_f64() == other.as_f64(),
             _ => false,
         }
     }
@@ -309,7 +309,11 @@ fn write_json(j: &Json, out: &mut String) {
 
 pub fn parse_json(src: &str) -> Result<Json, String> {
     let b = src.as_bytes();
-    let mut p = JsonParser { b, pos: 0, depth: 0 };
+    let mut p = JsonParser {
+        b,
+        pos: 0,
+        depth: 0,
+    };
     p.ws();
     let v = p.value()?;
     p.ws();
@@ -461,8 +465,9 @@ impl<'a> JsonParser<'a> {
                                     self.pos += 1;
                                     self.eat(b'u')?;
                                     let lo = self.hex4()?;
-                                    let combined =
-                                        0x10000 + (((cp - 0xD800) as u32) << 10) + (lo - 0xDC00) as u32;
+                                    let combined = 0x10000
+                                        + (((cp - 0xD800) as u32) << 10)
+                                        + (lo - 0xDC00) as u32;
                                     s.push(char::from_u32(combined).unwrap_or('\u{fffd}'));
                                 } else {
                                     s.push('\u{fffd}');
@@ -482,7 +487,9 @@ impl<'a> JsonParser<'a> {
                     if self.pos > self.b.len() {
                         return Err("truncated utf-8".into());
                     }
-                    s.push_str(std::str::from_utf8(&self.b[start..self.pos]).map_err(|e| e.to_string())?);
+                    s.push_str(
+                        std::str::from_utf8(&self.b[start..self.pos]).map_err(|e| e.to_string())?,
+                    );
                 }
             }
         }
@@ -493,7 +500,8 @@ impl<'a> JsonParser<'a> {
         if self.pos + 4 > self.b.len() {
             return Err("truncated \\u escape".into());
         }
-        let hex = std::str::from_utf8(&self.b[self.pos..self.pos + 4]).map_err(|e| e.to_string())?;
+        let hex =
+            std::str::from_utf8(&self.b[self.pos..self.pos + 4]).map_err(|e| e.to_string())?;
         self.pos += 4;
         u16::from_str_radix(hex, 16).map_err(|e| e.to_string())
     }
@@ -519,11 +527,16 @@ impl<'a> JsonParser<'a> {
             return Err(format!("expected a value at byte {}", start));
         }
         if float {
-            text.parse::<f64>().map(Json::Float).map_err(|e| e.to_string())
+            text.parse::<f64>()
+                .map(Json::Float)
+                .map_err(|e| e.to_string())
         } else {
             match text.parse::<i64>() {
                 Ok(i) => Ok(Json::Int(i)),
-                Err(_) => text.parse::<f64>().map(Json::Float).map_err(|e| e.to_string()),
+                Err(_) => text
+                    .parse::<f64>()
+                    .map(Json::Float)
+                    .map_err(|e| e.to_string()),
             }
         }
     }

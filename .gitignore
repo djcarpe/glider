@@ -1,3 +1,23 @@
-/target
+# Rust / Cargo
+/target/
+**/*.rs.bk
+*.pdb
+
+# Node (ts/ bindings and ui/ console)
+node_modules/
+dist/
+dist-standalone/
+
+# Databases produced by running or testing glider
 *.gldb
 *.compact.tmp
+
+# Benchmark inputs and results
+/bench/data/
+/bench/results.jsonl
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/

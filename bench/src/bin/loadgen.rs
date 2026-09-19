@@ -59,7 +59,10 @@ fn parse_args() -> Result<Args, String> {
                 .ok_or_else(|| format!("{} needs a value", argv[i]))
         };
         match argv[i].as_str() {
-            "--addr" => { addr = need(i)?; i += 2; }
+            "--addr" => {
+                addr = need(i)?;
+                i += 2;
+            }
             "--clients" | "-c" => {
                 clients = need(i)?.parse().map_err(|_| "bad --clients".to_string())?;
                 i += 2;
@@ -72,10 +75,22 @@ fn parse_args() -> Result<Args, String> {
                 warmup = need(i)?.parse().map_err(|_| "bad --warmup".to_string())?;
                 i += 2;
             }
-            "--query-file" | "-f" => { query_file = Some(need(i)?); i += 2; }
-            "--query" | "-q" => { query = Some(need(i)?); i += 2; }
-            "--label" => { label = need(i)?; i += 2; }
-            "--json" => { json = true; i += 1; }
+            "--query-file" | "-f" => {
+                query_file = Some(need(i)?);
+                i += 2;
+            }
+            "--query" | "-q" => {
+                query = Some(need(i)?);
+                i += 2;
+            }
+            "--label" => {
+                label = need(i)?;
+                i += 2;
+            }
+            "--json" => {
+                json = true;
+                i += 1;
+            }
             "-h" | "--help" => {
                 eprintln!(
                     "loadgen --addr HOST:PORT [--clients N] [--duration S] [--warmup S]\n\
@@ -139,13 +154,15 @@ fn one_request(addr: &std::net::SocketAddr, body: &str) -> Result<usize, String>
         body.len(),
         body
     );
-    s.write_all(req.as_bytes()).map_err(|e| format!("write: {}", e))?;
+    s.write_all(req.as_bytes())
+        .map_err(|e| format!("write: {}", e))?;
     s.flush().map_err(|e| format!("flush: {}", e))?;
 
     // The server closes the connection when done, so read to EOF. That is also
     // why we do not need to parse Content-Length here.
     let mut buf = Vec::with_capacity(8192);
-    s.read_to_end(&mut buf).map_err(|e| format!("read: {}", e))?;
+    s.read_to_end(&mut buf)
+        .map_err(|e| format!("read: {}", e))?;
     if buf.is_empty() {
         return Err("empty response".into());
     }
@@ -262,7 +279,11 @@ fn main() {
         let idx = ((p / 100.0) * n as f64).ceil() as usize;
         all[idx.saturating_sub(1).min(n - 1)]
     };
-    let mean = if n == 0 { 0.0 } else { all.iter().sum::<f64>() / n as f64 };
+    let mean = if n == 0 {
+        0.0
+    } else {
+        all.iter().sum::<f64>() / n as f64
+    };
     let qps = if wall > 0.0 { n as f64 / wall } else { 0.0 };
 
     if args.json {

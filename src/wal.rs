@@ -204,9 +204,15 @@ fn run_hook(cmd: &str, dir: &Path, gen: &str, seg: &Segment) -> io::Result<()> {
         .replace("{len}", &seg.len.to_string());
 
     let status = if cfg!(windows) {
-        std::process::Command::new("cmd").arg("/C").arg(&filled).status()
+        std::process::Command::new("cmd")
+            .arg("/C")
+            .arg(&filled)
+            .status()
     } else {
-        std::process::Command::new("sh").arg("-c").arg(&filled).status()
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&filled)
+            .status()
     }?;
 
     if !status.success() {
@@ -234,7 +240,12 @@ pub fn generations(dir: &Path) -> io::Result<Vec<String>> {
             }
         }
     }
-    out.sort_by_key(|g| segments(dir, g).ok().and_then(|s| s.last().map(|x| x.ts)).unwrap_or(0));
+    out.sort_by_key(|g| {
+        segments(dir, g)
+            .ok()
+            .and_then(|s| s.last().map(|x| x.ts))
+            .unwrap_or(0)
+    });
     Ok(out)
 }
 
@@ -292,7 +303,11 @@ fn manifest_times(path: &Path) -> Vec<(u64, u64)> {
     let field = |line: &str, key: &str| -> Option<u64> {
         let at = line.find(key)? + key.len();
         let rest = &line[at..];
-        let digits: String = rest.chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect();
+        let digits: String = rest
+            .chars()
+            .skip_while(|c| !c.is_ascii_digit())
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
         digits.parse().ok()
     };
     text.lines()
@@ -375,7 +390,9 @@ pub fn restore(
 
     let segs = segments(dir, &gen)?;
     if segs.is_empty() {
-        return Err(io::Error::other(format!("generation {gen} has no segments")));
+        return Err(io::Error::other(format!(
+            "generation {gen} has no segments"
+        )));
     }
     if segs[0].offset != 0 {
         return Err(io::Error::other(format!(
@@ -399,7 +416,10 @@ pub fn restore(
                 break;
             }
         }
-        let path = dir.join(&gen).join("segments").join(format!("{:016x}.seg", seg.offset));
+        let path = dir
+            .join(&gen)
+            .join("segments")
+            .join(format!("{:016x}.seg", seg.offset));
         let mut f = File::open(&path)?;
         io::copy(&mut f, &mut out)?;
         end = seg.end();
@@ -478,10 +498,10 @@ fn note(opts: &TailOptions, msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use crate::graph::Graph;
     use crate::store::Sync;
     use crate::value::Value;
+    use std::path::PathBuf;
 
     fn tmpdir(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("glider-wal-{}-{}", name, std::process::id()));
@@ -492,11 +512,8 @@ mod tests {
 
     fn write_nodes(g: &mut Graph, n: usize) {
         for i in 0..n {
-            g.add_node(
-                &["N".into()],
-                vec![("i".into(), Value::Int(i as i64))],
-            )
-            .unwrap();
+            g.add_node(&["N".into()], vec![("i".into(), Value::Int(i as i64))])
+                .unwrap();
         }
         g.commit().unwrap();
     }
@@ -565,7 +582,10 @@ mod tests {
         )
         .unwrap();
         let gen = store::read_header(&db).unwrap().generation_hex();
-        assert_eq!(contiguous_end(&segments(&replica, &gen).unwrap()), committed);
+        assert_eq!(
+            contiguous_end(&segments(&replica, &gen).unwrap()),
+            committed
+        );
     }
 
     #[test]

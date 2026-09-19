@@ -57,13 +57,48 @@ impl Metrics {
             format!("# HELP glider_{n} {help}\n# TYPE glider_{n} {kind}\nglider_{n}{l} {v}\n")
         };
         [
-            g("segments_total", "Segments shipped.", "counter", self.segments.load(Ordering::Relaxed)),
-            g("bytes_total", "Bytes shipped.", "counter", self.bytes.load(Ordering::Relaxed)),
-            g("snapshots_total", "Snapshots written.", "counter", self.snapshots.load(Ordering::Relaxed)),
-            g("deletions_total", "Objects removed by retention.", "counter", self.deletions.load(Ordering::Relaxed)),
-            g("errors_total", "Replication errors.", "counter", self.errors.load(Ordering::Relaxed)),
-            g("lag_bytes", "Committed bytes not yet replicated.", "gauge", self.lag_bytes.load(Ordering::Relaxed)),
-            g("last_sync_timestamp_seconds", "Unix time of the last successful sync.", "gauge", self.last_sync.load(Ordering::Relaxed)),
+            g(
+                "segments_total",
+                "Segments shipped.",
+                "counter",
+                self.segments.load(Ordering::Relaxed),
+            ),
+            g(
+                "bytes_total",
+                "Bytes shipped.",
+                "counter",
+                self.bytes.load(Ordering::Relaxed),
+            ),
+            g(
+                "snapshots_total",
+                "Snapshots written.",
+                "counter",
+                self.snapshots.load(Ordering::Relaxed),
+            ),
+            g(
+                "deletions_total",
+                "Objects removed by retention.",
+                "counter",
+                self.deletions.load(Ordering::Relaxed),
+            ),
+            g(
+                "errors_total",
+                "Replication errors.",
+                "counter",
+                self.errors.load(Ordering::Relaxed),
+            ),
+            g(
+                "lag_bytes",
+                "Committed bytes not yet replicated.",
+                "gauge",
+                self.lag_bytes.load(Ordering::Relaxed),
+            ),
+            g(
+                "last_sync_timestamp_seconds",
+                "Unix time of the last successful sync.",
+                "gauge",
+                self.last_sync.load(Ordering::Relaxed),
+            ),
         ]
         .concat()
     }
@@ -319,7 +354,9 @@ impl Replicator {
         let current = self.generation.clone().unwrap_or_default();
         let mut removed = 0usize;
 
-        let current_restorable = !listing(self.backend.as_ref(), &current)?.snapshots.is_empty();
+        let current_restorable = !listing(self.backend.as_ref(), &current)?
+            .snapshots
+            .is_empty();
 
         for gen in &all {
             let l = listing(self.backend.as_ref(), gen)?;
@@ -569,8 +606,11 @@ mod tests {
         // Three separate flushes, so three separate segments.
         for i in 0..3 {
             let mut g = Graph::open(&db, Sync::Always).unwrap();
-            g.add_node(&["N".into()], vec![("i".into(), crate::value::Value::Int(i))])
-                .unwrap();
+            g.add_node(
+                &["N".into()],
+                vec![("i".into(), crate::value::Value::Int(i))],
+            )
+            .unwrap();
             g.commit().unwrap();
             drop(g);
             r.sync(true, false, false).unwrap();
@@ -578,7 +618,11 @@ mod tests {
 
         let gen = crate::store::read_header(&db).unwrap().generation_hex();
         let segs = listing(backend.as_ref(), &gen).unwrap().segments;
-        assert!(segs.len() >= 3, "expected several segments, got {}", segs.len());
+        assert!(
+            segs.len() >= 3,
+            "expected several segments, got {}",
+            segs.len()
+        );
 
         // Lose the middle one, the way a failed upload or a lifecycle rule would.
         let victim = segs[1].0;

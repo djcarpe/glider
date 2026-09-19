@@ -22,10 +22,16 @@ fn persists_and_reopens() {
     {
         let mut g = Graph::open(&path, Sync::Always).unwrap();
         let a = g
-            .add_node(&["Person".into()], vec![("name".into(), Value::from("Ada"))])
+            .add_node(
+                &["Person".into()],
+                vec![("name".into(), Value::from("Ada"))],
+            )
             .unwrap();
         let b = g
-            .add_node(&["Person".into()], vec![("name".into(), Value::from("Bob"))])
+            .add_node(
+                &["Person".into()],
+                vec![("name".into(), Value::from("Bob"))],
+            )
             .unwrap();
         g.add_edge(a, b, "KNOWS", vec![("since".into(), Value::Int(2020))])
             .unwrap();
@@ -55,7 +61,10 @@ fn torn_tail_is_discarded() {
     // Simulate a crash mid-write by appending garbage.
     {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         f.write_all(&[0u8, 200, 0, 0, 0, 7, 7, 7]).unwrap();
     }
     {
@@ -111,7 +120,12 @@ fn compaction_preserves_state_and_shrinks() {
     let before = g.file_len();
     g.compact().unwrap();
     let after = g.file_len();
-    assert!(after < before, "compaction should shrink: {} -> {}", before, after);
+    assert!(
+        after < before,
+        "compaction should shrink: {} -> {}",
+        before,
+        after
+    );
     assert_eq!(g.node_count(), 10);
     drop(g);
 
@@ -151,7 +165,10 @@ fn query_create_match_and_aggregate() {
         r#"MATCH (a:Person),(b:Person) WHERE a.name="Ada" AND b.name="Cy" CREATE (a)-[:KNOWS]->(b)"#,
     );
 
-    let r = q(&mut g, r#"MATCH (a:Person)-[:KNOWS]->(b) RETURN a.name, count(b) AS n"#);
+    let r = q(
+        &mut g,
+        r#"MATCH (a:Person)-[:KNOWS]->(b) RETURN a.name, count(b) AS n"#,
+    );
     assert_eq!(r.rows.len(), 1);
     assert_eq!(r.rows[0][0].to_string(), "Ada");
     assert_eq!(r.rows[0][1].as_i64(), Some(2));
@@ -164,23 +181,41 @@ fn query_create_match_and_aggregate() {
     assert_eq!(r.rows[0][0].to_string(), "Bob");
     assert_eq!(r.rows[1][0].to_string(), "Ada");
 
-    let r = q(&mut g, r#"MATCH (p:Person) RETURN avg(p.age) AS a, max(p.age) AS m"#);
+    let r = q(
+        &mut g,
+        r#"MATCH (p:Person) RETURN avg(p.age) AS a, max(p.age) AS m"#,
+    );
     assert_eq!(r.rows[0][1].as_i64(), Some(41));
 
-    let r = q(&mut g, r#"MATCH (p:Person) WHERE p.name CONTAINS "o" RETURN p.name"#);
+    let r = q(
+        &mut g,
+        r#"MATCH (p:Person) WHERE p.name CONTAINS "o" RETURN p.name"#,
+    );
     assert_eq!(r.rows.len(), 1);
 
-    let r = q(&mut g, r#"MATCH (p:Person) WHERE p.name IN ["Ada","Cy"] RETURN p.name"#);
+    let r = q(
+        &mut g,
+        r#"MATCH (p:Person) WHERE p.name IN ["Ada","Cy"] RETURN p.name"#,
+    );
     assert_eq!(r.rows.len(), 2);
 }
 
 #[test]
 fn query_variable_length_paths() {
     let mut g = Graph::memory();
-    q(&mut g, r#"CREATE (:N {n:1})-[:R]->(:N {n:2})-[:R]->(:N {n:3})-[:R]->(:N {n:4})"#);
-    let r = q(&mut g, r#"MATCH (a:N {n:1})-[:R*1..2]->(b) RETURN b.n ORDER BY b.n"#);
+    q(
+        &mut g,
+        r#"CREATE (:N {n:1})-[:R]->(:N {n:2})-[:R]->(:N {n:3})-[:R]->(:N {n:4})"#,
+    );
+    let r = q(
+        &mut g,
+        r#"MATCH (a:N {n:1})-[:R*1..2]->(b) RETURN b.n ORDER BY b.n"#,
+    );
     assert_eq!(r.rows.len(), 2);
-    let r = q(&mut g, r#"MATCH (a:N {n:1})-[:R*1..3]->(b) RETURN b.n ORDER BY b.n"#);
+    let r = q(
+        &mut g,
+        r#"MATCH (a:N {n:1})-[:R*1..3]->(b) RETURN b.n ORDER BY b.n"#,
+    );
     assert_eq!(r.rows.len(), 3);
     let r = q(&mut g, r#"MATCH (a:N {n:1})-[:R*2..2]->(b) RETURN b.n"#);
     assert_eq!(r.rows.len(), 1);
@@ -219,7 +254,10 @@ fn index_is_used_and_maintained() {
     assert_eq!(hits.len(), 1);
 
     // Updating the indexed property moves the entry.
-    q(&mut g, r#"MATCH (p:Person {email:"u7@x.com"}) SET p.email = "moved@x.com""#);
+    q(
+        &mut g,
+        r#"MATCH (p:Person {email:"u7@x.com"}) SET p.email = "moved@x.com""#,
+    );
     assert!(g
         .indexed_lookup("Person", "email", &Value::from("u7@x.com"))
         .unwrap()
@@ -232,7 +270,10 @@ fn index_is_used_and_maintained() {
     );
 
     // Deleting removes it.
-    q(&mut g, r#"MATCH (p:Person {email:"moved@x.com"}) DETACH DELETE p"#);
+    q(
+        &mut g,
+        r#"MATCH (p:Person {email:"moved@x.com"}) DETACH DELETE p"#,
+    );
     assert!(g
         .indexed_lookup("Person", "email", &Value::from("moved@x.com"))
         .unwrap()
@@ -247,18 +288,27 @@ fn shortest_path_weighted_and_unweighted() {
         g.add_node(&["N".into()], vec![("n".into(), Value::Int(n))])
             .unwrap();
     }
-    g.add_edge(1, 2, "E", vec![("w".into(), Value::Int(5))]).unwrap();
-    g.add_edge(2, 4, "E", vec![("w".into(), Value::Int(5))]).unwrap();
-    g.add_edge(1, 3, "E", vec![("w".into(), Value::Int(1))]).unwrap();
-    g.add_edge(3, 4, "E", vec![("w".into(), Value::Int(1))]).unwrap();
-    g.add_edge(1, 4, "E", vec![("w".into(), Value::Int(99))]).unwrap();
+    g.add_edge(1, 2, "E", vec![("w".into(), Value::Int(5))])
+        .unwrap();
+    g.add_edge(2, 4, "E", vec![("w".into(), Value::Int(5))])
+        .unwrap();
+    g.add_edge(1, 3, "E", vec![("w".into(), Value::Int(1))])
+        .unwrap();
+    g.add_edge(3, 4, "E", vec![("w".into(), Value::Int(1))])
+        .unwrap();
+    g.add_edge(1, 4, "E", vec![("w".into(), Value::Int(99))])
+        .unwrap();
 
     let r = q(&mut g, "CALL shortestpath(from: 1, to: 4)");
     assert_eq!(r.rows.len(), 2, "unweighted should take the direct edge");
 
     let r = q(&mut g, r#"CALL shortestpath(from: 1, to: 4, weight: "w")"#);
     assert_eq!(r.rows.len(), 3);
-    assert_eq!(r.rows[1][1].as_i64(), Some(3), "should route through node 3");
+    assert_eq!(
+        r.rows[1][1].as_i64(),
+        Some(3),
+        "should route through node 3"
+    );
 }
 
 #[test]
@@ -280,7 +330,10 @@ fn algorithms_agree_with_hand_computed_values() {
     assert_eq!(tri[3], 0);
 
     let clustering = algo::clustering(&both, &tri);
-    assert!((clustering[1] - 1.0).abs() < 1e-9, "node 2 closes its only triangle");
+    assert!(
+        (clustering[1] - 1.0).abs() < 1e-9,
+        "node 2 closes its only triangle"
+    );
     assert!((clustering[0] - (1.0 / 3.0)).abs() < 1e-9);
 
     let cores = algo::core_numbers(&both);
@@ -294,13 +347,20 @@ fn algorithms_agree_with_hand_computed_values() {
     let out = g.csr(Dir::Out, None, None);
     let (_, nscc) = algo::strongly_connected(&out);
     assert_eq!(nscc, 2);
-    assert!(algo::topological_sort(&out).is_none(), "cycle blocks topo sort");
+    assert!(
+        algo::topological_sort(&out).is_none(),
+        "cycle blocks topo sort"
+    );
     assert!(algo::find_cycle(&out).is_some());
 
     // PageRank sums to 1 and the pendant with no out-edges still gets mass.
     let pr = algo::pagerank(&out, 0.85, 100, 1e-12);
     let sum: f64 = pr.scores.iter().sum();
-    assert!((sum - 1.0).abs() < 1e-6, "pagerank must be a distribution, got {}", sum);
+    assert!(
+        (sum - 1.0).abs() < 1e-6,
+        "pagerank must be a distribution, got {}",
+        sum
+    );
 }
 
 #[test]
@@ -344,9 +404,12 @@ fn mst_picks_the_cheap_edges() {
     for _ in 0..3 {
         g.add_node(&["N".into()], vec![]).unwrap();
     }
-    g.add_edge(1, 2, "E", vec![("w".into(), Value::Int(1))]).unwrap();
-    g.add_edge(2, 3, "E", vec![("w".into(), Value::Int(1))]).unwrap();
-    g.add_edge(1, 3, "E", vec![("w".into(), Value::Int(50))]).unwrap();
+    g.add_edge(1, 2, "E", vec![("w".into(), Value::Int(1))])
+        .unwrap();
+    g.add_edge(2, 3, "E", vec![("w".into(), Value::Int(1))])
+        .unwrap();
+    g.add_edge(1, 3, "E", vec![("w".into(), Value::Int(50))])
+        .unwrap();
     let both = g.csr(Dir::Both, None, Some("w"));
     let (edges, total) = algo::minimum_spanning_forest(&both);
     assert_eq!(edges.len(), 2);
@@ -368,7 +431,10 @@ fn write_back_stores_scores_as_properties() {
 #[test]
 fn jsonl_round_trip() {
     let mut g = Graph::memory();
-    q(&mut g, r#"CREATE (a:Person {name:"Ada", age:36})-[:KNOWS {since:2020}]->(b:Person {name:"Bob"})"#);
+    q(
+        &mut g,
+        r#"CREATE (a:Person {name:"Ada", age:36})-[:KNOWS {since:2020}]->(b:Person {name:"Bob"})"#,
+    );
     let dump = query::export_jsonl(&g);
 
     let mut g2 = Graph::memory();
@@ -443,7 +509,10 @@ fn discarding_a_torn_tail_starts_a_new_generation() {
 
     // A writer caught mid-transaction: bytes past the last commit marker.
     use std::io::Write;
-    let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
     f.write_all(&[9u8; 96]).unwrap();
     f.sync_all().unwrap();
 
@@ -567,9 +636,16 @@ fn an_id_predicate_is_pushed_into_the_anchor() {
     for i in 0..50 {
         glider::execute(&mut g, &format!("CREATE (:N {{i:{i}}})")).unwrap();
     }
-    glider::execute(&mut g, "MATCH (a:N {i:0}), (b:N {i:1}) CREATE (a)-[:R]->(b)").unwrap();
+    glider::execute(
+        &mut g,
+        "MATCH (a:N {i:0}), (b:N {i:1}) CREATE (a)-[:R]->(b)",
+    )
+    .unwrap();
 
-    let plan = rows(&mut g, "EXPLAIN MATCH (a)-[:R]->(b) WHERE id(a) = 1 RETURN b");
+    let plan = rows(
+        &mut g,
+        "EXPLAIN MATCH (a)-[:R]->(b) WHERE id(a) = 1 RETURN b",
+    );
     let text = format!("{plan:?}");
     assert!(text.contains("id(a) predicate"), "{text}");
     assert!(text.contains("pushed into anchor"), "{text}");
@@ -602,7 +678,10 @@ fn a_middle_anchor_expands_in_both_directions() {
         &mut g,
         "EXPLAIN MATCH (p:Person)-[:IN]->(t:Team)<-[:IN]-(q:Person) RETURN p, q",
     );
-    assert!(format!("{:?}", plan[0]).contains("(t:Team)"), "anchor should be the Team");
+    assert!(
+        format!("{:?}", plan[0]).contains("(t:Team)"),
+        "anchor should be the Team"
+    );
     assert_eq!(plan.len(), 3, "one anchor and two expansions");
 
     // Both people on both sides, including the reflexive pairs.
@@ -646,12 +725,18 @@ fn verify_distinguishes_a_torn_tail_from_corruption() {
     // Junk after the last commit is an ordinary torn tail: reported at or
     // above the commit point, so nothing committed was lost.
     use std::io::Write;
-    let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
     f.write_all(&[0xAB; 40]).unwrap();
     drop(f);
     let torn = glider::store::verify(&path).unwrap();
     let at = torn.bad_offset.expect("should report where it stopped");
-    assert!(at >= torn.committed_len, "a torn tail must not implicate committed data");
+    assert!(
+        at >= torn.committed_len,
+        "a torn tail must not implicate committed data"
+    );
     assert_eq!(torn.records, 20);
 
     std::fs::remove_file(&path).ok();

@@ -116,7 +116,11 @@ fn route(
         ("POST", "/api/query") => {
             let src = body.trim();
             if src.is_empty() {
-                return ("400 Bad Request", "application/json", error_json("empty query"));
+                return (
+                    "400 Bad Request",
+                    "application/json",
+                    error_json("empty query"),
+                );
             }
             let mut g = lock(graph);
             match api::query_json(&mut g, src) {
@@ -128,7 +132,11 @@ fn route(
             let mut g = lock(graph);
             match api::schema_json(&mut g) {
                 Ok(j) => ("200 OK", "application/json", j),
-                Err(e) => ("500 Internal Server Error", "application/json", error_json(&e)),
+                Err(e) => (
+                    "500 Internal Server Error",
+                    "application/json",
+                    error_json(&e),
+                ),
             }
         }
         ("GET", "/api/expand") => {
@@ -138,7 +146,11 @@ fn route(
                 .unwrap_or(50)
                 .min(1000);
             let Some(id) = id else {
-                return ("400 Bad Request", "application/json", error_json("expand needs ?id=<node id>"));
+                return (
+                    "400 Bad Request",
+                    "application/json",
+                    error_json("expand needs ?id=<node id>"),
+                );
             };
             let g = lock(graph);
             match api::expand_json(&g, id, limit) {
@@ -147,9 +159,17 @@ fn route(
             }
         }
         ("GET", "/stats") | ("POST", "/query") => {
-            let src = if route == "/stats" { "STATS" } else { body.trim() };
+            let src = if route == "/stats" {
+                "STATS"
+            } else {
+                body.trim()
+            };
             if src.is_empty() {
-                return ("400 Bad Request", "application/json", error_json("empty query"));
+                return (
+                    "400 Bad Request",
+                    "application/json",
+                    error_json("empty query"),
+                );
             }
             let mut g = lock(graph);
             match query::execute(&mut g, src) {

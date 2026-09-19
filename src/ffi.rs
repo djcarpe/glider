@@ -68,19 +68,23 @@ fn guard<T>(fallback: T, f: impl FnOnce() -> Result<T, String>) -> T {
 }
 
 unsafe fn as_str<'a>(p: *const c_char, what: &str) -> Result<&'a str, String> {
-    if p.is_null() {
-        return Err(format!("{what} was NULL"));
+    unsafe {
+        if p.is_null() {
+            return Err(format!("{what} was NULL"));
+        }
+        CStr::from_ptr(p)
+            .to_str()
+            .map_err(|_| format!("{what} was not valid UTF-8"))
     }
-    CStr::from_ptr(p)
-        .to_str()
-        .map_err(|_| format!("{what} was not valid UTF-8"))
 }
 
 unsafe fn as_db<'a>(p: *mut GliderDb) -> Result<&'a mut GliderDb, String> {
-    if p.is_null() {
-        return Err("database handle was NULL".into());
+    unsafe {
+        if p.is_null() {
+            return Err("database handle was NULL".into());
+        }
+        Ok(&mut *p)
     }
-    Ok(&mut *p)
 }
 
 fn out_string(s: String) -> Result<*mut c_char, String> {
@@ -100,16 +104,18 @@ fn out_string(s: String) -> Result<*mut c_char, String> {
 /// `path` must be a NUL-terminated UTF-8 string.
 #[no_mangle]
 pub unsafe extern "C" fn glider_open(path: *const c_char, sync: c_int) -> *mut GliderDb {
-    guard(std::ptr::null_mut(), || {
-        let path = as_str(path, "path")?;
-        let sync = match sync {
-            0 => Sync::Always,
-            2 => Sync::Off,
-            _ => Sync::Normal,
-        };
-        let graph = Graph::open(Path::new(path), sync).map_err(|e| e.to_string())?;
-        Ok(Box::into_raw(Box::new(GliderDb { graph })))
-    })
+    unsafe {
+        guard(std::ptr::null_mut(), || {
+            let path = as_str(path, "path")?;
+            let sync = match sync {
+                0 => Sync::Always,
+                2 => Sync::Off,
+                _ => Sync::Normal,
+            };
+            let graph = Graph::open(Path::new(path), sync).map_err(|e| e.to_string())?;
+            Ok(Box::into_raw(Box::new(GliderDb { graph })))
+        })
+    }
 }
 
 /// A graph that never touches disk. Useful for tests, caches, and scratch
@@ -130,15 +136,17 @@ pub extern "C" fn glider_open_memory() -> *mut GliderDb {
 /// used afterwards.
 #[no_mangle]
 pub unsafe extern "C" fn glider_close(db: *mut GliderDb) {
-    if db.is_null() {
-        return;
+    unsafe {
+        if db.is_null() {
+            return;
+        }
+        let _ = guard(0, || {
+            let mut boxed = Box::from_raw(db);
+            let _ = boxed.graph.checkpoint();
+            drop(boxed);
+            Ok(0)
+        });
     }
-    let _ = guard(0, || {
-        let mut boxed = Box::from_raw(db);
-        let _ = boxed.graph.checkpoint();
-        drop(boxed);
-        Ok(0)
-    });
 }
 
 // --------------------------------------------------------------------- query
@@ -151,12 +159,14 @@ pub unsafe extern "C" fn glider_close(db: *mut GliderDb) {
 /// `db` must be a live handle; `q` a NUL-terminated UTF-8 string.
 #[no_mangle]
 pub unsafe extern "C" fn glider_query(db: *mut GliderDb, q: *const c_char) -> *mut c_char {
-    guard(std::ptr::null_mut(), || {
-        let db = as_db(db)?;
-        let src = as_str(q, "query")?;
-        let result = query::execute(&mut db.graph, src).map_err(|e| e.to_string())?;
-        out_string(result.to_json())
-    })
+    unsafe {
+        guard(std::ptr::null_mut(), || {
+            let db = as_db(db)?;
+            let src = as_str(q, "query")?;
+            let result = query::execute(&mut db.graph, src).map_err(|e| e.to_string())?;
+            out_string(result.to_json())
+        })
+    }
 }
 
 /// Node and edge counts, label and type histograms, file size — as JSON.
@@ -165,11 +175,13 @@ pub unsafe extern "C" fn glider_query(db: *mut GliderDb, q: *const c_char) -> *m
 /// `db` must be a live handle.
 #[no_mangle]
 pub unsafe extern "C" fn glider_stats(db: *mut GliderDb) -> *mut c_char {
-    guard(std::ptr::null_mut(), || {
-        let db = as_db(db)?;
-        let result = query::execute(&mut db.graph, "STATS").map_err(|e| e.to_string())?;
-        out_string(result.to_json())
-    })
+    unsafe {
+        guard(std::ptr::null_mut(), || {
+            let db = as_db(db)?;
+            let result = query::execute(&mut db.graph, "STATS").map_err(|e| e.to_string())?;
+            out_string(result.to_json())
+        })
+    }
 }
 
 // ------------------------------------------------------------------ durability
@@ -182,11 +194,13 @@ pub unsafe extern "C" fn glider_stats(db: *mut GliderDb) -> *mut c_char {
 /// `db` must be a live handle.
 #[no_mangle]
 pub unsafe extern "C" fn glider_checkpoint(db: *mut GliderDb) -> c_int {
-    guard(-1, || {
-        let db = as_db(db)?;
-        db.graph.checkpoint().map_err(|e| e.to_string())?;
-        Ok(0)
-    })
+    unsafe {
+        guard(-1, || {
+            let db = as_db(db)?;
+            db.graph.checkpoint().map_err(|e| e.to_string())?;
+            Ok(0)
+        })
+    }
 }
 
 /// Rewrite the log as a minimal snapshot, reclaiming deleted space.
@@ -197,11 +211,13 @@ pub unsafe extern "C" fn glider_checkpoint(db: *mut GliderDb) -> c_int {
 /// `db` must be a live handle.
 #[no_mangle]
 pub unsafe extern "C" fn glider_compact(db: *mut GliderDb) -> c_int {
-    guard(-1, || {
-        let db = as_db(db)?;
-        db.graph.compact().map_err(|e| e.to_string())?;
-        Ok(0)
-    })
+    unsafe {
+        guard(-1, || {
+            let db = as_db(db)?;
+            db.graph.compact().map_err(|e| e.to_string())?;
+            Ok(0)
+        })
+    }
 }
 
 /// Change durability at runtime: 0 = always, 1 = normal, 2 = off.
@@ -211,15 +227,17 @@ pub unsafe extern "C" fn glider_compact(db: *mut GliderDb) -> c_int {
 /// `db` must be a live handle.
 #[no_mangle]
 pub unsafe extern "C" fn glider_set_sync(db: *mut GliderDb, sync: c_int) -> c_int {
-    guard(-1, || {
-        let db = as_db(db)?;
-        db.graph.set_sync(match sync {
-            0 => Sync::Always,
-            2 => Sync::Off,
-            _ => Sync::Normal,
-        });
-        Ok(0)
-    })
+    unsafe {
+        guard(-1, || {
+            let db = as_db(db)?;
+            db.graph.set_sync(match sync {
+                0 => Sync::Always,
+                2 => Sync::Off,
+                _ => Sync::Normal,
+            });
+            Ok(0)
+        })
+    }
 }
 
 // ------------------------------------------------------------------ transfer
@@ -230,12 +248,14 @@ pub unsafe extern "C" fn glider_set_sync(db: *mut GliderDb, sync: c_int) -> c_in
 /// `db` must be a live handle; `jsonl` a NUL-terminated UTF-8 string.
 #[no_mangle]
 pub unsafe extern "C" fn glider_import_jsonl(db: *mut GliderDb, jsonl: *const c_char) -> c_int {
-    guard(-1, || {
-        let db = as_db(db)?;
-        let text = as_str(jsonl, "jsonl")?;
-        let (n, e) = query::import_jsonl(&mut db.graph, text).map_err(|x| x.to_string())?;
-        Ok((n + e) as c_int)
-    })
+    unsafe {
+        guard(-1, || {
+            let db = as_db(db)?;
+            let text = as_str(jsonl, "jsonl")?;
+            let (n, e) = query::import_jsonl(&mut db.graph, text).map_err(|x| x.to_string())?;
+            Ok((n + e) as c_int)
+        })
+    }
 }
 
 /// Dump the whole graph as newline-delimited JSON. Deterministic, so it diffs
@@ -245,10 +265,12 @@ pub unsafe extern "C" fn glider_import_jsonl(db: *mut GliderDb, jsonl: *const c_
 /// `db` must be a live handle.
 #[no_mangle]
 pub unsafe extern "C" fn glider_export_jsonl(db: *mut GliderDb) -> *mut c_char {
-    guard(std::ptr::null_mut(), || {
-        let db = as_db(db)?;
-        out_string(query::export_jsonl(&db.graph))
-    })
+    unsafe {
+        guard(std::ptr::null_mut(), || {
+            let db = as_db(db)?;
+            out_string(query::export_jsonl(&db.graph))
+        })
+    }
 }
 
 // -------------------------------------------------------------------- errors
@@ -270,8 +292,10 @@ pub extern "C" fn glider_last_error() -> *const c_char {
 /// not be used afterwards.
 #[no_mangle]
 pub unsafe extern "C" fn glider_free(p: *mut c_char) {
-    if !p.is_null() {
-        drop(CString::from_raw(p));
+    unsafe {
+        if !p.is_null() {
+            drop(CString::from_raw(p));
+        }
     }
 }
 
@@ -279,9 +303,9 @@ pub unsafe extern "C" fn glider_free(p: *mut c_char) {
 #[no_mangle]
 pub extern "C" fn glider_version() -> *const c_char {
     static V: OnceLock<CString> = OnceLock::new();
-    V.get_or_init(|| CString::new(crate::VERSION).unwrap()).as_ptr()
+    V.get_or_init(|| CString::new(crate::VERSION).unwrap())
+        .as_ptr()
 }
-
 
 // --------------------------------------------------------- typed JSON API
 
@@ -298,11 +322,13 @@ pub extern "C" fn glider_version() -> *const c_char {
 /// `glider_free`.
 #[no_mangle]
 pub unsafe extern "C" fn glider_query_json(db: *mut GliderDb, q: *const c_char) -> *mut c_char {
-    guard(std::ptr::null_mut(), || {
-        let db = as_db(db)?;
-        let src = as_str(q, "query")?;
-        out_string(crate::api::query_json(&mut db.graph, src)?)
-    })
+    unsafe {
+        guard(std::ptr::null_mut(), || {
+            let db = as_db(db)?;
+            let src = as_str(q, "query")?;
+            out_string(crate::api::query_json(&mut db.graph, src)?)
+        })
+    }
 }
 
 /// Labels, relationship types and indexes with counts, as JSON.
@@ -311,10 +337,12 @@ pub unsafe extern "C" fn glider_query_json(db: *mut GliderDb, q: *const c_char) 
 /// `db` must be a live handle. Free the result with `glider_free`.
 #[no_mangle]
 pub unsafe extern "C" fn glider_schema_json(db: *mut GliderDb) -> *mut c_char {
-    guard(std::ptr::null_mut(), || {
-        let db = as_db(db)?;
-        out_string(crate::api::schema_json(&mut db.graph)?)
-    })
+    unsafe {
+        guard(std::ptr::null_mut(), || {
+            let db = as_db(db)?;
+            out_string(crate::api::schema_json(&mut db.graph)?)
+        })
+    }
 }
 
 /// Neighbours of one node as a drawable `{graph:{nodes,edges}}` payload.
@@ -327,10 +355,12 @@ pub unsafe extern "C" fn glider_expand_json(
     id: u64,
     limit: usize,
 ) -> *mut c_char {
-    guard(std::ptr::null_mut(), || {
-        let db = as_db(db)?;
-        out_string(crate::api::expand_json(&db.graph, id, limit.min(10_000))?)
-    })
+    unsafe {
+        guard(std::ptr::null_mut(), || {
+            let db = as_db(db)?;
+            out_string(crate::api::expand_json(&db.graph, id, limit.min(10_000))?)
+        })
+    }
 }
 
 // ------------------------------------------------------- guest-side memory
@@ -367,8 +397,10 @@ pub extern "C" fn glider_alloc(len: usize) -> *mut u8 {
 /// not be used afterwards.
 #[no_mangle]
 pub unsafe extern "C" fn glider_dealloc(ptr: *mut u8, len: usize) {
-    if !ptr.is_null() && len != 0 {
-        drop(Vec::from_raw_parts(ptr, 0, len));
+    unsafe {
+        if !ptr.is_null() && len != 0 {
+            drop(Vec::from_raw_parts(ptr, 0, len));
+        }
     }
 }
 

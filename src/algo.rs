@@ -21,7 +21,10 @@ impl PartialOrd for Weighted {
 impl Ord for Weighted {
     fn cmp(&self, other: &Self) -> Ordering {
         // Reversed: BinaryHeap is a max-heap, we want the smallest distance.
-        other.0.total_cmp(&self.0).then_with(|| other.1.cmp(&self.1))
+        other
+            .0
+            .total_cmp(&self.0)
+            .then_with(|| other.1.cmp(&self.1))
     }
 }
 
@@ -195,7 +198,12 @@ pub fn has_negative_weights(csr: &Csr) -> bool {
 
 /// A* with a caller-supplied admissible heuristic. Falls back to Dijkstra
 /// behaviour when the heuristic is zero everywhere.
-pub fn astar<H: Fn(usize) -> f64>(csr: &Csr, source: usize, target: usize, h: H) -> Option<Vec<usize>> {
+pub fn astar<H: Fn(usize) -> f64>(
+    csr: &Csr,
+    source: usize,
+    target: usize,
+    h: H,
+) -> Option<Vec<usize>> {
     let n = csr.len();
     if source >= n || target >= n {
         return None;
@@ -355,7 +363,11 @@ pub fn closeness(csr: &Csr, weighted: bool) -> Vec<f64> {
     let n = csr.len();
     let mut out = vec![0.0f64; n];
     for s in 0..n {
-        let paths = if weighted { dijkstra(csr, s) } else { bfs_paths(csr, s) };
+        let paths = if weighted {
+            dijkstra(csr, s)
+        } else {
+            bfs_paths(csr, s)
+        };
         let mut total = 0.0;
         let mut reached = 0usize;
         for (v, d) in paths.dist.iter().enumerate() {
@@ -472,7 +484,12 @@ pub fn triangles(csr: &Csr) -> (Vec<u64>, u64) {
     // Deduplicated, sorted neighbour sets — the CSR may contain parallel edges.
     let mut nbrs: Vec<Vec<u32>> = Vec::with_capacity(n);
     for v in 0..n {
-        let mut list: Vec<u32> = csr.out(v).iter().copied().filter(|t| *t as usize != v).collect();
+        let mut list: Vec<u32> = csr
+            .out(v)
+            .iter()
+            .copied()
+            .filter(|t| *t as usize != v)
+            .collect();
         list.sort_unstable();
         list.dedup();
         nbrs.push(list);
@@ -515,7 +532,12 @@ pub fn clustering(csr: &Csr, tri: &[u64]) -> Vec<f64> {
     let n = csr.len();
     let mut out = vec![0.0; n];
     for v in 0..n {
-        let mut list: Vec<u32> = csr.out(v).iter().copied().filter(|t| *t as usize != v).collect();
+        let mut list: Vec<u32> = csr
+            .out(v)
+            .iter()
+            .copied()
+            .filter(|t| *t as usize != v)
+            .collect();
         list.sort_unstable();
         list.dedup();
         let k = list.len() as f64;
