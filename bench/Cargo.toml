@@ -10,8 +10,10 @@ repository.workspace = true
 authors.workspace = true
 
 # Same rule as glider itself: std only. The harness must not drag in crates the
-# thing under test refuses to use.
+# thing under test refuses to use. glider itself is the one exception: the
+# stress generator writes its file format directly.
 [dependencies]
+glider = { path = ".." }
 
 [lints]
 workspace = true
@@ -23,3 +25,7 @@ path = "src/bin/ldbc-gen.rs"
 [[bin]]
 name = "loadgen"
 path = "src/bin/loadgen.rs"
+
+[[bin]]
+name = "stress-gen"
+path = "src/bin/stress-gen.rs"

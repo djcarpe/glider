@@ -21,6 +21,28 @@ export function transportLabel() {
   return active.label
 }
 
+/** Whether this backend can load a file the user picks (the wasm build can). */
+export function canOpenFiles() {
+  return !!active.canOpen
+}
+
+/** Name of the file the graph was opened from, if any. */
+export function sourceName() {
+  return active.source ?? null
+}
+
+/** Replace the graph with a `.gldb` or JSON Lines file. wasm only. */
+export function openFile(file) {
+  if (!active.open) return Promise.reject(new Error('this console cannot open files; start glider on the file instead'))
+  return active.open(file)
+}
+
+/** The whole graph as JSON Lines. wasm only. */
+export function exportJsonl() {
+  if (!active.exportJsonl) return Promise.reject(new Error('export is not available here'))
+  return active.exportJsonl()
+}
+
 /** Run a query. Resolves to {columns, rows, graph:{nodes,edges}, ms, message, touched}. */
 export function runQuery(q) {
   return active.query(q)

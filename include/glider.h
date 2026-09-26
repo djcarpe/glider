@@ -14,6 +14,8 @@
 #ifndef GLIDER_H
 #define GLIDER_H
 
+#include <stddef.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -29,6 +31,8 @@ typedef struct GliderDb glider_db;
 
 glider_db *glider_open(const char *path, int sync);
 glider_db *glider_open_memory(void);
+/* An in-memory graph from the bytes of a .gldb file; edits are not written back. */
+glider_db *glider_open_bytes(const unsigned char *bytes, size_t len);
 void       glider_close(glider_db *db);
 
 /* --- queries ----------------------------------------------------------- */

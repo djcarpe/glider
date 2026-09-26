@@ -1,8 +1,10 @@
 // Standalone console: glider runs in this tab as WebAssembly, with no server.
 //
-// Same React app as the embedded build; only the transport differs. Because
-// the wasm module has no filesystem, the graph starts empty and lives for the
-// life of the page — seed it with CREATE, or load JSONL.
+// Same React app as the embedded build; only the transport differs. The wasm
+// module has no filesystem, so the graph lives for the life of the page. It
+// starts as a small example; open a .gldb or JSONL file (button, or drop it on
+// the page) to explore that instead. Opening reads a copy: edits stay in the
+// tab until exported.
 
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
@@ -39,7 +41,13 @@ try {
   // Handy at the console: `window.glider.exportJsonl()` to get your data out.
   window.glider = db
 
-  setTransport(wasmTransport(db))
+  setTransport(
+    wasmTransport(glider, db, {
+      onSwap: (next) => {
+        window.glider = next
+      },
+    }),
+  )
   root.render(
     <StrictMode>
       <App />

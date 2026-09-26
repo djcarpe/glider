@@ -491,6 +491,88 @@ impl Store {
     }
 }
 
+/// Writes a brand-new database file straight from a stream of ops, without
+/// building a graph in memory first.
+///
+/// `Graph::open` and `import` both hold the whole graph, so the largest file
+/// they can produce is bounded by RAM. A generator that streams through this
+/// writer is not: memory stays flat at one buffer however big the file gets.
+/// That is what makes files larger than the machine possible — useful for
+/// stress tests, and for converting data that is bigger than any one host.
+///
+/// Nothing checks the ops. They are replayed verbatim on open, so they must
+/// make sense in order: an edge's endpoints must already exist, ids must not
+/// be reused. Ops between two `commit`s form one transaction; a file that is
+/// cut short loses only its unfinished tail, exactly like a crashed writer.
+pub struct LogWriter {
+    file: BufWriter<File>,
+    buf: Vec<u8>,
+    bytes: u64,
+    ops: u64,
+    /// Ops pushed since the last commit, whether or not already flushed.
+    open_tx: bool,
+}
+
+impl LogWriter {
+    /// Create `path`, which must not already exist, and write the header.
+    pub fn create(path: &Path) -> io::Result<LogWriter> {
+        let f = OpenOptions::new().write(true).create_new(true).open(path)?;
+        let mut file = BufWriter::with_capacity(1 << 20, f);
+        let header = encode_header(&new_generation());
+        file.write_all(&header)?;
+        Ok(LogWriter {
+            file,
+            buf: Vec::with_capacity(1 << 20),
+            bytes: header.len() as u64,
+            ops: 0,
+            open_tx: false,
+        })
+    }
+
+    pub fn push(&mut self, op: &Op) -> io::Result<()> {
+        let before = self.buf.len();
+        encode_record(&mut self.buf, op.kind(), |b| op.encode_payload(b));
+        self.bytes += (self.buf.len() - before) as u64;
+        self.ops += 1;
+        self.open_tx = true;
+        if self.buf.len() >= 1 << 20 {
+            self.file.write_all(&self.buf)?;
+            self.buf.clear();
+        }
+        Ok(())
+    }
+
+    /// End the current transaction. Cheap: no fsync until `finish`.
+    pub fn commit(&mut self) -> io::Result<()> {
+        let before = self.buf.len();
+        encode_record(&mut self.buf, K_TX_END, |_| {});
+        self.bytes += (self.buf.len() - before) as u64;
+        self.file.write_all(&self.buf)?;
+        self.buf.clear();
+        self.open_tx = false;
+        Ok(())
+    }
+
+    /// Bytes written so far, header included — the file's eventual size.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    pub fn ops(&self) -> u64 {
+        self.ops
+    }
+
+    /// Commit whatever is pending and make the file durable.
+    pub fn finish(mut self) -> io::Result<u64> {
+        if self.open_tx {
+            self.commit()?;
+        }
+        self.file.flush()?;
+        self.file.get_ref().sync_all()?;
+        Ok(self.bytes)
+    }
+}
+
 fn encode_record<F: FnOnce(&mut Vec<u8>)>(out: &mut Vec<u8>, kind: u8, payload: F) {
     let start = out.len();
     out.push(kind);
@@ -507,9 +589,15 @@ fn replay<F: FnMut(Op)>(file: &mut File, header_len: u64, apply: &mut F) -> io::
     file.seek(SeekFrom::Start(header_len))?;
     let mut data = Vec::new();
     file.read_to_end(&mut data)?;
+    Ok(header_len + replay_records(&data, apply))
+}
 
+/// Apply every committed transaction in `data`, a run of records with the
+/// header already stripped. Returns the length of the committed prefix; a
+/// torn or corrupt tail is ignored, exactly as on open.
+fn replay_records<F: FnMut(Op)>(data: &[u8], apply: &mut F) -> u64 {
     let mut pos = 0usize;
-    let mut committed = header_len;
+    let mut committed = 0u64;
     let mut batch: Vec<Op> = Vec::new();
 
     while pos + 5 <= data.len() {
@@ -530,7 +618,7 @@ fn replay<F: FnMut(Op)>(file: &mut File, header_len: u64, apply: &mut F) -> io::
             for op in batch.drain(..) {
                 apply(op);
             }
-            committed = header_len + end as u64;
+            committed = end as u64;
         } else {
             match Op::decode(kind, &data[pos + 5..pos + 5 + len]) {
                 Ok(op) => batch.push(op),
@@ -540,7 +628,17 @@ fn replay<F: FnMut(Op)>(file: &mut File, header_len: u64, apply: &mut F) -> io::
         pos = end;
     }
 
-    Ok(committed)
+    committed
+}
+
+/// Replay a whole database file held in memory — header and all — without a
+/// filesystem. This is how a `.gldb` reaches the wasm build: the host reads
+/// the bytes and hands them over. Returns the committed length, as `open`
+/// would have truncated the file to.
+pub fn replay_bytes<F: FnMut(Op)>(bytes: &[u8], apply: &mut F) -> io::Result<u64> {
+    let h = parse_header(bytes)?;
+    let body = &bytes[h.header_len as usize..];
+    Ok(h.header_len + replay_records(body, apply))
 }
 
 // ------------------------------------------------------- replication support
@@ -616,6 +714,13 @@ fn read_header_from(file: &mut File) -> io::Result<FileHeader> {
     file.seek(SeekFrom::Start(0))?;
     let mut head = [0u8; HEADER_LEN as usize];
     let n = file.read(&mut head)?;
+    parse_header(&head[..n])
+}
+
+/// Decode a header from the first bytes of a file. `head` may be shorter than
+/// `HEADER_LEN` for a v1 file.
+fn parse_header(head: &[u8]) -> io::Result<FileHeader> {
+    let n = head.len();
     if n < HEADER_V1_LEN as usize {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

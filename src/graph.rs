@@ -209,6 +209,9 @@ impl From<&str> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Property keys per label or relationship type, from `Graph::sample_keys`.
+pub type KeySample = Vec<(String, Vec<String>)>;
+
 // -------------------------------------------------------------------- graph
 
 pub struct Graph {
@@ -250,6 +253,15 @@ impl Graph {
             Store::open_with(path, sync, force, &mut |op| sink.apply_mem(&op))?
         };
         g.store = Some(store);
+        Ok(g)
+    }
+
+    /// An in-memory graph loaded from the bytes of a database file. Nothing
+    /// is written back: edits live only as long as the graph. This is how
+    /// hosts without a filesystem (wasm) open a `.gldb`.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Graph> {
+        let mut g = Graph::memory();
+        crate::store::replay_bytes(bytes, &mut |op| g.apply_mem(&op))?;
         Ok(g)
     }
 
@@ -786,6 +798,50 @@ impl Graph {
     }
 
     // -------------------------------------------------------------- lookups
+
+    /// Property keys seen on up to `per` members of each label and each
+    /// relationship type, sorted. A sample, not a census: it is for hints
+    /// such as autocomplete, and must stay cheap on a graph of millions. The
+    /// `""` label covers nodes regardless of label, so an unlabelled graph
+    /// still has keys to offer.
+    pub fn sample_keys(&self, per: usize) -> (KeySample, KeySample) {
+        fn names(g: &Graph, ids: std::collections::BTreeSet<u32>) -> Vec<String> {
+            let mut v: Vec<String> = ids
+                .into_iter()
+                .map(|k| g.strings.name(k).to_string())
+                .collect();
+            v.sort();
+            v
+        }
+        let mut nodes = Vec::new();
+        let mut any = std::collections::BTreeSet::new();
+        for n in self.nodes.values().take(per) {
+            any.extend(n.props.iter().map(|(k, _)| *k));
+        }
+        nodes.push((String::new(), names(self, any)));
+        for (label, set) in &self.label_index {
+            let mut keys = std::collections::BTreeSet::new();
+            for id in set.iter().take(per) {
+                if let Some(n) = self.nodes.get(id) {
+                    keys.extend(n.props.iter().map(|(k, _)| *k));
+                }
+            }
+            nodes.push((self.strings.name(*label).to_string(), names(self, keys)));
+        }
+        let mut edges = Vec::new();
+        for (etype, set) in &self.type_index {
+            let mut keys = std::collections::BTreeSet::new();
+            for id in set.iter().take(per) {
+                if let Some(e) = self.edges.get(id) {
+                    keys.extend(e.props.iter().map(|(k, _)| *k));
+                }
+            }
+            edges.push((self.strings.name(*etype).to_string(), names(self, keys)));
+        }
+        nodes.sort();
+        edges.sort();
+        (nodes, edges)
+    }
 
     pub fn nodes_with_label(&self, label: &str) -> Vec<u64> {
         match self

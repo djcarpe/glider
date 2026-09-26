@@ -173,7 +173,9 @@ straight out of the zero-dependency rule: there is nothing in glider that wants
 an operating system. 459 KB, 135 KB brotli, for the entire database.
 
 Under wasm there is no filesystem, so graphs are in-memory; persist with
-`exportJsonl()` / `importJsonl()`. Details and the full API: `ts/README.md`.
+`exportJsonl()` / `importJsonl()`. An existing `.gldb` can be loaded read-only
+from its bytes with `glider.openBytes()`. Details and the full API:
+`ts/README.md`.
 
 ## Algorithms
 
@@ -223,6 +225,25 @@ file       31 MB
 ```
 
 Run `glider bench <n>` on your own hardware.
+
+### Stress-test data
+
+`stress-gen` writes a realistic database file of a given size — the commerce
+graph from `scripts/mundane_graph.py`, with heavy-tailed degrees, skewed
+popularity, every value type, non-ASCII text, three indexes, and a history of
+updates and deletes — straight to disk through `store::LogWriter`, so it needs
+no more memory for 10 GiB than for 10 MB:
+
+```sh
+cargo build --release --workspace
+./target/release/stress-gen --size 1GiB --out bench/data/stress-1g.gldb
+```
+
+Opening is the part that needs memory. The whole graph is resident, at
+roughly 6× the file size (1 GiB of file ≈ 6.2 GiB of RAM), and replay runs
+at about 33 MB/s on a laptop core — 30 s per GiB. The browser build is capped
+by wasm32's 4 GiB address space, so files much above 500 MiB need
+`glider <file> browser` rather than **Open file…**.
 
 ## Embedding
 

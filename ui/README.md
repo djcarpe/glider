@@ -53,14 +53,16 @@ Cost: about +260 KB of HTML, taking the release binary from ~1.05 MB to
 
 | file | |
 |---|---|
-| `App.jsx` | shell, Console/Explore switch, editor, sidebar, frame stack, history |
+| `App.jsx` | shell, Console/Explore switch, sidebar, frame stack, history, opening files |
+| `Editor.jsx` | the query textarea: type-ahead list, keyboard handling, history walking |
+| `complete.js` | what the type-ahead offers: statements, labels, types, keys, procedures, keywords |
 | `Frame.jsx` | one result frame; Graph/Table/JSON tabs, table rendering |
 | `GraphView.jsx` | d3-force layout in SVG: drag, zoom, select, expand; controlled mode for the explorer |
-| `Explorer.jsx` | the Explore tab: search, lazy-loaded list, canvas, edit actions |
+| `Explorer.jsx` | the Explore tab: search with label/type suggestions, lazy-loaded list, canvas, edit actions |
 | `Inspector.jsx` | the explorer's edit panel: properties, labels, new node / relationship, delete |
 | `edit.js` | writes as queries: literal rendering, typed input, create/set/remove/delete |
 | `entities.js` | label colours, captions, entity narrowing |
-| `transport.js` | the HTTP and wasm backends |
+| `transport.js` | the HTTP and wasm backends; the wasm one can swap in an opened file |
 | `styles.css` | design tokens and all styling |
 
 ## Notes
@@ -81,3 +83,16 @@ Cost: about +260 KB of HTML, taking the release binary from ~1.05 MB to
   float, `true` a bool, `[..]` a list — with an explicit type override for the
   cases that guess wrong. Names that are not plain identifiers are
   backtick-quoted.
+- Type-ahead (`complete.js`) reads the text before the caret rather than
+  parsing it, because it has to work on half-written queries. It offers whole
+  statements on an empty line, labels after `(n:`, types after `[:`, property
+  keys after `n.` or inside `{…}`, procedures after `CALL` and their arguments
+  inside `(…)`, and otherwise the keywords, variables and functions that fit
+  the current clause. Keys come from `node_keys` / `edge_keys` in the schema —
+  a sample of each label, not a scan. Its vocabulary mirrors `HELP` in
+  `src/query.rs`; change one, change the other.
+- The standalone build can open a file: **Open file…** or drop a `.gldb` or
+  `.jsonl` on the page. A `.gldb` is replayed from its bytes
+  (`glider.openBytes`); it is a copy, so edits stay in the tab until
+  **Export** downloads them as JSON Lines. The embedded build has no such
+  button — there the server already has a file open (`glider my.gldb browser`).

@@ -75,6 +75,80 @@ fn torn_tail_is_discarded() {
 }
 
 #[test]
+fn opens_from_file_bytes_without_touching_disk() {
+    let path = temp("bytes");
+    {
+        let mut g = Graph::open(&path, Sync::Always).unwrap();
+        q(
+            &mut g,
+            r#"CREATE (a:Person {name:"Ada"})-[:KNOWS {since:2019}]->(b:Person {name:"Bob"})"#,
+        );
+        q(
+            &mut g,
+            r#"MATCH (n:Person {name:"Bob"}) SET n.city = "Paris""#,
+        );
+    }
+    let mut bytes = std::fs::read(&path).unwrap();
+    // A torn tail is ignored here exactly as it is on open.
+    bytes.extend_from_slice(&[0u8, 200, 0, 0, 0, 7, 7, 7]);
+
+    let mut g = Graph::from_bytes(&bytes).unwrap();
+    assert!(!g.is_persistent());
+    assert_eq!(g.node_count(), 2);
+    let r = q(
+        &mut g,
+        r#"MATCH (a)-[r:KNOWS]->(b) RETURN a.name, r.since, b.city"#,
+    );
+    assert_eq!(r.rows.len(), 1);
+    // New ids continue past the file's, rather than colliding with them.
+    q(&mut g, r#"CREATE (:Person {name:"Cai"})"#);
+    assert_eq!(g.node_count(), 3);
+
+    assert!(Graph::from_bytes(b"not a database at all").is_err());
+    assert!(Graph::from_bytes(&[]).is_err());
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn log_writer_streams_a_file_that_opens() {
+    use glider::store::{LogWriter, Op};
+    let path = temp("logwriter");
+    let mut w = LogWriter::create(&path).unwrap();
+    for id in 1..=3u64 {
+        w.push(&Op::NodeAdd {
+            id,
+            labels: vec!["Person".into()],
+            props: vec![("n".into(), Value::Int(id as i64))],
+        })
+        .unwrap();
+    }
+    w.push(&Op::EdgeAdd {
+        id: 1,
+        from: 1,
+        to: 2,
+        etype: "KNOWS".into(),
+        props: vec![],
+    })
+    .unwrap();
+    w.commit().unwrap();
+    // An unfinished transaction is flushed by `finish` as a committed one.
+    w.push(&Op::NodeDel { id: 3 }).unwrap();
+    let bytes = w.finish().unwrap();
+    assert_eq!(bytes, std::fs::metadata(&path).unwrap().len());
+    // It refuses to clobber an existing file.
+    assert!(LogWriter::create(&path).is_err());
+
+    let mut g = Graph::open(&path, Sync::Always).unwrap();
+    assert_eq!(g.node_count(), 2);
+    assert_eq!(g.edge_count(), 1);
+    // The engine carries on numbering after the streamed ids.
+    q(&mut g, r#"CREATE (:Person {n: 9})"#);
+    assert_eq!(g.node_count(), 3);
+    drop(g);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn uncommitted_transaction_is_not_visible_after_reopen() {
     let path = temp("tx");
     {

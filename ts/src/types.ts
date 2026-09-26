@@ -60,6 +60,13 @@ export interface Schema {
   readonly labels: SchemaEntry[]
   readonly edge_types: SchemaEntry[]
   readonly indexes: SchemaEntry[]
+  /**
+   * Property keys seen on a sample of each label's nodes, sorted. The `""`
+   * entry samples nodes regardless of label. A hint, not a census.
+   */
+  readonly node_keys: Readonly<Record<string, string[]>>
+  /** As `node_keys`, per relationship type. */
+  readonly edge_keys: Readonly<Record<string, string[]>>
 }
 
 /** Options for paging through the graph with `nodes()` / `edges()`. */

@@ -247,6 +247,29 @@ describe('paging', () => {
     const s = db.schema()
     assert.equal(s.nodes, 3)
     assert.equal(s.edges, 2)
+    assert.deepEqual(s.node_keys.Person, ['age', 'name'])
+    assert.deepEqual(s.edge_keys.KNOWS, ['since'])
     db.close()
+  })
+})
+
+describe('opening a database file', () => {
+  const fixture = new URL('./fixtures/people.gldb', import.meta.url)
+
+  test('a .gldb opens from its bytes', async () => {
+    const { readFile } = await import('node:fs/promises')
+    const db = glider.openBytes(await readFile(fixture))
+    assert.equal(nodeCount(db), 3)
+    const r = db.query('MATCH (a:Person)-[r:KNOWS]->(b) RETURN a.name, r.since, b.name')
+    assert.deepEqual(r.rows, [['Ada', 2019, 'Bob']])
+    // Writable, in memory only; ids carry on past the file's.
+    db.run('CREATE (:Person {name:"Cai"})')
+    assert.equal(nodeCount(db), 4)
+    db.close()
+  })
+
+  test('something that is not a database is an error', () => {
+    assert.throws(() => glider.openBytes(new TextEncoder().encode('{"hello":1}')), GliderError)
+    assert.throws(() => glider.openBytes(new Uint8Array(0)), /too short/)
   })
 })

@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import Editor from './Editor'
 import Explorer from './Explorer'
 import Frame from './Frame'
-import { fetchSchema, runQuery, transportKind, transportLabel } from './api'
+import { canOpenFiles, exportJsonl, fetchSchema, openFile, runQuery, sourceName, transportKind, transportLabel } from './api'
 import { labelColor } from './entities'
 
 const EXAMPLES = [
@@ -26,10 +27,14 @@ export default function App() {
   // 'console' writes queries; 'explore' browses without them. Both stay
   // mounted so switching back finds frames and the canvas as they were.
   const [mode, setMode] = useState(() => (loadStr(MODE_KEY) === 'explore' ? 'explore' : 'console'))
-  const taRef = useRef(null)
+  const editorRef = useRef(null)
   const nextId = useRef(1)
-  // Position in the history when arrowing up through it; null when typing.
-  const histPos = useRef(null)
+  // Bumped whenever a file replaces the graph, to remount the explorer so it
+  // holds nothing from the graph that was there before.
+  const [epoch, setEpoch] = useState(0)
+  const [fileNote, setFileNote] = useState(null) // {error?, text}
+  const [dragging, setDragging] = useState(false)
+  const fileRef = useRef(null)
 
   const refreshSchema = useCallback(async () => {
     try {
@@ -58,7 +63,6 @@ export default function App() {
         save(HISTORY_KEY, next)
         return next
       })
-      histPos.current = null
 
       try {
         const result = await runQuery(query)
@@ -81,45 +85,72 @@ export default function App() {
     setText('')
   }, [execute, text])
 
-  const onKeyDown = useCallback(
-    (e) => {
-      // Ctrl/Cmd+Enter runs; plain Enter inserts a newline, because these
-      // queries are routinely multi-line.
-      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
-        e.preventDefault()
-        submit()
-        return
-      }
-      // Arrow through history, but only from the edges of the text so that
-      // normal cursor movement inside a multi-line query still works.
-      const ta = e.currentTarget
-      if (e.key === 'ArrowUp' && ta.selectionStart === 0 && history.length) {
-        e.preventDefault()
-        const pos = histPos.current == null ? 0 : Math.min(histPos.current + 1, history.length - 1)
-        histPos.current = pos
-        setText(history[pos])
-      } else if (e.key === 'ArrowDown' && ta.selectionStart === ta.value.length && histPos.current != null) {
-        e.preventDefault()
-        const pos = histPos.current - 1
-        if (pos < 0) {
-          histPos.current = null
-          setText('')
-        } else {
-          histPos.current = pos
-          setText(history[pos])
-        }
-      }
-    },
-    [history, submit],
-  )
-
   const insert = useCallback((q) => {
-    setText(q)
-    taRef.current?.focus()
+    editorRef.current?.set(q)
   }, [])
 
+  // ---- opening a file (wasm build only: the server's graph is its own file)
+  const open = useCallback(
+    async (file) => {
+      if (!file) return
+      setFileNote({ text: `opening ${file.name}…` })
+      try {
+        const t0 = performance.now()
+        await openFile(file)
+        const s = await fetchSchema()
+        setSchema(s)
+        setOnline(true)
+        setFrames([])
+        setEpoch((n) => n + 1)
+        const secs = ((performance.now() - t0) / 1000).toFixed(2)
+        setFileNote({ text: `${file.name}: ${s.nodes.toLocaleString()} nodes, ${s.edges.toLocaleString()} relationships in ${secs}s` })
+      } catch (e) {
+        setFileNote({ error: true, text: `could not open ${file.name}: ${e.message || e}` })
+      }
+    },
+    [],
+  )
+
+  const download = useCallback(async () => {
+    try {
+      const text = await exportJsonl()
+      const url = URL.createObjectURL(new Blob([text], { type: 'application/x-ndjson' }))
+      const a = document.createElement('a')
+      a.href = url
+      a.download = (sourceName() ?? 'graph').replace(/\.[^.]*$/, '') + '.jsonl'
+      a.click()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+    } catch (e) {
+      setFileNote({ error: true, text: `export failed: ${e.message || e}` })
+    }
+  }, [])
+
+  const canOpen = canOpenFiles()
+  const dropProps = canOpen
+    ? {
+        onDragOver: (e) => {
+          if (![...e.dataTransfer.types].includes('Files')) return
+          e.preventDefault()
+          setDragging(true)
+        },
+        onDragLeave: (e) => {
+          if (e.currentTarget === e.target || !e.currentTarget.contains(e.relatedTarget)) setDragging(false)
+        },
+        onDrop: (e) => {
+          e.preventDefault()
+          setDragging(false)
+          open(e.dataTransfer.files?.[0])
+        },
+      }
+    : {}
+
   return (
-    <div className="app">
+    <div className="app" {...dropProps}>
+      {dragging && (
+        <div className="drop-veil">
+          <div>Drop a <code>.gldb</code> or <code>.jsonl</code> file to explore it</div>
+        </div>
+      )}
       <header className="topbar">
         <button className="icon-btn" title="Toggle sidebar" onClick={() => setSidebar((s) => !s)}>
           ☰
@@ -145,11 +176,40 @@ export default function App() {
           ))}
         </div>
         <div className="spacer" />
+        {canOpen && (
+          <>
+            <input
+              ref={fileRef}
+              type="file"
+              accept=".gldb,.jsonl,.ndjson,.json"
+              hidden
+              onChange={(e) => {
+                open(e.target.files?.[0])
+                e.target.value = ''
+              }}
+            />
+            <button className="top-btn" title="Open a .gldb database or JSON Lines file in this tab" onClick={() => fileRef.current?.click()}>
+              Open file…
+            </button>
+            <button className="top-btn" title="Download this graph as JSON Lines — edits here are not written back to the file" onClick={download}>
+              Export
+            </button>
+          </>
+        )}
         <div className="conn" title={transportKind() === 'wasm' ? 'glider is running in this tab as WebAssembly' : 'talking to a glider server'}>
           <span className={`dot ${online === null ? '' : online ? 'up' : 'down'}`} />
           {online === null ? 'starting' : online ? transportLabel() : 'offline'}
         </div>
       </header>
+
+      {fileNote && (
+        <div className={`file-note${fileNote.error ? ' err' : ''}`} role="status">
+          {fileNote.text}
+          <button className="icon-btn" title="Dismiss" onClick={() => setFileNote(null)}>
+            ×
+          </button>
+        </div>
+      )}
 
       <div className="body" hidden={mode !== 'console'}>
         <aside className={`sidebar${sidebar ? '' : ' collapsed'}`}>
@@ -215,25 +275,20 @@ export default function App() {
           <div className="editor-wrap">
             <div className="editor">
               <span className="prompt">»</span>
-              <textarea
-                ref={taRef}
+              <Editor
+                ref={editorRef}
                 value={text}
-                spellCheck={false}
-                autoFocus
-                rows={Math.min(10, Math.max(1, text.split('\n').length))}
-                placeholder="MATCH (n)-[r]->(m) RETURN n, r, m LIMIT 25"
-                onChange={(e) => {
-                  setText(e.target.value)
-                  histPos.current = null
-                }}
-                onKeyDown={onKeyDown}
+                onChange={setText}
+                onRun={submit}
+                history={history}
+                schema={schema}
               />
               <button className="run" onClick={submit} disabled={!text.trim()}>
                 ▶ Run
               </button>
             </div>
             <div className="hint">
-              <kbd>Ctrl</kbd>+<kbd>Enter</kbd> run · <kbd>↑</kbd> history · double-click a node to expand
+              <kbd>Ctrl</kbd>+<kbd>Enter</kbd> run · <kbd>Ctrl</kbd>+<kbd>Space</kbd> suggest · <kbd>Tab</kbd> accept · <kbd>↑</kbd> history · double-click a node to expand
             </div>
           </div>
 
@@ -241,7 +296,16 @@ export default function App() {
             {frames.length === 0 && (
               <div className="welcome">
                 <h2>An embeddable property-graph database</h2>
-                <p>Run a query to begin. Results that contain nodes or relationships are drawn as a graph.</p>
+                <p>
+                  Run a query to begin — start typing and suggestions will show what fits, or press{' '}
+                  <kbd>Ctrl</kbd>+<kbd>Space</kbd>. Results that contain nodes or relationships are drawn as a graph.
+                  {canOpen && (
+                    <>
+                      <br />
+                      To explore your own data, <button className="linkish" onClick={() => fileRef.current?.click()}>open a .gldb file</button> or drop one here.
+                    </>
+                  )}
+                </p>
                 <div className="examples">
                   {EXAMPLES.map((q) => (
                     <button key={q} onClick={() => execute(q)}>
@@ -264,7 +328,7 @@ export default function App() {
       </div>
 
       <div className="body" hidden={mode !== 'explore'}>
-        <Explorer schema={schema} onSchemaChange={refreshSchema} />
+        <Explorer key={epoch} schema={schema} onSchemaChange={refreshSchema} />
       </div>
     </div>
   )

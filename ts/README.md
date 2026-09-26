@@ -70,11 +70,12 @@ isolated graph.
 | | |
 |---|---|
 | `glider.open()` | a fresh in-memory graph |
+| `glider.openBytes(bytes)` | an in-memory graph loaded from a `.gldb` file's bytes |
 | `glider.version` | engine version |
 | `db.query(q)` | typed `QueryResult` — columns, rows, graph payload |
 | `db.run(q)` | run for effect, returns entities touched |
 | `db.graph(q)` | just the `{nodes, edges}` projection |
-| `db.schema()` | labels, relationship types, indexes, with counts |
+| `db.schema()` | labels, relationship types, indexes, with counts; sampled property keys per label and type |
 | `db.expand(id, limit?)` | neighbours of one node, both directions |
 | `db.nodes({label?, q?, from?, limit?})` | a page of nodes, cursor-paged by id; `q` searches labels, property values and ids |
 | `db.edges({type?, q?, from?, limit?})` | a page of relationships with their endpoints |
@@ -117,6 +118,15 @@ using db = glider.open()      // TypeScript 5.2+, closed at scope exit
 `wasm32-unknown-unknown` has no filesystem, so graphs are **in-memory only**.
 The file-backed modes — `glider_open`, the WAL, compaction, replication — are
 not reachable from this build.
+
+A `.gldb` file can still be *read*: hand its bytes to `openBytes` and it is
+replayed into memory exactly as `glider_open` would (a torn tail is ignored).
+Nothing is written back — the file is a starting point, not a live database.
+
+```ts
+const bytes = await file.arrayBuffer()        // <input type=file>, fetch, fs.readFile
+const db = glider.openBytes(bytes)
+```
 
 Persist by moving JSONL yourself:
 

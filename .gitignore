@@ -10,6 +10,7 @@ dist-standalone/
 
 # Databases produced by running or testing glider
 *.gldb
+!/ts/test/fixtures/*.gldb
 *.compact.tmp
 
 # Benchmark inputs and results

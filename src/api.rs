@@ -309,16 +309,46 @@ pub fn schema_json(g: &mut Graph) -> Result<String, String> {
         bucket.push_str(&format!(",\"count\":{}}}", count));
     }
 
+    // Property keys by label and by relationship type, sampled, so the
+    // editor can complete `n.` without a query of its own.
+    let (nk, ek) = g.sample_keys(KEY_SAMPLE);
+
     // Label counts overlap (a node may carry several), so the explorer needs
     // the true totals too.
     Ok(format!(
-        "{{\"nodes\":{},\"edges\":{},\"labels\":[{}],\"edge_types\":[{}],\"indexes\":[{}]}}",
+        "{{\"nodes\":{},\"edges\":{},\"labels\":[{}],\"edge_types\":[{}],\"indexes\":[{}],\"node_keys\":{},\"edge_keys\":{}}}",
         g.node_count(),
         g.edge_count(),
         labels,
         etypes,
-        indexes
+        indexes,
+        keys_json(&nk),
+        keys_json(&ek)
     ))
+}
+
+/// How many members of each label or type `schema_json` inspects for keys.
+const KEY_SAMPLE: usize = 200;
+
+/// `{"Person":["age","name"],...}`
+fn keys_json(groups: &[(String, Vec<String>)]) -> String {
+    let mut out = String::from("{");
+    for (i, (name, keys)) in groups.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write_json_string(name, &mut out);
+        out.push_str(":[");
+        for (j, k) in keys.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            write_json_string(k, &mut out);
+        }
+        out.push(']');
+    }
+    out.push('}');
+    out
 }
 
 // ------------------------------------------------------------------ expand
@@ -656,6 +686,7 @@ mod tests {
         assert!(j.contains("\"name\":\"KNOWS\""), "{}", j);
         assert!(j.contains("\"count\":2"), "{}", j);
         assert!(j.contains("\"nodes\":2,\"edges\":1"), "{}", j);
+        assert!(j.contains("\"node_keys\":{\"\":[\"name\"]"), "{}", j);
     }
 
     #[test]

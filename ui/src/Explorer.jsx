@@ -317,16 +317,17 @@ export default function Explorer({ schema, onSchemaChange }) {
       </datalist>
 
       <aside className="ex-side">
-        <div className="ex-search">
-          <input
-            className="ins-input"
-            type="search"
-            placeholder={kind === 'nodes' ? 'Search nodes — any label, property or id' : 'Search relationships — type, property or id'}
-            value={q}
-            autoFocus
-            onChange={(e) => setQ(e.target.value)}
-          />
-        </div>
+        <SearchBox
+          q={q}
+          setQ={setQ}
+          kind={kind}
+          schema={schema}
+          onScope={(k, name) => {
+            setKind(k)
+            setFilter(name)
+            setQ('')
+          }}
+        />
         <div className="ex-kind">
           <button className={`tab${kind === 'nodes' ? ' on' : ''}`} onClick={() => { setKind('nodes'); setFilter(null) }}>
             Nodes {schema && <span className="n">{fmt(schema.nodes)}</span>}
@@ -462,6 +463,110 @@ function RelItem({ edge, nodeById, onCanvas, selected, onClick }) {
       </span>
       {onCanvas && <span className="ex-item-mark" title="on canvas">●</span>}
     </button>
+  )
+}
+
+/**
+ * The search input, with type-ahead for scope: typing part of a label or
+ * relationship type offers to filter to it, which is both faster than a
+ * text match and how a newcomer learns the filters exist. Plain Enter still
+ * just searches.
+ */
+function SearchBox({ q, setQ, kind, schema, onScope }) {
+  const [focus, setFocus] = useState(false)
+  const [active, setActive] = useState(-1)
+  const [shut, setShut] = useState(false)
+
+  const matches = useMemo(() => {
+    const w = q.trim().toLowerCase()
+    if (!w) return []
+    const hit = (name) => name.toLowerCase().includes(w)
+    const labels = (schema?.labels ?? []).filter((l) => hit(l.name)).map((l) => ({ kind: 'nodes', name: l.name, count: l.count }))
+    const types = (schema?.edge_types ?? []).filter((t) => hit(t.name)).map((t) => ({ kind: 'rels', name: t.name, count: t.count }))
+    // The current list's kind first; prefix hits before substring ones.
+    const all = kind === 'nodes' ? [...labels, ...types] : [...types, ...labels]
+    const pre = (m) => (m.name.toLowerCase().startsWith(w) ? 0 : 1)
+    return all.sort((a, b) => pre(a) - pre(b)).slice(0, 8)
+  }, [q, schema, kind])
+
+  useEffect(() => {
+    setActive(-1)
+    setShut(false)
+  }, [q])
+
+  const open = focus && !shut && matches.length > 0
+  const pick = (m) => {
+    onScope(m.kind, m.name)
+    setShut(true)
+  }
+
+  return (
+    <div className="ex-search">
+      <input
+        className="ins-input"
+        type="search"
+        placeholder={kind === 'nodes' ? 'Search nodes — any label, property or id' : 'Search relationships — type, property or id'}
+        value={q}
+        autoFocus
+        role="combobox"
+        aria-expanded={open}
+        aria-autocomplete="list"
+        onChange={(e) => setQ(e.target.value)}
+        onFocus={() => setFocus(true)}
+        onBlur={() => setFocus(false)}
+        onKeyDown={(e) => {
+          if (!open) return
+          if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+            e.preventDefault()
+            const n = matches.length
+            // -1 is "just search the text", above the first suggestion.
+            setActive((a) => ((a + 1 + (e.key === 'ArrowDown' ? 1 : -1) + n + 1) % (n + 1)) - 1)
+          } else if (e.key === 'Enter') {
+            e.preventDefault()
+            if (active >= 0) pick(matches[active])
+            else setShut(true)
+          } else if (e.key === 'Escape') {
+            setShut(true)
+          }
+        }}
+      />
+      {open && (
+        <div className="sug ex-sug" role="listbox">
+          <div className="sug-list">
+            <div className={`sug-item${active === -1 ? ' on' : ''}`} onMouseDown={(e) => { e.preventDefault(); setShut(true) }}>
+              <span className="sug-kind">⌕</span>
+              <span className="sug-label">search every property for “{q.trim()}”</span>
+            </div>
+            {matches.map((m, i) => (
+              <div
+                key={`${m.kind}:${m.name}`}
+                role="option"
+                aria-selected={i === active}
+                className={`sug-item${i === active ? ' on' : ''}`}
+                onMouseDown={(e) => {
+                  e.preventDefault()
+                  pick(m)
+                }}
+                onMouseEnter={() => setActive(i)}
+              >
+                {m.kind === 'nodes' ? (
+                  <span className="sug-kind"><span className="ins-dot" style={{ background: labelColor(m.name) }} /></span>
+                ) : (
+                  <span className="sug-kind k-type">→</span>
+                )}
+                <span className="sug-label">
+                  {m.kind === 'nodes' ? `only :${m.name} nodes` : `only ${m.name} relationships`}
+                </span>
+                <span className="sug-count">{fmt(m.count)}</span>
+              </div>
+            ))}
+          </div>
+          <div className="sug-detail sug-keys">
+            <kbd>↓</kbd> pick a filter · <kbd>Enter</kbd> apply · <kbd>Esc</kbd> close
+          </div>
+        </div>
+      )}
+    </div>
   )
 }
 

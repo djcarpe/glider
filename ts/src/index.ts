@@ -37,6 +37,7 @@ export * from './types.js'
 interface Exports {
   memory: WebAssembly.Memory
   glider_open_memory(): number
+  glider_open_bytes(bytes: number, len: number): number
   glider_close(db: number): void
   glider_query(db: number, q: number): number
   glider_query_json(db: number, q: number): number
@@ -142,6 +143,33 @@ export class GliderModule {
   open(): GliderDb {
     const handle = this.#e.glider_open_memory()
     if (!handle) throw new GliderError(this.#lastError() ?? 'could not open a graph')
+    return new GliderDb(this, handle)
+  }
+
+  /**
+   * Open a graph from the bytes of a `.gldb` database file — read with
+   * `File.arrayBuffer()`, `fetch`, or `fs.readFile`. The graph is in memory:
+   * edits are not written back to the file. Persist with `exportJsonl()`.
+   */
+  openBytes(bytes: ArrayBuffer | ArrayBufferView): GliderDb {
+    const src =
+      bytes instanceof ArrayBuffer
+        ? new Uint8Array(bytes)
+        : new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+    const len = src.byteLength
+    // Allocate at least one byte so an empty file still gets a real pointer;
+    // glider then reports it as too short, which is the useful error.
+    const cap = Math.max(len, 1)
+    const ptr = this.#e.glider_alloc(cap)
+    if (!ptr) throw new GliderError(`could not allocate ${len} bytes in wasm memory`)
+    let handle: number
+    try {
+      this.#bytes().set(src, ptr)
+      handle = this.#e.glider_open_bytes(ptr, len)
+    } finally {
+      this.#e.glider_dealloc(ptr, cap)
+    }
+    if (!handle) throw new GliderError(this.#lastError() ?? 'could not open that file')
     return new GliderDb(this, handle)
   }
 

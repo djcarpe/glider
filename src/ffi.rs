@@ -129,6 +129,29 @@ pub extern "C" fn glider_open_memory() -> *mut GliderDb {
     })
 }
 
+/// An in-memory graph loaded from the bytes of a `.gldb` file. Edits are not
+/// written back anywhere. For hosts with no filesystem, chiefly wasm, where
+/// the embedder reads the file and passes the bytes in. NULL on error.
+///
+/// # Safety
+/// `bytes` must point to `len` readable bytes (or be NULL with `len` 0).
+#[no_mangle]
+pub unsafe extern "C" fn glider_open_bytes(bytes: *const u8, len: usize) -> *mut GliderDb {
+    unsafe {
+        guard(std::ptr::null_mut(), || {
+            let data: &[u8] = if len == 0 {
+                &[]
+            } else if bytes.is_null() {
+                return Err("bytes is NULL".into());
+            } else {
+                std::slice::from_raw_parts(bytes, len)
+            };
+            let graph = Graph::from_bytes(data).map_err(|e| e.to_string())?;
+            Ok(Box::into_raw(Box::new(GliderDb { graph })))
+        })
+    }
+}
+
 /// Flush, close and free the handle. Safe to call with NULL.
 ///
 /// # Safety
