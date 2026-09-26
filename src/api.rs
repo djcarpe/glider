@@ -407,13 +407,13 @@ fn node_matches(g: &Graph, id: u64, needle: &str) -> bool {
     if id.to_string() == needle {
         return true;
     }
-    if n.labels
+    if n.labels()
         .iter()
         .any(|l| contains_ci(g.strings.name(*l), needle))
     {
         return true;
     }
-    n.props.iter().any(|(_, v)| value_matches(v, needle))
+    n.props().iter().any(|(_, v)| value_matches(v, needle))
 }
 
 fn edge_matches(g: &Graph, id: u64, needle: &str) -> bool {
@@ -424,7 +424,7 @@ fn edge_matches(g: &Graph, id: u64, needle: &str) -> bool {
     if contains_ci(g.strings.name(e.etype), needle) {
         return true;
     }
-    e.props.iter().any(|(_, v)| value_matches(v, needle))
+    e.props().iter().any(|(_, v)| value_matches(v, needle))
 }
 
 fn needle_of(q: Option<&str>) -> Option<String> {

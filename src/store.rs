@@ -1,9 +1,16 @@
-//! Durability. One file, append-only, CRC-checked records grouped into
-//! transactions by an explicit commit marker.
+//! Durability. One file: an optional snapshot image, then an append-only run
+//! of CRC-checked records grouped into transactions by an explicit commit
+//! marker.
 //!
-//! The whole graph lives in memory; this file is the write-ahead log *and* the
-//! persistent form. `compact` rewrites it as the minimal set of records that
-//! reproduce current state, which is the equivalent of a checkpoint.
+//! ```text
+//! [header 64 B][image (see image.rs)][record][record]...[TX_END]...
+//! ```
+//!
+//! The image is current state as of the last compaction, laid out to be read
+//! in bulk. The records after it are the write-ahead log of everything since.
+//! Only compaction writes an image, and it does so by writing a whole new file
+//! and renaming it into place, so between compactions the file is strictly
+//! append-only — which is what replication depends on.
 //!
 //! Crash behaviour: a torn tail (a half-written record, or ops with no commit
 //! marker) is discarded on open and the file is truncated back to the last
@@ -20,11 +27,16 @@ pub const MAGIC: &[u8; 8] = b"GLIDER\x00\x01";
 /// The magic this format shipped with before the rename. Still accepted on
 /// open; a COMPACT rewrites the header with the current magic.
 pub const MAGIC_LEGACY: &[u8; 8] = b"GRAPHLT\x01";
-/// v2 added the generation id. v1 files still open; a COMPACT upgrades them.
-pub const FORMAT_VERSION: u32 = 2;
-/// magic(8) version(4) flags(4) generation(16)
-pub const HEADER_LEN: u64 = 32;
+/// v2 added the generation id; v3 the snapshot image. v1 and v2 files still
+/// open, by replaying their whole log; a COMPACT upgrades them.
+pub const FORMAT_VERSION: u32 = 3;
+/// v3: magic(8) version(4) flags(4) generation(16) image_len(8) log_start(8)
+/// reserved(12) crc(4)
+pub const HEADER_LEN: u64 = 64;
+pub const HEADER_V2_LEN: u64 = 32;
 pub const HEADER_V1_LEN: u64 = 16;
+/// Header flag: an image follows the header.
+const FLAG_IMAGE: u32 = 1;
 
 const K_NODE_ADD: u8 = 0;
 const K_NODE_DEL: u8 = 1;
@@ -251,6 +263,64 @@ impl Op {
     }
 }
 
+impl Op {
+    /// Check that a payload decodes, without allocating anything. Accepts
+    /// exactly what `decode` accepts, so a transaction whose records all
+    /// validate can be decoded and applied one record at a time with no
+    /// chance of failing halfway.
+    fn validate(kind: u8, payload: &[u8]) -> Result<(), String> {
+        let mut r = Reader::new(payload);
+        let props = |r: &mut Reader| -> Result<(), String> {
+            let n = r.varint()? as usize;
+            if n > r.remaining() + 1 {
+                return Err("property count exceeds record".into());
+            }
+            for _ in 0..n {
+                r.skip_str()?;
+                r.skip_value()?;
+            }
+            Ok(())
+        };
+        match kind {
+            K_NODE_ADD => {
+                r.varint()?;
+                let n = r.varint()?;
+                for _ in 0..n {
+                    r.skip_str()?;
+                }
+                props(&mut r)
+            }
+            K_NODE_DEL | K_EDGE_DEL => r.varint().map(|_| ()),
+            K_EDGE_ADD => {
+                r.varint()?;
+                r.varint()?;
+                r.varint()?;
+                r.skip_str()?;
+                props(&mut r)
+            }
+            K_NODE_SET | K_EDGE_SET => {
+                r.varint()?;
+                r.skip_str()?;
+                r.skip_value()
+            }
+            K_NODE_UNSET | K_EDGE_UNSET | K_LABEL_ADD | K_LABEL_DEL => {
+                r.varint()?;
+                r.skip_str()
+            }
+            K_INDEX_ADD | K_INDEX_DEL => {
+                r.skip_str()?;
+                r.skip_str()
+            }
+            K_COUNTERS => {
+                r.varint()?;
+                r.varint().map(|_| ())
+            }
+            K_CLEAR => Ok(()),
+            other => Err(format!("unknown record kind {}", other)),
+        }
+    }
+}
+
 fn put_props(out: &mut Vec<u8>, props: &[(String, Value)]) {
     codec::put_varint(out, props.len() as u64);
     for (k, v) in props {
@@ -297,42 +367,34 @@ pub struct Store {
     _lock: Option<Lock>,
 }
 
-impl Store {
-    /// Open (creating if needed) and replay every committed op into `apply`.
-    pub fn open<F: FnMut(Op)>(path: &Path, sync: Sync, apply: F) -> io::Result<Store> {
-        let mut apply = apply;
-        Store::open_with(path, sync, false, &mut apply)
+/// A database file that is locked and has had its header read, but whose log
+/// has not been replayed yet. The caller loads the image (if any) between the
+/// two steps.
+pub struct Opening {
+    path: PathBuf,
+    file: File,
+    header: FileHeader,
+    sync: Sync,
+    lock: Lock,
+}
+
+impl Opening {
+    pub fn header(&self) -> &FileHeader {
+        &self.header
     }
 
-    /// `force` breaks a lock held by a process we cannot prove is gone. Use it
-    /// when you know the previous writer is dead and the platform will not
-    /// tell us so.
-    pub fn open_with<F: FnMut(Op)>(
-        path: &Path,
-        sync: Sync,
-        force: bool,
-        apply: &mut F,
-    ) -> io::Result<Store> {
-        let lock = Lock::acquire(path, force)?;
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(path)?;
-
-        let len = file.metadata()?.len();
-        let (mut generation, header_len) = if len == 0 {
-            let generation = new_generation();
-            file.write_all(&encode_header(&generation))?;
-            file.sync_all()?;
-            // A new file is not durable until its directory entry is.
-            sync_parent(path);
-            (generation, HEADER_LEN)
-        } else {
-            let h = read_header_from(&mut file)?;
-            (h.generation, h.header_len)
-        };
-
+    /// Replay every committed op after the image into `apply`, discard any
+    /// torn tail, and hand back a store ready to append.
+    pub fn replay<F: FnMut(Op)>(self, apply: &mut F) -> io::Result<Store> {
+        let Opening {
+            path,
+            mut file,
+            header,
+            sync,
+            lock,
+        } = self;
+        let header_len = header.header_len;
+        let mut generation = header.generation;
         let committed_len = replay(&mut file, header_len, apply)?;
 
         // Discard any torn tail so the next append starts from a clean boundary.
@@ -345,19 +407,31 @@ impl Store {
         // file that is CRC-valid and wrong at the seam. A new generation makes
         // the discontinuity explicit, so replicas start a fresh lineage
         // instead of splicing two histories together.
+        //
+        // `committed_len` is never below `header_len`, so the image is never
+        // cut into.
         if committed_len < file.metadata()?.len() {
             file.set_len(committed_len)?;
-            if header_len == HEADER_LEN {
-                generation = new_generation();
-                file.seek(SeekFrom::Start(16))?;
-                file.write_all(&generation)?;
-                file.sync_all()?;
+            match header.version {
+                2 => {
+                    generation = new_generation();
+                    file.seek(SeekFrom::Start(16))?;
+                    file.write_all(&generation)?;
+                    file.sync_all()?;
+                }
+                3 => {
+                    generation = new_generation();
+                    file.seek(SeekFrom::Start(0))?;
+                    file.write_all(&encode_header(&generation, header.image_len))?;
+                    file.sync_all()?;
+                }
+                _ => {}
             }
         }
         file.seek(SeekFrom::Start(committed_len))?;
 
         Ok(Store {
-            path: path.to_path_buf(),
+            path,
             file: BufWriter::with_capacity(1 << 16, file),
             committed_len,
             pending: Vec::with_capacity(1 << 14),
@@ -367,6 +441,65 @@ impl Store {
             generation,
             header_len,
             _lock: Some(lock),
+        })
+    }
+}
+
+impl Store {
+    /// Open (creating if needed) and replay every committed op into `apply`.
+    /// Refuses a file that carries a snapshot image, since the ops after an
+    /// image are not the whole state; open those through `Graph`.
+    pub fn open<F: FnMut(Op)>(path: &Path, sync: Sync, apply: F) -> io::Result<Store> {
+        let mut apply = apply;
+        let opening = Store::begin_open(path, sync, false)?;
+        if opening.header().image_len > 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file has a snapshot image; open it with Graph::open",
+            ));
+        }
+        opening.replay(&mut apply)
+    }
+
+    /// Lock the file (creating it if needed) and read its header. `force`
+    /// breaks a lock held by a process we cannot prove is gone. Use it when
+    /// you know the previous writer is dead and the platform will not tell us
+    /// so.
+    pub fn begin_open(path: &Path, sync: Sync, force: bool) -> io::Result<Opening> {
+        let lock = Lock::acquire(path, force)?;
+        // A compaction that died before its rename leaves its temp file
+        // behind. We hold the lock, so nobody else is writing it.
+        let _ = std::fs::remove_file(compact_tmp_path(path));
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)?;
+
+        let len = file.metadata()?.len();
+        let header = if len == 0 {
+            let generation = new_generation();
+            let bytes = encode_header(&generation, 0);
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            // A new file is not durable until its directory entry is.
+            sync_parent(path);
+            parse_header(&bytes)?
+        } else {
+            read_header_from(&mut file)?
+        };
+        if header.header_len > file.metadata()?.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "file is shorter than its header and snapshot image",
+            ));
+        }
+        Ok(Opening {
+            path: path.to_path_buf(),
+            file,
+            header,
+            sync,
+            lock,
         })
     }
 
@@ -420,41 +553,54 @@ impl Store {
         self.file.get_ref().sync_data()
     }
 
-    /// Rewrite the file as a minimal snapshot: write to a sibling temp file,
-    /// fsync it, then rename over the original. The rename is atomic, so a
-    /// crash mid-compaction leaves the old database intact.
-    pub fn compact(&mut self, ops: &[Op]) -> io::Result<()> {
+    /// Rewrite the file as a snapshot image followed by an empty log.
+    ///
+    /// `write` puts the image bytes into a sibling temp file, positioned just
+    /// past the header; the file is then fsynced and handed to `load`, which
+    /// reads the image back — a check that what was written is what will be
+    /// opened, and the caller's way to swap the new image in. Only then is
+    /// the temp file renamed over the original. The rename is atomic, so a
+    /// crash at any point leaves either the old database or the new one.
+    pub fn compact_image<T>(
+        &mut self,
+        write: impl FnOnce(&mut BufWriter<File>) -> io::Result<()>,
+        load: impl FnOnce(&Path, &FileHeader) -> io::Result<T>,
+    ) -> io::Result<T> {
         self.file.flush()?;
-        let tmp = self.path.with_extension("compact.tmp");
-        {
+        let tmp = compact_tmp_path(&self.path);
+        // A compaction rewrites every byte, so offsets from the old file mean
+        // nothing now. That is exactly what a generation change is for:
+        // replicas see it and start a fresh lineage instead of appending
+        // segments onto a log that no longer exists.
+        let generation = new_generation();
+        let written = (|| -> io::Result<FileHeader> {
             let f = OpenOptions::new()
+                .read(true)
                 .write(true)
                 .create(true)
                 .truncate(true)
                 .open(&tmp)?;
             let mut w = BufWriter::with_capacity(1 << 20, f);
-            // A compaction rewrites every byte, so offsets from the old file
-            // mean nothing now. That is exactly what a generation change is
-            // for: replicas see it and start a fresh lineage instead of
-            // appending segments onto a log that no longer exists.
-            let generation = new_generation();
-            w.write_all(&encode_header(&generation))?;
-            self.generation = generation;
-            self.header_len = HEADER_LEN;
-
-            let mut buf = Vec::with_capacity(1 << 16);
-            for op in ops {
-                encode_record(&mut buf, op.kind(), |b| op.encode_payload(b));
-                if buf.len() > (1 << 20) {
-                    w.write_all(&buf)?;
-                    buf.clear();
-                }
-            }
-            encode_record(&mut buf, K_TX_END, |_| {});
-            w.write_all(&buf)?;
+            w.write_all(&[0u8; HEADER_LEN as usize])?;
+            write(&mut w)?;
+            let end = w.stream_position()?;
+            let header = encode_header(&generation, end - HEADER_LEN);
+            w.seek(SeekFrom::Start(0))?;
+            w.write_all(&header)?;
             w.flush()?;
+            w.get_ref().set_len(end)?;
             w.get_ref().sync_all()?;
-        }
+            parse_header(&header)
+        })();
+        let loaded = written.and_then(|h| load(&tmp, &h).map(|t| (h, t)));
+        let (header, out) = match loaded {
+            Ok(x) => x,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+        };
+
         // On Unix this always succeeds. On Windows a virus scanner or the
         // search indexer can hold a transient handle on the destination and
         // make MoveFileEx fail with ACCESS_DENIED; it clears in milliseconds,
@@ -463,10 +609,9 @@ impl Store {
         loop {
             match std::fs::rename(&tmp, &self.path) {
                 Ok(()) => break,
-                Err(e) if attempt < 10 => {
+                Err(_) if attempt < 10 => {
                     attempt += 1;
                     std::thread::sleep(std::time::Duration::from_millis(20 * attempt));
-                    let _ = e;
                 }
                 Err(e) => {
                     let _ = std::fs::remove_file(&tmp);
@@ -475,20 +620,27 @@ impl Store {
             }
         }
         // POSIX: the rename is not durable until the directory is synced. A
-        // crash in this window can leave the old file, or neither.
+        // crash in this window can leave the old file, or the new one.
         sync_parent(&self.path);
 
-        let file = OpenOptions::new().read(true).write(true).open(&self.path)?;
-        let len = file.metadata()?.len();
-        let mut file = file;
-        file.seek(SeekFrom::Start(len))?;
+        let mut file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        file.seek(SeekFrom::Start(header.header_len))?;
         self.file = BufWriter::with_capacity(1 << 16, file);
-        self.committed_len = len;
+        self.committed_len = header.header_len;
+        self.header_len = header.header_len;
+        self.generation = generation;
         self.pending.clear();
         self.pending_ops = 0;
-        self.records_written = ops.len() as u64;
-        Ok(())
+        self.records_written = 0;
+        Ok(out)
     }
+}
+
+/// Where a compaction writes before renaming into place.
+pub fn compact_tmp_path(db: &Path) -> PathBuf {
+    let mut name = db.file_name().unwrap_or_default().to_os_string();
+    name.push(".compact.tmp");
+    db.with_file_name(name)
 }
 
 /// Writes a brand-new database file straight from a stream of ops, without
@@ -518,7 +670,7 @@ impl LogWriter {
     pub fn create(path: &Path) -> io::Result<LogWriter> {
         let f = OpenOptions::new().write(true).create_new(true).open(path)?;
         let mut file = BufWriter::with_capacity(1 << 20, f);
-        let header = encode_header(&new_generation());
+        let header = encode_header(&new_generation(), 0);
         file.write_all(&header)?;
         Ok(LogWriter {
             file,
@@ -595,40 +747,61 @@ fn replay<F: FnMut(Op)>(file: &mut File, header_len: u64, apply: &mut F) -> io::
 /// Apply every committed transaction in `data`, a run of records with the
 /// header already stripped. Returns the length of the committed prefix; a
 /// torn or corrupt tail is ignored, exactly as on open.
+///
+/// Two passes per transaction: the first checks every frame and validates
+/// every payload without allocating, and only when the commit marker arrives
+/// does the second decode and apply the records one at a time. Uncommitted
+/// ops must not reach the graph, but that no longer means holding a whole
+/// transaction's worth of decoded ops — for a bulk load that was a second
+/// copy of the log in its most expensive form.
 fn replay_records<F: FnMut(Op)>(data: &[u8], apply: &mut F) -> u64 {
     let mut pos = 0usize;
     let mut committed = 0u64;
-    let mut batch: Vec<Op> = Vec::new();
+    let mut tx_start = 0usize;
 
-    while pos + 5 <= data.len() {
-        let kind = data[pos];
-        let len = u32::from_le_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]])
-            as usize;
-        let end = match pos.checked_add(9).and_then(|v| v.checked_add(len)) {
-            Some(e) if e <= data.len() => e,
-            _ => break, // truncated tail
-        };
-        let body = &data[pos..pos + 5 + len];
-        let stored_crc =
-            u32::from_le_bytes([data[end - 4], data[end - 3], data[end - 2], data[end - 1]]);
-        if crc32(body) != stored_crc {
-            break; // corrupt tail: stop here, everything before is still good
-        }
+    while let Some((kind, body, end)) = frame(data, pos) {
         if kind == K_TX_END {
-            for op in batch.drain(..) {
-                apply(op);
+            let mut p = tx_start;
+            while p < pos {
+                let Some((k, payload, e)) = frame(data, p) else {
+                    break;
+                };
+                match Op::decode(k, payload) {
+                    Ok(op) => apply(op),
+                    // Unreachable: validate accepts exactly what decode does.
+                    Err(_) => debug_assert!(false, "validated record failed to decode"),
+                }
+                p = e;
             }
             committed = end as u64;
-        } else {
-            match Op::decode(kind, &data[pos + 5..pos + 5 + len]) {
-                Ok(op) => batch.push(op),
-                Err(_) => break,
-            }
+            tx_start = end;
+        } else if Op::validate(kind, body).is_err() {
+            break;
         }
         pos = end;
     }
 
     committed
+}
+
+/// The CRC-checked frame at `pos`: (kind, payload, end). `None` at a torn or
+/// corrupt frame, or at the end of the data.
+fn frame(data: &[u8], pos: usize) -> Option<(u8, &[u8], usize)> {
+    if pos.checked_add(5)? > data.len() {
+        return None;
+    }
+    let kind = data[pos];
+    let len =
+        u32::from_le_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]]) as usize;
+    let end = pos.checked_add(9)?.checked_add(len)?;
+    if end > data.len() {
+        return None;
+    }
+    let stored = u32::from_le_bytes([data[end - 4], data[end - 3], data[end - 2], data[end - 1]]);
+    if crc32(&data[pos..pos + 5 + len]) != stored {
+        return None;
+    }
+    Some((kind, &data[pos + 5..pos + 5 + len], end))
 }
 
 /// Replay a whole database file held in memory — header and all — without a
@@ -647,7 +820,12 @@ pub fn replay_bytes<F: FnMut(Op)>(bytes: &[u8], apply: &mut F) -> io::Result<u64
 #[derive(Clone, Copy, Debug)]
 pub struct FileHeader {
     pub version: u32,
+    /// Where the log records begin: after the header, and after the image
+    /// if there is one. Offsets below this are never records.
     pub header_len: u64,
+    /// Offset and length of the snapshot image. Length 0 means none.
+    pub image_at: u64,
+    pub image_len: u64,
     /// Identifies this lineage of the file. Changes on every compaction,
     /// because compaction rewrites every byte and invalidates every offset.
     /// All-zero means a v1 file, which predates the idea.
@@ -671,12 +849,17 @@ pub fn hex16(bytes: &[u8; 16]) -> String {
     s
 }
 
-fn encode_header(generation: &[u8; 16]) -> Vec<u8> {
+fn encode_header(generation: &[u8; 16], image_len: u64) -> Vec<u8> {
     let mut header = Vec::with_capacity(HEADER_LEN as usize);
     header.extend_from_slice(MAGIC);
     codec::put_u32(&mut header, FORMAT_VERSION);
-    codec::put_u32(&mut header, 0);
+    codec::put_u32(&mut header, if image_len > 0 { FLAG_IMAGE } else { 0 });
     header.extend_from_slice(generation);
+    codec::put_u64(&mut header, image_len);
+    codec::put_u64(&mut header, HEADER_LEN + image_len);
+    header.resize(60, 0);
+    let crc = crc32(&header);
+    codec::put_u32(&mut header, crc);
     header
 }
 
@@ -718,47 +901,64 @@ fn read_header_from(file: &mut File) -> io::Result<FileHeader> {
 }
 
 /// Decode a header from the first bytes of a file. `head` may be shorter than
-/// `HEADER_LEN` for a v1 file.
-fn parse_header(head: &[u8]) -> io::Result<FileHeader> {
+/// `HEADER_LEN` for a v1 or v2 file.
+pub(crate) fn parse_header(head: &[u8]) -> io::Result<FileHeader> {
+    let invalid = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
     let n = head.len();
     if n < HEADER_V1_LEN as usize {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "file is too short to be a glider database",
-        ));
+        return Err(invalid("file is too short to be a glider database".into()));
     }
     if &head[0..8] != MAGIC && &head[0..8] != MAGIC_LEGACY {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "not a glider database (bad magic)",
-        ));
+        return Err(invalid("not a glider database (bad magic)".into()));
     }
     let version = u32::from_le_bytes([head[8], head[9], head[10], head[11]]);
+    let mut generation = [0u8; 16];
     match version {
         1 => Ok(FileHeader {
             version,
             header_len: HEADER_V1_LEN,
-            generation: [0u8; 16],
+            image_at: 0,
+            image_len: 0,
+            generation,
         }),
         2 => {
-            if n < HEADER_LEN as usize {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "truncated v2 header",
-                ));
+            if n < HEADER_V2_LEN as usize {
+                return Err(invalid("truncated v2 header".into()));
             }
-            let mut generation = [0u8; 16];
             generation.copy_from_slice(&head[16..32]);
             Ok(FileHeader {
                 version,
-                header_len: HEADER_LEN,
+                header_len: HEADER_V2_LEN,
+                image_at: 0,
+                image_len: 0,
                 generation,
             })
         }
-        v => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unsupported format version {v}"),
-        )),
+        3 => {
+            if n < HEADER_LEN as usize {
+                return Err(invalid("truncated v3 header".into()));
+            }
+            let stored = u32::from_le_bytes([head[60], head[61], head[62], head[63]]);
+            if crc32(&head[..60]) != stored {
+                return Err(invalid("header checksum mismatch".into()));
+            }
+            generation.copy_from_slice(&head[16..32]);
+            let image_len = u64::from_le_bytes(head[32..40].try_into().unwrap());
+            let log_start = u64::from_le_bytes(head[40..48].try_into().unwrap());
+            if HEADER_LEN.checked_add(image_len) != Some(log_start) {
+                return Err(invalid("header image length and log start disagree".into()));
+            }
+            Ok(FileHeader {
+                version,
+                header_len: log_start,
+                image_at: HEADER_LEN,
+                image_len,
+                generation,
+            })
+        }
+        v => Err(invalid(format!(
+            "unsupported format version {v} (this build reads up to {FORMAT_VERSION})"
+        ))),
     }
 }
 
@@ -778,9 +978,9 @@ pub fn read_header(path: &Path) -> io::Result<FileHeader> {
 /// the scan rather than being replicated.
 pub fn scan_committed_end(path: &Path, from: u64) -> io::Result<u64> {
     let mut f = File::open(path)?;
-    // Offset 0 is the header, not a record. Callers track offsets from 0 so
-    // that segment 0 carries the header, so clamp the scan start here rather
-    // than making every caller remember.
+    // Offsets below `header_len` are the header and the snapshot image, not
+    // records. Callers track offsets from 0 so that segment 0 carries both,
+    // so clamp the scan start here rather than making every caller remember.
     let header = read_header_from(&mut f)?;
     let from = from.max(header.header_len);
     let len = f.metadata()?.len();
@@ -960,6 +1160,10 @@ pub struct VerifyReport {
     /// `committed_len` is an ordinary torn tail from a crash; anything lower
     /// means real corruption and data loss above it.
     pub bad_offset: Option<u64>,
+    /// The snapshot image, if the file has one: what it holds, or why it
+    /// failed its checks. Every section and every property chunk is read and
+    /// checksummed.
+    pub image: Option<Result<crate::image::ImageReport, String>>,
 }
 
 /// Walk every frame: check CRCs, decode every payload, count what is there.
@@ -1009,11 +1213,17 @@ pub fn verify(path: &Path) -> io::Result<VerifyReport> {
         pos = end;
     }
 
+    let image = (header.image_len > 0).then(|| {
+        crate::image::verify_file(path, header.image_at, header.image_len)
+            .map_err(|e| e.to_string())
+    });
+
     Ok(VerifyReport {
         records,
         transactions,
         committed_len: committed,
         file_len,
         bad_offset: bad,
+        image,
     })
 }

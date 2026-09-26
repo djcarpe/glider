@@ -26,16 +26,18 @@ SQLite keeps a main database of fixed-size pages that get rewritten in place,
 so it needs a *separate* write-ahead log, and Litestream exists to tail that
 log before a checkpoint overwrites it.
 
-Glider has no pages and rewrites nothing. The database file **is** the
-write-ahead log: every mutation is a CRC-framed record appended at the end, and
-a transaction ends with a commit marker. Which means replication is not a
+Glider has no pages and rewrites nothing in place. The database file is a
+snapshot image followed by the write-ahead log: every mutation is a CRC-framed
+record appended at the end, and a transaction ends with a commit marker. Only a
+compaction writes an image, and it does so by replacing the whole file, so
+between compactions the file is strictly append-only. Which means replication is not a
 protocol, it's byte ranges. A replica is your database, in pieces:
 
 ```
 /var/backups/glider/
   c46f16170b58b63f.../            <- generation
     segments/
-      0000000000000000.seg        <- bytes [0, 172), header included
+      0000000000000000.seg        <- bytes [0, 172), header and image included
       00000000000000ac.seg        <- bytes [172, 209)
       00000000000000d1.seg
     manifest.jsonl
@@ -48,12 +50,14 @@ auditable: there is no format to trust beyond the one you already have.
 Two rules make it safe.
 
 **Only ship to a transaction boundary.** The writer may be mid-transaction when
-the tailer looks. `store::scan_committed_end` walks frames, verifies CRCs, and
-returns the offset after the last commit marker; bytes past that are not
-shipped. A torn tail stops the scan instead of being replicated.
+the tailer looks. `store::scan_committed_end` walks frames from the end of the
+image, verifies CRCs, and returns the offset after the last commit marker;
+bytes past that are not shipped. A torn tail stops the scan instead of being
+replicated.
 
 **A compaction starts a new generation.** `COMPACT` rewrites the file from
-scratch, so every existing offset becomes meaningless — this is exactly the
+scratch — a new image, an empty log — so every existing offset becomes
+meaningless — this is exactly the
 hazard Litestream's generations exist for. Glider puts a 16-byte generation id
 in the file header and mints a fresh one on every compaction. The tailer sees
 it change and starts a new lineage rather than appending onto a log that no
@@ -149,12 +153,15 @@ the filenames, and that is what makes gaps detectable.
 
 ## Upgrading an existing database
 
-Generation ids landed in format v2. A v1 file still opens and reads normally,
-but cannot be replicated, because there is no way to tell one lineage from
-another. Run a compaction once:
+Generation ids landed in format v2, snapshot images in v3. v1 and v2 files
+still open and read normally, but a v1 file cannot be replicated, because there
+is no way to tell one lineage from another. Compaction — by hand, or
+automatically on the first write once the log is large — rewrites either as v3.
+Binaries from before v3 cannot open v3 files, so upgrade replicas' readers
+first. Run a compaction once:
 
 ```sh
-glider old.gldb compact     # rewrites as v2 with a fresh generation
+glider old.gldb compact     # rewrites as v3 (image + log) with a fresh generation
 ```
 
 ## What this does not do

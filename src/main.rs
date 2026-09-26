@@ -31,6 +31,12 @@ replication (see docs/MOBILE.md / README for the full story):
 
 options:
   --sync always|normal|off   durability (default normal)
+  --props memory|disk[:MB]   where property values live after the snapshot
+                             image loads: in RAM (default), or read from disk
+                             on demand through an MB-sized cache (default 64)
+  --auto-compact MB|off      rewrite the file as a fresh image once the log
+                             after it passes MB (or the image size, if larger);
+                             default 64
   --force                    open despite a lock left by a dead writer
   --json                     print results as JSON instead of a table
   --addr HOST:PORT           bind address for serve/browser (default 127.0.0.1:7878)
@@ -55,6 +61,8 @@ struct Options {
     force: bool,
     /// `browser` only: skip launching the user's browser.
     no_open: bool,
+    residency: glider::Residency,
+    auto_compact: Option<u64>,
 }
 
 enum Mode {
@@ -111,6 +119,14 @@ fn run() -> Result<(), String> {
                 at, at
             ),
         }
+        match &r.image {
+            None => println!("image         none (the whole log is replayed on open)"),
+            Some(Ok(i)) => println!(
+                "image         ok; {} bytes, {} nodes, {} edges, {} indexes",
+                i.bytes, i.nodes, i.edges, i.indexes
+            ),
+            Some(Err(e)) => println!("image         CORRUPT: {}", e),
+        }
         return Ok(());
     }
 
@@ -129,6 +145,8 @@ fn run() -> Result<(), String> {
         json: false,
         addr: "127.0.0.1:7878".into(),
         bench: 50_000,
+        residency: glider::Residency::Memory,
+        auto_compact: Some(glider::DEFAULT_AUTO_COMPACT),
     };
 
     let mut i = 0;
@@ -153,6 +171,35 @@ fn run() -> Result<(), String> {
                     Some("normal") => Sync::Normal,
                     Some("off") => Sync::Off,
                     _ => return Err("--sync takes always, normal or off".into()),
+                };
+            }
+            "--props" => {
+                i += 1;
+                let v = args.get(i).map(|s| s.as_str()).unwrap_or("");
+                opts.residency = match v.split_once(':') {
+                    None if v == "memory" => glider::Residency::Memory,
+                    None if v == "disk" => glider::Residency::OnDisk {
+                        cache_bytes: 64 << 20,
+                    },
+                    Some(("disk", mb)) => glider::Residency::OnDisk {
+                        cache_bytes: mb
+                            .parse::<usize>()
+                            .map_err(|_| "--props disk:MB needs a number")?
+                            << 20,
+                    },
+                    _ => return Err("--props takes memory, disk or disk:MB".into()),
+                };
+            }
+            "--auto-compact" => {
+                i += 1;
+                opts.auto_compact = match args.get(i).map(|s| s.as_str()) {
+                    Some("off") => None,
+                    Some(mb) => Some(
+                        mb.parse::<u64>()
+                            .map_err(|_| "--auto-compact takes MB or off")?
+                            << 20,
+                    ),
+                    None => return Err("--auto-compact takes MB or off".into()),
                 };
             }
             "--addr" => {
@@ -190,11 +237,7 @@ fn run() -> Result<(), String> {
         i += 1;
     }
 
-    let mut graph = if opts.force {
-        open_graph_forced(&opts.db, opts.sync)?
-    } else {
-        open_graph(&opts.db, opts.sync)?
-    };
+    let mut graph = open_graph(&opts)?;
 
     if let Some(cmd) = &opts.command {
         return run_script(&mut graph, cmd, opts.json);
@@ -253,16 +296,17 @@ fn run() -> Result<(), String> {
     }
 }
 
-fn open_graph_forced(spec: &str, sync: Sync) -> Result<Graph, String> {
-    Graph::open_forced(std::path::Path::new(spec), sync).map_err(|e| e.to_string())
-}
-
-fn open_graph(spec: &str, sync: Sync) -> Result<Graph, String> {
-    if spec == ":memory:" {
-        Ok(Graph::memory())
-    } else {
-        Graph::open(std::path::Path::new(spec), sync).map_err(|e| e.to_string())
+fn open_graph(opts: &Options) -> Result<Graph, String> {
+    if opts.db == ":memory:" {
+        return Ok(Graph::memory());
     }
+    let o = glider::OpenOptions {
+        sync: opts.sync,
+        force: opts.force,
+        residency: opts.residency,
+        auto_compact: opts.auto_compact,
+    };
+    Graph::open_opts(std::path::Path::new(&opts.db), o).map_err(|e| e.to_string())
 }
 
 fn run_script(graph: &mut Graph, text: &str, json: bool) -> Result<(), String> {

@@ -1118,7 +1118,7 @@ pub fn execute(g: &mut Graph, src: &str) -> Result<QueryResult> {
         }
         Stmt::Stats => {
             let s = g.stats();
-            let rows = vec![
+            let mut rows = vec![
                 vec![Value::Text("nodes".into()), Value::Int(s.nodes as i64)],
                 vec![Value::Text("edges".into()), Value::Int(s.edges as i64)],
                 vec![
@@ -1141,7 +1141,29 @@ pub fn execute(g: &mut Graph, src: &str) -> Result<QueryResult> {
                     Value::Text("file_bytes".into()),
                     Value::Int(s.file_bytes as i64),
                 ],
+                vec![
+                    Value::Text("image_bytes".into()),
+                    Value::Int(s.image_bytes as i64),
+                ],
+                vec![
+                    Value::Text("tail_bytes".into()),
+                    Value::Int(s.tail_bytes as i64),
+                ],
+                vec![
+                    Value::Text("props_on_disk".into()),
+                    Value::Bool(s.props_on_disk),
+                ],
+                vec![
+                    Value::Text("read_errors".into()),
+                    Value::Int(s.read_errors as i64),
+                ],
             ];
+            if let Some(e) = s.auto_compact_error {
+                rows.push(vec![
+                    Value::Text("auto_compact_error".into()),
+                    Value::Text(e),
+                ]);
+            }
             Ok(QueryResult::table(
                 vec!["metric".into(), "value".into()],
                 rows,
@@ -1824,7 +1846,7 @@ fn node_matches(g: &Graph, pat: &NodePat, id: u64, binds: &Binds) -> bool {
     for (key, expr) in &pat.props {
         let want = eval(g, expr, binds);
         match g.node_prop(id, key) {
-            Some(got) if *got == want => {}
+            Some(got) if got == want => {}
             _ => return false,
         }
     }
@@ -1835,7 +1857,7 @@ fn edge_props_match(g: &Graph, rel: &RelPat, edge: u64, binds: &Binds) -> bool {
     for (key, expr) in &rel.props {
         let want = eval(g, expr, binds);
         match g.edge_prop(edge, key) {
-            Some(got) if *got == want => {}
+            Some(got) if got == want => {}
             _ => return false,
         }
     }
@@ -2073,8 +2095,8 @@ fn eval(g: &Graph, e: &Expr, binds: &Binds) -> Value {
             None => Value::Null,
         },
         Expr::Prop(var, key) => match lookup(binds, var) {
-            Some(Bind::Node(id)) => g.node_prop(id, key).cloned().unwrap_or(Value::Null),
-            Some(Bind::Edge(id)) => g.edge_prop(id, key).cloned().unwrap_or(Value::Null),
+            Some(Bind::Node(id)) => g.node_prop(id, key).unwrap_or(Value::Null),
+            Some(Bind::Edge(id)) => g.edge_prop(id, key).unwrap_or(Value::Null),
             None => Value::Null,
         },
         Expr::Not(inner) => Value::Bool(!eval(g, inner, binds).truthy()),
@@ -2681,7 +2703,7 @@ fn default_dir(name: &str) -> Dir {
 fn label_of(g: &Graph, id: u64) -> Value {
     for key in ["name", "title", "label", "key"] {
         if let Some(v) = g.node_prop(id, key) {
-            return v.clone();
+            return v;
         }
     }
     match g.node_labels(id).first() {

@@ -55,20 +55,39 @@ Three layers, each independently usable:
 
 | module | what it does |
 |---|---|
-| `store` | append-only log: CRC32 records, transactions delimited by a commit marker, atomic compaction |
-| `graph` | in-memory graph, interning, label and property indexes, CSR projection |
+| `store` | one file: header, snapshot image, then an append-only log of CRC32 records with transactions delimited by a commit marker; atomic compaction |
+| `image` | the snapshot image: current state as flat, checksummed columns that load in bulk |
+| `graph` | image + in-memory delta, interning, label and property indexes, CSR projection |
 | `algo` | algorithms over the CSR view — all iterative, no recursion |
 | `query` | lexer, parser, pattern matcher, expression evaluator |
 | `server` | ~150 lines of `std::net` HTTP |
 | `api` | typed JSON for the console and the wasm bindings |
 
-The graph is **memory-resident**; the file is the write-ahead log and the
-persistent form at once. Reads never touch disk, which is what makes whole-graph
-algorithms fast. Writes append. `COMPACT` rewrites the file as the minimal set of
-records reproducing current state, reclaiming space from deletes and overwrites.
-The trade: your graph must fit in RAM. For the knowledge-graph and
-context-graph sizes this is aimed at, that's the right trade; for a
-billion-edge graph it is not.
+The file is a **snapshot image followed by a log**:
+
+```
+[header][image: nodes, labels, CSR adjacency, edges, indexes, properties][log records...]
+```
+
+The image is current state as of the last compaction, written as flat columns
+indexed by position — the same arrays that sit in memory — so opening it is a
+bulk read, a checksum and a decode, with no per-node allocation. Everything
+written since goes to the log, and lives in memory as a *delta* over the image:
+new nodes and edges, changed copies, deletion masks. Reads merge the two.
+
+`COMPACT` folds the delta into a fresh image and empties the log. It also runs
+automatically after a commit once the log grows past 64 MiB or the image size,
+whichever is larger (`--auto-compact MB|off`), so open time stays bounded by
+one image load plus a short replay. Files written before images existed open
+by replaying their log, exactly as before; the first write compacts them.
+
+Topology, labels and indexes are memory-resident, which is what keeps
+traversal and whole-graph algorithms fast. Property values can be too
+(the default) or stay on disk and be read on demand through a cache
+(`--props disk[:MB]`, `Residency::OnDisk`) — a big RAM saving for
+property-heavy graphs, paid for in slower property scans. The graph's
+structure must still fit in RAM; for a billion-edge graph this is the wrong
+engine.
 
 ### Durability
 
@@ -82,9 +101,12 @@ billion-edge graph it is not.
 A transaction is a run of records followed by a commit marker. On open, the log
 replays; a torn tail (half-written record, or records with no commit marker) is
 discarded and the file truncated to the last committed offset. You never see a
-partial transaction. Compaction writes a temp file, fsyncs it, then renames —
-atomic, so a crash mid-compaction leaves the original intact. Both paths are
-covered by tests.
+partial transaction, and truncation never reaches into the image. Compaction
+writes a temp file, fsyncs it, reads the image back to check it, then renames —
+atomic, so a crash mid-compaction leaves the original intact. Every byte of an
+image is covered by a checksum; a damaged image is an error at open, never a
+wrong answer. `glider <db> verify` checks the image and the log. All of these
+paths are covered by tests.
 
 ## Query language
 
@@ -239,9 +261,16 @@ cargo build --release --workspace
 ./target/release/stress-gen --size 1GiB --out bench/data/stress-1g.gldb
 ```
 
-Opening is the part that needs memory. The whole graph is resident, at
-roughly 6× the file size (1 GiB of file ≈ 6.2 GiB of RAM), and replay runs
-at about 33 MB/s on a laptop core — 30 s per GiB. The browser build is capped
+Those files are logs with no image, so the first open replays them — about
+30 s and 6 GiB of RAM per GiB of log. Compact once and every later open loads
+the image instead. Measured on a laptop, same data before and after:
+
+| file | log replay (before) | image open | image open, `--props disk` |
+|---|---|---|---|
+| 500 MiB (0.9M nodes, 4.7M edges) | 13.1 s, 3.1 GB RSS | 0.50 s, 529 MB | 0.34 s, 295 MB |
+| 1 GiB (1.8M nodes, 9.7M edges) | 30.0 s, 6.4 GB RSS | 0.99 s, 1.1 GB | 0.67 s, 599 MB |
+
+Query results are byte-identical across the three. The browser build is capped
 by wasm32's 4 GiB address space, so files much above 500 MiB need
 `glider <file> browser` rather than **Open file…**.
 
@@ -317,8 +346,10 @@ Honest limits, so you find them here rather than in production:
 
 - **Single process, single writer.** One `Mutex`, no MVCC, no concurrent
   readers during a write. Same shape as SQLite's default mode.
-- **Memory-resident.** Capacity is bounded by RAM, roughly 150–250 bytes per
-  node plus property size.
+- **Structure is memory-resident.** Capacity is bounded by RAM: about the
+  image size with properties in memory, well under it with `--props disk`.
+  Changes since the last compaction cost more per node than the image does,
+  which is one reason compaction runs automatically.
 - **Not full Cypher.** No `WITH`, `UNWIND`, `OPTIONAL MATCH`, `MERGE`, or
   multi-part queries. What's documented above is what exists.
 - **Pattern results are materialised.** A pattern that matches millions of rows

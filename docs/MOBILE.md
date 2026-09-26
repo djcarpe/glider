@@ -163,11 +163,26 @@ to copy.
 
 ## The constraint that actually matters on mobile
 
-The whole graph lives in RAM while open. That is the design — it is what makes
-the algorithms fast — but on a phone it is a budget, not an afterthought.
-Roughly: a node costs ~120 bytes plus its properties, an edge ~80. A million
-nodes and four million edges lands near 450 MB, which Android will kill you
-for. Practical ceilings:
+The graph's structure lives in RAM while open. That is the design — it is what
+makes the algorithms fast — but on a phone it is a budget, not an afterthought.
+
+Once compacted, a database opens from its snapshot image at roughly the image's
+size in RAM, in about half a second per 500 MB. Property values can stay on
+disk instead, read on demand through a small cache:
+
+```c
+glider_db *db = glider_open_ex(path, GLIDER_SYNC_NORMAL, 8 << 20); /* 8 MB cache */
+```
+
+On the benchmark graph that halves RSS (529 MB to 295 MB for a 500 MB file).
+Traversal is unaffected; scans that read a property of every node get slower.
+
+Writes since the last compaction cost more — roughly 120 bytes per node plus
+its properties, ~80 per edge — until compaction folds them into the image.
+That happens automatically inside the commit that pushes the log past 64 MiB
+(or the image size). If you commit on the UI thread, turn that off with
+`glider_set_auto_compact(db, 0)` and call `glider_compact` from a background
+task instead. Practical ceilings:
 
 | Device budget | Comfortable graph |
 |---|---|
@@ -175,11 +190,13 @@ for. Practical ceilings:
 | iOS, foreground (~500 MB) | ~1M nodes / 4M edges |
 | Desktop | tens of millions of edges |
 
-If you need more on-device, the honest answer is that glider's storage model
-has to change — a paged B-tree with an LRU buffer pool instead of
-replay-into-memory. That is a real rewrite of `store.rs` and `graph.rs`, not a
-flag. Before doing it, check whether you can shard by subgraph and open one at
-a time, which is usually true for per-user or per-repo graphs.
+(Those ceilings are for graphs held in the delta. A compacted graph with
+properties on disk goes considerably further.)
+
+If you need more on-device than structure-in-RAM allows, the storage model
+has to change again — a paged B-tree with an LRU buffer pool. Before that,
+check whether you can shard by subgraph and open one at a time, which is
+usually true for per-user or per-repo graphs.
 
 Interning helps already: labels, edge types and property keys are stored once
 as `u32` ids, so a million nodes with the same schema pay for the schema once.

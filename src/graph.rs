@@ -1,17 +1,20 @@
-//! The engine. A labelled property graph held in memory, backed by the
-//! append-only log in `store`.
+//! The engine. A labelled property graph: a snapshot image loaded from the
+//! front of the file (`image`), plus an in-memory delta of everything changed
+//! since, backed by the append-only log in `store`.
 //!
 //! Shape of the data:
-//!   node  = id + set of labels + flat property map + adjacency lists
+//!   node  = id + set of labels + flat property map + adjacency
 //!   edge  = id + from + to + one type + flat property map
 //!
 //! Labels, edge types and property keys are interned to `u32`, so the per-node
 //! cost is a couple of small vectors rather than a pile of Strings.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::path::Path;
 
+use crate::image::{self, Base, Residency};
 use crate::store::{Op, Store, Sync};
 use crate::value::Value;
 
@@ -91,6 +94,21 @@ impl Interner {
     pub fn is_empty(&self) -> bool {
         self.list.is_empty()
     }
+
+    /// Every interned string, in id order.
+    pub fn all(&self) -> &[String] {
+        &self.list
+    }
+
+    /// An interner holding exactly `list`, with ids in list order.
+    pub(crate) fn from_list(list: Vec<String>) -> Interner {
+        let map = list
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.clone(), i as u32))
+            .collect();
+        Interner { map, list }
+    }
 }
 
 // -------------------------------------------------------------- graph types
@@ -102,25 +120,101 @@ pub struct Adj {
     pub etype: u32,
 }
 
+/// A node held in the delta: created since the image was written, or copied
+/// out of the image in order to change its labels or properties.
 #[derive(Clone, Debug, Default)]
-pub struct Node {
-    pub id: u64,
-    pub labels: Vec<u32>,
-    pub props: Vec<(u32, Value)>,
-    pub out: Vec<Adj>,
-    pub inc: Vec<Adj>,
+pub(crate) struct DNode {
+    labels: Vec<u32>,
+    props: Vec<(u32, Value)>,
 }
 
+/// An edge created since the image was written.
 #[derive(Clone, Debug)]
-pub struct Edge {
+pub(crate) struct DEdge {
+    from: u64,
+    to: u64,
+    etype: u32,
+    props: Vec<(u32, Value)>,
+}
+
+/// A read-only view of one node, wherever it lives. Cheap to copy; borrows
+/// the graph, so it cannot outlive the next mutation.
+#[derive(Clone, Copy)]
+pub struct NodeRef<'g> {
+    pub id: u64,
+    src: NodeSrc<'g>,
+}
+
+#[derive(Clone, Copy)]
+enum NodeSrc<'g> {
+    Delta(&'g DNode),
+    Base(&'g Base, u32),
+}
+
+impl<'g> NodeRef<'g> {
+    /// Interned label ids.
+    pub fn labels(&self) -> &'g [u32] {
+        match self.src {
+            NodeSrc::Delta(n) => &n.labels,
+            NodeSrc::Base(b, s) => b.node_labels(s),
+        }
+    }
+
+    pub fn has_label(&self, label: u32) -> bool {
+        self.labels().contains(&label)
+    }
+
+    /// Every property, keyed by interned id. Borrowed when the node is in
+    /// the delta, decoded when it is in the image.
+    pub fn props(&self) -> Cow<'g, [(u32, Value)]> {
+        match self.src {
+            NodeSrc::Delta(n) => Cow::Borrowed(&n.props),
+            NodeSrc::Base(b, s) => Cow::Owned(b.node_props(s)),
+        }
+    }
+
+    /// One property. From the image this decodes only the matching value.
+    pub fn prop(&self, key: u32) -> Option<Value> {
+        match self.src {
+            NodeSrc::Delta(n) => get_prop(&n.props, key).cloned(),
+            NodeSrc::Base(b, s) => b.node_prop(s, key),
+        }
+    }
+}
+
+/// A read-only view of one edge. Endpoints and type are plain fields.
+#[derive(Clone, Copy)]
+pub struct EdgeRef<'g> {
     pub id: u64,
     pub from: u64,
     pub to: u64,
     pub etype: u32,
-    pub props: Vec<(u32, Value)>,
+    src: EdgeSrc<'g>,
 }
 
-pub fn get_prop<'a>(props: &'a [(u32, Value)], key: u32) -> Option<&'a Value> {
+#[derive(Clone, Copy)]
+enum EdgeSrc<'g> {
+    Props(&'g [(u32, Value)]),
+    Base(&'g Base, u32),
+}
+
+impl<'g> EdgeRef<'g> {
+    pub fn props(&self) -> Cow<'g, [(u32, Value)]> {
+        match self.src {
+            EdgeSrc::Props(p) => Cow::Borrowed(p),
+            EdgeSrc::Base(b, s) => Cow::Owned(b.edge_props(s)),
+        }
+    }
+
+    pub fn prop(&self, key: u32) -> Option<Value> {
+        match self.src {
+            EdgeSrc::Props(p) => get_prop(p, key).cloned(),
+            EdgeSrc::Base(b, s) => b.edge_prop(s, key),
+        }
+    }
+}
+
+pub fn get_prop(props: &[(u32, Value)], key: u32) -> Option<&Value> {
     props.iter().find(|(k, _)| *k == key).map(|(_, v)| v)
 }
 
@@ -128,6 +222,33 @@ fn set_prop(props: &mut Vec<(u32, Value)>, key: u32, value: Value) {
     match props.iter_mut().find(|(k, _)| *k == key) {
         Some(slot) => slot.1 = value,
         None => props.push((key, value)),
+    }
+}
+
+/// One bit per image slot.
+#[derive(Clone, Default)]
+struct Bits(Vec<u64>);
+
+impl Bits {
+    fn new(n: usize) -> Bits {
+        Bits(vec![0; n.div_ceil(64)])
+    }
+
+    #[inline]
+    fn get(&self, i: u32) -> bool {
+        self.0
+            .get(i as usize / 64)
+            .map(|w| (w >> (i % 64)) & 1 == 1)
+            .unwrap_or(false)
+    }
+
+    /// Set a bit; true if it was clear before.
+    fn set(&mut self, i: u32) -> bool {
+        let w = &mut self.0[i as usize / 64];
+        let bit = 1u64 << (i % 64);
+        let was = *w & bit != 0;
+        *w |= bit;
+        !was
     }
 }
 
@@ -214,43 +335,139 @@ pub type KeySample = Vec<(String, Vec<String>)>;
 
 // -------------------------------------------------------------------- graph
 
+/// Rewrite the file once the log after the image grows past this, or past
+/// the image itself if that is larger. Bounds open time to roughly one image
+/// load plus one image's worth of replay.
+pub const DEFAULT_AUTO_COMPACT: u64 = 64 << 20;
+
+/// How to open a database file. `Default` is what `Graph::open` uses.
+#[derive(Clone, Copy, Debug)]
+pub struct OpenOptions {
+    pub sync: Sync,
+    /// Break a lock left behind by a writer that is definitely gone.
+    pub force: bool,
+    /// Where property values live once the image is loaded.
+    pub residency: Residency,
+    /// Compact automatically after a commit once the log tail exceeds this
+    /// many bytes (or the image size, if larger). `None` turns it off.
+    pub auto_compact: Option<u64>,
+}
+
+impl Default for OpenOptions {
+    fn default() -> Self {
+        OpenOptions {
+            sync: Sync::Normal,
+            force: false,
+            residency: Residency::Memory,
+            auto_compact: Some(DEFAULT_AUTO_COMPACT),
+        }
+    }
+}
+
+/// A property index: the part covered by the image (`base`, an index into
+/// `Base::indexes`) plus a map for nodes in the delta. An index created after
+/// the image has no base part and maps every member itself.
+struct PIndex {
+    base: Option<usize>,
+    map: BTreeMap<VKey, Vec<u64>>,
+}
+
+/// The graph is two layers.
+///
+/// `base` is the snapshot image the last compaction wrote: flat columns,
+/// loaded in bulk, never modified. Everything since lives in the *delta*:
+/// nodes and edges created since, copies of image nodes whose labels or
+/// properties changed, and bitmasks over image slots for what was changed or
+/// deleted. Reads consult the delta first and fall through to the image.
+///
+/// A graph without an image — in memory, or a log that has never been
+/// compacted — is an empty base and a delta holding everything, which is
+/// exactly how the engine worked before images existed.
 pub struct Graph {
     store: Option<Store>,
     pub strings: Interner,
-    nodes: IdMap<Node>,
-    edges: IdMap<Edge>,
+    base: Base,
+    /// New nodes, and copied image nodes (whose image slot is masked).
+    nodes: IdMap<DNode>,
+    /// New edges only. Image edges are changed in place through `edge_props`
+    /// and `edge_dead`, since an edge's endpoints and type never change.
+    edges: IdMap<DEdge>,
+    /// Replacement property lists for image edges.
+    edge_props: IdMap<Vec<(u32, Value)>>,
+    /// Adjacency of delta edges, keyed by endpoint (image or delta node).
+    out: IdMap<Vec<Adj>>,
+    inc: IdMap<Vec<Adj>>,
+    /// Image node slots that are deleted or copied into `nodes`.
+    node_masked: Bits,
+    masked_nodes: usize,
+    edge_dead: Bits,
+    dead_edges: usize,
+    /// Label membership of delta nodes.
     label_index: HashMap<u32, IdSet>,
+    /// Per label, how many image members are masked.
+    label_masked: HashMap<u32, usize>,
+    /// Type membership of delta edges.
     type_index: HashMap<u32, IdSet>,
-    prop_indexes: HashMap<(u32, u32), BTreeMap<VKey, Vec<u64>>>,
+    /// Per type, how many image edges are deleted.
+    type_dead: HashMap<u32, usize>,
+    prop_indexes: HashMap<(u32, u32), PIndex>,
     next_node: u64,
     next_edge: u64,
     uncommitted: u64,
     /// Commit after every mutating statement. Turn off for bulk loads.
     pub autocommit: bool,
+    residency: Residency,
+    auto_compact: Option<u64>,
+    auto_compact_error: Option<String>,
 }
 
 impl Graph {
-    /// Open a database file, replaying it into memory. Creates it if absent.
+    /// Open a database file, creating it if absent.
     pub fn open(path: &Path, sync: Sync) -> Result<Graph> {
-        Graph::open_with(path, sync, false)
+        Graph::open_opts(
+            path,
+            OpenOptions {
+                sync,
+                ..OpenOptions::default()
+            },
+        )
     }
 
     /// Open even if a lock file is present. Only when you know the previous
     /// writer is dead — two live writers corrupt the file.
     pub fn open_forced(path: &Path, sync: Sync) -> Result<Graph> {
-        Graph::open_with(path, sync, true)
+        Graph::open_opts(
+            path,
+            OpenOptions {
+                sync,
+                force: true,
+                ..OpenOptions::default()
+            },
+        )
     }
 
-    fn open_with(path: &Path, sync: Sync, force: bool) -> Result<Graph> {
+    /// Open with every knob exposed.
+    ///
+    /// Opening loads the snapshot image, if the file has one, then replays
+    /// only the log written after it. The image is a bulk read; replay builds
+    /// state one record at a time and is the slow part, which is why the file
+    /// is compacted automatically once the tail grows.
+    pub fn open_opts(path: &Path, opts: OpenOptions) -> Result<Graph> {
+        let opening = Store::begin_open(path, opts.sync, opts.force)?;
         let mut g = Graph::memory();
-        // Apply each op as it is decoded. Collecting them into a Vec first
-        // meant holding every historical mutation in memory at once — each one
-        // carrying its own allocated label and property strings — before any of
-        // it reached the graph. On a 159 MB log that intermediate cost more
-        // than everything else in the open put together.
+        g.residency = opts.residency;
+        g.auto_compact = opts.auto_compact;
+        let h = opening.header();
+        if h.image_len > 0 {
+            let (base, strings) = image::load_file(path, h.image_at, h.image_len, opts.residency)?;
+            g.strings = Interner::from_list(strings);
+            g.install_base(base);
+        }
+        // Apply each op as it is decoded, rather than collecting them first:
+        // holding every decoded op at once cost more than the graph itself.
         let store = {
             let sink = &mut g;
-            Store::open_with(path, sync, force, &mut |op| sink.apply_mem(&op))?
+            opening.replay(&mut |op| sink.apply_mem(&op))?
         };
         g.store = Some(store);
         Ok(g)
@@ -261,6 +478,17 @@ impl Graph {
     /// hosts without a filesystem (wasm) open a `.gldb`.
     pub fn from_bytes(bytes: &[u8]) -> Result<Graph> {
         let mut g = Graph::memory();
+        let h = crate::store::parse_header(bytes)?;
+        if h.image_len > 0 {
+            let image = usize::try_from(h.image_at)
+                .ok()
+                .zip(usize::try_from(h.image_at + h.image_len).ok())
+                .and_then(|(a, b)| bytes.get(a..b))
+                .ok_or_else(|| Error::Msg("image extends past the end of the bytes".into()))?;
+            let (base, strings) = image::load_slice(image)?;
+            g.strings = Interner::from_list(strings);
+            g.install_base(base);
+        }
         crate::store::replay_bytes(bytes, &mut |op| g.apply_mem(&op))?;
         Ok(g)
     }
@@ -270,15 +498,28 @@ impl Graph {
         Graph {
             store: None,
             strings: Interner::default(),
+            base: Base::empty(),
             nodes: id_map(),
             edges: id_map(),
+            edge_props: id_map(),
+            out: id_map(),
+            inc: id_map(),
+            node_masked: Bits::default(),
+            masked_nodes: 0,
+            edge_dead: Bits::default(),
+            dead_edges: 0,
             label_index: HashMap::new(),
+            label_masked: HashMap::new(),
             type_index: HashMap::new(),
+            type_dead: HashMap::new(),
             prop_indexes: HashMap::new(),
             next_node: 1,
             next_edge: 1,
             uncommitted: 0,
             autocommit: true,
+            residency: Residency::Memory,
+            auto_compact: None,
+            auto_compact_error: None,
         }
     }
 
@@ -300,6 +541,12 @@ impl Graph {
         }
     }
 
+    /// Compact automatically once the log tail passes `bytes` (or the image
+    /// size, if larger). `None` turns it off.
+    pub fn set_auto_compact(&mut self, bytes: Option<u64>) {
+        self.auto_compact = bytes;
+    }
+
     /// Force everything committed so far down to the platter, whatever the
     /// sync mode says. An open transaction is left open and unwritten.
     ///
@@ -315,31 +562,114 @@ impl Graph {
     }
 
     pub fn node_count(&self) -> usize {
-        self.nodes.len()
+        self.base.n() - self.masked_nodes + self.nodes.len()
     }
 
     pub fn edge_count(&self) -> usize {
-        self.edges.len()
+        self.base.m() - self.dead_edges + self.edges.len()
     }
 
-    pub fn node(&self, id: u64) -> Option<&Node> {
-        self.nodes.get(&id)
+    #[inline]
+    fn base_live_node(&self, id: u64) -> Option<u32> {
+        let s = self.base.node_slot(id)?;
+        (!self.node_masked.get(s)).then_some(s)
     }
 
-    pub fn edge(&self, id: u64) -> Option<&Edge> {
-        self.edges.get(&id)
+    #[inline]
+    fn base_live_edge(&self, id: u64) -> Option<u32> {
+        let s = self.base.edge_slot(id)?;
+        (!self.edge_dead.get(s)).then_some(s)
+    }
+
+    #[inline]
+    fn node_exists(&self, id: u64) -> bool {
+        self.nodes.contains_key(&id) || self.base_live_node(id).is_some()
+    }
+
+    #[inline]
+    fn edge_exists(&self, id: u64) -> bool {
+        self.edges.contains_key(&id) || self.base_live_edge(id).is_some()
+    }
+
+    pub fn node(&self, id: u64) -> Option<NodeRef<'_>> {
+        if let Some(n) = self.nodes.get(&id) {
+            return Some(NodeRef {
+                id,
+                src: NodeSrc::Delta(n),
+            });
+        }
+        let s = self.base_live_node(id)?;
+        Some(NodeRef {
+            id,
+            src: NodeSrc::Base(&self.base, s),
+        })
+    }
+
+    pub fn edge(&self, id: u64) -> Option<EdgeRef<'_>> {
+        if let Some(e) = self.edges.get(&id) {
+            return Some(EdgeRef {
+                id,
+                from: e.from,
+                to: e.to,
+                etype: e.etype,
+                src: EdgeSrc::Props(&e.props),
+            });
+        }
+        let s = self.base_live_edge(id)?;
+        Some(EdgeRef {
+            id,
+            from: self.base.edge_from(s),
+            to: self.base.edge_to(s),
+            etype: self.base.edge_type(s),
+            src: match self.edge_props.get(&id) {
+                Some(p) => EdgeSrc::Props(p),
+                None => EdgeSrc::Base(&self.base, s),
+            },
+        })
     }
 
     pub fn node_ids(&self) -> Vec<u64> {
-        let mut v: Vec<u64> = self.nodes.keys().copied().collect();
-        v.sort_unstable();
+        let mut v = Vec::with_capacity(self.node_count());
+        let ids = self.base.node_ids();
+        if self.masked_nodes == 0 {
+            v.extend_from_slice(ids);
+        } else {
+            v.extend(
+                ids.iter()
+                    .enumerate()
+                    .filter(|(s, _)| !self.node_masked.get(*s as u32))
+                    .map(|(_, id)| *id),
+            );
+        }
+        if !self.nodes.is_empty() {
+            v.extend(self.nodes.keys().copied());
+            v.sort_unstable();
+        }
         v
     }
 
     pub fn edge_ids(&self) -> Vec<u64> {
-        let mut v: Vec<u64> = self.edges.keys().copied().collect();
-        v.sort_unstable();
+        let mut v = Vec::with_capacity(self.edge_count());
+        let ids = self.base.edge_ids();
+        if self.dead_edges == 0 {
+            v.extend_from_slice(ids);
+        } else {
+            v.extend(
+                ids.iter()
+                    .enumerate()
+                    .filter(|(s, _)| !self.edge_dead.get(*s as u32))
+                    .map(|(_, id)| *id),
+            );
+        }
+        if !self.edges.is_empty() {
+            v.extend(self.edges.keys().copied());
+            v.sort_unstable();
+        }
         v
+    }
+
+    pub(crate) fn next_ids(&self) -> (u64, u64) {
+        (self.next_node, self.next_edge)
     }
 
     // --------------------------------------------------------- transactions
@@ -352,11 +682,32 @@ impl Graph {
     }
 
     pub fn commit(&mut self) -> Result<()> {
+        let mut wrote = false;
         if let Some(s) = &mut self.store {
+            wrote = s.pending_ops() > 0;
             s.commit()?;
         }
         self.uncommitted = 0;
+        if wrote {
+            self.maybe_auto_compact();
+        }
         Ok(())
+    }
+
+    /// Compaction after a commit is housekeeping: the commit already
+    /// succeeded, so a failure here is recorded (see `stats`) rather than
+    /// reported as a failed write. The old file is intact either way.
+    ///
+    /// Only a commit that appended something gets here, so reading a large
+    /// old log never rewrites it; the first write does.
+    fn maybe_auto_compact(&mut self) {
+        let (Some(min), Some(s)) = (self.auto_compact, &self.store) else {
+            return;
+        };
+        let tail = s.file_len().saturating_sub(s.header_len());
+        if tail > min.max(self.base.image_bytes) {
+            self.auto_compact_error = self.compact().err().map(|e| e.to_string());
+        }
     }
 
     fn maybe_commit(&mut self) -> Result<()> {
@@ -393,10 +744,10 @@ impl Graph {
         etype: &str,
         props: Vec<(String, Value)>,
     ) -> Result<u64> {
-        if !self.nodes.contains_key(&from) {
+        if !self.node_exists(from) {
             return Err(Error::Msg(format!("no node {}", from)));
         }
-        if !self.nodes.contains_key(&to) {
+        if !self.node_exists(to) {
             return Err(Error::Msg(format!("no node {}", to)));
         }
         let id = self.next_edge;
@@ -414,7 +765,7 @@ impl Graph {
     }
 
     pub fn delete_node(&mut self, id: u64) -> Result<bool> {
-        if !self.nodes.contains_key(&id) {
+        if !self.node_exists(id) {
             return Ok(false);
         }
         let op = Op::NodeDel { id };
@@ -425,7 +776,7 @@ impl Graph {
     }
 
     pub fn delete_edge(&mut self, id: u64) -> Result<bool> {
-        if !self.edges.contains_key(&id) {
+        if !self.edge_exists(id) {
             return Ok(false);
         }
         let op = Op::EdgeDel { id };
@@ -436,7 +787,7 @@ impl Graph {
     }
 
     pub fn set_node_prop(&mut self, id: u64, key: &str, value: Value) -> Result<()> {
-        if !self.nodes.contains_key(&id) {
+        if !self.node_exists(id) {
             return Err(Error::Msg(format!("no node {}", id)));
         }
         let op = Op::NodeSet {
@@ -460,7 +811,7 @@ impl Graph {
     }
 
     pub fn set_edge_prop(&mut self, id: u64, key: &str, value: Value) -> Result<()> {
-        if !self.edges.contains_key(&id) {
+        if !self.edge_exists(id) {
             return Err(Error::Msg(format!("no edge {}", id)));
         }
         let op = Op::EdgeSet {
@@ -484,7 +835,7 @@ impl Graph {
     }
 
     pub fn add_label(&mut self, id: u64, label: &str) -> Result<()> {
-        if !self.nodes.contains_key(&id) {
+        if !self.node_exists(id) {
             return Err(Error::Msg(format!("no node {}", id)));
         }
         let op = Op::LabelAdd {
@@ -533,15 +884,16 @@ impl Graph {
         self.maybe_commit()
     }
 
+    /// Every index as (label, key, distinct values currently indexed).
     pub fn indexes(&self) -> Vec<(String, String, usize)> {
         let mut out: Vec<(String, String, usize)> = self
             .prop_indexes
             .iter()
-            .map(|((l, k), m)| {
+            .map(|((l, k), p)| {
                 (
                     self.strings.name(*l).to_string(),
                     self.strings.name(*k).to_string(),
-                    m.len(),
+                    self.index_key_count(p),
                 )
             })
             .collect();
@@ -549,7 +901,99 @@ impl Graph {
         out
     }
 
+    fn index_key_count(&self, p: &PIndex) -> usize {
+        let Some(i) = p.base else {
+            return p.map.len();
+        };
+        let bi = &self.base.indexes[i];
+        let live = |slots: &[u32]| slots.iter().any(|s| !self.node_masked.get(*s));
+        let base_keys = if self.masked_nodes == 0 {
+            bi.key_count()
+        } else {
+            bi.buckets().filter(|b| live(b)).count()
+        };
+        base_keys + p.map.keys().filter(|k| !live(bi.lookup(&k.0))).count()
+    }
+
+    pub(crate) fn index_defs(&self) -> Vec<(u32, u32)> {
+        let mut v: Vec<(u32, u32)> = self.prop_indexes.keys().copied().collect();
+        v.sort_unstable();
+        v
+    }
+
     // ------------------------------------------------------- memory mutation
+
+    /// Swap in a freshly loaded image. The delta is emptied: everything it
+    /// held is in the image now.
+    fn install_base(&mut self, base: Base) {
+        self.nodes = id_map();
+        self.edges = id_map();
+        self.edge_props = id_map();
+        self.out = id_map();
+        self.inc = id_map();
+        self.node_masked = Bits::new(base.n());
+        self.masked_nodes = 0;
+        self.edge_dead = Bits::new(base.m());
+        self.dead_edges = 0;
+        self.label_index.clear();
+        self.label_masked.clear();
+        self.type_index.clear();
+        self.type_dead.clear();
+        self.prop_indexes = base
+            .indexes
+            .iter()
+            .enumerate()
+            .map(|(i, x)| {
+                (
+                    (x.label, x.key),
+                    PIndex {
+                        base: Some(i),
+                        map: BTreeMap::new(),
+                    },
+                )
+            })
+            .collect();
+        self.next_node = self.next_node.max(base.next_node);
+        self.next_edge = self.next_edge.max(base.next_edge);
+        self.base = base;
+    }
+
+    /// Mark an image node slot as no longer authoritative — deleted, or
+    /// copied into the delta. Idempotent.
+    fn mask_base_node(&mut self, s: u32) {
+        if self.node_masked.set(s) {
+            self.masked_nodes += 1;
+            for l in self.base.node_labels(s) {
+                *self.label_masked.entry(*l).or_default() += 1;
+            }
+        }
+    }
+
+    /// Make sure a node is in the delta, copying it out of the image if it is
+    /// only there. False if there is no such node.
+    fn cow_node(&mut self, id: u64) -> bool {
+        if self.nodes.contains_key(&id) {
+            return true;
+        }
+        let Some(s) = self.base_live_node(id) else {
+            return false;
+        };
+        let labels = self.base.node_labels(s).to_vec();
+        let props = self.base.node_props(s);
+        self.mask_base_node(s);
+        for l in &labels {
+            self.label_index.entry(*l).or_insert_with(id_set).insert(id);
+        }
+        self.nodes.insert(id, DNode { labels, props });
+        true
+    }
+
+    /// Every edge touching a node, from both layers. Self-loops appear twice.
+    fn incident_edges(&self, id: u64) -> Vec<u64> {
+        let mut v = Vec::new();
+        self.for_each_adj(id, Dir::Both, None, |a| v.push(a.edge));
+        v
+    }
 
     /// Apply an op to in-memory state only. Used by both the public API and
     /// log replay, so there is exactly one implementation of each mutation.
@@ -561,6 +1005,21 @@ impl Graph {
                     .iter()
                     .map(|(k, v)| (self.strings.intern(k), v.clone()))
                     .collect();
+                // Re-adding an id that exists replaces its labels and
+                // properties. Normal use never does this; hand-built logs can.
+                if self.node_exists(*id) {
+                    self.deindex_node(*id);
+                    if let Some(old) = self.nodes.remove(id) {
+                        for l in old.labels {
+                            if let Some(set) = self.label_index.get_mut(&l) {
+                                set.remove(id);
+                            }
+                        }
+                    }
+                    if let Some(s) = self.base.node_slot(*id) {
+                        self.mask_base_node(s);
+                    }
+                }
                 for l in &label_ids {
                     self.label_index
                         .entry(*l)
@@ -569,12 +1028,9 @@ impl Graph {
                 }
                 self.nodes.insert(
                     *id,
-                    Node {
-                        id: *id,
+                    DNode {
                         labels: label_ids,
                         props: prop_ids,
-                        out: Vec::new(),
-                        inc: Vec::new(),
                     },
                 );
                 if *id >= self.next_node {
@@ -583,12 +1039,11 @@ impl Graph {
                 self.index_node(*id);
             }
             Op::NodeDel { id } => {
+                if !self.node_exists(*id) {
+                    return;
+                }
                 self.deindex_node(*id);
-                let incident: Vec<u64> = match self.nodes.get(id) {
-                    Some(n) => n.out.iter().chain(n.inc.iter()).map(|a| a.edge).collect(),
-                    None => return,
-                };
-                for e in incident {
+                for e in self.incident_edges(*id) {
                     self.remove_edge_mem(e);
                 }
                 if let Some(n) = self.nodes.remove(id) {
@@ -598,6 +1053,11 @@ impl Graph {
                         }
                     }
                 }
+                if let Some(s) = self.base.node_slot(*id) {
+                    self.mask_base_node(s);
+                }
+                self.out.remove(id);
+                self.inc.remove(id);
             }
             Op::EdgeAdd {
                 id,
@@ -606,7 +1066,7 @@ impl Graph {
                 etype,
                 props,
             } => {
-                if !self.nodes.contains_key(from) || !self.nodes.contains_key(to) {
+                if !self.node_exists(*from) || !self.node_exists(*to) {
                     return;
                 }
                 let t = self.strings.intern(etype);
@@ -614,25 +1074,20 @@ impl Graph {
                     .iter()
                     .map(|(k, v)| (self.strings.intern(k), v.clone()))
                     .collect();
-                if let Some(n) = self.nodes.get_mut(from) {
-                    n.out.push(Adj {
-                        edge: *id,
-                        other: *to,
-                        etype: t,
-                    });
-                }
-                if let Some(n) = self.nodes.get_mut(to) {
-                    n.inc.push(Adj {
-                        edge: *id,
-                        other: *from,
-                        etype: t,
-                    });
-                }
+                self.out.entry(*from).or_default().push(Adj {
+                    edge: *id,
+                    other: *to,
+                    etype: t,
+                });
+                self.inc.entry(*to).or_default().push(Adj {
+                    edge: *id,
+                    other: *from,
+                    etype: t,
+                });
                 self.type_index.entry(t).or_insert_with(id_set).insert(*id);
                 self.edges.insert(
                     *id,
-                    Edge {
-                        id: *id,
+                    DEdge {
                         from: *from,
                         to: *to,
                         etype: t,
@@ -646,6 +1101,9 @@ impl Graph {
             Op::EdgeDel { id } => self.remove_edge_mem(*id),
             Op::NodeSet { id, key, value } => {
                 let k = self.strings.intern(key);
+                if !self.cow_node(*id) {
+                    return;
+                }
                 self.deindex_node(*id);
                 if let Some(n) = self.nodes.get_mut(id) {
                     set_prop(&mut n.props, k, value.clone());
@@ -653,49 +1111,76 @@ impl Graph {
                 self.index_node(*id);
             }
             Op::NodeUnset { id, key } => {
-                if let Some(k) = self.strings.lookup(key) {
-                    self.deindex_node(*id);
-                    if let Some(n) = self.nodes.get_mut(id) {
-                        n.props.retain(|(pk, _)| *pk != k);
-                    }
-                    self.index_node(*id);
+                let Some(k) = self.strings.lookup(key) else {
+                    return;
+                };
+                if self.node(*id).and_then(|n| n.prop(k)).is_none() || !self.cow_node(*id) {
+                    return;
                 }
+                self.deindex_node(*id);
+                if let Some(n) = self.nodes.get_mut(id) {
+                    n.props.retain(|(pk, _)| *pk != k);
+                }
+                self.index_node(*id);
             }
             Op::EdgeSet { id, key, value } => {
                 let k = self.strings.intern(key);
                 if let Some(e) = self.edges.get_mut(id) {
                     set_prop(&mut e.props, k, value.clone());
+                } else if let Some(s) = self.base_live_edge(*id) {
+                    let base = &self.base;
+                    let props = self
+                        .edge_props
+                        .entry(*id)
+                        .or_insert_with(|| base.edge_props(s));
+                    set_prop(props, k, value.clone());
                 }
             }
             Op::EdgeUnset { id, key } => {
-                if let Some(k) = self.strings.lookup(key) {
-                    if let Some(e) = self.edges.get_mut(id) {
-                        e.props.retain(|(pk, _)| *pk != k);
+                let Some(k) = self.strings.lookup(key) else {
+                    return;
+                };
+                if let Some(e) = self.edges.get_mut(id) {
+                    e.props.retain(|(pk, _)| *pk != k);
+                } else if let Some(s) = self.base_live_edge(*id) {
+                    if !self.edge_props.contains_key(id) && self.base.edge_prop(s, k).is_none() {
+                        return;
                     }
+                    let base = &self.base;
+                    let props = self
+                        .edge_props
+                        .entry(*id)
+                        .or_insert_with(|| base.edge_props(s));
+                    props.retain(|(pk, _)| *pk != k);
                 }
             }
             Op::LabelAdd { id, label } => {
                 let l = self.strings.intern(label);
+                if self.node(*id).map(|n| n.has_label(l)).unwrap_or(true) || !self.cow_node(*id) {
+                    return;
+                }
                 self.deindex_node(*id);
                 if let Some(n) = self.nodes.get_mut(id) {
-                    if !n.labels.contains(&l) {
-                        n.labels.push(l);
-                    }
+                    n.labels.push(l);
                 }
                 self.label_index.entry(l).or_insert_with(id_set).insert(*id);
                 self.index_node(*id);
             }
             Op::LabelDel { id, label } => {
-                if let Some(l) = self.strings.lookup(label) {
-                    self.deindex_node(*id);
-                    if let Some(n) = self.nodes.get_mut(id) {
-                        n.labels.retain(|x| *x != l);
-                    }
-                    if let Some(set) = self.label_index.get_mut(&l) {
-                        set.remove(id);
-                    }
-                    self.index_node(*id);
+                let Some(l) = self.strings.lookup(label) else {
+                    return;
+                };
+                if !self.node(*id).map(|n| n.has_label(l)).unwrap_or(false) || !self.cow_node(*id) {
+                    return;
                 }
+                self.deindex_node(*id);
+                if let Some(n) = self.nodes.get_mut(id) {
+                    n.labels.retain(|x| *x != l);
+                }
+                if let Some(set) = self.label_index.get_mut(&l) {
+                    set.remove(id);
+                }
+                self.index_node(*id);
             }
             Op::IndexAdd { label, key } => {
                 let l = self.strings.intern(label);
@@ -704,19 +1189,12 @@ impl Graph {
                     return;
                 }
                 let mut map: BTreeMap<VKey, Vec<u64>> = BTreeMap::new();
-                if let Some(ids) = self.label_index.get(&l) {
-                    for id in ids {
-                        if let Some(n) = self.nodes.get(id) {
-                            if let Some(v) = get_prop(&n.props, k) {
-                                map.entry(VKey(v.clone())).or_default().push(*id);
-                            }
-                        }
+                for id in self.label_member_ids(l) {
+                    if let Some(v) = self.node(id).and_then(|n| n.prop(k)) {
+                        map.entry(VKey(v)).or_default().push(id);
                     }
                 }
-                for list in map.values_mut() {
-                    list.sort_unstable();
-                }
-                self.prop_indexes.insert((l, k), map);
+                self.prop_indexes.insert((l, k), PIndex { base: None, map });
             }
             Op::IndexDel { label, key } => {
                 if let (Some(l), Some(k)) = (self.strings.lookup(label), self.strings.lookup(key)) {
@@ -731,12 +1209,17 @@ impl Graph {
                 self.next_edge = self.next_edge.max(*next_edge);
             }
             Op::Clear => {
-                self.nodes.clear();
-                self.edges.clear();
-                self.label_index.clear();
-                self.type_index.clear();
-                for m in self.prop_indexes.values_mut() {
-                    m.clear();
+                // Index definitions survive a clear; their contents do not.
+                let defs = self.index_defs();
+                self.install_base(Base::empty());
+                for d in defs {
+                    self.prop_indexes.insert(
+                        d,
+                        PIndex {
+                            base: None,
+                            map: BTreeMap::new(),
+                        },
+                    );
                 }
                 self.next_node = 1;
                 self.next_edge = 1;
@@ -745,30 +1228,46 @@ impl Graph {
     }
 
     fn remove_edge_mem(&mut self, id: u64) {
-        let Some(e) = self.edges.remove(&id) else {
+        if let Some(e) = self.edges.remove(&id) {
+            if let Some(list) = self.out.get_mut(&e.from) {
+                list.retain(|a| a.edge != id);
+            }
+            if let Some(list) = self.inc.get_mut(&e.to) {
+                list.retain(|a| a.edge != id);
+            }
+            if let Some(set) = self.type_index.get_mut(&e.etype) {
+                set.remove(&id);
+            }
             return;
-        };
-        if let Some(n) = self.nodes.get_mut(&e.from) {
-            n.out.retain(|a| a.edge != id);
         }
-        if let Some(n) = self.nodes.get_mut(&e.to) {
-            n.inc.retain(|a| a.edge != id);
-        }
-        if let Some(set) = self.type_index.get_mut(&e.etype) {
-            set.remove(&id);
+        if let Some(s) = self.base_live_edge(id) {
+            self.edge_dead.set(s);
+            self.dead_edges += 1;
+            *self.type_dead.entry(self.base.edge_type(s)).or_default() += 1;
+            self.edge_props.remove(&id);
         }
     }
 
-    fn index_node(&mut self, id: u64) {
-        let Some(node) = self.nodes.get(&id) else {
-            return;
+    /// The (index, value) pairs a node contributes to property indexes.
+    fn index_entries(&self, id: u64) -> Vec<((u32, u32), Value)> {
+        let Some(node) = self.node(id) else {
+            return Vec::new();
         };
-        for ((l, k), map) in self.prop_indexes.iter_mut() {
-            if !node.labels.contains(l) {
-                continue;
-            }
-            if let Some(v) = get_prop(&node.props, *k) {
-                let list = map.entry(VKey(v.clone())).or_default();
+        let delta = self.nodes.contains_key(&id);
+        self.prop_indexes
+            .iter()
+            // An index with an image part covers image nodes itself; its map
+            // holds only nodes that live in the delta.
+            .filter(|(_, p)| delta || p.base.is_none())
+            .filter(|((l, _), _)| node.has_label(*l))
+            .filter_map(|((l, k), _)| node.prop(*k).map(|v| ((*l, *k), v)))
+            .collect()
+    }
+
+    fn index_node(&mut self, id: u64) {
+        for (key, v) in self.index_entries(id) {
+            if let Some(p) = self.prop_indexes.get_mut(&key) {
+                let list = p.map.entry(VKey(v)).or_default();
                 if let Err(pos) = list.binary_search(&id) {
                     list.insert(pos, id);
                 }
@@ -777,21 +1276,17 @@ impl Graph {
     }
 
     fn deindex_node(&mut self, id: u64) {
-        let Some(node) = self.nodes.get(&id) else {
-            return;
-        };
-        for ((l, k), map) in self.prop_indexes.iter_mut() {
-            if !node.labels.contains(l) {
+        for (key, v) in self.index_entries(id) {
+            let Some(p) = self.prop_indexes.get_mut(&key) else {
                 continue;
-            }
-            if let Some(v) = get_prop(&node.props, *k) {
-                if let Some(list) = map.get_mut(&VKey(v.clone())) {
-                    if let Ok(pos) = list.binary_search(&id) {
-                        list.remove(pos);
-                    }
-                    if list.is_empty() {
-                        map.remove(&VKey(v.clone()));
-                    }
+            };
+            let vk = VKey(v);
+            if let Some(list) = p.map.get_mut(&vk) {
+                if let Ok(pos) = list.binary_search(&id) {
+                    list.remove(pos);
+                }
+                if list.is_empty() {
+                    p.map.remove(&vk);
                 }
             }
         }
@@ -813,72 +1308,179 @@ impl Graph {
             v.sort();
             v
         }
-        let mut nodes = Vec::new();
-        let mut any = std::collections::BTreeSet::new();
-        for n in self.nodes.values().take(per) {
-            any.extend(n.props.iter().map(|(k, _)| *k));
-        }
-        nodes.push((String::new(), names(self, any)));
-        for (label, set) in &self.label_index {
+        let node_keys = |ids: &mut dyn Iterator<Item = u64>| {
             let mut keys = std::collections::BTreeSet::new();
-            for id in set.iter().take(per) {
-                if let Some(n) = self.nodes.get(id) {
-                    keys.extend(n.props.iter().map(|(k, _)| *k));
+            for id in ids {
+                if let Some(n) = self.node(id) {
+                    keys.extend(n.props().iter().map(|(k, _)| *k));
                 }
             }
-            nodes.push((self.strings.name(*label).to_string(), names(self, keys)));
+            keys
+        };
+
+        let mut nodes = Vec::new();
+        let base_live = self
+            .base
+            .node_ids()
+            .iter()
+            .enumerate()
+            .filter(|(s, _)| !self.node_masked.get(*s as u32))
+            .map(|(_, id)| *id);
+        let any = node_keys(&mut self.nodes.keys().copied().chain(base_live).take(per));
+        nodes.push((String::new(), names(self, any)));
+        for l in self.all_labels() {
+            let mut ids = self.label_members(l).take(per);
+            let keys = node_keys(&mut ids);
+            nodes.push((self.strings.name(l).to_string(), names(self, keys)));
+        }
+
+        // Edge types: delta members first, then one pass over the image that
+        // stops as soon as every type has its sample.
+        let mut sample: HashMap<u32, Vec<u64>> = HashMap::new();
+        for t in self.all_types() {
+            let v: Vec<u64> = self
+                .type_index
+                .get(&t)
+                .map(|s| s.iter().copied().take(per).collect())
+                .unwrap_or_default();
+            sample.insert(t, v);
+        }
+        let mut hungry = sample.values().filter(|v| v.len() < per).count();
+        for (s, t) in self.base.edge_types().iter().enumerate() {
+            if hungry == 0 {
+                break;
+            }
+            if self.edge_dead.get(s as u32) {
+                continue;
+            }
+            if let Some(v) = sample.get_mut(t) {
+                if v.len() < per {
+                    v.push(self.base.edge_id(s as u32));
+                    if v.len() == per {
+                        hungry -= 1;
+                    }
+                }
+            }
         }
         let mut edges = Vec::new();
-        for (etype, set) in &self.type_index {
+        for (t, ids) in sample {
             let mut keys = std::collections::BTreeSet::new();
-            for id in set.iter().take(per) {
-                if let Some(e) = self.edges.get(id) {
-                    keys.extend(e.props.iter().map(|(k, _)| *k));
+            for id in ids {
+                if let Some(e) = self.edge(id) {
+                    keys.extend(e.props().iter().map(|(k, _)| *k));
                 }
             }
-            edges.push((self.strings.name(*etype).to_string(), names(self, keys)));
+            edges.push((self.strings.name(t).to_string(), names(self, keys)));
         }
         nodes.sort();
         edges.sort();
         (nodes, edges)
     }
 
+    /// Labels with at least one live member.
+    fn all_labels(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = self.base.labels().collect();
+        v.extend(self.label_index.keys().copied());
+        v.sort_unstable();
+        v.dedup();
+        v.retain(|l| self.label_count_id(*l) > 0);
+        v
+    }
+
+    /// Edge types with at least one live edge.
+    fn all_types(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = self.base.type_counts().keys().copied().collect();
+        v.extend(self.type_index.keys().copied());
+        v.sort_unstable();
+        v.dedup();
+        v.retain(|t| self.type_count_id(*t) > 0);
+        v
+    }
+
+    /// Members of a label, delta first, in no particular order.
+    fn label_members(&self, l: u32) -> impl Iterator<Item = u64> + '_ {
+        let delta = self.label_index.get(&l).into_iter().flatten().copied();
+        let base = self
+            .base
+            .label_members(l)
+            .iter()
+            .filter(move |s| !self.node_masked.get(**s))
+            .map(move |s| self.base.node_id(*s));
+        delta.chain(base)
+    }
+
+    /// Members of a label, ascending.
+    pub(crate) fn label_member_ids(&self, l: u32) -> Vec<u64> {
+        let mut v: Vec<u64> = self.label_members(l).collect();
+        v.sort_unstable();
+        v
+    }
+
+    fn label_count_id(&self, l: u32) -> usize {
+        self.base.label_members(l).len() - self.label_masked.get(&l).copied().unwrap_or(0)
+            + self.label_index.get(&l).map(|s| s.len()).unwrap_or(0)
+    }
+
+    fn type_count_id(&self, t: u32) -> usize {
+        self.base.type_counts().get(&t).copied().unwrap_or(0)
+            - self.type_dead.get(&t).copied().unwrap_or(0)
+            + self.type_index.get(&t).map(|s| s.len()).unwrap_or(0)
+    }
+
     pub fn nodes_with_label(&self, label: &str) -> Vec<u64> {
-        match self
-            .strings
-            .lookup(label)
-            .and_then(|l| self.label_index.get(&l))
-        {
-            Some(set) => {
-                let mut v: Vec<u64> = set.iter().copied().collect();
-                v.sort_unstable();
-                v
-            }
+        match self.strings.lookup(label) {
+            Some(l) => self.label_member_ids(l),
             None => Vec::new(),
         }
     }
 
     pub fn edges_with_type(&self, etype: &str) -> Vec<u64> {
-        match self
-            .strings
-            .lookup(etype)
-            .and_then(|t| self.type_index.get(&t))
-        {
-            Some(set) => {
-                let mut v: Vec<u64> = set.iter().copied().collect();
-                v.sort_unstable();
-                v
-            }
-            None => Vec::new(),
+        let Some(t) = self.strings.lookup(etype) else {
+            return Vec::new();
+        };
+        let mut v: Vec<u64> = self
+            .type_index
+            .get(&t)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default();
+        if self.base.type_counts().contains_key(&t) {
+            v.extend(
+                self.base
+                    .edge_types()
+                    .iter()
+                    .enumerate()
+                    .filter(|(s, x)| **x == t && !self.edge_dead.get(*s as u32))
+                    .map(|(s, _)| self.base.edge_id(s as u32)),
+            );
         }
+        v.sort_unstable();
+        v
+    }
+
+    /// Image slots in an index bucket that are still authoritative.
+    fn base_bucket(&self, p: &PIndex, value: &Value) -> impl Iterator<Item = u32> + '_ {
+        let slots: &[u32] = match p.base {
+            Some(i) => self.base.indexes[i].lookup(value),
+            None => &[],
+        };
+        slots
+            .iter()
+            .copied()
+            .filter(move |s| !self.node_masked.get(*s))
     }
 
     /// Exact-match lookup through a property index, if one exists.
     pub fn indexed_lookup(&self, label: &str, key: &str, value: &Value) -> Option<Vec<u64>> {
         let l = self.strings.lookup(label)?;
         let k = self.strings.lookup(key)?;
-        let map = self.prop_indexes.get(&(l, k))?;
-        Some(map.get(&VKey(value.clone())).cloned().unwrap_or_default())
+        let p = self.prop_indexes.get(&(l, k))?;
+        let mut v: Vec<u64> = p.map.get(&VKey(value.clone())).cloned().unwrap_or_default();
+        let before = v.len();
+        v.extend(self.base_bucket(p, value).map(|s| self.base.node_id(s)));
+        if before > 0 && v.len() > before {
+            v.sort_unstable();
+        }
+        Some(v)
     }
 
     /// How many nodes carry a label, without materialising them. The planner
@@ -886,8 +1488,7 @@ impl Graph {
     pub fn label_count(&self, label: &str) -> usize {
         self.strings
             .lookup(label)
-            .and_then(|l| self.label_index.get(&l))
-            .map(|set| set.len())
+            .map(|l| self.label_count_id(l))
             .unwrap_or(0)
     }
 
@@ -896,8 +1497,13 @@ impl Graph {
     pub fn index_count(&self, label: &str, key: &str, value: &Value) -> Option<usize> {
         let l = self.strings.lookup(label)?;
         let k = self.strings.lookup(key)?;
-        let map = self.prop_indexes.get(&(l, k))?;
-        Some(map.get(&VKey(value.clone())).map(|v| v.len()).unwrap_or(0))
+        let p = self.prop_indexes.get(&(l, k))?;
+        let delta = p
+            .map
+            .get(&VKey(value.clone()))
+            .map(|v| v.len())
+            .unwrap_or(0);
+        Some(delta + self.base_bucket(p, value).count())
     }
 
     pub fn has_index(&self, label: &str, key: &str) -> bool {
@@ -907,20 +1513,20 @@ impl Graph {
         }
     }
 
-    pub fn node_prop(&self, id: u64, key: &str) -> Option<&Value> {
+    pub fn node_prop(&self, id: u64, key: &str) -> Option<Value> {
         let k = self.strings.lookup(key)?;
-        get_prop(&self.nodes.get(&id)?.props, k)
+        self.node(id)?.prop(k)
     }
 
-    pub fn edge_prop(&self, id: u64, key: &str) -> Option<&Value> {
+    pub fn edge_prop(&self, id: u64, key: &str) -> Option<Value> {
         let k = self.strings.lookup(key)?;
-        get_prop(&self.edges.get(&id)?.props, k)
+        self.edge(id)?.prop(k)
     }
 
     pub fn node_labels(&self, id: u64) -> Vec<String> {
-        match self.nodes.get(&id) {
+        match self.node(id) {
             Some(n) => n
-                .labels
+                .labels()
                 .iter()
                 .map(|l| self.strings.name(*l).to_string())
                 .collect(),
@@ -929,16 +1535,13 @@ impl Graph {
     }
 
     pub fn has_label(&self, id: u64, label: u32) -> bool {
-        self.nodes
-            .get(&id)
-            .map(|n| n.labels.contains(&label))
-            .unwrap_or(false)
+        self.node(id).map(|n| n.has_label(label)).unwrap_or(false)
     }
 
     pub fn node_props(&self, id: u64) -> Vec<(String, Value)> {
-        match self.nodes.get(&id) {
+        match self.node(id) {
             Some(n) => n
-                .props
+                .props()
                 .iter()
                 .map(|(k, v)| (self.strings.name(*k).to_string(), v.clone()))
                 .collect(),
@@ -947,9 +1550,9 @@ impl Graph {
     }
 
     pub fn edge_props(&self, id: u64) -> Vec<(String, Value)> {
-        match self.edges.get(&id) {
+        match self.edge(id) {
             Some(e) => e
-                .props
+                .props()
                 .iter()
                 .map(|(k, v)| (self.strings.name(*k).to_string(), v.clone()))
                 .collect(),
@@ -958,124 +1561,159 @@ impl Graph {
     }
 
     pub fn edge_type_name(&self, id: u64) -> Option<&str> {
-        self.edges.get(&id).map(|e| self.strings.name(e.etype))
+        let t = self.edge(id)?.etype;
+        Some(self.strings.name(t))
+    }
+
+    /// Visit a node's adjacency without allocating: image edges first (in
+    /// ascending edge id), then delta edges (in creation order, which is also
+    /// ascending id). `Both` visits outgoing, then incoming.
+    pub(crate) fn for_each_adj(
+        &self,
+        id: u64,
+        dir: Dir,
+        etype: Option<u32>,
+        mut f: impl FnMut(Adj),
+    ) {
+        if !self.node_exists(id) {
+            return;
+        }
+        let slot = self.base.node_slot(id);
+        let sides: &[bool] = match dir {
+            Dir::Out => &[true],
+            Dir::In => &[false],
+            Dir::Both => &[true, false],
+        };
+        for &out in sides {
+            if let Some(s) = slot {
+                for (nbr, e) in self.base.adj(s, out) {
+                    if self.dead_edges > 0 && self.edge_dead.get(e) {
+                        continue;
+                    }
+                    let t = self.base.edge_type(e);
+                    if etype.map(|x| x != t).unwrap_or(false) {
+                        continue;
+                    }
+                    f(Adj {
+                        edge: self.base.edge_id(e),
+                        other: self.base.node_id(nbr),
+                        etype: t,
+                    });
+                }
+            }
+            let list = if out {
+                self.out.get(&id)
+            } else {
+                self.inc.get(&id)
+            };
+            for a in list.into_iter().flatten() {
+                if etype.map(|x| x == a.etype).unwrap_or(true) {
+                    f(*a);
+                }
+            }
+        }
     }
 
     /// Adjacency in a direction, optionally filtered to one edge type.
     pub fn neighbors(&self, id: u64, dir: Dir, etype: Option<u32>) -> Vec<Adj> {
-        let Some(n) = self.nodes.get(&id) else {
-            return Vec::new();
-        };
         let mut out = Vec::new();
-        let mut push = |list: &Vec<Adj>| {
-            for a in list {
-                if etype.map(|t| t == a.etype).unwrap_or(true) {
-                    out.push(*a);
-                }
-            }
-        };
-        match dir {
-            Dir::Out => push(&n.out),
-            Dir::In => push(&n.inc),
-            Dir::Both => {
-                push(&n.out);
-                push(&n.inc);
-            }
-        }
+        self.for_each_adj(id, dir, etype, |a| out.push(a));
         out
     }
 
     pub fn degree(&self, id: u64, dir: Dir) -> usize {
-        match self.nodes.get(&id) {
-            Some(n) => match dir {
-                Dir::Out => n.out.len(),
-                Dir::In => n.inc.len(),
-                Dir::Both => n.out.len() + n.inc.len(),
-            },
-            None => 0,
+        if !self.node_exists(id) {
+            return 0;
         }
+        if self.dead_edges == 0 {
+            let slot = self.base.node_slot(id);
+            let side = |out: bool| {
+                slot.map(|s| self.base.degree(s, out)).unwrap_or(0)
+                    + if out {
+                        self.out.get(&id)
+                    } else {
+                        self.inc.get(&id)
+                    }
+                    .map(|l| l.len())
+                    .unwrap_or(0)
+            };
+            return match dir {
+                Dir::Out => side(true),
+                Dir::In => side(false),
+                Dir::Both => side(true) + side(false),
+            };
+        }
+        let mut n = 0;
+        self.for_each_adj(id, dir, None, |_| n += 1);
+        n
     }
 
     // ------------------------------------------------------------ housekeeping
 
-    /// Every op needed to rebuild current state from an empty file.
-    pub fn snapshot_ops(&self) -> Vec<Op> {
-        let mut ops = Vec::with_capacity(self.nodes.len() + self.edges.len() + 8);
-        for (label, key, _) in self.indexes() {
-            ops.push(Op::IndexAdd { label, key });
-        }
-        for id in self.node_ids() {
-            let n = &self.nodes[&id];
-            ops.push(Op::NodeAdd {
-                id,
-                labels: n
-                    .labels
-                    .iter()
-                    .map(|l| self.strings.name(*l).to_string())
-                    .collect(),
-                props: n
-                    .props
-                    .iter()
-                    .map(|(k, v)| (self.strings.name(*k).to_string(), v.clone()))
-                    .collect(),
-            });
-        }
-        for id in self.edge_ids() {
-            let e = &self.edges[&id];
-            ops.push(Op::EdgeAdd {
-                id,
-                from: e.from,
-                to: e.to,
-                etype: self.strings.name(e.etype).to_string(),
-                props: e
-                    .props
-                    .iter()
-                    .map(|(k, v)| (self.strings.name(*k).to_string(), v.clone()))
-                    .collect(),
-            });
-        }
-        ops.push(Op::Counters {
-            next_node: self.next_node,
-            next_edge: self.next_edge,
-        });
-        ops
-    }
-
-    /// Rewrite the log as a minimal snapshot. Reclaims space from deletes and
-    /// overwritten properties.
+    /// Rewrite the file as a snapshot image of current state, with an empty
+    /// log after it. Reclaims space from deletes and overwrites, and makes
+    /// the next open a bulk load instead of a replay. Returns the file size
+    /// before.
     pub fn compact(&mut self) -> Result<u64> {
         let before = self.file_len();
-        let ops = self.snapshot_ops();
-        if let Some(s) = &mut self.store {
-            s.commit()?;
-            s.compact(&ops)?;
-        }
+        let Some(mut store) = self.store.take() else {
+            return Ok(before);
+        };
+        let residency = self.residency;
+        let res = store.commit().and_then(|_| {
+            store.compact_image(
+                |w| image::write(self, w).map(|_| ()),
+                |path, h| image::load_file(path, h.image_at, h.image_len, residency),
+            )
+        });
+        self.store = Some(store);
+        let (base, _strings) = res?;
+        self.uncommitted = 0;
+        self.install_base(base);
         Ok(before)
     }
 
+    /// Fold the delta into a fresh in-memory image, as a compaction would,
+    /// without touching any file. For tests and benchmarks of the image
+    /// path on graphs that have no file.
+    #[doc(hidden)]
+    pub fn rebase_in_memory(&mut self) -> Result<()> {
+        let mut cur = std::io::Cursor::new(Vec::new());
+        image::write(self, &mut cur)?;
+        let (base, _strings) = image::load_slice(cur.get_ref())?;
+        self.install_base(base);
+        Ok(())
+    }
+
     pub fn stats(&self) -> Stats {
-        let mut label_counts: Vec<(String, usize)> = self
-            .label_index
-            .iter()
-            .filter(|(_, s)| !s.is_empty())
-            .map(|(l, s)| (self.strings.name(*l).to_string(), s.len()))
+        let label_counts: Vec<(String, usize)> = self
+            .all_labels()
+            .into_iter()
+            .map(|l| (self.strings.name(l).to_string(), self.label_count_id(l)))
             .collect();
+        let type_counts: Vec<(String, usize)> = self
+            .all_types()
+            .into_iter()
+            .map(|t| (self.strings.name(t).to_string(), self.type_count_id(t)))
+            .collect();
+        let mut label_counts = label_counts;
+        let mut type_counts = type_counts;
         label_counts.sort();
-        let mut type_counts: Vec<(String, usize)> = self
-            .type_index
-            .iter()
-            .filter(|(_, s)| !s.is_empty())
-            .map(|(t, s)| (self.strings.name(*t).to_string(), s.len()))
-            .collect();
         type_counts.sort();
+        let log_start = self.store.as_ref().map(|s| s.header_len()).unwrap_or(0);
         Stats {
-            nodes: self.nodes.len(),
-            edges: self.edges.len(),
+            nodes: self.node_count(),
+            edges: self.edge_count(),
             labels: label_counts,
             edge_types: type_counts,
             interned: self.strings.len(),
             file_bytes: self.file_len(),
             indexes: self.indexes(),
+            image_bytes: self.base.image_bytes,
+            tail_bytes: self.file_len().saturating_sub(log_start),
+            props_on_disk: self.base.props_on_disk(),
+            read_errors: self.base.read_errors(),
+            auto_compact_error: self.auto_compact_error.clone(),
         }
     }
 
@@ -1100,38 +1738,20 @@ impl Graph {
         off.push(0u32);
 
         for id in &ids {
-            let node = &self.nodes[id];
-            let emit =
-                |list: &Vec<Adj>, adj: &mut Vec<u32>, eids: &mut Vec<u64>, w: &mut Vec<f64>| {
-                    for a in list {
-                        if let Some(t) = etype {
-                            if a.etype != t {
-                                continue;
-                            }
-                        }
-                        let Some(p) = pos.get(&a.other) else { continue };
-                        adj.push(*p);
-                        eids.push(a.edge);
-                        let weight = match wkey {
-                            Some(k) => self
-                                .edges
-                                .get(&a.edge)
-                                .and_then(|e| get_prop(&e.props, k))
-                                .and_then(|v| v.as_f64())
-                                .unwrap_or(1.0),
-                            None => 1.0,
-                        };
-                        w.push(weight);
-                    }
+            self.for_each_adj(*id, dir, etype, |a| {
+                let Some(p) = pos.get(&a.other) else { return };
+                adj.push(*p);
+                eids.push(a.edge);
+                let weight = match wkey {
+                    Some(k) => self
+                        .edge(a.edge)
+                        .and_then(|e| e.prop(k))
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(1.0),
+                    None => 1.0,
                 };
-            match dir {
-                Dir::Out => emit(&node.out, &mut adj, &mut eids, &mut w),
-                Dir::In => emit(&node.inc, &mut adj, &mut eids, &mut w),
-                Dir::Both => {
-                    emit(&node.out, &mut adj, &mut eids, &mut w);
-                    emit(&node.inc, &mut adj, &mut eids, &mut w);
-                }
-            }
+                w.push(weight);
+            });
             off.push(adj.len() as u32);
         }
 
@@ -1154,6 +1774,16 @@ pub struct Stats {
     pub interned: usize,
     pub file_bytes: u64,
     pub indexes: Vec<(String, String, usize)>,
+    /// Size of the snapshot image at the front of the file; 0 if none.
+    pub image_bytes: u64,
+    /// Log bytes after the image: what the next open has to replay.
+    pub tail_bytes: u64,
+    /// Whether property values are read from disk on demand.
+    pub props_on_disk: bool,
+    /// Property reads that failed (I/O or checksum) and read as empty.
+    pub read_errors: u64,
+    /// Why the last automatic compaction failed, if it did.
+    pub auto_compact_error: Option<String>,
 }
 
 /// Compressed sparse row view of the graph, with dense indices 0..n.

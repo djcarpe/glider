@@ -415,12 +415,12 @@ impl<'a> Digraph<'a> {
                 continue;
             };
             let labels: Vec<String> = node
-                .labels
+                .labels()
                 .iter()
                 .map(|l| self.graph.strings.name(*l).to_string())
                 .collect();
             let mut props: Vec<(String, Value)> = node
-                .props
+                .props()
                 .iter()
                 .map(|(k, v)| (self.graph.strings.name(*k).to_string(), v.clone()))
                 .collect();
@@ -444,7 +444,7 @@ impl<'a> Digraph<'a> {
                 };
                 let etype = self.graph.strings.name(edge.etype).to_string();
                 let props: Vec<(String, Value)> = edge
-                    .props
+                    .props()
                     .iter()
                     .map(|(k, v)| (self.graph.strings.name(*k).to_string(), v.clone()))
                     .collect();

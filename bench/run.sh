@@ -11,7 +11,8 @@
 #               this quantifies that rather than asserting it
 #   durability  --sync always|normal|off, a documented knob, on spinning disk
 #   memory      the graph is memory-resident, so the ceiling is RAM, not IO;
-#               we record peak RSS and log-replay time at every size
+#               we record peak RSS, log-replay time and snapshot-image open
+#               time at every size
 #
 # Deliberately NOT swept: core count. Nothing in query.rs, graph.rs or algo.rs
 # spawns a thread, so that axis is flat by construction and would be a
@@ -88,7 +89,9 @@ for scale in "${SCALES[@]}"; do
   # ---- ingest, default sync
   rm -f "$db" "$db".*
   log "importing $scale"
-  read -r imp_s imp_rss <<<"$(timed "$GLIDER" "$db" import "$jsonl")"
+  # Auto-compaction off, so the file is a pure log and "reopen" below
+  # measures replay; the image is measured separately after.
+  read -r imp_s imp_rss <<<"$(timed "$GLIDER" "$db" --auto-compact off import "$jsonl")"
   db_bytes=$(stat -c %s "$db" 2>/dev/null || echo 0)
 
   counts=$("$GLIDER" "$db" -c "STATS" --json 2>/dev/null)
@@ -97,15 +100,24 @@ for scale in "${SCALES[@]}"; do
   edges=$(echo "$counts" | grep -o '"edges",[0-9]*' | grep -o '[0-9]*$' || echo 0)
   [ -z "$edges" ] && edges=0
 
-  # ---- reopen: replays the whole log from disk. The one genuinely IO-bound
-  #      path in the engine, and the thing that grows with file size.
-  read -r reopen_s reopen_rss <<<"$(timed "$GLIDER" "$db" -c "RETURN 1")"
+  # ---- reopen: replays the whole log from disk. Grows with file size.
+  read -r reopen_s reopen_rss <<<"$(timed "$GLIDER" "$db" -c "STATS")"
+
+  # ---- compact to a snapshot image, then reopen from it: a bulk load.
+  read -r compact_s compact_rss <<<"$(timed "$GLIDER" "$db" compact)"
+  image_bytes=$(stat -c %s "$db" 2>/dev/null || echo 0)
+  read -r image_s image_rss <<<"$(timed "$GLIDER" "$db" -c "STATS")"
+  read -r disk_s disk_rss <<<"$(timed "$GLIDER" "$db" --props disk -c "STATS")"
 
   emit "{\"record\":\"size\",\"scale\":\"$scale\",\"nodes\":$nodes,\"edges\":$edges,\
 \"jsonl_bytes\":$jsonl_bytes,\"db_bytes\":$db_bytes,\
 \"import_s\":$imp_s,\"import_peak_rss_kb\":$imp_rss,\
-\"reopen_s\":$reopen_s,\"reopen_peak_rss_kb\":$reopen_rss}"
+\"reopen_s\":$reopen_s,\"reopen_peak_rss_kb\":$reopen_rss,\
+\"compact_s\":$compact_s,\"compact_peak_rss_kb\":$compact_rss,\"image_bytes\":$image_bytes,\
+\"reopen_image_s\":$image_s,\"reopen_image_peak_rss_kb\":$image_rss,\
+\"reopen_image_disk_props_s\":$disk_s,\"reopen_image_disk_props_peak_rss_kb\":$disk_rss}"
   log "  $nodes nodes, $edges edges, import ${imp_s}s, reopen ${reopen_s}s, RSS $((reopen_rss/1024)) MB"
+  log "  image: reopen ${image_s}s, RSS $((image_rss/1024)) MB; props on disk ${disk_s}s, RSS $((disk_rss/1024)) MB"
 
   # ---- index build
   read -r idx_s idx_rss <<<"$(timed "$GLIDER" "$db" -c 'INDEX ON :Person(email)')"

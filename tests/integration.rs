@@ -526,10 +526,10 @@ fn jsonl_round_trip() {
 fn negative_literals_stay_integers() {
     let mut g = Graph::memory();
     q(&mut g, r#"CREATE (n:T {delta:-5, temp:-2.5})"#);
-    assert_eq!(g.node_prop(1, "delta"), Some(&Value::Int(-5)));
-    assert_eq!(g.node_prop(1, "temp"), Some(&Value::Float(-2.5)));
+    assert_eq!(g.node_prop(1, "delta"), Some(Value::Int(-5)));
+    assert_eq!(g.node_prop(1, "temp"), Some(Value::Float(-2.5)));
     q(&mut g, r#"MATCH (n:T) SET n.delta = -7"#);
-    assert_eq!(g.node_prop(1, "delta"), Some(&Value::Int(-7)));
+    assert_eq!(g.node_prop(1, "delta"), Some(Value::Int(-7)));
 }
 
 #[test]

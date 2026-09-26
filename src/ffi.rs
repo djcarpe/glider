@@ -118,6 +118,46 @@ pub unsafe extern "C" fn glider_open(path: *const c_char, sync: c_int) -> *mut G
     }
 }
 
+/// `glider_open` with the memory knob exposed.
+///
+/// `props_cache_bytes` = 0 keeps property values in RAM once the snapshot
+/// image is loaded (what `glider_open` does). Anything else leaves them on
+/// disk, read on demand through a cache of about that many bytes: topology,
+/// labels and indexes stay in memory, so traversal is unaffected, while RAM
+/// stops growing with the size of your property data. For low-memory devices.
+///
+/// # Safety
+/// `path` must be a NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn glider_open_ex(
+    path: *const c_char,
+    sync: c_int,
+    props_cache_bytes: usize,
+) -> *mut GliderDb {
+    unsafe {
+        guard(std::ptr::null_mut(), || {
+            let path = as_str(path, "path")?;
+            let opts = crate::OpenOptions {
+                sync: match sync {
+                    0 => Sync::Always,
+                    2 => Sync::Off,
+                    _ => Sync::Normal,
+                },
+                residency: if props_cache_bytes == 0 {
+                    crate::Residency::Memory
+                } else {
+                    crate::Residency::OnDisk {
+                        cache_bytes: props_cache_bytes,
+                    }
+                },
+                ..crate::OpenOptions::default()
+            };
+            let graph = Graph::open_opts(Path::new(path), opts).map_err(|e| e.to_string())?;
+            Ok(Box::into_raw(Box::new(GliderDb { graph })))
+        })
+    }
+}
+
 /// A graph that never touches disk. Useful for tests, caches, and scratch
 /// work on a device where you do not want to spend storage.
 #[no_mangle]
@@ -226,7 +266,8 @@ pub unsafe extern "C" fn glider_checkpoint(db: *mut GliderDb) -> c_int {
     }
 }
 
-/// Rewrite the log as a minimal snapshot, reclaiming deleted space.
+/// Rewrite the file as a snapshot image of current state, reclaiming deleted
+/// space and making the next open a bulk load rather than a log replay.
 /// Potentially slow and I/O heavy — do not call it on the UI thread, and on
 /// iOS wrap it in a background task so the OS does not suspend you mid-write.
 ///
@@ -238,6 +279,27 @@ pub unsafe extern "C" fn glider_compact(db: *mut GliderDb) -> c_int {
         guard(-1, || {
             let db = as_db(db)?;
             db.graph.compact().map_err(|e| e.to_string())?;
+            Ok(0)
+        })
+    }
+}
+
+/// Compact automatically once the log after the snapshot image passes
+/// `bytes` (or the image size, if larger). 0 turns it off. The default is
+/// 64 MiB. Automatic compaction runs inside a commit, so a commit that
+/// triggers one takes as long as a `glider_compact`; turn it off and call
+/// `glider_compact` from a background task if commits happen on the UI
+/// thread.
+///
+/// # Safety
+/// `db` must be a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn glider_set_auto_compact(db: *mut GliderDb, bytes: u64) -> c_int {
+    unsafe {
+        guard(-1, || {
+            let db = as_db(db)?;
+            db.graph
+                .set_auto_compact(if bytes == 0 { None } else { Some(bytes) });
             Ok(0)
         })
     }

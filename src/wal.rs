@@ -626,6 +626,42 @@ mod tests {
     }
 
     #[test]
+    fn an_image_and_the_log_after_it_replicate_and_restore() {
+        let dir = tmpdir("image");
+        let db = dir.join("e.gldb");
+        let replica = dir.join("replica");
+        let opts = TailOptions {
+            once: true,
+            min_bytes: 0,
+            quiet: true,
+            ..Default::default()
+        };
+
+        let mut g = Graph::open(&db, Sync::Always).unwrap();
+        write_nodes(&mut g, 60);
+        g.compact().unwrap();
+        let h = store::read_header(&db).unwrap();
+        assert!(h.image_len > 0);
+        drop(g);
+        // Segment 0 carries the header and the whole image.
+        tail(&db, &replica, &opts).unwrap();
+
+        let mut g = Graph::open(&db, Sync::Always).unwrap();
+        write_nodes(&mut g, 15);
+        g.set_node_prop(1, "i", Value::Int(-1)).unwrap();
+        drop(g);
+        tail(&db, &replica, &opts).unwrap();
+
+        let out = dir.join("restored.gldb");
+        restore(&replica, None, None, &out).unwrap();
+        assert_eq!(fs::read(&db).unwrap(), fs::read(&out).unwrap());
+        let r = Graph::open(&out, Sync::Normal).unwrap();
+        assert_eq!(r.node_count(), 75);
+        assert_eq!(r.node_prop(1, "i"), Some(Value::Int(-1)));
+        assert!(r.stats().image_bytes > 0);
+    }
+
+    #[test]
     fn point_in_time_stops_where_asked() {
         let dir = tmpdir("pitr");
         let db = dir.join("d.gldb");

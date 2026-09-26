@@ -50,7 +50,18 @@ These produce wrong results or lost data. Nothing else should go first.
 
 ## Storage and durability
 
-- [ ] **DUR-1 · Opening rebuilds the graph, and that is nearly all of the cost** [S1] · L
+- [x] **DUR-1 · Opening rebuilds the graph, and that is nearly all of the cost** [S1] · L
+  **Done: snapshot image (format v3).** Compaction writes current state as
+  flat, checksummed columns at the front of the file (`image.rs`); open loads
+  them in bulk and replays only the log after. Changes since live in a delta
+  overlay (`graph.rs`), and auto-compaction bounds the tail. No mmap and no
+  unsafe code: plain reads, plus positional reads for properties left on
+  disk (`Residency::OnDisk`). Measured, same data: 500 MiB log 13.1 s /
+  3.1 GB RSS before, 0.50 s / 529 MB after (0.34 s / 295 MB with properties
+  on disk); 1 GiB 30.0 s / 6.4 GB before, 0.99 s / 1.1 GB after. Tests:
+  `tests/image_differential.rs` (random ops against an image-free oracle,
+  every read compared) and `tests/image_file.rs`. Original diagnosis below.
+
   **Diagnosis corrected.** I originally blamed replaying superseded history and
   proposed in-log checkpoints. Measured on a 159 MB log (5,000,000 records),
   with `verify` used to separate the phases:
@@ -99,7 +110,11 @@ These produce wrong results or lost data. Nothing else should go first.
   against a consistent snapshot while a writer appends. Needs copy-on-write
   index structures or generation-tagged reads.
 
-- [ ] **DUR-7 · A single large transaction is buffered entirely in memory** · **new** · M
+- [x] **DUR-7 · A single large transaction is buffered entirely in memory** · **new** · M
+  **Fixed:** replay validates a transaction's records without allocating,
+  then decodes and applies them one at a time when its commit marker
+  arrives. Same atomicity, no batch. Test:
+  `a_transaction_with_an_undecodable_record_is_discarded_whole`.
   `replay` holds decoded ops in a `batch` until the commit marker, which is
   correct — uncommitted ops must not reach the graph — but unbounded. The
   benchmark file above is 5,000,000 records in **two** transactions, so opening
@@ -109,7 +124,10 @@ These produce wrong results or lost data. Nothing else should go first.
   Bound it: spill to a temp file past a threshold, or apply speculatively with
   an undo log.
 
-- [ ] **PERF-7 · 13.7× memory amplification** · **new** · L
+- [x] **PERF-7 · 13.7× memory amplification** · **new** · L
+  **Fixed for compacted data** by the image (DUR-1): RSS is ~1× the image,
+  less with properties on disk. The delta still pays per-node `Vec`s for
+  changes since the last compaction; auto-compaction keeps that bounded.
   A 159 MB file becomes 2.17 GB of live graph. Per-node and per-edge `Vec`
   allocations dominate. Inline storage for the common small cases (one label,
   a handful of properties) without an allocation, arena-backed property
@@ -119,8 +137,9 @@ These produce wrong results or lost data. Nothing else should go first.
   construction entirely.
 
 - [ ] **DUR-6 · Working set cannot exceed RAM** · L
-  The structural ceiling, documented in `MOBILE.md` (~150k nodes on a low-end
-  Android device). Fixing it means a paged B-tree with a buffer pool — a
+  The structural ceiling, documented in `MOBILE.md`. Raised by DUR-1: a
+  compacted graph costs ~1× its image in RAM, and property values can stay
+  on disk. Topology and indexes must still fit. Fixing it means a paged B-tree with a buffer pool — a
   rewrite of `store.rs` and `graph.rs`, not a flag. Check first whether
   sharding by subgraph covers the real cases; for per-user or per-repo graphs
   it usually does.
