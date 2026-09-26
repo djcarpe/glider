@@ -25,8 +25,24 @@ const RADIUS = 19
  * state here holds a *version counter* rather than the positions themselves —
  * re-rendering 300 nodes on every tick through React's reconciler is far more
  * expensive than letting d3 own the vectors and asking React to redraw.
+ *
+ * Two modes. On its own (a result frame) it owns selection, expansion and an
+ * inspector. Controlled — the explorer — the parent owns all three through
+ * `selectedId`/`onSelect`, `onExpand` and `inspector={false}`, and grows the
+ * `graph` prop itself. Either way the graph the parent passes is the truth;
+ * only positions live here.
  */
-export default function GraphView({ graph, onRunQuery }) {
+export default function GraphView({
+  graph,
+  onRunQuery,
+  selectedId,
+  onSelect,
+  selectedEdgeId,
+  onSelectEdge,
+  onExpand,
+  inspector = true,
+  fill = false,
+}) {
   const svgRef = useRef(null)
   const simRef = useRef(null)
   const nodesRef = useRef([])
@@ -35,10 +51,20 @@ export default function GraphView({ graph, onRunQuery }) {
   const panRef = useRef(null)
 
   const [, bump] = useState(0)
-  const [selected, setSelected] = useState(null)
+  const [ownSelected, setOwnSelected] = useState(null)
   const [view, setView] = useState({ x: 0, y: 0, k: 1 })
   const [extra, setExtra] = useState({ nodes: [], edges: [] })
   const [expanding, setExpanding] = useState(false)
+
+  const controlled = onSelect !== undefined
+  const selected = controlled ? selectedId ?? null : ownSelected
+  const select = useCallback(
+    (node) => {
+      if (controlled) onSelect(node)
+      else setOwnSelected(node ? node.id : null)
+    },
+    [controlled, onSelect],
+  )
 
   // Merge the query's graph with anything pulled in by expansion, de-duped by
   // id so expanding a node twice does not double it.
@@ -69,8 +95,19 @@ export default function GraphView({ graph, onRunQuery }) {
     return [...seen.entries()].sort((a, b) => b[1] - a[1])
   }, [merged.nodes])
 
+  // The simulation is rebuilt only when *membership* changes. An edit to a
+  // property produces a new graph object but the same shape, and must not
+  // re-heat the layout and send every node drifting.
+  const shape = useMemo(
+    () => merged.nodes.map((n) => n.id).join(',') + '|' + merged.edges.map((e) => e.id).join(','),
+    [merged],
+  )
+  const mergedRef = useRef(merged)
+  mergedRef.current = merged
+
   // ---- build / rebuild the simulation when the node or edge set changes
   useEffect(() => {
+    const { nodes: mnodes, edges: medges } = mergedRef.current
     const box = svgRef.current?.getBoundingClientRect()
     const w = box?.width || 800
     const h = box?.height || 460
@@ -78,12 +115,12 @@ export default function GraphView({ graph, onRunQuery }) {
     // Carry positions across rebuilds so an expand animates outward from where
     // the node already is rather than teleporting the whole layout.
     const prev = new Map(nodesRef.current.map((n) => [n.id, n]))
-    const nodes = merged.nodes.map((n) => {
+    const nodes = mnodes.map((n) => {
       const p = prev.get(n.id)
       return p ? Object.assign(p, n) : { ...n, x: w / 2 + (Math.random() - 0.5) * 240, y: h / 2 + (Math.random() - 0.5) * 240 }
     })
     const byId = new Map(nodes.map((n) => [n.id, n]))
-    const links = merged.edges
+    const links = medges
       .map((e) => ({ ...e, source: byId.get(e.from), target: byId.get(e.to) }))
       .filter((l) => l.source && l.target)
 
@@ -102,7 +139,25 @@ export default function GraphView({ graph, onRunQuery }) {
 
     simRef.current = sim
     return () => sim.stop()
-  }, [merged.nodes, merged.edges])
+  }, [shape])
+
+  // ---- same shape, new data: copy labels/props into the live objects
+  useEffect(() => {
+    const live = new Map(nodesRef.current.map((n) => [n.id, n]))
+    for (const n of merged.nodes) {
+      const l = live.get(n.id)
+      if (l && l !== n) Object.assign(l, n)
+    }
+    const liveE = new Map(linksRef.current.map((l) => [l.id, l]))
+    for (const e of merged.edges) {
+      const l = liveE.get(e.id)
+      if (l) {
+        l.props = e.props
+        l.type = e.type
+      }
+    }
+    bump((v) => v + 1)
+  }, [merged])
 
   // ---- pointer: drag a node, or pan the canvas
   const onPointerDown = useCallback(
@@ -110,16 +165,16 @@ export default function GraphView({ graph, onRunQuery }) {
       e.stopPropagation()
       svgRef.current?.setPointerCapture?.(e.pointerId)
       if (node) {
-        setSelected(node.id)
+        select(node)
         node.fx = node.x
         node.fy = node.y
         dragRef.current = { node, id: e.pointerId }
         simRef.current?.alphaTarget(0.25).restart()
       } else {
-        panRef.current = { x: e.clientX, y: e.clientY, ox: view.x, oy: view.y, id: e.pointerId }
+        panRef.current = { x: e.clientX, y: e.clientY, ox: view.x, oy: view.y, id: e.pointerId, moved: false }
       }
     },
-    [view.x, view.y],
+    [view.x, view.y, select],
   )
 
   const onPointerMove = useCallback((e) => {
@@ -133,6 +188,7 @@ export default function GraphView({ graph, onRunQuery }) {
     }
     const p = panRef.current
     if (p) {
+      if (Math.abs(e.clientX - p.x) > 3 || Math.abs(e.clientY - p.y) > 3) p.moved = true
       setView((v) => ({ ...v, x: p.ox + (e.clientX - p.x), y: p.oy + (e.clientY - p.y) }))
     }
   }, [])
@@ -146,8 +202,13 @@ export default function GraphView({ graph, onRunQuery }) {
       simRef.current?.alphaTarget(0)
       dragRef.current = null
     }
-    panRef.current = null
-  }, [])
+    const p = panRef.current
+    if (p) {
+      // A click on empty canvas — a pan that never moved — clears the selection.
+      if (!p.moved) select(null)
+      panRef.current = null
+    }
+  }, [select])
 
   // Keep a ref of the view for the coordinate transform, which runs inside a
   // pointer handler that must not re-subscribe on every pan frame.
@@ -168,20 +229,27 @@ export default function GraphView({ graph, onRunQuery }) {
     })
   }, [])
 
-  const doExpand = useCallback(async (id) => {
-    setExpanding(true)
-    try {
-      const r = await expandNode(id, 40)
-      setExtra((prev) => ({
-        nodes: [...prev.nodes, ...(r.graph?.nodes || [])],
-        edges: [...prev.edges, ...(r.graph?.edges || [])],
-      }))
-    } catch (err) {
-      console.error('expand failed', err)
-    } finally {
-      setExpanding(false)
-    }
-  }, [])
+  const doExpand = useCallback(
+    async (id) => {
+      if (onExpand) {
+        onExpand(id)
+        return
+      }
+      setExpanding(true)
+      try {
+        const r = await expandNode(id, 40)
+        setExtra((prev) => ({
+          nodes: [...prev.nodes, ...(r.graph?.nodes || [])],
+          edges: [...prev.edges, ...(r.graph?.edges || [])],
+        }))
+      } catch (err) {
+        console.error('expand failed', err)
+      } finally {
+        setExpanding(false)
+      }
+    },
+    [onExpand],
+  )
 
   const fit = useCallback(() => setView({ x: 0, y: 0, k: 1 }), [])
 
@@ -200,7 +268,7 @@ export default function GraphView({ graph, onRunQuery }) {
   }
 
   return (
-    <div className="graph-wrap">
+    <div className={`graph-wrap${fill ? ' fill' : ''}`}>
       <svg
         ref={svgRef}
         className={dragRef.current || panRef.current ? 'dragging' : ''}
@@ -228,12 +296,27 @@ export default function GraphView({ graph, onRunQuery }) {
           {linksRef.current.map((l) => {
             if (!l.source || !l.target) return null
             const hl = selNeighbours.has(l.id)
+            const isSel = l.id === selectedEdgeId
             const mx = (l.source.x + l.target.x) / 2
             const my = (l.source.y + l.target.y) / 2
             return (
-              <g key={l.id}>
+              <g key={l.id} className={onSelectEdge ? 'g-link' : ''}>
+                {onSelectEdge && (
+                  // A wide, invisible twin of the line so a 1px edge is clickable.
+                  <line
+                    className="g-edge-hit"
+                    x1={l.source.x}
+                    y1={l.source.y}
+                    x2={l.target.x}
+                    y2={l.target.y}
+                    onPointerDown={(e) => {
+                      e.stopPropagation()
+                      onSelectEdge(l)
+                    }}
+                  />
+                )}
                 <line
-                  className={`g-edge${hl ? ' hl' : ''}`}
+                  className={`g-edge${hl ? ' hl' : ''}${isSel ? ' sel' : ''}`}
                   x1={l.source.x}
                   y1={l.source.y}
                   x2={l.target.x}
@@ -292,7 +375,7 @@ export default function GraphView({ graph, onRunQuery }) {
         {expanding && ' · expanding…'}
       </div>
 
-      {sel && (
+      {inspector && sel && (
         <div className="inspector">
           <h4>
             <span
@@ -354,4 +437,4 @@ function formatProp(v) {
   return String(v)
 }
 
-export { LABEL_PALETTE }
+export { LABEL_PALETTE, RENDER_CAP }

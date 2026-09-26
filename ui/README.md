@@ -53,9 +53,12 @@ Cost: about +260 KB of HTML, taking the release binary from ~1.05 MB to
 
 | file | |
 |---|---|
-| `App.jsx` | shell, editor, sidebar, frame stack, history |
+| `App.jsx` | shell, Console/Explore switch, editor, sidebar, frame stack, history |
 | `Frame.jsx` | one result frame; Graph/Table/JSON tabs, table rendering |
-| `GraphView.jsx` | d3-force layout in SVG: drag, zoom, select, expand |
+| `GraphView.jsx` | d3-force layout in SVG: drag, zoom, select, expand; controlled mode for the explorer |
+| `Explorer.jsx` | the Explore tab: search, lazy-loaded list, canvas, edit actions |
+| `Inspector.jsx` | the explorer's edit panel: properties, labels, new node / relationship, delete |
+| `edit.js` | writes as queries: literal rendering, typed input, create/set/remove/delete |
 | `entities.js` | label colours, captions, entity narrowing |
 | `transport.js` | the HTTP and wasm backends |
 | `styles.css` | design tokens and all styling |
@@ -68,3 +71,13 @@ Cost: about +260 KB of HTML, taking the release binary from ~1.05 MB to
   counter rather than holding coordinates in state.
 - Query history lives in `localStorage`, wrapped in try/catch so a private
   window or blocked site data does not stop the console from starting.
+- The explorer's list is the only thing that touches the whole graph, and it
+  does so through `/api/nodes` and `/api/edges`: cursor-paged by id, fifty at
+  a time, fetched as a sentinel at the foot of the list scrolls into view. The
+  canvas only ever holds what you clicked or expanded, and still stops drawing
+  at 300 nodes.
+- Explorer edits are queries (`edit.js`), not a separate write API. Values
+  typed into the inspector are read like literals — `42` is an int, `4.2` a
+  float, `true` a bool, `[..]` a list — with an explicit type override for the
+  cases that guess wrong. Names that are not plain identifiers are
+  backtick-quoted.

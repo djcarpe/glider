@@ -126,6 +126,16 @@ established: a query editor, stacked result frames, and a force-directed graph
 view with click-to-expand, alongside table and JSON tabs and a live schema
 sidebar.
 
+The **Explore** tab browses a graph without queries. A search bar lists nodes
+or relationships — filtered by label or type, matched against any property —
+and loads them a page at a time as you scroll, so a graph of any size opens
+instantly. Click a result to put it on the canvas, double-click a node to pull
+in its neighbours, and edit whatever is selected in place: properties (typed —
+text, int, float, bool, null, list), labels, new nodes, new relationships,
+deletes. Every edit is issued as an ordinary `SET` / `REMOVE` / `CREATE` /
+`DELETE` statement, so it is logged, indexed and committed exactly as if you
+had typed it.
+
 It is compiled into the binary — one file, nothing to serve, nothing to
 install. `glider <db> serve` hosts the same console without opening a browser.
 
@@ -247,9 +257,17 @@ GET  /health
 GET  /                                  -> the browser console
 
 POST /api/query                         -> typed result + graph:{nodes,edges}
-GET  /api/schema                        -> labels, rel types, indexes with counts
+GET  /api/schema                        -> node/edge totals; labels, rel types, indexes with counts
 GET  /api/expand?id=N&limit=K           -> neighbours of one node
+GET  /api/nodes?label=&q=&from=&limit=  -> a page of nodes:  {nodes, next, total}
+GET  /api/edges?type=&q=&from=&limit=   -> a page of edges:  {edges, nodes, next, total}
 ```
+
+The page endpoints are cursor-paged by id: pass a page's `next` as the next
+request's `from`. That keeps a walk through a million nodes O(page) per
+request rather than O(offset), and means a node created or deleted between
+pages shifts nothing. `q` is case-insensitive free text matched server-side
+against labels (or the relationship type), every property value, and the id.
 
 `/query` returns entities as JSON *strings*; `/api/query` returns them as
 objects tagged `"_e":"node"` / `"_e":"rel"` and adds the drawable graph

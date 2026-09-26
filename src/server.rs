@@ -6,7 +6,8 @@
 //!   POST /query   body is the query text     -> JSON {columns, rows, message}
 //!   GET  /stats                              -> JSON
 //!   GET  /health                             -> ok
-//!   GET  /                                   -> a tiny browser console
+//!   GET  /                                   -> the browser console
+//!   /api/*                                   -> typed JSON, see api.rs
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -157,6 +158,25 @@ fn route(
                 Ok(j) => ("200 OK", "application/json", j),
                 Err(e) => ("404 Not Found", "application/json", error_json(&e)),
             }
+        }
+        ("GET", "/api/nodes") | ("GET", "/api/edges") => {
+            let from = api::query_param(path, "from")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            let limit = api::query_param(path, "limit")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(50)
+                .clamp(1, 1000);
+            let q = api::query_param(path, "q");
+            let g = lock(graph);
+            let j = if route == "/api/nodes" {
+                let label = api::query_param(path, "label");
+                api::nodes_json(&g, label.as_deref(), q.as_deref(), from, limit)
+            } else {
+                let etype = api::query_param(path, "type");
+                api::edges_json(&g, etype.as_deref(), q.as_deref(), from, limit)
+            };
+            ("200 OK", "application/json", j)
         }
         ("GET", "/stats") | ("POST", "/query") => {
             let src = if route == "/stats" {

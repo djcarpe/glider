@@ -363,6 +363,73 @@ pub unsafe extern "C" fn glider_expand_json(
     }
 }
 
+/// Optional C string: NULL means "not given" rather than an error.
+unsafe fn as_opt_str<'a>(p: *const c_char, what: &str) -> Result<Option<&'a str>, String> {
+    if p.is_null() {
+        return Ok(None);
+    }
+    unsafe { as_str(p, what).map(Some) }
+}
+
+/// A page of nodes for the explorer: `{nodes, next, total}`. `label` and `q`
+/// may be NULL; `from` is the id cursor (0 for the first page).
+///
+/// # Safety
+/// `db` must be a live handle; `label` and `q` NULL or NUL-terminated UTF-8.
+/// Free the result with `glider_free`.
+#[no_mangle]
+pub unsafe extern "C" fn glider_nodes_json(
+    db: *mut GliderDb,
+    label: *const c_char,
+    q: *const c_char,
+    from: u64,
+    limit: usize,
+) -> *mut c_char {
+    unsafe {
+        guard(std::ptr::null_mut(), || {
+            let db = as_db(db)?;
+            let label = as_opt_str(label, "label")?;
+            let q = as_opt_str(q, "q")?;
+            out_string(crate::api::nodes_json(
+                &db.graph,
+                label,
+                q,
+                from,
+                limit.clamp(1, 1000),
+            ))
+        })
+    }
+}
+
+/// A page of edges with their endpoints: `{edges, nodes, next, total}`.
+/// Same contract as `glider_nodes_json`, filtering by relationship `etype`.
+///
+/// # Safety
+/// As `glider_nodes_json`.
+#[no_mangle]
+pub unsafe extern "C" fn glider_edges_json(
+    db: *mut GliderDb,
+    etype: *const c_char,
+    q: *const c_char,
+    from: u64,
+    limit: usize,
+) -> *mut c_char {
+    unsafe {
+        guard(std::ptr::null_mut(), || {
+            let db = as_db(db)?;
+            let etype = as_opt_str(etype, "type")?;
+            let q = as_opt_str(q, "q")?;
+            out_string(crate::api::edges_json(
+                &db.graph,
+                etype,
+                q,
+                from,
+                limit.clamp(1, 1000),
+            ))
+        })
+    }
+}
+
 // ------------------------------------------------------- guest-side memory
 //
 // A C caller has malloc. A WebAssembly caller does not: JavaScript cannot put

@@ -38,7 +38,18 @@ export function httpTransport() {
     schema: () => req('/api/schema'),
     expand: (id, limit = 50) =>
       req(`/api/expand?id=${encodeURIComponent(id)}&limit=${limit}`),
+    nodes: (o) => req(`/api/nodes?${qs({ label: o.label, q: o.q, from: o.from, limit: o.limit })}`),
+    edges: (o) => req(`/api/edges?${qs({ type: o.type, q: o.q, from: o.from, limit: o.limit })}`),
   }
+}
+
+/** Encode the defined entries of an object as a query string. */
+function qs(params) {
+  const p = new URLSearchParams()
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null && v !== '') p.set(k, String(v))
+  }
+  return p.toString()
 }
 
 /**
@@ -65,5 +76,7 @@ export function wasmTransport(db) {
     query: async (q) => timed(() => db.query(q)),
     schema: async () => db.schema(),
     expand: async (id, limit = 50) => ({ graph: db.expand(Number(id), limit) }),
+    nodes: async (o) => db.nodes(o),
+    edges: async (o) => db.edges(o),
   }
 }

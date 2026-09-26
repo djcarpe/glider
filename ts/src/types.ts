@@ -15,6 +15,8 @@ export interface GliderNode {
   readonly _e: 'node'
   readonly id: number
   readonly labels: string[]
+  /** Relationships in either direction. Lets a list show connectivity before expanding. */
+  readonly degree: number
   readonly props: Record<string, PropValue>
 }
 
@@ -52,9 +54,41 @@ export interface SchemaEntry {
 }
 
 export interface Schema {
+  /** True totals; label counts overlap when a node carries several. */
+  readonly nodes: number
+  readonly edges: number
   readonly labels: SchemaEntry[]
   readonly edge_types: SchemaEntry[]
   readonly indexes: SchemaEntry[]
+}
+
+/** Options for paging through the graph with `nodes()` / `edges()`. */
+export interface PageOptions {
+  /** Restrict to one label (`nodes`) or relationship type (`edges`). */
+  readonly label?: string
+  readonly type?: string
+  /** Case-insensitive text matched against labels/type, property values and the id. */
+  readonly q?: string
+  /** Id cursor: the `next` of the previous page. Omit for the first page. */
+  readonly from?: number
+  /** Page size, 1–1000. Default 50. */
+  readonly limit?: number
+}
+
+export interface NodePage {
+  readonly nodes: GliderNode[]
+  /** Cursor for the next page, or null on the last one. */
+  readonly next: number | null
+  /** Candidates before the text filter: the label's size, or the whole graph. */
+  readonly total: number
+}
+
+export interface EdgePage {
+  readonly edges: GliderRel[]
+  /** The endpoints of every edge on the page. */
+  readonly nodes: GliderNode[]
+  readonly next: number | null
+  readonly total: number
 }
 
 /** Narrow a cell to a node. */

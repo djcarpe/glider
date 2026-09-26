@@ -14,8 +14,15 @@
 //! entity, in which case drawing it is the right answer anyway.
 //!
 //!   POST /api/query   -> {columns, rows, graph:{nodes,edges}, ms, message, touched}
-//!   GET  /api/schema  -> {labels:[{name,count}], edge_types:[...], indexes:[...]}
+//!   GET  /api/schema  -> {nodes, edges, labels:[{name,count}], edge_types:[...], indexes:[...]}
 //!   GET  /api/expand  -> {graph:{nodes,edges}}   neighbours of one node
+//!   GET  /api/nodes   -> {nodes:[..], next, total}          a page of nodes
+//!   GET  /api/edges   -> {edges:[..], nodes:[..], next, total}  a page of edges
+//!
+//! The two page endpoints back the explorer. They are cursor-paged by id
+//! rather than offset-paged, so walking a million-node graph fifty at a time
+//! costs O(page) per request instead of O(offset), and a node created or
+//! deleted between pages shifts nothing.
 
 use std::collections::BTreeSet;
 #[cfg(not(target_arch = "wasm32"))]
@@ -38,7 +45,9 @@ fn write_node(g: &Graph, id: u64, out: &mut String) {
         }
         write_json_string(l, out);
     }
-    out.push_str("],\"props\":{");
+    out.push_str("],\"degree\":");
+    out.push_str(&g.degree(id, Dir::Both).to_string());
+    out.push_str(",\"props\":{");
     for (i, (k, v)) in g.node_props(id).iter().enumerate() {
         if i > 0 {
             out.push(',');
@@ -300,9 +309,15 @@ pub fn schema_json(g: &mut Graph) -> Result<String, String> {
         bucket.push_str(&format!(",\"count\":{}}}", count));
     }
 
+    // Label counts overlap (a node may carry several), so the explorer needs
+    // the true totals too.
     Ok(format!(
-        "{{\"labels\":[{}],\"edge_types\":[{}],\"indexes\":[{}]}}",
-        labels, etypes, indexes
+        "{{\"nodes\":{},\"edges\":{},\"labels\":[{}],\"edge_types\":[{}],\"indexes\":[{}]}}",
+        g.node_count(),
+        g.edge_count(),
+        labels,
+        etypes,
+        indexes
     ))
 }
 
@@ -328,17 +343,213 @@ pub fn expand_json(g: &Graph, id: u64, limit: usize) -> Result<String, String> {
     Ok(out)
 }
 
-/// Parse `?id=..&limit=..` off a request path.
+// ----------------------------------------------------------------- explore
+
+/// Case-insensitive substring test. `needle` is already lowercased. The ASCII
+/// path avoids allocating a lowercased copy of every property value in the
+/// graph on each keystroke, which is what a scan of a large graph would
+/// otherwise spend most of its time doing.
+fn contains_ci(hay: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if hay.is_ascii() && needle.is_ascii() {
+        let (h, n) = (hay.as_bytes(), needle.as_bytes());
+        h.len() >= n.len() && h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+    } else {
+        hay.to_lowercase().contains(needle)
+    }
+}
+
+fn value_matches(v: &Value, needle: &str) -> bool {
+    match v {
+        Value::Null => false,
+        Value::Text(s) => contains_ci(s, needle),
+        Value::List(items) => items.iter().any(|i| value_matches(i, needle)),
+        other => contains_ci(&other.to_string(), needle),
+    }
+}
+
+/// Does a node match free text? By id exactly, or by any label or property
+/// value containing it.
+fn node_matches(g: &Graph, id: u64, needle: &str) -> bool {
+    let Some(n) = g.node(id) else { return false };
+    if id.to_string() == needle {
+        return true;
+    }
+    if n.labels
+        .iter()
+        .any(|l| contains_ci(g.strings.name(*l), needle))
+    {
+        return true;
+    }
+    n.props.iter().any(|(_, v)| value_matches(v, needle))
+}
+
+fn edge_matches(g: &Graph, id: u64, needle: &str) -> bool {
+    let Some(e) = g.edge(id) else { return false };
+    if id.to_string() == needle {
+        return true;
+    }
+    if contains_ci(g.strings.name(e.etype), needle) {
+        return true;
+    }
+    e.props.iter().any(|(_, v)| value_matches(v, needle))
+}
+
+fn needle_of(q: Option<&str>) -> Option<String> {
+    q.map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty())
+}
+
+/// Walk sorted `ids` from the cursor, keeping those that pass `keep`, and
+/// return (page, next cursor). The cursor is the id to start *from*, so page
+/// one is `from = 0` and `next` is simply the first id not yet delivered.
+fn page<F: Fn(u64) -> bool>(
+    ids: &[u64],
+    from: u64,
+    limit: usize,
+    keep: F,
+) -> (Vec<u64>, Option<u64>) {
+    let start = ids.partition_point(|&id| id < from);
+    let mut out = Vec::with_capacity(limit.min(ids.len()));
+    for &id in &ids[start..] {
+        if !keep(id) {
+            continue;
+        }
+        if out.len() == limit {
+            return (out, Some(id));
+        }
+        out.push(id);
+    }
+    (out, None)
+}
+
+/// A page of nodes: `{"nodes":[..],"next":<id>|null,"total":N}`.
+///
+/// `total` counts the candidates *before* the text filter — the label's size,
+/// or the whole graph — because counting matches would mean scanning
+/// everything on each request, which is exactly what paging is avoiding.
+pub fn nodes_json(
+    g: &Graph,
+    label: Option<&str>,
+    q: Option<&str>,
+    from: u64,
+    limit: usize,
+) -> String {
+    let ids = match label.filter(|l| !l.is_empty()) {
+        Some(l) => g.nodes_with_label(l),
+        None => g.node_ids(),
+    };
+    let needle = needle_of(q);
+    let (hits, next) = page(&ids, from, limit, |id| match &needle {
+        Some(n) => node_matches(g, id, n),
+        None => true,
+    });
+
+    let mut out = String::with_capacity(hits.len() * 160 + 64);
+    out.push_str("{\"nodes\":[");
+    for (i, id) in hits.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write_node(g, *id, &mut out);
+    }
+    out.push_str("],");
+    write_page_tail(next, ids.len(), &mut out);
+    out
+}
+
+/// A page of edges: `{"edges":[..],"nodes":[..],"next":<id>|null,"total":N}`.
+/// Endpoints ride along so a row can read "Ada —KNOWS→ Bob" without a second
+/// request per edge.
+pub fn edges_json(
+    g: &Graph,
+    etype: Option<&str>,
+    q: Option<&str>,
+    from: u64,
+    limit: usize,
+) -> String {
+    let ids = match etype.filter(|t| !t.is_empty()) {
+        Some(t) => g.edges_with_type(t),
+        None => g.edge_ids(),
+    };
+    let needle = needle_of(q);
+    let (hits, next) = page(&ids, from, limit, |id| match &needle {
+        Some(n) => edge_matches(g, id, n),
+        None => true,
+    });
+
+    let mut endpoints = BTreeSet::new();
+    let mut out = String::with_capacity(hits.len() * 260 + 64);
+    out.push_str("{\"edges\":[");
+    for (i, id) in hits.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write_edge(g, *id, &mut out);
+        if let Some(e) = g.edge(*id) {
+            endpoints.insert(e.from);
+            endpoints.insert(e.to);
+        }
+    }
+    out.push_str("],\"nodes\":[");
+    for (i, id) in endpoints.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write_node(g, *id, &mut out);
+    }
+    out.push_str("],");
+    write_page_tail(next, ids.len(), &mut out);
+    out
+}
+
+fn write_page_tail(next: Option<u64>, total: usize, out: &mut String) {
+    out.push_str("\"next\":");
+    match next {
+        Some(id) => out.push_str(&id.to_string()),
+        None => out.push_str("null"),
+    }
+    out.push_str(&format!(",\"total\":{}}}", total));
+}
+
+/// Parse `?id=..&limit=..` off a request path. Values are percent-decoded,
+/// with `+` as space, so a search for "New York" or "a&b" arrives intact.
 pub fn query_param(path: &str, key: &str) -> Option<String> {
     let qs = path.split_once('?')?.1;
     for pair in qs.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
             if k == key {
-                return Some(v.to_string());
+                return Some(percent_decode(v));
             }
         }
     }
     None
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'+' => out.push(b' '),
+            b'%' if i + 2 < b.len() => {
+                let hex = |c: u8| (c as char).to_digit(16);
+                match (hex(b[i + 1]), hex(b[i + 2])) {
+                    (Some(h), Some(l)) => {
+                        out.push((h * 16 + l) as u8);
+                        i += 3;
+                        continue;
+                    }
+                    _ => out.push(b'%'),
+                }
+            }
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 // -------------------------------------------------------------------- tests
@@ -444,6 +655,7 @@ mod tests {
         assert!(j.contains("\"name\":\"Person\""), "{}", j);
         assert!(j.contains("\"name\":\"KNOWS\""), "{}", j);
         assert!(j.contains("\"count\":2"), "{}", j);
+        assert!(j.contains("\"nodes\":2,\"edges\":1"), "{}", j);
     }
 
     #[test]
@@ -468,6 +680,133 @@ mod tests {
         );
         assert_eq!(query_param("/api/expand", "id"), None);
         assert_eq!(query_param("/api/expand?id=7", "missing"), None);
+    }
+
+    #[test]
+    fn query_params_are_percent_decoded() {
+        assert_eq!(
+            query_param("/api/nodes?q=New+York&label=City", "q").as_deref(),
+            Some("New York")
+        );
+        assert_eq!(
+            query_param("/api/nodes?q=a%26b%3Dc", "q").as_deref(),
+            Some("a&b=c")
+        );
+        // Malformed escapes are kept literally rather than rejected.
+        assert_eq!(
+            query_param("/api/nodes?q=100%", "q").as_deref(),
+            Some("100%")
+        );
+        assert_eq!(query_param("/api/nodes?q=%zz", "q").as_deref(), Some("%zz"));
+    }
+
+    fn explore_fixture() -> Graph {
+        let mut g = Graph::memory();
+        for i in 0..7 {
+            query::execute(
+                &mut g,
+                &format!(
+                    r#"CREATE (:Person {{name:"P{}", city:"{}"}})"#,
+                    i,
+                    if i % 2 == 0 { "London" } else { "Paris" }
+                ),
+            )
+            .unwrap();
+        }
+        query::execute(&mut g, r#"CREATE (:City {name:"London", pop:8900000})"#).unwrap();
+        query::execute(
+            &mut g,
+            r#"MATCH (a:Person {name:"P0"}), (b:Person {name:"P1"}) CREATE (a)-[:KNOWS {since:2019}]->(b)"#,
+        )
+        .unwrap();
+        query::execute(
+            &mut g,
+            r#"MATCH (a:Person {name:"P1"}), (c:City) CREATE (a)-[:LIVES_IN]->(c)"#,
+        )
+        .unwrap();
+        g
+    }
+
+    fn ids_in(json: &str, key: &str) -> Vec<u64> {
+        // Pull `"id":N` out of the entities in one top-level array of the
+        // payload. The array ends where the next top-level key begins.
+        let arr = json.split(&format!("\"{}\":[", key)).nth(1).unwrap();
+        let end = ["],\"nodes\":[", "],\"next\":"]
+            .iter()
+            .filter_map(|k| arr.find(k))
+            .min()
+            .unwrap_or(arr.len());
+        arr[..end]
+            .split("\"id\":")
+            .skip(1)
+            .map(|s| {
+                s.split(|c: char| !c.is_ascii_digit())
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn nodes_page_by_cursor_and_report_the_next_one() {
+        let g = explore_fixture();
+        let p1 = nodes_json(&g, None, None, 0, 3);
+        assert_eq!(ids_in(&p1, "nodes"), vec![1, 2, 3], "{}", p1);
+        assert!(p1.contains("\"next\":4"), "{}", p1);
+        assert!(p1.contains("\"total\":8"), "{}", p1);
+
+        let p2 = nodes_json(&g, None, None, 4, 3);
+        assert_eq!(ids_in(&p2, "nodes"), vec![4, 5, 6]);
+        let p3 = nodes_json(&g, None, None, 7, 3);
+        assert_eq!(ids_in(&p3, "nodes"), vec![7, 8]);
+        assert!(p3.contains("\"next\":null"), "{}", p3);
+    }
+
+    #[test]
+    fn nodes_filter_by_label_and_text() {
+        let g = explore_fixture();
+        let j = nodes_json(&g, Some("City"), None, 0, 10);
+        assert_eq!(ids_in(&j, "nodes"), vec![8]);
+        assert!(j.contains("\"total\":1"));
+
+        // Text is case-insensitive and reaches into property values...
+        let j = nodes_json(&g, None, Some("paris"), 0, 10);
+        assert_eq!(ids_in(&j, "nodes"), vec![2, 4, 6]);
+        // ...labels...
+        let j = nodes_json(&g, None, Some("cit"), 0, 10);
+        assert_eq!(ids_in(&j, "nodes"), vec![8]);
+        // ...numbers, and the id itself.
+        let j = nodes_json(&g, None, Some("8900000"), 0, 10);
+        assert_eq!(ids_in(&j, "nodes"), vec![8]);
+        // Node 3 matches by id; node 4 is "P3" and matches by name.
+        let j = nodes_json(&g, None, Some("3"), 0, 10);
+        assert_eq!(ids_in(&j, "nodes"), vec![3, 4]);
+
+        // Filtered pages still cursor correctly: the cursor is the next match.
+        let j = nodes_json(&g, Some("Person"), Some("london"), 0, 2);
+        assert_eq!(ids_in(&j, "nodes"), vec![1, 3]);
+        assert!(j.contains("\"next\":5"), "{}", j);
+        assert!(j.contains("\"degree\":1"), "degree missing: {}", j);
+    }
+
+    #[test]
+    fn edges_page_with_their_endpoints() {
+        let g = explore_fixture();
+        let j = edges_json(&g, None, None, 0, 10);
+        assert_eq!(ids_in(&j, "edges"), vec![1, 2]);
+        assert_eq!(ids_in(&j, "nodes"), vec![1, 2, 8], "{}", j);
+        assert!(j.contains("\"next\":null"));
+
+        let j = edges_json(&g, Some("LIVES_IN"), None, 0, 10);
+        assert_eq!(ids_in(&j, "edges"), vec![2]);
+        let j = edges_json(&g, None, Some("2019"), 0, 10);
+        assert_eq!(ids_in(&j, "edges"), vec![1]);
+        let j = edges_json(&g, None, Some("knows"), 0, 10);
+        assert_eq!(ids_in(&j, "edges"), vec![1]);
+        let j = edges_json(&g, None, None, 2, 1);
+        assert_eq!(ids_in(&j, "edges"), vec![2]);
     }
 
     #[test]

@@ -76,6 +76,8 @@ isolated graph.
 | `db.graph(q)` | just the `{nodes, edges}` projection |
 | `db.schema()` | labels, relationship types, indexes, with counts |
 | `db.expand(id, limit?)` | neighbours of one node, both directions |
+| `db.nodes({label?, q?, from?, limit?})` | a page of nodes, cursor-paged by id; `q` searches labels, property values and ids |
+| `db.edges({type?, q?, from?, limit?})` | a page of relationships with their endpoints |
 | `db.importJsonl(text)` | bulk load |
 | `db.exportJsonl()` | dump the whole graph |
 | `db.stats()` | node/edge/label/index counts |

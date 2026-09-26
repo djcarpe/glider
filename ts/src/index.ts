@@ -22,8 +22,11 @@
 import {
   GliderError,
   type Cell,
+  type EdgePage,
   type GliderNode,
   type GliderRel,
+  type NodePage,
+  type PageOptions,
   type QueryResult,
   type Schema,
 } from './types.js'
@@ -39,6 +42,8 @@ interface Exports {
   glider_query_json(db: number, q: number): number
   glider_schema_json(db: number): number
   glider_expand_json(db: number, id: bigint, limit: number): number
+  glider_nodes_json(db: number, label: number, q: number, from: bigint, limit: number): number
+  glider_edges_json(db: number, etype: number, q: number, from: bigint, limit: number): number
   glider_import_jsonl(db: number, jsonl: number): number
   glider_export_jsonl(db: number): number
   glider_stats(db: number): number
@@ -194,6 +199,12 @@ export class GliderModule {
     }
   }
 
+  /** As `withCString`, but an absent string is passed as NULL. */
+  /** @internal */
+  withOptCString<T>(s: string | undefined, fn: (ptr: number) => T): T {
+    return s === undefined || s === '' ? fn(0) : this.withCString(s, fn)
+  }
+
   /** @internal */
   get raw(): Exports {
     return this.#e
@@ -255,6 +266,37 @@ export class GliderDb {
     const json = this.mod.take(this.mod.raw.glider_expand_json(db, BigInt(id), limit))
     if (json === null) throw new GliderError(this.mod.lastError() ?? `could not expand node ${id}`)
     return (JSON.parse(json) as { graph: QueryResult['graph'] }).graph
+  }
+
+  /**
+   * A page of nodes, cursor-paged by id. Pass the previous page's `next` as
+   * `from` to continue; `q` matches labels, property values and the id.
+   */
+  nodes(opts: PageOptions = {}): NodePage {
+    const db = this.#alive()
+    const json = this.mod.withOptCString(opts.label, (lp) =>
+      this.mod.withOptCString(opts.q, (qp) =>
+        this.mod.take(
+          this.mod.raw.glider_nodes_json(db, lp, qp, BigInt(opts.from ?? 0), opts.limit ?? 50),
+        ),
+      ),
+    )
+    if (json === null) throw new GliderError(this.mod.lastError() ?? 'nodes failed')
+    return JSON.parse(json) as NodePage
+  }
+
+  /** A page of relationships with their endpoints. Same contract as `nodes`. */
+  edges(opts: PageOptions = {}): EdgePage {
+    const db = this.#alive()
+    const json = this.mod.withOptCString(opts.type, (tp) =>
+      this.mod.withOptCString(opts.q, (qp) =>
+        this.mod.take(
+          this.mod.raw.glider_edges_json(db, tp, qp, BigInt(opts.from ?? 0), opts.limit ?? 50),
+        ),
+      ),
+    )
+    if (json === null) throw new GliderError(this.mod.lastError() ?? 'edges failed')
+    return JSON.parse(json) as EdgePage
   }
 
   /** Bulk load JSON Lines. Returns the number of entities imported. */

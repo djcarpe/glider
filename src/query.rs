@@ -934,7 +934,12 @@ fn const_value(e: &Expr) -> Result<Value> {
             Ok(Value::List(out))
         }
         Expr::Arith('-', a, b) => {
+            // `-5` parses as `0 - 5`; keep it an Int so a negative literal in
+            // CREATE or CALL does not silently become a float.
             let (x, y) = (const_value(a)?, const_value(b)?);
+            if let (Value::Int(x), Value::Int(y)) = (&x, &y) {
+                return Ok(Value::Int(x - y));
+            }
             match (x.as_f64(), y.as_f64()) {
                 (Some(x), Some(y)) => Ok(Value::Float(x - y)),
                 _ => Err(Error::Msg("expected a constant".into())),

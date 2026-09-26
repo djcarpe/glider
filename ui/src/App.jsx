@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import Explorer from './Explorer'
 import Frame from './Frame'
 import { fetchSchema, runQuery, transportKind, transportLabel } from './api'
 import { labelColor } from './entities'
@@ -12,6 +13,7 @@ const EXAMPLES = [
 ]
 
 const HISTORY_KEY = 'glider.history'
+const MODE_KEY = 'glider.mode'
 const MAX_HISTORY = 40
 
 export default function App() {
@@ -21,6 +23,9 @@ export default function App() {
   const [online, setOnline] = useState(null)
   const [history, setHistory] = useState(() => load(HISTORY_KEY, []))
   const [sidebar, setSidebar] = useState(true)
+  // 'console' writes queries; 'explore' browses without them. Both stay
+  // mounted so switching back finds frames and the canvas as they were.
+  const [mode, setMode] = useState(() => (loadStr(MODE_KEY) === 'explore' ? 'explore' : 'console'))
   const taRef = useRef(null)
   const nextId = useRef(1)
   // Position in the history when arrowing up through it; null when typing.
@@ -123,6 +128,22 @@ export default function App() {
           <Logo />
           glider <span className="ver">browser</span>
         </div>
+        <div className="mode" role="tablist">
+          {['console', 'explore'].map((m) => (
+            <button
+              key={m}
+              role="tab"
+              aria-selected={mode === m}
+              className={`tab${mode === m ? ' on' : ''}`}
+              onClick={() => {
+                setMode(m)
+                saveStr(MODE_KEY, m)
+              }}
+            >
+              {m === 'console' ? 'Console' : 'Explore'}
+            </button>
+          ))}
+        </div>
         <div className="spacer" />
         <div className="conn" title={transportKind() === 'wasm' ? 'glider is running in this tab as WebAssembly' : 'talking to a glider server'}>
           <span className={`dot ${online === null ? '' : online ? 'up' : 'down'}`} />
@@ -130,7 +151,7 @@ export default function App() {
         </div>
       </header>
 
-      <div className="body">
+      <div className="body" hidden={mode !== 'console'}>
         <aside className={`sidebar${sidebar ? '' : ' collapsed'}`}>
           <Section title="Node labels">
             {schema?.labels?.length ? (
@@ -241,6 +262,10 @@ export default function App() {
           </div>
         </main>
       </div>
+
+      <div className="body" hidden={mode !== 'explore'}>
+        <Explorer schema={schema} onSchemaChange={refreshSchema} />
+      </div>
     </div>
   )
 }
@@ -282,6 +307,22 @@ function load(key, fallback) {
 function save(key, value) {
   try {
     localStorage.setItem(key, JSON.stringify(value))
+  } catch {
+    /* non-fatal */
+  }
+}
+
+function loadStr(key) {
+  try {
+    return localStorage.getItem(key)
+  } catch {
+    return null
+  }
+}
+
+function saveStr(key, value) {
+  try {
+    localStorage.setItem(key, value)
   } catch {
     /* non-fatal */
   }

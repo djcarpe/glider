@@ -21,3 +21,4 @@ dist-standalone/
 *.swp
 .idea/
 .vscode/
+*.gldb.lock

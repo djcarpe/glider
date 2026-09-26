@@ -210,3 +210,43 @@ describe('errors', () => {
     db.close()
   })
 })
+
+describe('paging', () => {
+  test('nodes page by id cursor and filter by label and text', () => {
+    const db = seeded()
+    const first = db.nodes({ limit: 2 })
+    assert.equal(first.nodes.length, 2)
+    assert.equal(first.total, 3)
+    assert.ok(first.next !== null)
+    const rest = db.nodes({ from: first.next, limit: 2 })
+    assert.equal(rest.nodes.length, 1)
+    assert.equal(rest.next, null)
+
+    assert.deepEqual(db.nodes({ label: 'City' }).nodes.map((n) => n.props.name), ['London'])
+    // Case-insensitive, against any property value.
+    assert.deepEqual(db.nodes({ q: 'ADA' }).nodes.map((n) => n.props.name), ['Ada'])
+    assert.equal(db.nodes({ q: 'nobody' }).nodes.length, 0)
+    // Degree rides along so a list can show connectivity.
+    assert.equal(db.nodes({ q: 'Ada' }).nodes[0].degree, 2)
+    db.close()
+  })
+
+  test('edges page with their endpoints', () => {
+    const db = seeded()
+    const page = db.edges({ type: 'KNOWS' })
+    assert.equal(page.edges.length, 1)
+    assert.equal(page.edges[0].type, 'KNOWS')
+    assert.equal(page.nodes.length, 2)
+    assert.equal(db.edges({ q: 'lives' }).edges.length, 1)
+    assert.equal(db.edges().total, 2)
+    db.close()
+  })
+
+  test('schema carries true node and edge totals', () => {
+    const db = seeded()
+    const s = db.schema()
+    assert.equal(s.nodes, 3)
+    assert.equal(s.edges, 2)
+    db.close()
+  })
+})

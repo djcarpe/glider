@@ -35,3 +35,17 @@ export function fetchSchema() {
 export function expandNode(id, limit = 50) {
   return active.expand(id, limit)
 }
+
+/**
+ * A page of nodes for the explorer: {nodes, next, total}. Cursor-paged: pass
+ * the previous page's `next` as `from` to continue. `q` is free text matched
+ * server-side against labels, property values and the id.
+ */
+export function fetchNodes({ label, q, from = 0, limit = 50 } = {}) {
+  return active.nodes({ label, q, from, limit })
+}
+
+/** A page of relationships with their endpoints: {edges, nodes, next, total}. */
+export function fetchEdges({ type, q, from = 0, limit = 50 } = {}) {
+  return active.edges({ type, q, from, limit })
+}
