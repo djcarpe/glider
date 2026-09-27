@@ -1,0 +1,551 @@
+<title>Glider vs SQLite</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root {
+  --bg: #f6f7f8;
+  --surface: #fdfdfc;
+  --sunken: #eef0f1;
+  --line: #dadee1;
+  --grid: #e6e9eb;
+  --ink: #111417;
+  --ink-2: #4c5359;
+  --ink-3: #737a80;
+  --glider: #2a78d6;
+  --sqlite: #eb6834;
+  --good: #1a7f37;
+  --bad: #c62828;
+  --focus: #2a78d6;
+  --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #121416;
+    --surface: #1a1c1e;
+    --sunken: #222528;
+    --line: #33383c;
+    --grid: #2a2e32;
+    --ink: #f3f4f5;
+    --ink-2: #b9bfc4;
+    --ink-3: #8b9298;
+    --glider: #3987e5;
+    --sqlite: #d95926;
+    --good: #4cc36b;
+    --bad: #ef6b6b;
+    --focus: #6da7ec;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #121416;
+  --surface: #1a1c1e;
+  --sunken: #222528;
+  --line: #33383c;
+  --grid: #2a2e32;
+  --ink: #f3f4f5;
+  --ink-2: #b9bfc4;
+  --ink-3: #8b9298;
+  --glider: #3987e5;
+  --sqlite: #d95926;
+  --good: #4cc36b;
+  --bad: #ef6b6b;
+  --focus: #6da7ec;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.5 var(--sans);
+  padding-inline: 16px;
+  padding-block: 28px 64px;
+}
+.wrap { max-width: 1120px; margin: 0 auto; display: grid; gap: 28px; }
+h1, h2, h3 { text-wrap: balance; margin: 0; font-weight: 600; }
+h1 { font-size: 30px; letter-spacing: -0.01em; }
+h2 { font-size: 19px; }
+h3 { font-size: 15px; }
+p { margin: 0; max-width: 72ch; color: var(--ink-2); }
+code, .mono { font-family: var(--mono); font-size: 0.92em; }
+.num { font-variant-numeric: tabular-nums; }
+.eyebrow { font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-3); font-weight: 500; }
+
+header { display: grid; gap: 10px; }
+.legend { display: flex; gap: 18px; flex-wrap: wrap; font-size: 14px; color: var(--ink-2); align-items: center; }
+.key { display: inline-flex; align-items: center; gap: 7px; }
+.dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex: none; }
+.dot.g { background: var(--glider); }
+.dot.s { background: var(--sqlite); }
+
+details.method { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; }
+details.method summary { cursor: pointer; font-weight: 500; }
+details.method ul { margin: 10px 0 0; padding-left: 20px; color: var(--ink-2); display: grid; gap: 6px; max-width: 90ch; }
+
+.tabs { display: flex; gap: 4px; flex-wrap: wrap; border-bottom: 1px solid var(--line); }
+.tab {
+  appearance: none; border: 0; background: none; font: inherit; color: var(--ink-2);
+  padding: 10px 14px; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px;
+  font-weight: 500;
+}
+.tab:hover { color: var(--ink); }
+.tab[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--ink); }
+.tab small { color: var(--ink-3); font-weight: 400; margin-left: 4px; }
+button:focus-visible, summary:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 4px; }
+
+.panel { display: grid; gap: 24px; }
+.facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 12px; }
+.fact { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; display: grid; gap: 6px; align-content: start; }
+.fact .rows { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; font-size: 14px; }
+.fact .rows span:nth-child(odd) { color: var(--ink-2); display: inline-flex; align-items: center; gap: 6px; }
+.fact .rows span:nth-child(even) { text-align: right; font-variant-numeric: tabular-nums; }
+.fact .big { font-size: 24px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.fact .sub { font-size: 13px; color: var(--ink-3); }
+
+.toolbar { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; background: var(--surface); }
+.seg button { appearance: none; border: 0; background: none; font: inherit; font-size: 13px; padding: 5px 12px; color: var(--ink-2); cursor: pointer; }
+.seg button + button { border-left: 1px solid var(--line); }
+.seg button[aria-pressed="true"] { background: var(--ink); color: var(--bg); }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { appearance: none; font: inherit; font-size: 13px; border: 1px solid var(--line); background: var(--surface); color: var(--ink-2); border-radius: 999px; padding: 3px 10px; cursor: pointer; }
+.chip[aria-pressed="true"] { border-color: var(--ink); color: var(--ink); background: var(--sunken); }
+
+.chartbox { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 14px 8px 8px; overflow-x: auto; position: relative; }
+.chartbox svg { display: block; min-width: 680px; width: 100%; }
+.chartbox text { fill: var(--ink-2); font-family: var(--sans); font-size: 12px; }
+.chartbox .axis text { fill: var(--ink-3); font-size: 11px; }
+.chartbox .gridline { stroke: var(--grid); stroke-width: 1; }
+.chartbox .conn { stroke: var(--ink-3); stroke-width: 2; opacity: 0.45; }
+.chartbox .row-hit { fill: transparent; }
+.chartbox .row-hit:hover, .chartbox .row-hit.on { fill: var(--sunken); }
+.tip {
+  position: absolute; pointer-events: none; background: var(--ink); color: var(--bg); font-size: 12.5px; line-height: 1.45;
+  padding: 8px 10px; border-radius: 6px; max-width: 320px; box-shadow: 0 4px 16px rgba(0,0,0,.18); z-index: 3;
+}
+.tip b { font-weight: 600; }
+.tip .dot { width: 8px; height: 8px; margin-right: 5px; box-shadow: 0 0 0 1.5px var(--bg); }
+
+.tablebox { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; min-width: 760px; font-size: 14px; }
+th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-size: 12px; font-weight: 500; color: var(--ink-3); letter-spacing: 0.04em; text-transform: uppercase; background: var(--surface); position: sticky; top: 0; }
+td.r, th.r { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+tr.q { cursor: pointer; }
+tr.q:hover td { background: var(--sunken); }
+tr.q td:first-child { display: flex; gap: 8px; align-items: baseline; }
+.caret { color: var(--ink-3); width: 10px; display: inline-block; transition: transform .15s; flex: none; }
+tr.q[aria-expanded="true"] .caret { transform: rotate(90deg); }
+.shape { font-size: 12px; color: var(--ink-3); white-space: nowrap; }
+.winner { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.muted { color: var(--ink-3); }
+.ok { color: var(--good); font-weight: 500; white-space: nowrap; }
+.no { color: var(--bad); font-weight: 500; white-space: nowrap; }
+tr.detail td { background: var(--bg); padding: 16px; }
+.detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+.pane { display: grid; gap: 8px; align-content: start; min-width: 0; }
+.pane h4 { margin: 0; font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 7px; }
+pre { margin: 0; background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; font: 12.5px/1.55 var(--mono); white-space: pre-wrap; word-break: break-word; color: var(--ink); }
+.params { font-size: 12.5px; color: var(--ink-3); }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; font-size: 13px; }
+.kv span:nth-child(odd) { color: var(--ink-3); }
+.kv span:nth-child(even) { font-variant-numeric: tabular-nums; }
+.err { color: var(--bad); font-size: 13px; }
+
+.scale-table td.cell { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.bar-s { display: inline-block; height: 8px; border-radius: 2px; vertical-align: middle; margin-left: 6px; }
+.note { font-size: 13px; color: var(--ink-3); }
+.empty { padding: 32px; text-align: center; color: var(--ink-3); }
+@media (max-width: 520px) { h1 { font-size: 24px; } }
+@media (prefers-reduced-motion: reduce) { .caret { transition: none; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <span class="eyebrow">Graph workloads · same graph in both engines</span>
+    <h1>Glider vs SQLite</h1>
+    <p>Every query is written once in glider's Cypher and once in hand-written SQL against a normalized schema with foreign keys and indexes, run on the same graph, and checked row for row. Pick a dataset size below, then open a row to see both queries, their answers and SQLite's plan.</p>
+    <div class="legend">
+      <span class="key"><span class="dot g"></span>glider (paged engine)</span>
+      <span class="key"><span class="dot s"></span>SQLite <span class="mono" id="sqlite-ver"></span></span>
+    </div>
+  </header>
+
+  <details class="method">
+    <summary>How this was measured</summary>
+    <ul>
+      <li><b>Data.</b> <code>scale-gen</code> writes a deterministic graph (people, companies, products, orders, documents, a category tree, an event chain) with 16 relationship types: power-law hubs, communities, bipartite, multi-edges, dense cliques, trees, a DAG, a long chain and self-loops. The size names the generator's target; each engine's on-disk size is shown per tab.</li>
+      <li><b>SQLite schema.</b> One table per label, one table per relationship type with <code>FOREIGN KEY</code>s to its end tables and <code>(src, dst)</code> + <code>(dst, src)</code> indexes, plus the same property indexes glider keeps: Person email / age / country, Order ref, Product sku, Event seq. Loaded from <code>glider export</code>, then indexed, <code>PRAGMA foreign_key_check</code>ed and <code>ANALYZE</code>d. MENTIONS points at three tables, so it carries a kind column instead of a foreign key.</li>
+      <li><b>Timing.</b> Both engines are timed inside the process running the query: glider by its shell's <code>.timer</code>, SQLite around <code>execute</code> + <code>fetchall</code> in Python's sqlite3. <b>Cold</b> is the first run in a fresh process after evicting the files from the OS page cache; <b>warm</b> is the median of the next five. Both use a 1 GiB page cache.</li>
+      <li><b>Answers.</b> Rows are compared after normalizing numbers; unordered results are compared as sets. BFS compares (id, depth) sets; shortest path compares hop counts.</li>
+      <li><b>Machine.</b> 8 cores, 31 GiB RAM, NVMe, Linux. Each process ran under a 12 GiB address-space cap.</li>
+    </ul>
+  </details>
+
+  <nav class="tabs" role="tablist" id="tabs"></nav>
+  <main id="panel" class="panel" role="tabpanel"></main>
+</div>
+
+<script>
+const DATA = /*__DATA__*/null;
+
+const $ = (s, el = document) => el.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const slug = s => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+const SIZE_LABEL = s => s.replace("MiB", " MiB").replace("GiB", " GiB");
+
+function fmtMs(ms) {
+  if (ms == null) return "—";
+  if (ms < 0.001) return (ms * 1000).toFixed(2) + " µs";
+  if (ms < 1) return (ms * 1000).toFixed(ms < 0.1 ? 1 : 0) + " µs";
+  if (ms < 100) return ms.toFixed(ms < 10 ? 2 : 1) + " ms";
+  if (ms < 1000) return ms.toFixed(0) + " ms";
+  if (ms < 60000) return (ms / 1000).toFixed(ms < 10000 ? 2 : 1) + " s";
+  return (ms / 60000).toFixed(1) + " min";
+}
+function fmtBytes(b) {
+  if (!b) return "—";
+  const u = ["B", "KB", "MB", "GB", "TB"]; let i = 0;
+  while (b >= 1000 && i < u.length - 1) { b /= 1000; i++; }
+  return b.toFixed(b < 10 ? 2 : 1) + " " + u[i];
+}
+const fmtInt = n => n == null ? "—" : n.toLocaleString("en-US");
+function fmtSecs(s) { return s == null ? "—" : s < 60 ? s.toFixed(1) + " s" : (s / 60).toFixed(1) + " min"; }
+function fmtMB(mb) { return mb == null ? "—" : mb >= 1000 ? (mb / 1000).toFixed(2) + " GB" : mb.toFixed(0) + " MB"; }
+
+let state = { tab: null, mode: "warm", shape: "all", open: new Set() };
+try { const m = localStorage.getItem("gvs-mode"); if (m) state.mode = m; } catch (e) {}
+
+function val(q, eng, mode) {
+  const r = q[eng];
+  const v = r[mode + "_ms"];
+  if (v == null && mode === "warm") return r.cold_ms;  // slow queries ran once
+  return v;
+}
+function status(q, eng) {
+  const e = q[eng].error;
+  if (!e) return null;
+  return /timeout/i.test(e) ? "timeout" : "error";
+}
+function ratio(q, mode) {
+  const g = val(q, "glider", mode), s = val(q, "sqlite", mode);
+  if (g == null || s == null || g <= 0 || s <= 0) return null;
+  return s / g;  // > 1: glider faster
+}
+function winnerHTML(r) {
+  if (r == null) return '<span class="muted">—</span>';
+  if (r >= 1.1) return `<span class="winner"><span class="dot g"></span>glider ${fmtX(r)} faster</span>`;
+  if (r <= 1 / 1.1) return `<span class="winner"><span class="dot s"></span>SQLite ${fmtX(1 / r)} faster</span>`;
+  return '<span class="winner muted">about even</span>';
+}
+function fmtX(x) { return x >= 100 ? Math.round(x) + "×" : x >= 10 ? x.toFixed(0) + "×" : x.toFixed(1) + "×"; }
+
+// ------------------------------------------------------------------ tabs
+function buildTabs() {
+  const nav = $("#tabs");
+  const tabs = DATA.sizes.map(s => ({ id: slug(s), label: SIZE_LABEL(s), size: s }));
+  if (DATA.sizes.length > 1) tabs.push({ id: "scaling", label: "Across sizes" });
+  nav.innerHTML = tabs.map(t => {
+    const b = t.size && DATA.builds[t.size];
+    const n = b && b.sqlite ? `<small>${(b.sqlite.nodes / 1e6).toFixed(1)}M nodes</small>` : "";
+    return `<button class="tab" role="tab" id="tab-${t.id}" aria-selected="false" data-id="${t.id}">${esc(t.label)}${n}</button>`;
+  }).join("");
+  nav.addEventListener("click", e => { const b = e.target.closest(".tab"); if (b) select(b.dataset.id, true); });
+  nav.addEventListener("keydown", e => {
+    if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
+    const all = [...nav.querySelectorAll(".tab")];
+    const i = all.findIndex(b => b.dataset.id === state.tab);
+    const next = all[(i + (e.key === "ArrowRight" ? 1 : all.length - 1)) % all.length];
+    select(next.dataset.id, true); next.focus();
+  });
+  const hash = location.hash.slice(1);
+  select(tabs.some(t => t.id === hash) ? hash : tabs[0].id, false);
+}
+function select(id, push) {
+  state.tab = id; state.open.clear(); state.shape = "all";
+  document.querySelectorAll(".tab").forEach(b => { b.setAttribute("aria-selected", b.dataset.id === id); b.tabIndex = b.dataset.id === id ? 0 : -1; });
+  if (push) { try { history.replaceState(null, "", "#" + id); } catch (e) {} }
+  render();
+}
+function render() {
+  if (state.tab === "scaling") return renderScaling();
+  const size = DATA.sizes.find(s => slug(s) === state.tab);
+  renderSize(size);
+}
+
+// ------------------------------------------------------------------ size tab
+function renderSize(size) {
+  const qs = DATA.queries[size];
+  const b = DATA.builds[size] || {}, g = b.glider || {}, s = b.sqlite || {}, m = DATA.memory[size] || {};
+  const matched = qs.filter(q => q.match === true).length;
+  const mism = qs.filter(q => q.match === false);
+  const compared = qs.filter(q => q.match != null).length;
+  let gw = 0, sw = 0, even = 0;
+  qs.forEach(q => { const r = ratio(q, state.mode); if (r == null) return; if (r >= 1.1) gw++; else if (r <= 1 / 1.1) sw++; else even++; });
+  const sum = (eng) => qs.reduce((a, q) => a + (val(q, eng, state.mode) || 0), 0);
+  const shapes = ["all", ...new Set(qs.map(q => q.shape))];
+  const list = qs.filter(q => state.shape === "all" || q.shape === state.shape);
+
+  $("#panel").innerHTML = `
+    <section class="facts">
+      <div class="fact">
+        <span class="eyebrow">Graph</span>
+        <div class="rows">
+          <span>Nodes</span><span>${fmtInt(s.nodes ?? g.gen?.nodes)}</span>
+          <span>Relationships</span><span>${fmtInt(s.edges ?? g.gen?.edges)}</span>
+          <span>Queries</span><span>${qs.length}</span>
+        </div>
+      </div>
+      <div class="fact">
+        <span class="eyebrow">On disk</span>
+        <div class="rows">
+          <span><span class="dot g"></span>glider</span><span>${fmtBytes(g.file_bytes)}</span>
+          <span><span class="dot s"></span>SQLite</span><span>${fmtBytes(s.file_bytes)}</span>
+        </div>
+        <span class="sub">SQLite includes ${EDGE_INDEXES} relationship indexes and 6 property indexes</span>
+      </div>
+      <div class="fact">
+        <span class="eyebrow">Build</span>
+        <div class="rows">
+          <span><span class="dot g"></span>glider bulk load</span><span>${fmtSecs(g.wall_s)}</span>
+          <span><span class="dot s"></span>SQLite load + index</span><span>${fmtSecs(s.wall_s)}</span>
+          <span class="muted">of which indexes</span><span class="muted">${fmtSecs(s.index_s)}</span>
+          <span class="muted">FK check</span><span class="muted">${fmtSecs(s.fk_check_s)} · ${s.fk_violations === 0 ? "0 violations" : (s.fk_violations ?? "—") + " violations"}</span>
+        </div>
+      </div>
+      <div class="fact">
+        <span class="eyebrow">Peak memory while querying</span>
+        <div class="rows">
+          <span><span class="dot g"></span>glider</span><span>${fmtMB(m.glider_peak_rss_mb)}</span>
+          <span><span class="dot s"></span>SQLite (Python process)</span><span>${fmtMB(m.sqlite_peak_rss_mb)}</span>
+        </div>
+      </div>
+      <div class="fact">
+        <span class="eyebrow">Answers</span>
+        <span class="big ${mism.length ? "no" : "ok"}">${matched} / ${compared} match</span>
+        <span class="sub">${mism.length ? "Mismatch: " + esc(mism.map(q => q.name).join(", ")) : "Every compared query returned the same rows"}${qs.length > compared ? ` · ${qs.length - compared} not compared (error or timeout)` : ""}</span>
+      </div>
+      <div class="fact">
+        <span class="eyebrow">Faster (${state.mode})</span>
+        <div class="rows">
+          <span><span class="dot g"></span>glider</span><span>${gw} queries</span>
+          <span><span class="dot s"></span>SQLite</span><span>${sw} queries</span>
+          <span class="muted">within 10%</span><span class="muted">${even}</span>
+        </div>
+        <span class="sub">Sum of all ${state.mode} times: glider ${fmtMs(sum("glider"))}, SQLite ${fmtMs(sum("sqlite"))}</span>
+      </div>
+    </section>
+
+    <section class="toolbar" aria-label="View options">
+      <div class="seg" role="group" aria-label="Cache state">
+        <button data-mode="warm" aria-pressed="${state.mode === "warm"}">Warm</button>
+        <button data-mode="cold" aria-pressed="${state.mode === "cold"}">Cold</button>
+      </div>
+      <div class="chips" role="group" aria-label="Query shape">
+        ${shapes.map(sh => `<button class="chip" data-shape="${esc(sh)}" aria-pressed="${state.shape === sh}">${sh === "all" ? "All shapes" : esc(sh)}</button>`).join("")}
+      </div>
+    </section>
+
+    <section>
+      <div class="chartbox" id="chart"></div>
+      <p class="note" style="margin-top:8px">${state.mode === "warm" ? "Median of five warm runs" : "First run after evicting both files from the OS page cache"}. Log scale; each row joins the two engines' times. Queries that took longer than 20 s cold ran once, so their warm value is the cold one.</p>
+    </section>
+
+    <section class="tablebox">
+      <table>
+        <thead><tr><th>Query</th><th>Shape</th><th class="r">glider ${state.mode}</th><th class="r">SQLite ${state.mode}</th><th>Faster</th><th>Answer</th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </section>`;
+
+  $("#panel .seg").addEventListener("click", e => {
+    const b = e.target.closest("button"); if (!b) return;
+    state.mode = b.dataset.mode; try { localStorage.setItem("gvs-mode", state.mode); } catch (err) {}
+    render();
+  });
+  $("#panel .chips").addEventListener("click", e => {
+    const b = e.target.closest(".chip"); if (!b) return;
+    state.shape = b.dataset.shape; render();
+  });
+  drawChart(list, size);
+  drawRows(list);
+}
+
+const EDGE_INDEXES = 32;
+
+function cell(q, eng) {
+  const st = status(q, eng);
+  if (st) return `<span class="no">${st}</span>`;
+  return fmtMs(val(q, eng, state.mode));
+}
+function answerCell(q) {
+  if (q.match === true) return '<span class="ok">✓ same</span>';
+  if (q.match === false) return '<span class="no">✕ differs</span>';
+  return '<span class="muted">not compared</span>';
+}
+
+function drawRows(list) {
+  const tb = $("#rows");
+  tb.innerHTML = list.map((q, i) => {
+    const open = state.open.has(q.name);
+    return `<tr class="q" tabindex="0" data-i="${i}" aria-expanded="${open}">
+        <td><span class="caret">▸</span><span>${esc(q.name)}</span></td>
+        <td class="shape">${esc(q.shape)}</td>
+        <td class="r">${cell(q, "glider")}</td>
+        <td class="r">${cell(q, "sqlite")}</td>
+        <td>${winnerHTML(ratio(q, state.mode))}</td>
+        <td>${answerCell(q)}</td>
+      </tr>${open ? detailRow(q) : ""}`;
+  }).join("") || `<tr><td colspan="6" class="empty">No queries of this shape.</td></tr>`;
+  const toggle = tr => {
+    const q = list[+tr.dataset.i];
+    state.open.has(q.name) ? state.open.delete(q.name) : state.open.add(q.name);
+    drawRows(list);
+    const again = tb.querySelector(`tr.q[data-i="${tr.dataset.i}"]`); if (again) again.focus();
+  };
+  tb.onclick = e => { const tr = e.target.closest("tr.q"); if (tr && !window.getSelection().toString()) toggle(tr); };
+  tb.onkeydown = e => { const tr = e.target.closest("tr.q"); if (tr && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); toggle(tr); } };
+}
+
+function rowsTable(r) {
+  if (r.error) return `<div class="err">${esc(r.error)}</div>`;
+  if (!r.rows || !r.rows.length) return '<span class="muted">no rows</span>';
+  const fmt = v => {
+    if (v === null) return "null";
+    if (typeof v === "number" && !Number.isInteger(v)) return String(+v.toPrecision(8));
+    const t = typeof v === "object" ? JSON.stringify(v) : String(v);
+    return t.length > 60 ? t.slice(0, 57) + "…" : t;
+  };
+  const shown = r.rows.map(row => row.map(fmt).join("  |  ")).join("\n");
+  const more = r.row_count > r.rows.length ? `\n… ${fmtInt(r.row_count - r.rows.length)} more rows (${fmtInt(r.row_count)} total)` : "";
+  return `<pre>${esc(shown + more)}</pre>`;
+}
+function timings(r) {
+  return `<div class="kv">
+    <span>cold</span><span>${fmtMs(r.cold_ms)}</span>
+    <span>warm (median)</span><span>${r.warm_ms == null ? (r.runs === 1 ? "ran once" : "—") : fmtMs(r.warm_ms)}</span>
+    <span>rows</span><span>${fmtInt(r.row_count)}</span>
+  </div>`;
+}
+function detailRow(q) {
+  const params = q.params && q.params.length ? `<div class="params">parameters: <code>${esc(JSON.stringify(q.params))}</code></div>` : "";
+  const plan = q.sqlite.plan && q.sqlite.plan.length ? `<pre>${esc(q.sqlite.plan.join("\n"))}</pre>` : '<span class="muted">no plan recorded</span>';
+  return `<tr class="detail"><td colspan="6">
+    <div class="detail-grid">
+      <div class="pane"><h4><span class="dot g"></span>glider · Cypher</h4><pre>${esc(q.cypher)}</pre>${timings(q.glider)}<h4>Result</h4>${rowsTable(q.glider)}</div>
+      <div class="pane"><h4><span class="dot s"></span>SQLite · SQL</h4><pre>${esc(q.sql)}</pre>${params}${timings(q.sqlite)}<h4>Result</h4>${rowsTable(q.sqlite)}<h4>Query plan</h4>${plan}</div>
+    </div></td></tr>`;
+}
+
+// ------------------------------------------------------------------ chart
+function drawChart(list, size) {
+  const box = $("#chart");
+  const W = Math.max(680, box.clientWidth - 16), rowH = 26, top = 26, labelW = Math.min(300, W * 0.36), right = 70;
+  const H = top + list.length * rowH + 8;
+  const vals = list.flatMap(q => [val(q, "glider", state.mode), val(q, "sqlite", state.mode)]).filter(v => v > 0);
+  if (!vals.length) { box.innerHTML = '<div class="empty">No timings for this selection.</div>'; return; }
+  const lo = Math.floor(Math.log10(Math.min(...vals))), hi = Math.ceil(Math.log10(Math.max(...vals)));
+  const x0 = labelW + 12, x1 = W - right;
+  const x = v => x0 + (Math.log10(v) - lo) / Math.max(1, hi - lo) * (x1 - x0);
+  let svg = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" aria-label="${state.mode} query times, glider vs SQLite, log scale">`;
+  svg += '<g class="axis">';
+  for (let d = lo; d <= hi; d++) {
+    const xv = x(10 ** d);
+    svg += `<line class="gridline" x1="${xv}" x2="${xv}" y1="${top - 6}" y2="${H - 4}"/>`;
+    svg += `<text x="${xv}" y="${top - 12}" text-anchor="middle">${d >= 3 ? (10 ** (d - 3)).toLocaleString("en-US") + " s" : fmtMs(10 ** d)}</text>`;
+  }
+  svg += "</g>";
+  list.forEach((q, i) => {
+    const y = top + i * rowH + rowH / 2;
+    const g = val(q, "glider", state.mode), s = val(q, "sqlite", state.mode);
+    const name = q.name.length > 44 ? q.name.slice(0, 42) + "…" : q.name;
+    svg += `<rect class="row-hit" data-i="${i}" x="0" y="${y - rowH / 2}" width="${W}" height="${rowH}"/>`;
+    svg += `<text x="${labelW}" y="${y + 4}" text-anchor="end" pointer-events="none">${esc(name)}</text>`;
+    if (g > 0 && s > 0) svg += `<line class="conn" x1="${x(g)}" x2="${x(s)}" y1="${y}" y2="${y}" pointer-events="none"/>`;
+    // SQLite first so glider's ring sits on top where they overlap
+    [["sqlite", s], ["glider", g]].forEach(([eng, v]) => {
+      if (v > 0) svg += `<circle cx="${x(v)}" cy="${y}" r="5.5" fill="var(--${eng})" stroke="var(--surface)" stroke-width="2" pointer-events="none"/>`;
+      else if (status(q, eng)) svg += `<text x="${x1 + 6}" y="${y + 4}" fill="var(--bad)" pointer-events="none">${eng} ${status(q, eng)}</text>`;
+    });
+    const r = ratio(q, state.mode);
+    if (r != null) {
+      const hiX = Math.max(x(g), x(s));
+      svg += `<text x="${Math.min(hiX + 10, W - 4)}" y="${y + 4}" text-anchor="${hiX + 10 > W - 50 ? "end" : "start"}" pointer-events="none" style="fill:var(--ink-3)">${r >= 1 ? fmtX(r) : fmtX(1 / r)}</text>`;
+    }
+  });
+  svg += "</svg>";
+  box.innerHTML = svg + '<div class="tip" hidden></div>';
+  const tip = $(".tip", box);
+  box.querySelectorAll(".row-hit").forEach(rect => {
+    rect.addEventListener("mousemove", e => {
+      const q = list[+rect.dataset.i];
+      box.querySelectorAll(".row-hit.on").forEach(r => r.classList.remove("on")); rect.classList.add("on");
+      tip.innerHTML = `<b>${esc(q.name)}</b><br><span class="dot g"></span>glider ${cell(q, "glider")}<br><span class="dot s"></span>SQLite ${cell(q, "sqlite")}<br>${winnerHTML(ratio(q, state.mode)).replace(/<span class="dot [gs]"><\/span>/, "")}`;
+      tip.hidden = false;
+      const bb = box.getBoundingClientRect();
+      let left = e.clientX - bb.left + box.scrollLeft + 14, topPx = e.clientY - bb.top + 14;
+      if (left + 330 > box.scrollLeft + bb.width) left -= 350;
+      tip.style.left = Math.max(4, left) + "px"; tip.style.top = topPx + "px";
+    });
+    rect.addEventListener("mouseleave", () => { tip.hidden = true; rect.classList.remove("on"); });
+    rect.addEventListener("click", () => {
+      const q = list[+rect.dataset.i]; state.open.add(q.name); drawRows(list);
+      const tr = document.querySelector(`#rows tr.q[data-i="${rect.dataset.i}"]`); if (tr) { tr.scrollIntoView({ block: "center" }); tr.focus({ preventScroll: true }); }
+    });
+  });
+}
+
+// ------------------------------------------------------------------ scaling tab
+function renderScaling() {
+  const sizes = DATA.sizes;
+  const names = [...new Set(sizes.flatMap(s => DATA.queries[s].map(q => q.name)))];
+  const bySize = Object.fromEntries(sizes.map(s => [s, Object.fromEntries(DATA.queries[s].map(q => [q.name, q]))]));
+  const head = sizes.map(s => `<th class="r" colspan="2">${SIZE_LABEL(s)}</th>`).join("");
+  const sub = sizes.map(() => `<th class="r"><span class="dot g"></span></th><th class="r"><span class="dot s"></span></th>`).join("");
+  const rows = names.map(n => `<tr><td>${esc(n)}</td>${sizes.map(s => {
+    const q = bySize[s][n];
+    if (!q) return '<td class="cell muted">—</td><td class="cell muted">—</td>';
+    const r = ratio(q, state.mode);
+    const gb = r != null && r >= 1.1 ? ' style="font-weight:600"' : "", sb = r != null && r <= 1 / 1.1 ? ' style="font-weight:600"' : "";
+    return `<td class="cell"${gb}>${cell(q, "glider")}</td><td class="cell"${sb}>${cell(q, "sqlite")}</td>`;
+  }).join("")}</tr>`).join("");
+  const build = e => sizes.map(s => `<td class="cell" colspan="2">${fmtSecs(DATA.builds[s]?.[e]?.wall_s)} · ${fmtBytes(DATA.builds[s]?.[e]?.file_bytes)}</td>`).join("");
+  const wins = sizes.map(s => {
+    let g = 0, q = 0; DATA.queries[s].forEach(x => { const r = ratio(x, state.mode); if (r == null) return; q++; if (r >= 1.1) g++; });
+    return `<td class="cell" colspan="2">${g} of ${q}</td>`;
+  }).join("");
+  $("#panel").innerHTML = `
+    <section class="toolbar">
+      <div class="seg" role="group" aria-label="Cache state">
+        <button data-mode="warm" aria-pressed="${state.mode === "warm"}">Warm</button>
+        <button data-mode="cold" aria-pressed="${state.mode === "cold"}">Cold</button>
+      </div>
+      <p class="note">${state.mode === "warm" ? "Warm medians" : "Cold first runs"} for every query at every size. The faster engine's time is bold.</p>
+    </section>
+    <section class="tablebox scale-table">
+      <table>
+        <thead><tr><th rowspan="2">Query</th>${head}</tr><tr>${sub}</tr></thead>
+        <tbody>
+          <tr><td><span class="dot g"></span> glider build · size</td>${build("glider")}</tr>
+          <tr><td><span class="dot s"></span> SQLite build · size</td>${build("sqlite")}</tr>
+          <tr><td>glider faster (≥10%)</td>${wins}</tr>
+          ${rows}
+        </tbody>
+      </table>
+    </section>`;
+  $("#panel .seg").addEventListener("click", e => {
+    const b = e.target.closest("button"); if (!b) return;
+    state.mode = b.dataset.mode; try { localStorage.setItem("gvs-mode", state.mode); } catch (err) {}
+    render();
+  });
+}
+
+if (!DATA || !DATA.sizes.length) {
+  $("#panel").innerHTML = '<div class="empty">No results yet. Run bench/sqlite_compare.py.</div>';
+} else {
+  $("#sqlite-ver").textContent = DATA.sqlite_version || "";
+  buildTabs();
+  let rw; window.addEventListener("resize", () => { clearTimeout(rw); rw = setTimeout(() => { if (state.tab !== "scaling") render(); }, 150); });
+}
+</script>
