@@ -1,7 +1,7 @@
 //! Writes a large, realistic glider database straight to a `.gldb` file, for
 //! stress testing. Sized by bytes, not by node count:
 //!
-//!   stress-gen --size 1GiB --out bench/data/stress-1g.gldb
+//!   stress-gen --size 1GiB --out ../glider-bench-data/stress-1g.gldb
 //!
 //! Unlike `ldbc-gen`, which emits JSONL for `glider import`, this streams
 //! records through `glider::store::LogWriter` and never builds the graph, so

@@ -25,6 +25,8 @@ glider social.gldb -f schema.gql       # run a script
 glider social.gldb serve               # HTTP on 127.0.0.1:7878, plus a browser console
 glider social.gldb browser             # same, and open the console in your browser
 glider :memory:                        # throwaway graph, nothing hits disk
+glider :memory: --max-memory 4G        # ... that may use at most 4 GiB
+glider big.gldb --cache-size 256M      # a file of any size, in about 256 MiB of RAM
 ```
 
 ```
@@ -51,43 +53,52 @@ small vectors rather than a pile of `String`s.
 
 ## Architecture
 
-Three layers, each independently usable:
+The SQLite model: **one engine, one page format, two places for the pages.**
+
+| | `:memory:` | a file on disk |
+|---|---|---|
+| where pages live | in RAM | the database file, plus 64 GiB segment files in `<db>-data/` |
+| how big the graph can get | `--max-memory` (default: physical RAM) | the disk. Nothing about capacity depends on RAM |
+| what RAM holds | the graph | a page cache (`--cache-size`, default 1 GiB) and bounded working memory |
+| when it is full | `Error::Full` — the transaction rolls back, the graph stays usable | the same, for a full disk |
+| durability | none | write-ahead log + checkpoints |
 
 | module | what it does |
 |---|---|
-| `store` | one file: header, snapshot image, then an append-only log of CRC32 records with transactions delimited by a commit marker; atomic compaction |
-| `image` | the snapshot image: current state as flat, checksummed columns that load in bulk |
-| `graph` | image + in-memory delta, interning, label and property indexes, CSR projection |
-| `algo` | algorithms over the CSR view — all iterative, no recursion |
-| `query` | lexer, parser, pattern matcher, expression evaluator |
-| `server` | ~150 lines of `std::net` HTTP |
-| `api` | typed JSON for the console and the wasm bindings |
+| `storage::pager` | fixed-size pages (16 KiB default), copy-on-write by transaction epoch, CLOCK cache, free list, alternating superblocks |
+| `storage::btree` | copy-on-write B+trees over byte keys, overflow chains, a bottom-up bulk builder |
+| `storage::log`, `storage::db` | the logical write-ahead log, checkpoints, recovery, locking |
+| `storage::extsort`, `ooc` | external merge sort; per-node arrays, queues and stacks that spill to disk |
+| `graph` | nodes, edges, adjacency, label, type and property-index trees; one mutation path shared by live writes and recovery |
+| `algo` | algorithms, written once over an `Adjacency` view: an in-memory CSR or the pages themselves |
+| `query` | lexer, parser, streaming pattern matcher, expression evaluator |
+| `server`, `api` | ~200 lines of `std::net` HTTP; typed JSON for the console and wasm |
+| `replica`, `wal` | replication: base snapshots plus the shipped log |
 
-The file is a **snapshot image followed by a log**:
+The graph is seven B+trees: nodes, edges, adjacency (`(node, direction, edge)`,
+so a node's neighbours are one range scan), label and type membership, property
+indexes (keys encoded so byte order equals value order), and a catalog. A point
+lookup reads a handful of pages — about 1.4 disk reads cold at 100 GB — and
+opening any database takes milliseconds: it reads a superblock, not the data.
 
-```
-[header][image: nodes, labels, CSR adjacency, edges, indexes, properties][log records...]
-```
+Queries stream: a match is consumed as it is produced, `count(*)` never
+builds rows, `ORDER BY … LIMIT` keeps only the top k, and the writes of a
+`MATCH … SET/DELETE/CREATE` spool their match set to a temp file past the
+working memory. Algorithms run over an in-memory projection when it fits the
+working memory (`--work-mem`, default 256 MiB; `:memory:` uses the headroom
+under `--max-memory`) and straight over the pages when it does not, with
+their per-node state spilling to disk — same code, same answers.
 
-The image is current state as of the last compaction, written as flat columns
-indexed by position — the same arrays that sit in memory — so opening it is a
-bulk read, a checksum and a decode, with no per-node allocation. Everything
-written since goes to the log, and lives in memory as a *delta* over the image:
-new nodes and edges, changed copies, deletion masks. Reads merge the two.
+To make a database too large to build through the graph API, implement
+`glider::legacy::image::ImageSource` over your data and call
+`Graph::bulk_load`: external sorts feed bottom-up tree builds, so memory
+stays at the working-memory budget however large the result.
+`bench/src/bin/scale-gen.rs` builds a 25 GiB graph that way; a 100 GB B+tree
+built the same way (`pagebench`) took 15 minutes in 1.1 GB of RAM.
 
-`COMPACT` folds the delta into a fresh image and empties the log. It also runs
-automatically after a commit once the log grows past 64 MiB or the image size,
-whichever is larger (`--auto-compact MB|off`), so open time stays bounded by
-one image load plus a short replay. Files written before images existed open
-by replaying their log, exactly as before; the first write compacts them.
-
-Topology, labels and indexes are memory-resident, which is what keeps
-traversal and whole-graph algorithms fast. Property values can be too
-(the default) or stay on disk and be read on demand through a cache
-(`--props disk[:MB]`, `Residency::OnDisk`) — a big RAM saving for
-property-heavy graphs, paid for in slower property scans. The graph's
-structure must still fit in RAM; for a billion-edge graph this is the wrong
-engine.
+Databases from before paged storage (a snapshot image followed by a log) are
+converted with `glider <db> migrate`, which keeps the original as
+`<db>.legacy.bak`. `Graph::from_bytes` still reads them, for the browser.
 
 ### Durability
 
@@ -98,15 +109,22 @@ engine.
   crash, not power loss.
 - `off` — buffer aggressively. For bulk load.
 
-A transaction is a run of records followed by a commit marker. On open, the log
-replays; a torn tail (half-written record, or records with no commit marker) is
-discarded and the file truncated to the last committed offset. You never see a
-partial transaction, and truncation never reaches into the image. Compaction
-writes a temp file, fsyncs it, reads the image back to check it, then renames —
-atomic, so a crash mid-compaction leaves the original intact. Every byte of an
-image is covered by a checksum; a damaged image is an error at open, never a
-wrong answer. `glider <db> verify` checks the image and the log. All of these
-paths are covered by tests.
+A commit appends the transaction's operations and a commit marker to the
+write-ahead log (`<db>-wal/`). Pages are copy-on-write: a transaction never
+overwrites a page the last checkpoint refers to, so the file always holds a
+consistent state. A checkpoint (every 256 MiB of log, `--checkpoint SIZE|off`,
+`COMPACT`, and on close) writes the dirty pages, fsyncs, then flips to the
+other of two superblocks; the log it covers is deleted. Recovery opens the
+newest valid superblock and replays committed transactions from the log
+through the same code that ran them; a torn tail is discarded, so you never
+see a partial transaction. `ROLLBACK`, and any failed statement, drops the
+transaction's pages and cuts the log back.
+
+Every page carries a CRC and its own page number. Damage found while reading
+is recorded as the graph's integrity error: queries then fail instead of
+returning results. `glider <db> verify` walks every tree. A kill -9 loop
+(`pagebench crashloop`) recovers cleanly every time; that and the other
+recovery paths are tests.
 
 ## Query language
 
@@ -122,7 +140,7 @@ CREATE (a:Person {name:"Ada"})-[:KNOWS {since:2020}]->(b:Person {name:"Bob"})
 MATCH (n:Person) WHERE n.age IS NULL SET n.age = 0, n:Unknown
 MATCH (n) WHERE id(n) = 4 DETACH DELETE n
 INDEX ON :Person(email)
-STATS   SCHEMA   COMPACT   CLEAR   BEGIN   COMMIT   HELP
+STATS   SCHEMA   COMPACT   CLEAR   BEGIN   COMMIT   ROLLBACK   HELP
 ```
 
 - **operators** `= <> < <= > >= AND OR NOT IN [..] IS NULL CONTAINS STARTS WITH ENDS WITH + - * /`
@@ -130,8 +148,9 @@ STATS   SCHEMA   COMPACT   CLEAR   BEGIN   COMMIT   HELP
 - **aggregates** `count sum avg min max collect`, with implicit grouping on the
   non-aggregate return items, as Cypher does.
 
-`BEGIN` turns off autocommit so a batch of statements becomes one durable
-transaction; `COMMIT` flushes and turns it back on.
+Each statement is a transaction: it commits whole, or on an error leaves no
+trace. `BEGIN` groups the statements that follow into one transaction;
+`COMMIT` makes it durable, `ROLLBACK` discards it. `COMPACT` checkpoints.
 
 ### Indexes
 
@@ -192,12 +211,12 @@ const r = db.query('MATCH (a)-[r]->(b) RETURN a, r, b')
 
 The module imports **nothing** — no WASI, no `wasm-bindgen` glue. That falls
 straight out of the zero-dependency rule: there is nothing in glider that wants
-an operating system. 459 KB, 135 KB brotli, for the entire database.
+an operating system. 824 KB for the entire database, storage engine included.
 
-Under wasm there is no filesystem, so graphs are in-memory; persist with
-`exportJsonl()` / `importJsonl()`. An existing `.gldb` can be loaded read-only
-from its bytes with `glider.openBytes()`. Details and the full API:
-`ts/README.md`.
+Under wasm there is no filesystem, so graphs are in-memory page stores;
+persist with `exportJsonl()` / `importJsonl()`. An existing database file can
+be loaded from its bytes with `glider.openBytes()` (edits stay in memory).
+Details and the full API: `ts/README.md`.
 
 ## Algorithms
 
@@ -231,48 +250,43 @@ MATCH (p:Person) WHERE p.rank > 0.01 RETURN p.name ORDER BY p.rank DESC
 Everything is iterative. A 100k-node chain runs Tarjan and topological sort
 without touching the stack — that's a test, not a hope.
 
+**Any size.** Each algorithm is written once against an adjacency interface
+with two implementations: an in-memory CSR projection, used when it fits the
+working memory (`--work-mem`, default 256 MiB; for `:memory:` the headroom
+under `--max-memory`), and a view that reads adjacency straight from the
+pages. Per-node state (ranks, distances, component ids), BFS queues and DFS
+stacks live in arrays that spill to temp files past the budget; Kruskal's
+edge list is sorted externally. Results are identical either way — a test
+runs every algorithm both ways, and against the previous engine's
+implementation bit for bit. `tier: "mem"` or `tier: "ooc"` forces one.
+
 ## Performance
 
-Measured on one core of the container this was built in (`glider bench
-200000`): 200k nodes, 800k edges, default sync.
+See [`bench/PAGED.md`](bench/PAGED.md): every query shape, the browsing API,
+algorithms, writes in each sync mode, crash recovery, checkpoint,
+replication and export at 1, 5, 10 and 25 GiB, with a 1 GiB and a 64 MiB page
+cache, compared with the previous engine ([`bench/SCALE.md`](bench/SCALE.md)).
+In short: opening takes milliseconds at any size; RAM stays at the page cache
+plus working memory however large the file; point queries cost a few page
+reads. A 100 GB B+tree (`pagebench`) was built in 15 minutes at 1.1 GB of
+RAM, answered cold point lookups in 0.5 ms (1.35 disk reads each), scanned at
+450 MB/s, and recovered from 50 kill -9s in a row.
 
-```
-nodes      0.19s   1,044,000/s
-edges      1.61s     498,000/s
-pagerank   0.285s  (20 iterations, converged at 16)
-components 0.664s
-kcore      0.386s
-triangles  0.587s
-file       31 MB
-```
+`glider bench <n>` runs a quick synthetic benchmark on your own hardware.
 
-Run `glider bench <n>` on your own hardware.
+### Test data
 
-### Stress-test data
-
-`stress-gen` writes a realistic database file of a given size — the commerce
-graph from `scripts/mundane_graph.py`, with heavy-tailed degrees, skewed
-popularity, every value type, non-ASCII text, three indexes, and a history of
-updates and deletes — straight to disk through `store::LogWriter`, so it needs
-no more memory for 10 GiB than for 10 MB:
+`scale-gen` builds graphs of a given size — sixteen relationship types with
+power-law hubs, cliques, trees, chains, DAGs, self-loops and multi-edges —
+directly as paged databases (`--paged`, a bulk load) or through the
+transactional API (`--paged-insert`). `stress-gen` writes the commerce graph
+from `scripts/mundane_graph.py` as a log in the pre-paged format, in constant
+memory; convert its output with `glider <file> migrate`.
 
 ```sh
 cargo build --release --workspace
-./target/release/stress-gen --size 1GiB --out bench/data/stress-1g.gldb
+./target/release/scale-gen --size 10GiB --paged --out big.gldb
 ```
-
-Those files are logs with no image, so the first open replays them — about
-30 s and 6 GiB of RAM per GiB of log. Compact once and every later open loads
-the image instead. Measured on a laptop, same data before and after:
-
-| file | log replay (before) | image open | image open, `--props disk` |
-|---|---|---|---|
-| 500 MiB (0.9M nodes, 4.7M edges) | 13.1 s, 3.1 GB RSS | 0.50 s, 529 MB | 0.34 s, 295 MB |
-| 1 GiB (1.8M nodes, 9.7M edges) | 30.0 s, 6.4 GB RSS | 0.99 s, 1.1 GB | 0.67 s, 599 MB |
-
-Query results are byte-identical across the three. The browser build is capped
-by wasm32's 4 GiB address space, so files much above 500 MiB need
-`glider <file> browser` rather than **Open file…**.
 
 ## Embedding
 
@@ -294,6 +308,11 @@ for row in &result.rows { println!("{:?}", row); }
 let csr = g.csr(glider::Dir::Both, None, None);
 let (comp, n) = glider::algo::components(&csr);
 ```
+
+`Graph::open_opts` takes `OpenOptions` for the page cache, working memory,
+page size, checkpoint interval and sync mode; `Graph::memory_with_limit(bytes)`
+caps an in-memory graph, which then reports `Error::Full` (and rolls the
+transaction back) instead of growing past it.
 
 `Graph` is `Send`; wrap it in a `Mutex` for shared access, which is what the
 server does.
@@ -346,15 +365,13 @@ Honest limits, so you find them here rather than in production:
 
 - **Single process, single writer.** One `Mutex`, no MVCC, no concurrent
   readers during a write. Same shape as SQLite's default mode.
-- **Structure is memory-resident.** Capacity is bounded by RAM: about the
-  image size with properties in memory, well under it with `--props disk`.
-  Changes since the last compaction cost more per node than the image does,
-  which is one reason compaction runs automatically.
+- **Bigger than the old format.** A paged file is about 1.4× the snapshot
+  image the previous engine wrote for the same graph.
 - **Not full Cypher.** No `WITH`, `UNWIND`, `OPTIONAL MATCH`, `MERGE`, or
   multi-part queries. What's documented above is what exists.
-- **Pattern results are materialised.** A pattern that matches millions of rows
-  builds millions of binding vectors — the 3.2M-result two-hop match in the
-  benchmark takes 11s. Filter earlier or use `LIMIT`.
+- **Results are returned whole.** Matching streams, and `count`, `LIMIT` and
+  `ORDER BY … LIMIT` hold only what they return, but a query that *returns*
+  millions of rows builds them all. Aggregate, filter or page.
 - **Variable-length patterns return distinct endpoints, not distinct paths.**
   Deliberate, to avoid combinatorial blowup.
 - **`betweenness` is O(n·m).** Use `samples:` above a few thousand nodes.
@@ -366,17 +383,23 @@ Honest limits, so you find them here rather than in production:
 cargo test
 ```
 
-26 integration tests and 37 unit tests covering reopen, torn-tail recovery,
-uncommitted-transaction
-rollback, compaction correctness, index maintenance through updates and deletes,
-each query form, algorithm results against hand-computed values, deep-chain
-recursion safety, and that malformed queries return errors instead of panicking.
+About 120 tests. The central one is differential: random operations run
+against the previous engine as an oracle and against the paged engine with
+tiny pages and a tiny cache — in memory, on disk, reopened between batches,
+and filling up to `max_memory` — and every observable read is compared.
+Others cover B+trees against `BTreeMap` through commits and rollbacks, crash
+recovery, checkpoint holds under a live writer, replication end to end,
+every algorithm in memory against out of core, write statements whose match
+sets spill, each query form, and that malformed queries return errors
+instead of panicking.
 
 ## Repository layout
 
 ```
 src/            the library and both binaries
-src/stream/     replication: WAL shipping, S3 backend, config
+src/storage/    pages, B+trees, write-ahead log, external sort
+src/legacy/     the previous engine: test oracle, and `migrate`
+src/stream/     glider-stream: S3/HTTP replication of pre-paged files
 tests/          integration tests
 bench/          benchmark harness (workspace member; ./bench/run.sh)
 include/        glider.h, the C ABI header

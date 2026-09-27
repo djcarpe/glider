@@ -118,13 +118,9 @@ pub unsafe extern "C" fn glider_open(path: *const c_char, sync: c_int) -> *mut G
     }
 }
 
-/// `glider_open` with the memory knob exposed.
-///
-/// `props_cache_bytes` = 0 keeps property values in RAM once the snapshot
-/// image is loaded (what `glider_open` does). Anything else leaves them on
-/// disk, read on demand through a cache of about that many bytes: topology,
-/// labels and indexes stay in memory, so traversal is unaffected, while RAM
-/// stops growing with the size of your property data. For low-memory devices.
+/// `glider_open` with the memory knob exposed: `cache_bytes` is the page
+/// cache (0 = the default, 1 GiB). RAM use stays near it however large the
+/// database grows; the database itself is limited only by the disk.
 ///
 /// # Safety
 /// `path` must be a NUL-terminated UTF-8 string.
@@ -132,7 +128,7 @@ pub unsafe extern "C" fn glider_open(path: *const c_char, sync: c_int) -> *mut G
 pub unsafe extern "C" fn glider_open_ex(
     path: *const c_char,
     sync: c_int,
-    props_cache_bytes: usize,
+    cache_bytes: usize,
 ) -> *mut GliderDb {
     unsafe {
         guard(std::ptr::null_mut(), || {
@@ -143,12 +139,10 @@ pub unsafe extern "C" fn glider_open_ex(
                     2 => Sync::Off,
                     _ => Sync::Normal,
                 },
-                residency: if props_cache_bytes == 0 {
-                    crate::Residency::Memory
+                cache_size: if cache_bytes == 0 {
+                    crate::storage::pager::DEFAULT_CACHE_BYTES
                 } else {
-                    crate::Residency::OnDisk {
-                        cache_bytes: props_cache_bytes,
-                    }
+                    cache_bytes as u64
                 },
                 ..crate::OpenOptions::default()
             };
@@ -156,6 +150,21 @@ pub unsafe extern "C" fn glider_open_ex(
             Ok(Box::into_raw(Box::new(GliderDb { graph })))
         })
     }
+}
+
+/// A `:memory:` graph that may occupy at most `max_bytes` (0 = the
+/// machine's physical memory). Past the limit, writes fail with an error
+/// and are rolled back; the graph stays usable. NULL on error.
+#[no_mangle]
+pub extern "C" fn glider_open_memory_ex(max_bytes: u64) -> *mut GliderDb {
+    guard(std::ptr::null_mut(), || {
+        let graph = if max_bytes == 0 {
+            Graph::memory()
+        } else {
+            Graph::memory_with_limit(max_bytes)
+        };
+        Ok(Box::into_raw(Box::new(GliderDb { graph })))
+    })
 }
 
 /// A graph that never touches disk. Useful for tests, caches, and scratch
@@ -266,10 +275,9 @@ pub unsafe extern "C" fn glider_checkpoint(db: *mut GliderDb) -> c_int {
     }
 }
 
-/// Rewrite the file as a snapshot image of current state, reclaiming deleted
-/// space and making the next open a bulk load rather than a log replay.
-/// Potentially slow and I/O heavy — do not call it on the UI thread, and on
-/// iOS wrap it in a background task so the OS does not suspend you mid-write.
+/// On paged storage, the same as `glider_checkpoint`: fold the log into the
+/// pages. Freed pages are reused as the database grows, so there is no
+/// separate rewrite step. Kept for callers written against the older engine.
 ///
 /// # Safety
 /// `db` must be a live handle.
@@ -284,12 +292,9 @@ pub unsafe extern "C" fn glider_compact(db: *mut GliderDb) -> c_int {
     }
 }
 
-/// Compact automatically once the log after the snapshot image passes
-/// `bytes` (or the image size, if larger). 0 turns it off. The default is
-/// 64 MiB. Automatic compaction runs inside a commit, so a commit that
-/// triggers one takes as long as a `glider_compact`; turn it off and call
-/// `glider_compact` from a background task if commits happen on the UI
-/// thread.
+/// Checkpoint automatically once this many bytes of write-ahead log have
+/// accumulated (0 = only on close or `glider_checkpoint`). Bounds the time a
+/// crash recovery can take. Default 256 MiB.
 ///
 /// # Safety
 /// `db` must be a live handle.
@@ -298,8 +303,7 @@ pub unsafe extern "C" fn glider_set_auto_compact(db: *mut GliderDb, bytes: u64) 
     unsafe {
         guard(-1, || {
             let db = as_db(db)?;
-            db.graph
-                .set_auto_compact(if bytes == 0 { None } else { Some(bytes) });
+            db.graph.set_checkpoint_bytes(if bytes == 0 { u64::MAX } else { bytes });
             Ok(0)
         })
     }

@@ -1,14 +1,15 @@
-//! The v3 file format: snapshot image at the front, log after it.
+//! The legacy v3 file format (snapshot image at the front, log after it),
+//! read by `glider::legacy` — kept for migrating old files.
 
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
 use glider::codec;
-use glider::graph::{Dir, Graph};
+use glider::legacy::graph::{Dir, Graph, OpenOptions};
+use glider::legacy::image::Residency;
 use glider::store::{self, Sync};
 use glider::value::Value;
-use glider::{OpenOptions, Residency};
 
 fn temp(name: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
@@ -282,28 +283,68 @@ fn a_corrupt_image_is_an_error_not_a_panic() {
     let path = temp("corrupt");
     {
         let mut g = Graph::open_opts(&path, no_auto(Sync::Normal)).unwrap();
+        g.create_index("Person", "name").unwrap();
         people(&mut g, 100);
         g.compact().unwrap();
     }
     let h = store::read_header(&path).unwrap();
     let clean = fs::read(&path).unwrap();
-    // Flip one byte at a spread of places inside the image.
-    for k in 0..40u64 {
-        let at = (h.image_at + k * h.image_len / 40) as usize;
+    let preload = OpenOptions {
+        preload: true,
+        ..no_auto(Sync::Normal)
+    };
+    // Reads that between them touch every column, every index and every
+    // property chunk.
+    let touch_everything = |g: &Graph| {
+        for id in g.node_ids() {
+            let _ = g.node_props(id);
+            let _ = g.node_labels(id);
+            let _ = g.neighbors(id, Dir::Both, None);
+        }
+        for id in g.edge_ids() {
+            let _ = g.edge_props(id);
+            let _ = g.edge(id).map(|e| (e.from, e.to, e.etype));
+            let _ = g.edge_type_name(id);
+        }
+        let _ = g.edges_with_type("KNOWS");
+        let _ = g.stats();
+        let _ = g.sample_keys(1000);
+        let _ = g.csr(Dir::Both, None, Some("w"));
+        let _ = g.nodes_with_label("Person");
+        let _ = g.indexed_lookup("Person", "name", &Value::from("p7"));
+        let _ = g.label_count("Person");
+    };
+    // Flip one byte at a spread of places inside the image. Parts of an
+    // image load on first use, so damage may surface at open or only when a
+    // query reaches it — but always as an error, never a panic, and never
+    // as results.
+    let points = 200u64;
+    for k in 0..points {
+        let at = (h.image_at + k * h.image_len / points) as usize;
         let mut bytes = clean.clone();
         bytes[at] ^= 0x5a;
         fs::write(&path, &bytes).unwrap();
         let _ = fs::remove_file(store::lock_path(&path));
+
         assert!(
-            Graph::open(&path, Sync::Normal).is_err(),
-            "flip at {at} opened"
+            Graph::open_opts(&path, preload).is_err(),
+            "flip at {at} passed a preloading open"
         );
+        let _ = fs::remove_file(store::lock_path(&path));
         assert!(
             Graph::from_bytes(&bytes).is_err(),
             "flip at {at} loaded from bytes"
         );
         let v = store::verify(&path).unwrap();
         assert!(matches!(v.image, Some(Err(_))), "flip at {at} verified");
+
+        if let Ok(mut g) = Graph::open_opts(&path, no_auto(Sync::Normal)) {
+            touch_everything(&g);
+            assert!(g.integrity_error().is_some(), "flip at {at}: not recorded");
+            assert!(g.compact().is_err(), "flip at {at}: compacted a damaged image");
+            assert!(g.stats().integrity_error.is_some());
+        }
+        let _ = fs::remove_file(store::lock_path(&path));
     }
     // A flip in the header is caught by its own checksum.
     let mut bytes = clean.clone();
@@ -424,7 +465,7 @@ fn a_read_only_session_never_triggers_auto_compaction() {
         },
     )
     .unwrap();
-    glider::query::execute(&mut g, "MATCH (n:Person) RETURN count(n)").unwrap();
+    assert_eq!(g.nodes_with_label("Person").len(), 300);
     g.commit().unwrap();
     drop(g);
     assert_eq!(fs::metadata(&path).unwrap().len(), len);
@@ -456,4 +497,96 @@ fn clear_after_an_image_then_compact() {
         Some(vec![1])
     );
     let _ = fs::remove_file(&path);
+}
+
+// ------------------------------------------------------- image::build
+
+struct Tiny {
+    bad: Option<&'static str>,
+}
+
+impl glider::legacy::image::ImageSource for Tiny {
+    fn strings(&self) -> Vec<String> {
+        ["P", "name", "R", "w"].iter().map(|s| s.to_string()).collect()
+    }
+    fn next_ids(&self) -> (u64, u64) {
+        (100, 50)
+    }
+    fn indexes(&self) -> Vec<(u32, u32)> {
+        vec![(0, 1)]
+    }
+    fn nodes(&self, f: &mut dyn FnMut(u64, &[u32], &[(u32, Value)])) -> std::io::Result<()> {
+        let ids: &[u64] = if self.bad == Some("order") { &[5, 3] } else { &[3, 5, 9] };
+        for id in ids {
+            f(*id, &[0], &[(1, Value::Text(format!("n{id}")))]);
+        }
+        Ok(())
+    }
+    fn edges(
+        &self,
+        f: &mut dyn FnMut(u64, u64, u64, u32, &[(u32, Value)]),
+    ) -> std::io::Result<()> {
+        let to = if self.bad == Some("dangling") { 4 } else { 9 };
+        let t = if self.bad == Some("string") { 17 } else { 2 };
+        f(1, 3, 5, t, &[(3, Value::Float(0.5))]);
+        f(7, 5, to, 2, &[]);
+        f(8, 9, 9, 2, &[]);
+        Ok(())
+    }
+}
+
+#[test]
+fn image_build_writes_a_database_from_a_stream() {
+    let path = temp("build");
+    glider::legacy::image::build(&path, &Tiny { bad: None }).unwrap();
+    let mut g = Graph::open(&path, Sync::Normal).unwrap();
+    assert_eq!((g.node_count(), g.edge_count()), (3, 3));
+    assert_eq!(g.node_prop(5, "name"), Some(Value::from("n5")));
+    assert_eq!(g.edge_prop(1, "w"), Some(Value::Float(0.5)));
+    assert_eq!(g.indexed_lookup("P", "name", &Value::from("n9")), Some(vec![9]));
+    let out: Vec<u64> = g.neighbors(9, Dir::Both, None).iter().map(|a| a.edge).collect();
+    assert_eq!(out, vec![8, 7, 8], "self-loop appears once each way, runs in edge order");
+    // Ids carry on from the source's next ids.
+    assert_eq!(g.add_node(&[], vec![]).unwrap(), 100);
+    assert!(matches!(store::verify(&path).unwrap().image, Some(Ok(_))));
+    drop(g);
+    let _ = fs::remove_file(&path);
+
+    for bad in ["order", "dangling", "string"] {
+        let path = temp(&format!("build-{bad}"));
+        assert!(glider::legacy::image::build(&path, &Tiny { bad: Some(bad) }).is_err(), "{bad}");
+        assert!(!path.exists(), "{bad}: a failed build leaves no file");
+    }
+}
+
+#[test]
+fn preload_loads_everything_and_a_graph_copies_into_a_new_file() {
+    let path = temp("preload");
+    {
+        let mut g = Graph::open_opts(&path, no_auto(Sync::Normal)).unwrap();
+        g.create_index("Person", "name").unwrap();
+        people(&mut g, 500);
+        g.compact().unwrap();
+    }
+    let g = Graph::open_opts(
+        &path,
+        OpenOptions {
+            preload: true,
+            ..no_auto(Sync::Normal)
+        },
+    )
+    .unwrap();
+    assert!(g.integrity_error().is_none());
+    // A graph is an ImageSource: copy it, image and delta, to a new file.
+    let copy = temp("preload-copy");
+    glider::legacy::image::build(&copy, &g).unwrap();
+    drop(g);
+    let a = Graph::open(&path, Sync::Normal).unwrap();
+    let b = Graph::open(&copy, Sync::Normal).unwrap();
+    assert_eq!(a.node_ids(), b.node_ids());
+    assert_eq!(a.edge_ids(), b.edge_ids());
+    assert_eq!(b.indexed_lookup("Person", "name", &Value::from("p9")), Some(vec![10]));
+    drop((a, b));
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(&copy);
 }

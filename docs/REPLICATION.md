@@ -4,119 +4,112 @@
 
 | You want | Open it as | Notes |
 |---|---|---|
-| Scratch graph, nothing persisted | `:memory:` | `Graph::memory()`, `glider_open_memory()` |
+| Scratch graph, nothing persisted | `:memory:` | `Graph::memory()`, `glider_open_memory()`; cap it with `--max-memory` |
 | Durable, normal case | `file.gldb --sync normal` | survives process death; not power loss |
 | Durable through power loss | `--sync always` | fsync per commit |
-| Memory speed *and* a durable copy elsewhere | file on `/dev/shm` + `wal tail` | see below |
+| A durable copy elsewhere | any file + `wal tail` | see below |
 
-That last row is the interesting one. Because replication reads the file rather
-than the process, you can put the database on a tmpfs — memory, as far as the
-kernel is concerned — and still have every committed byte shipped off-box
-within a second. You get in-memory write performance with off-host durability,
-and you lose only the unshipped tail if the machine dies.
+## How it works
 
-```sh
-glider /dev/shm/live.gldb --sync off -c "..."          # writes never touch a disk
-glider /dev/shm/live.gldb wal tail --to /var/backups/glider --interval 1
-```
+A database is pages (the file, and segment files in `<db>-data/`) plus a
+write-ahead log (`<db>-wal/`). Every commit appends the transaction's
+operations and a commit marker to the log. A checkpoint writes the pages the
+log describes, flips the superblock, and deletes the log it covered.
 
-## Why there is no separate WAL file
-
-SQLite keeps a main database of fixed-size pages that get rewritten in place,
-so it needs a *separate* write-ahead log, and Litestream exists to tail that
-log before a checkpoint overwrites it.
-
-Glider has no pages and rewrites nothing in place. The database file is a
-snapshot image followed by the write-ahead log: every mutation is a CRC-framed
-record appended at the end, and a transaction ends with a commit marker. Only a
-compaction writes an image, and it does so by replacing the whole file, so
-between compactions the file is strictly append-only. Which means replication is not a
-protocol, it's byte ranges. A replica is your database, in pieces:
+A replica is **base snapshots plus the log shipped after them**:
 
 ```
 /var/backups/glider/
-  c46f16170b58b63f.../            <- generation
+  96348bfb24205901.../                 <- generation (one per database)
+    base/
+      0000000000000059/                <- the pages of one checkpoint, covering log up to 0x59
+        db  data/00000001.seg  base.json
     segments/
-      0000000000000000.seg        <- bytes [0, 172), header and image included
-      00000000000000ac.seg        <- bytes [172, 209)
-      00000000000000d1.seg
-    manifest.jsonl
+      0000000000000059.seg             <- log bytes from 0x59, whole transactions
+      0000000000013f20.seg
+    manifest.jsonl                     <- when each segment was shipped
 ```
 
-`cat segments/*.seg > restored.gldb` is a genuine restore. That is not a
-coincidence to be papered over, it's the property that makes the whole thing
-auditable: there is no format to trust beyond the one you already have.
+Restoring is: copy the newest base, lay the log shipped after it beside it,
+open. Opening replays that log, through the same code that ran it the first
+time.
 
-Two rules make it safe.
+The tailer is a separate process and never blocks the writer. Three rules
+keep it correct:
 
-**Only ship to a transaction boundary.** The writer may be mid-transaction when
-the tailer looks. `store::scan_committed_end` walks frames from the end of the
-image, verifies CRCs, and returns the offset after the last commit marker;
-bytes past that are not shipped. A torn tail stops the scan instead of being
-replicated.
+**Only ship whole transactions.** The tailer scans the log for the last
+commit marker, checking every frame's CRC, and ships up to there; a frame
+still being written fails its CRC and ends the scan. What it copied is
+checked again before the segment is published.
 
-**A compaction starts a new generation.** `COMPACT` rewrites the file from
-scratch — a new image, an empty log — so every existing offset becomes
-meaningless — this is exactly the
-hazard Litestream's generations exist for. Glider puts a 16-byte generation id
-in the file header and mints a fresh one on every compaction. The tailer sees
-it change and starts a new lineage rather than appending onto a log that no
-longer exists. Old generations stay restorable until you delete them.
+**The writer keeps the log that has not been shipped.** The tailer leaves a
+pin file (`<db>-wal/replica.pin`) saying how far it has shipped. The writer
+reads it at most once a second, on commit, and a checkpoint deletes only log
+the tailer already has. A pin not refreshed for 10 minutes is ignored, so a
+dead tailer cannot make the log grow forever; if the log it needs is gone
+when it comes back, it takes a new base and carries on.
 
-## Streaming to S3, MinIO, or anything else
+**A base is copied from a checkpoint that stays put.** Copying 100 TB takes a
+while, and meanwhile the writer keeps writing and checkpointing. Pages are
+copy-on-write, so a checkpoint's pages are never overwritten in place — but
+once a later checkpoint frees them they can be reused. So the tailer asks, in
+the pin, for a *hold*. At its next commit the writer checkpoints, and from
+then on keeps every page freed after that checkpoint out of reuse (listed in
+the free list, marked held) until the tailer says it is done. The tailer
+copies that checkpoint's superblock and pages, verifies the hold lasted the
+whole copy, then releases it. With no writer running, the tailer takes the
+database's lock instead and copies directly.
 
-Glider does not speak S3. An HTTP client, TLS and SigV4 would be the first
-dependencies in the codebase, and they would be dependencies on a moving target.
-Instead the tailer writes a segment and runs a command:
+`glider serve` looks at the pin every second even when idle. An embedding
+application that may sit idle for long periods calls
+`Graph::poll_replication()` from time to time, or a base waits for its next
+commit.
+
+## Shipping to S3, MinIO, or anything else
+
+Glider does not speak S3: an HTTP client, TLS and SigV4 would be its first
+dependencies. The tailer writes to a directory and runs a command for each
+base and log segment:
 
 ```sh
 glider app.gldb wal tail --to /var/spool/glider \
   --interval 10 --min-bytes 1048576 \
-  --exec 'aws s3 cp {path} s3://my-bucket/glider/{gen}/{name}'
+  --exec 'aws s3 cp --recursive {path} s3://my-bucket/glider/{gen}/{kind}/{name}'
 ```
 
-Placeholders: `{path} {name} {gen} {offset} {len}`. A non-zero exit fails the
-tailer loudly rather than silently dropping a segment.
-
-For MinIO, `mc` is the natural fit:
-
-```sh
---exec 'mc cp {path} minio/graphs/{gen}/{name}'
-```
-
-Anything that moves a file works the same way — `rclone copyto`, `restic
-backup`, `scp`, a script that also writes a row to a tracking table. The
-segments are immutable once written, which is what makes this safe: a retry is
-always idempotent, and object storage lifecycle rules can expire whole
-generations without coordination.
-
-Flags worth knowing:
+Placeholders: `{path} {name} {gen} {kind} {offset} {len}`, where `{kind}` is
+`base` (a directory) or `segments` (a file). A non-zero exit stops the
+tailer rather than silently dropping something.
 
 | Flag | Default | Effect |
 |---|---|---|
 | `--interval S` | 10 | ship at least this often, however little has changed |
 | `--min-bytes N` | 1 MiB | ship immediately once this much is pending |
-| `--once` | off | ship what exists and exit — for cron |
+| `--once` | off | ship what exists and exit — for cron (a pin older than 10 minutes lapses, so run it more often than that or expect a fresh base) |
 | `--quiet` | off | no progress on stderr |
 
-Lag is `--interval` in the worst case. Set it to what you can afford to lose.
+Lag is `--interval` in the worst case.
+
+`glider-stream`, the daemon with built-in S3 and HTTP backends, replicates
+databases from before paged storage; for paged databases use `wal tail
+--exec`.
 
 ## Restoring
 
 ```sh
 glider wal verify --from /var/spool/glider
-# c46f1617...  4 segments, 283 bytes, complete to 283
-#     2026-09-12 20:57:13Z .. 2026-09-12 20:57:15Z
+# 96348bfb...  2 bases (newest at log 89), 14 log segments, 1048576 bytes, log complete to 1048665
+#     last activity 2026-09-27 00:07:43Z
 
 glider wal restore --from /var/spool/glider --to recovered.gldb
-# restored 283 bytes from 4 segments of generation c46f1617...
-# 6 nodes, 1 edges
+# restored generation 96348bfb... from the base at log 89 (2026-09-27 00:07:43Z) and 14 log segments, through log 1048665
+# 1247371 nodes, 8027661 edges
 ```
 
-Restore refuses to overwrite an existing file, refuses to start from a missing
-first segment, stops at any gap rather than producing a plausible-looking
-corrupt file, and opens the result before declaring success. A restore that
-does not open is not a restore.
+Restore refuses to overwrite an existing file, stops at a gap in the log
+rather than producing a plausible-looking wrong database, replays the log,
+checks every tree, and reports the counts. A restore that does not open is
+not a restore.
 
 Point in time, to the segment:
 
@@ -125,54 +118,33 @@ glider wal restore --from /var/spool/glider --to before.gldb --as-of -30m
 glider wal restore --from /var/spool/glider --to before.gldb --as-of 1757692800
 ```
 
-Note that `--as-of` picks within one generation, defaulting to the most
-recently active one. To recover to a moment *before* a compaction, name the
-older generation explicitly — `wal verify` prints the time range of each.
-
-Checking on things:
+It takes the newest base taken at or before that time and the log shipped up
+to it.
 
 ```sh
 glider app.gldb wal status --to /var/spool/glider
-# committed   283 bytes
-# replicated  283 bytes in 4 segments
+# committed   log to 1048665
+# base        at log 89 (2026-09-27 00:07:43Z), 2 bases
+# replicated  log to 1048665 in 14 segments
 # lag         0 bytes
 ```
 
-## Restoring from object storage
+To restore from object storage, pull the generation down and restore
+locally; keep the directory layout, since offsets live in the names.
 
-Pull the generation down, then restore locally:
+## Databases from before paged storage
 
-```sh
-aws s3 sync s3://my-bucket/glider/ ./replica/
-glider wal restore --from ./replica --to recovered.gldb
-```
-
-The layout on the remote is the same as on disk because the exec hook preserves
-`{gen}/{name}`. If you flatten it, keep the `.seg` names — the offsets live in
-the filenames, and that is what makes gaps detectable.
-
-## Upgrading an existing database
-
-Generation ids landed in format v2, snapshot images in v3. v1 and v2 files
-still open and read normally, but a v1 file cannot be replicated, because there
-is no way to tell one lineage from another. Compaction — by hand, or
-automatically on the first write once the log is large — rewrites either as v3.
-Binaries from before v3 cannot open v3 files, so upgrade replicas' readers
-first. Run a compaction once:
-
-```sh
-glider old.gldb compact     # rewrites as v3 (image + log) with a fresh generation
-```
+Files written by earlier versions (an append-only log with a snapshot image)
+are replicated as they always were: the file itself, in byte ranges, a new
+lineage per compaction. `wal restore` recognises such a replica and restores
+the file, which `glider <file> migrate` then converts.
 
 ## What this does not do
 
-- **No leader election, no consensus.** One writer. If two processes open the
-  same file for writing, they will corrupt it — that is true of SQLite without
-  its locking too, and glider has no lock file yet.
-- **No live read replicas.** A restored file is a point-in-time copy, not a
-  follower that stays current. You could poll-restore, but there is no
-  streaming reader.
-- **Segment granularity, not transaction granularity.** PITR lands on a segment
-  boundary. Lower `--interval` to tighten it.
-- **No encryption.** Segments are raw database bytes. If the destination is not
-  trusted, encrypt in the exec hook (`age`, `gpg`, SSE-KMS on the bucket).
+- **No leader election, no consensus.** One writer, enforced by a lock file.
+- **No live read replicas.** A restore is a point-in-time copy.
+- **Segment granularity for point-in-time restore.** Lower `--interval` to
+  tighten it.
+- **Full bases only.** A new base copies every page; incremental bases
+  (only pages changed since the last) are future work.
+- **No encryption.** Encrypt in the exec hook (`age`, `gpg`, SSE-KMS).

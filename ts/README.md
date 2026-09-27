@@ -115,13 +115,16 @@ using db = glider.open()      // TypeScript 5.2+, closed at scope exit
 
 ## Persistence
 
-`wasm32-unknown-unknown` has no filesystem, so graphs are **in-memory only**.
-The file-backed modes — `glider_open`, the WAL, compaction, replication — are
-not reachable from this build.
+`wasm32-unknown-unknown` has no filesystem, so graphs are **in-memory only**:
+the same page format as a file, with the pages held in memory. The
+file-backed parts — the write-ahead log, checkpoints, replication — are not
+reachable from this build.
 
-A `.gldb` file can still be *read*: hand its bytes to `openBytes` and it is
-replayed into memory exactly as `glider_open` would (a torn tail is ignored).
-Nothing is written back — the file is a starting point, not a live database.
+A database file can still be *read*: hand its bytes to `openBytes` and its
+pages, as of its last checkpoint, are loaded into memory (a file from before
+paged storage is converted as it loads). Nothing is written back — the file
+is a starting point, not a live database. A database that spans segment
+files (over 64 GiB) cannot be loaded this way.
 
 ```ts
 const bytes = await file.arrayBuffer()        // <input type=file>, fetch, fs.readFile
@@ -167,5 +170,5 @@ anyway. Give each Worker its own `loadGlider()`.
 
 ## Size
 
-The module is 459 KB uncompressed — 168 KB gzipped, 135 KB brotli. That is the
+The module is 824 KB uncompressed — 292 KB gzipped, 227 KB brotli. That is the
 entire database: storage layer, query engine and fifteen graph algorithms.

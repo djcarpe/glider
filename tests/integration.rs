@@ -58,14 +58,20 @@ fn torn_tail_is_discarded() {
             .unwrap();
         g.commit().unwrap();
     }
-    // Simulate a crash mid-write by appending garbage.
+    // Simulate a crash mid-write by appending garbage to the write-ahead
+    // log, where an interrupted commit would leave it.
     {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap();
-        f.write_all(&[0u8, 200, 0, 0, 0, 7, 7, 7]).unwrap();
+        let mut wal = path.as_os_str().to_os_string();
+        wal.push("-wal");
+        let seg = std::fs::read_dir(PathBuf::from(wal))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .max()
+            .expect("a log segment");
+        let mut f = std::fs::OpenOptions::new().append(true).open(&seg).unwrap();
+        f.write_all(&[1u8, 200, 0, 0, 0, 7, 7, 7]).unwrap();
     }
     {
         let g = Graph::open(&path, Sync::Always).unwrap();
@@ -138,11 +144,14 @@ fn log_writer_streams_a_file_that_opens() {
     // It refuses to clobber an existing file.
     assert!(LogWriter::create(&path).is_err());
 
-    let mut g = Graph::open(&path, Sync::Always).unwrap();
+    // A streamed log is the legacy format: the paged engine asks for a
+    // migration, the legacy engine reads it.
+    assert!(Graph::open(&path, Sync::Always).is_err());
+    let mut g = glider::legacy::graph::Graph::open(&path, Sync::Always).unwrap();
     assert_eq!(g.node_count(), 2);
     assert_eq!(g.edge_count(), 1);
     // The engine carries on numbering after the streamed ids.
-    q(&mut g, r#"CREATE (:Person {n: 9})"#);
+    assert_eq!(g.add_node(&["Person".into()], vec![]).unwrap(), 4);
     assert_eq!(g.node_count(), 3);
     drop(g);
     std::fs::remove_file(&path).ok();
@@ -174,7 +183,7 @@ fn uncommitted_transaction_is_not_visible_after_reopen() {
 }
 
 #[test]
-fn compaction_preserves_state_and_shrinks() {
+fn compaction_preserves_state_and_reuses_space() {
     let path = temp("compact");
     let mut g = Graph::open(&path, Sync::Normal).unwrap();
     for i in 0..200 {
@@ -191,15 +200,17 @@ fn compaction_preserves_state_and_shrinks() {
         g.delete_node(i).unwrap();
     }
     g.commit().unwrap();
+    g.compact().unwrap();
     let before = g.file_len();
+    // Churn again: freed pages are reused, so the file does not grow.
+    for i in 191..=200u64 {
+        for r in 0..5 {
+            g.set_node_prop(i, "i", Value::Int(r)).unwrap();
+        }
+    }
     g.compact().unwrap();
     let after = g.file_len();
-    assert!(
-        after < before,
-        "compaction should shrink: {} -> {}",
-        before,
-        after
-    );
+    assert!(after <= before, "freed pages must be reused: {before} -> {after}");
     assert_eq!(g.node_count(), 10);
     drop(g);
 
@@ -398,19 +409,19 @@ fn algorithms_agree_with_hand_computed_values() {
     g.add_edge(1, 4, "E", vec![]).unwrap();
 
     let both = g.csr(Dir::Both, None, None);
-    let (tri, total) = algo::triangles(&both);
+    let (mut tri, total) = algo::triangles(&both);
     assert_eq!(total, 1);
+    let clustering = algo::clustering(&both, &mut tri).to_vec();
+    let tri = tri.to_vec();
     assert_eq!(tri[0], 1);
     assert_eq!(tri[3], 0);
-
-    let clustering = algo::clustering(&both, &tri);
     assert!(
         (clustering[1] - 1.0).abs() < 1e-9,
         "node 2 closes its only triangle"
     );
     assert!((clustering[0] - (1.0 / 3.0)).abs() < 1e-9);
 
-    let cores = algo::core_numbers(&both);
+    let cores = algo::core_numbers(&both).to_vec();
     assert_eq!(cores[0], 2);
     assert_eq!(cores[3], 1);
 
@@ -428,8 +439,8 @@ fn algorithms_agree_with_hand_computed_values() {
     assert!(algo::find_cycle(&out).is_some());
 
     // PageRank sums to 1 and the pendant with no out-edges still gets mass.
-    let pr = algo::pagerank(&out, 0.85, 100, 1e-12);
-    let sum: f64 = pr.scores.iter().sum();
+    let mut pr = algo::pagerank(&out, 0.85, 100, 1e-12);
+    let sum: f64 = pr.scores.to_vec().iter().sum();
     assert!(
         (sum - 1.0).abs() < 1e-6,
         "pagerank must be a distribution, got {}",
@@ -450,7 +461,7 @@ fn scc_handles_deep_chains_without_stack_overflow() {
     }
     let csr = g.csr(Dir::Out, None, None);
     let (_, count) = algo::strongly_connected(&csr);
-    assert_eq!(count, n as u32, "a chain has n singleton SCCs");
+    assert_eq!(count, n, "a chain has n singleton SCCs");
     let order = algo::topological_sort(&csr).expect("a chain is acyclic");
     assert_eq!(order.len(), n as usize);
 }
@@ -465,10 +476,10 @@ fn betweenness_on_a_star_graph() {
         g.add_edge(1, leaf, "E", vec![]).unwrap();
     }
     let both = g.csr(Dir::Both, None, None);
-    let bc = algo::betweenness(&both, None, false);
+    let bc = algo::betweenness(&both, None, false).to_vec();
     assert!(bc[0] > 0.0, "the hub is on every path");
-    for leaf in 1..5 {
-        assert_eq!(bc[leaf], 0.0, "leaves are on no shortest path");
+    for b in &bc[1..5] {
+        assert_eq!(*b, 0.0, "leaves are on no shortest path");
     }
 }
 
@@ -585,7 +596,7 @@ fn discarding_a_torn_tail_starts_a_new_generation() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("t.gldb");
 
-    let mut g = glider::Graph::open(&path, glider::Sync::Always).unwrap();
+    let mut g = glider::legacy::graph::Graph::open(&path, glider::Sync::Always).unwrap();
     g.add_node(&["N".into()], vec![]).unwrap();
     g.commit().unwrap();
     drop(g);
@@ -600,7 +611,7 @@ fn discarding_a_torn_tail_starts_a_new_generation() {
     f.write_all(&[9u8; 96]).unwrap();
     f.sync_all().unwrap();
 
-    let g = glider::Graph::open(&path, glider::Sync::Always).unwrap();
+    let g = glider::legacy::graph::Graph::open(&path, glider::Sync::Always).unwrap();
     assert_eq!(g.node_count(), 1, "committed data survives");
     drop(g);
 
@@ -608,7 +619,7 @@ fn discarding_a_torn_tail_starts_a_new_generation() {
     assert_ne!(before, after, "a discarded tail must end the lineage");
 
     // A clean reopen must NOT churn the generation.
-    let g = glider::Graph::open(&path, glider::Sync::Always).unwrap();
+    let g = glider::legacy::graph::Graph::open(&path, glider::Sync::Always).unwrap();
     drop(g);
     assert_eq!(
         glider::store::read_header(&path).unwrap().generation_hex(),
@@ -794,7 +805,7 @@ fn explain_reports_without_executing() {
 fn verify_distinguishes_a_torn_tail_from_corruption() {
     let path = temp("verify");
     {
-        let mut g = Graph::open(&path, Sync::Always).unwrap();
+        let mut g = glider::legacy::graph::Graph::open(&path, Sync::Always).unwrap();
         for i in 0..20 {
             g.add_node(&["N".into()], vec![("i".into(), glider::Value::Int(i))])
                 .unwrap();
@@ -825,4 +836,53 @@ fn verify_distinguishes_a_torn_tail_from_corruption() {
 
     std::fs::remove_file(&path).ok();
     std::fs::remove_file(glider::store::lock_path(&path)).ok();
+}
+
+#[test]
+fn rollback_discards_the_open_transaction() {
+    let path = temp("rollback-stmt");
+    {
+        let mut g = Graph::open(&path, Sync::Normal).unwrap();
+        q(&mut g, "CREATE (:Keep {n: 1})");
+        q(&mut g, "INDEX ON :Keep(n)");
+        q(&mut g, "BEGIN");
+        q(&mut g, "CREATE (:Gone {n: 2})");
+        q(&mut g, "MATCH (k:Keep) SET k.n = 99");
+        q(&mut g, "INDEX ON :Gone(n)");
+        let r = q(&mut g, "ROLLBACK");
+        assert!(r.message.unwrap().starts_with("rolled back"));
+        assert!(g.autocommit, "ROLLBACK ends the transaction");
+        let r = q(&mut g, "MATCH (n) RETURN labels(n), n.n");
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][1], Value::Int(1));
+        assert!(!g.has_index("Gone", "n"), "schema changes roll back too");
+        assert_eq!(q(&mut g, "MATCH (k:Keep {n: 1}) RETURN count(k)").rows[0][0], Value::Int(1));
+        q(&mut g, "CREATE (:After)");
+    }
+    let mut g = Graph::open(&path, Sync::Normal).unwrap();
+    let r = q(&mut g, "MATCH (n) RETURN labels(n)");
+    assert_eq!(r.rows.len(), 2, "nothing rolled back comes back on reopen");
+}
+
+#[test]
+fn parameters_are_values_never_syntax() {
+    let mut g = Graph::memory();
+    let p = |pairs: &[(&str, Value)]| -> Vec<(String, Value)> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+    };
+    let evil = Value::from("x\"}) DETACH DELETE n //");
+    query::execute_with(&mut g, "CREATE (:P {name: $n, tags: $t, age: $a})",
+        &p(&[("n", evil.clone()), ("t", Value::List(vec![Value::Int(1), Value::Null, Value::from("a")])), ("a", Value::Int(-4))])).unwrap();
+    query::execute_with(&mut g, "CREATE (:P {name: $n, age: $a})", &p(&[("n", Value::from("Bob")), ("a", Value::Float(2.5))])).unwrap();
+    q(&mut g, "INDEX ON :P(name)");
+    let r = query::execute_with(&mut g, "MATCH (x:P {name: $n}) RETURN x.name, x.tags, x.age", &p(&[("n", evil.clone())])).unwrap();
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.rows[0][0], evil);
+    assert_eq!(r.rows[0][2], Value::Int(-4));
+    let r = query::execute_with(&mut g, "MATCH (x:P) WHERE x.age > $min AND x.name IN $names RETURN x.name",
+        &p(&[("min", Value::Int(0)), ("names", Value::List(vec![Value::from("Bob")]))])).unwrap();
+    assert_eq!(r.rows, vec![vec![Value::from("Bob")]]);
+    let e = query::execute_with(&mut g, "MATCH (x:P {name: $nope}) RETURN x", &[]).err().unwrap();
+    assert!(e.to_string().contains("missing parameter $nope"));
+    assert_eq!(q(&mut g, "MATCH (x:P) RETURN count(x)").rows[0][0], Value::Int(2));
 }

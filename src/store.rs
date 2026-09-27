@@ -264,6 +264,20 @@ impl Op {
 }
 
 impl Op {
+    /// The op as one self-contained record: kind byte, then payload. What
+    /// the paged engine writes to its log.
+    pub fn encode_record(&self) -> Vec<u8> {
+        let mut out = vec![self.kind()];
+        self.encode_payload(&mut out);
+        out
+    }
+
+    pub fn decode_record(rec: &[u8]) -> Result<Op, String> {
+        let (&kind, payload) = rec.split_first().ok_or("empty op record")?;
+        Op::validate(kind, payload)?;
+        Op::decode(kind, payload)
+    }
+
     /// Check that a payload decodes, without allocating anything. Accepts
     /// exactly what `decode` accepts, so a transaction whose records all
     /// validate can be decoded and applied one record at a time with no
@@ -573,25 +587,13 @@ impl Store {
         // replicas see it and start a fresh lineage instead of appending
         // segments onto a log that no longer exists.
         let generation = new_generation();
-        let written = (|| -> io::Result<FileHeader> {
-            let f = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp)?;
-            let mut w = BufWriter::with_capacity(1 << 20, f);
-            w.write_all(&[0u8; HEADER_LEN as usize])?;
-            write(&mut w)?;
-            let end = w.stream_position()?;
-            let header = encode_header(&generation, end - HEADER_LEN);
-            w.seek(SeekFrom::Start(0))?;
-            w.write_all(&header)?;
-            w.flush()?;
-            w.get_ref().set_len(end)?;
-            w.get_ref().sync_all()?;
-            parse_header(&header)
-        })();
+        let written = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .and_then(|f| write_image_into(f, &generation, write));
         let loaded = written.and_then(|h| load(&tmp, &h).map(|t| (h, t)));
         let (header, out) = match loaded {
             Ok(x) => x,
@@ -636,6 +638,45 @@ impl Store {
     }
 }
 
+/// Write header + image (produced by `write`, starting just past the
+/// header) + an empty log into `f`, and make it durable.
+fn write_image_into(
+    f: File,
+    generation: &[u8; 16],
+    write: impl FnOnce(&mut BufWriter<File>) -> io::Result<()>,
+) -> io::Result<FileHeader> {
+    let mut w = BufWriter::with_capacity(1 << 20, f);
+    w.write_all(&[0u8; HEADER_LEN as usize])?;
+    write(&mut w)?;
+    let end = w.stream_position()?;
+    let header = encode_header(generation, end - HEADER_LEN);
+    w.seek(SeekFrom::Start(0))?;
+    w.write_all(&header)?;
+    w.flush()?;
+    w.get_ref().set_len(end)?;
+    w.get_ref().sync_all()?;
+    parse_header(&header)
+}
+
+/// Create a brand-new database file at `path`, which must not exist,
+/// holding the image `write` produces and an empty log. Returns the file
+/// length.
+pub(crate) fn write_image_file(
+    path: &Path,
+    write: impl FnOnce(&mut BufWriter<File>) -> io::Result<()>,
+) -> io::Result<u64> {
+    let f = OpenOptions::new().read(true).write(true).create_new(true).open(path)?;
+    let h = match write_image_into(f, &new_generation(), write) {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = std::fs::remove_file(path);
+            return Err(e);
+        }
+    };
+    sync_parent(path);
+    Ok(h.header_len)
+}
+
 /// Where a compaction writes before renaming into place.
 pub fn compact_tmp_path(db: &Path) -> PathBuf {
     let mut name = db.file_name().unwrap_or_default().to_os_string();
@@ -671,6 +712,27 @@ impl LogWriter {
         let f = OpenOptions::new().write(true).create_new(true).open(path)?;
         let mut file = BufWriter::with_capacity(1 << 20, f);
         let header = encode_header(&new_generation(), 0);
+        file.write_all(&header)?;
+        Ok(LogWriter {
+            file,
+            buf: Vec::with_capacity(1 << 20),
+            bytes: header.len() as u64,
+            ops: 0,
+            open_tx: false,
+        })
+    }
+
+    /// As `create`, but with a format-v2 header: no image, and readable by
+    /// builds that predate v3. For producing files to compare old and new
+    /// builds against; a v2 file upgrades on its first compaction.
+    pub fn create_v2(path: &Path) -> io::Result<LogWriter> {
+        let f = OpenOptions::new().write(true).create_new(true).open(path)?;
+        let mut file = BufWriter::with_capacity(1 << 20, f);
+        let mut header = Vec::with_capacity(HEADER_V2_LEN as usize);
+        header.extend_from_slice(MAGIC);
+        codec::put_u32(&mut header, 2);
+        codec::put_u32(&mut header, 0);
+        header.extend_from_slice(&new_generation());
         file.write_all(&header)?;
         Ok(LogWriter {
             file,
@@ -867,7 +929,7 @@ fn encode_header(generation: &[u8; 16], image_len: u64) -> Vec<u8> {
 /// time, not to be unguessable. Seeded from the OS through RandomState, the
 /// clock, and the pid, so two compactions a microsecond apart on the same
 /// machine still differ.
-fn new_generation() -> [u8; 16] {
+pub(crate) fn new_generation() -> [u8; 16] {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1037,7 +1099,7 @@ impl Store {
 /// survives a crash. A no-op on Windows, where directories are not openable
 /// this way and the guarantee comes from elsewhere; failures are ignored
 /// because some filesystems refuse the call and the write itself succeeded.
-fn sync_parent(path: &Path) {
+pub(crate) fn sync_parent(path: &Path) {
     #[cfg(not(windows))]
     {
         let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
@@ -1059,12 +1121,12 @@ fn sync_parent(path: &Path) {
 /// leaves one behind, and a network filesystem may not honour `create_new`
 /// atomically — but it turns the overwhelmingly common accident (starting the
 /// service twice) from silent corruption into a clear error.
-struct Lock {
+pub(crate) struct Lock {
     path: PathBuf,
 }
 
 impl Lock {
-    fn acquire(db: &Path, force: bool) -> io::Result<Lock> {
+    pub(crate) fn acquire(db: &Path, force: bool) -> io::Result<Lock> {
         let path = lock_path(db);
 
         loop {
@@ -1079,7 +1141,8 @@ impl Lock {
                             .map(|d| d.as_secs())
                             .unwrap_or(0)
                     );
-                    let _ = f.sync_all();
+                    // Not synced: a lock only matters while its holder
+                    // lives, and after a crash it is stale anyway.
                     return Ok(Lock { path });
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
@@ -1163,7 +1226,7 @@ pub struct VerifyReport {
     /// The snapshot image, if the file has one: what it holds, or why it
     /// failed its checks. Every section and every property chunk is read and
     /// checksummed.
-    pub image: Option<Result<crate::image::ImageReport, String>>,
+    pub image: Option<Result<crate::legacy::image::ImageReport, String>>,
 }
 
 /// Walk every frame: check CRCs, decode every payload, count what is there.
@@ -1214,7 +1277,7 @@ pub fn verify(path: &Path) -> io::Result<VerifyReport> {
     }
 
     let image = (header.image_len > 0).then(|| {
-        crate::image::verify_file(path, header.image_at, header.image_len)
+        crate::legacy::image::verify_file(path, header.image_at, header.image_len)
             .map_err(|e| e.to_string())
     });
 

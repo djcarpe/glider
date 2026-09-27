@@ -362,7 +362,7 @@ pub fn expand_json(g: &Graph, id: u64, limit: usize) -> Result<String, String> {
     let mut proj = Projection::default();
     proj.nodes.insert(id);
 
-    for a in g.neighbors(id, Dir::Both, None).into_iter().take(limit) {
+    for a in g.neighbors_limited(id, Dir::Both, limit) {
         proj.edges.insert(a.edge);
         proj.nodes.insert(a.other);
     }
@@ -434,24 +434,44 @@ fn needle_of(q: Option<&str>) -> Option<String> {
 /// Walk sorted `ids` from the cursor, keeping those that pass `keep`, and
 /// return (page, next cursor). The cursor is the id to start *from*, so page
 /// one is `from = 0` and `next` is simply the first id not yet delivered.
+/// Most candidates one page request examines while filtering. A rare
+/// search term therefore returns a short page and a cursor to continue from,
+/// instead of scanning the whole graph in one request.
+const SCAN_BUDGET: usize = 200_000;
+
+/// Walk ids from `from` upwards through `fetch` (which returns up to n ids
+/// >= a cursor, ascending), keeping those `keep` accepts, until `limit` are
+/// found. Returns them and the cursor to continue from, if any.
 fn page<F: Fn(u64) -> bool>(
-    ids: &[u64],
+    fetch: &dyn Fn(u64, usize) -> Vec<u64>,
     from: u64,
     limit: usize,
     keep: F,
 ) -> (Vec<u64>, Option<u64>) {
-    let start = ids.partition_point(|&id| id < from);
-    let mut out = Vec::with_capacity(limit.min(ids.len()));
-    for &id in &ids[start..] {
-        if !keep(id) {
-            continue;
+    let mut out = Vec::with_capacity(limit.min(1024));
+    let mut cursor = from;
+    let mut scanned = 0usize;
+    loop {
+        let batch = fetch(cursor, 1024);
+        let n = batch.len();
+        for id in batch {
+            scanned += 1;
+            cursor = id + 1;
+            if keep(id) {
+                // The cursor is the next match, so the next page starts on it.
+                if out.len() == limit {
+                    return (out, Some(id));
+                }
+                out.push(id);
+            }
+            if scanned >= SCAN_BUDGET {
+                return (out, Some(cursor));
+            }
         }
-        if out.len() == limit {
-            return (out, Some(id));
+        if n < 1024 {
+            return (out, None);
         }
-        out.push(id);
     }
-    (out, None)
 }
 
 /// A page of nodes: `{"nodes":[..],"next":<id>|null,"total":N}`.
@@ -466,12 +486,16 @@ pub fn nodes_json(
     from: u64,
     limit: usize,
 ) -> String {
-    let ids = match label.filter(|l| !l.is_empty()) {
-        Some(l) => g.nodes_with_label(l),
-        None => g.node_ids(),
+    let label = label.filter(|l| !l.is_empty());
+    let (fetch, total): (Box<dyn Fn(u64, usize) -> Vec<u64>>, usize) = match label {
+        Some(l) => match g.strings.lookup(l) {
+            Some(lid) => (Box::new(move |c, n| g.label_members_from(lid, c, n)), g.label_count(l)),
+            None => (Box::new(|_, _| Vec::new()), 0),
+        },
+        None => (Box::new(|c, n| g.nodes_from(c, n)), g.node_count()),
     };
     let needle = needle_of(q);
-    let (hits, next) = page(&ids, from, limit, |id| match &needle {
+    let (hits, next) = page(&*fetch, from, limit, |id| match &needle {
         Some(n) => node_matches(g, id, n),
         None => true,
     });
@@ -485,7 +509,7 @@ pub fn nodes_json(
         write_node(g, *id, &mut out);
     }
     out.push_str("],");
-    write_page_tail(next, ids.len(), &mut out);
+    write_page_tail(next, total, &mut out);
     out
 }
 
@@ -499,12 +523,16 @@ pub fn edges_json(
     from: u64,
     limit: usize,
 ) -> String {
-    let ids = match etype.filter(|t| !t.is_empty()) {
-        Some(t) => g.edges_with_type(t),
-        None => g.edge_ids(),
+    let etype = etype.filter(|t| !t.is_empty());
+    let (fetch, total): (Box<dyn Fn(u64, usize) -> Vec<u64>>, usize) = match etype {
+        Some(t) => match g.strings.lookup(t) {
+            Some(tid) => (Box::new(move |c, n| g.type_members_from(tid, c, n)), g.type_count(t)),
+            None => (Box::new(|_, _| Vec::new()), 0),
+        },
+        None => (Box::new(|c, n| g.edges_from(c, n)), g.edge_count()),
     };
     let needle = needle_of(q);
-    let (hits, next) = page(&ids, from, limit, |id| match &needle {
+    let (hits, next) = page(&*fetch, from, limit, |id| match &needle {
         Some(n) => edge_matches(g, id, n),
         None => true,
     });
@@ -530,7 +558,7 @@ pub fn edges_json(
         write_node(g, *id, &mut out);
     }
     out.push_str("],");
-    write_page_tail(next, ids.len(), &mut out);
+    write_page_tail(next, total, &mut out);
     out
 }
 

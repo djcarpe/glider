@@ -1,5 +1,12 @@
 # glider-stream
 
+> **Paged databases:** `glider-stream` replicates database files from before
+> paged storage (an append-only log with a snapshot image). For a paged
+> database it stops with an error pointing at `glider <db> wal tail --exec`,
+> which ships base snapshots and the write-ahead log to any destination a
+> command can reach — see [REPLICATION.md](REPLICATION.md). Built-in S3 and
+> HTTP backends for paged replicas are future work (PAGED-6 in TODO.md).
+
 Continuous replication for glider databases, built to Litestream's shape: a
 daemon that watches database files and streams committed bytes to object
 storage, plus a restore that puts them back.

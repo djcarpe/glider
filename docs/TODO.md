@@ -58,7 +58,11 @@ These produce wrong results or lost data. Nothing else should go first.
   unsafe code: plain reads, plus positional reads for properties left on
   disk (`Residency::OnDisk`). Measured, same data: 500 MiB log 13.1 s /
   3.1 GB RSS before, 0.50 s / 529 MB after (0.34 s / 295 MB with properties
-  on disk); 1 GiB 30.0 s / 6.4 GB before, 0.99 s / 1.1 GB after. Tests:
+  on disk); 1 GiB 30.0 s / 6.4 GB before, 0.99 s / 1.1 GB after. Then made
+  lazy: open reads the header and directory only, each column and 64 KiB
+  property chunk loads and is checksummed on first use (open + STATS on
+  500 MiB: under 5 ms, 13 MB). Validated at 1, 5, 10 and 25 GiB — see
+  `bench/SCALE.md`. Tests:
   `tests/image_differential.rs` (random ops against an image-free oracle,
   every read compared) and `tests/image_file.rs`. Original diagnosis below.
 
@@ -136,13 +140,57 @@ These produce wrong results or lost data. Nothing else should go first.
   building: `verify` now gives a clean baseline that excludes graph
   construction entirely.
 
-- [ ] **DUR-6 · Working set cannot exceed RAM** · L
-  The structural ceiling, documented in `MOBILE.md`. Raised by DUR-1: a
-  compacted graph costs ~1× its image in RAM, and property values can stay
-  on disk. Topology and indexes must still fit. Fixing it means a paged B-tree with a buffer pool — a
-  rewrite of `store.rs` and `graph.rs`, not a flag. Check first whether
-  sharding by subgraph covers the real cases; for per-user or per-repo graphs
-  it usually does.
+- [x] **DUR-6 · Working set cannot exceed RAM** · L
+  **Done: paged storage (format v4).** One engine, one page format, two
+  page stores, as SQLite: `:memory:` holds its pages in RAM up to
+  `max_memory` and reports `Error::Full` (rolled back, graph usable) past
+  it; a file holds them on disk across 64 GiB segment files, behind a CLOCK
+  page cache of fixed size, so capacity is the disk's. Copy-on-write
+  B+trees (`storage/btree.rs`) under transaction epochs, a logical
+  write-ahead log with checkpoints and alternating superblocks
+  (`storage/{pager,log,db}.rs`), external sort and bottom-up bulk build,
+  streaming query execution, algorithms that run over the pages with
+  spilling per-node state (`ooc.rs`), and replication by base snapshot plus
+  shipped log with a writer-side hold (`replica.rs`). The previous engine
+  lives on in `legacy/` as the differential-test oracle and for
+  `glider <db> migrate`. Measured: a 100 GB B+tree built in 15 min at
+  1.1 GB RSS, cold point lookups ~1.4 page reads, a kill -9 loop always
+  recovering; the 1–25 GiB graph runs are in `bench/PAGED.md`. Remaining
+  items are under **Paged storage** below.
+
+- [ ] **PAGED-1 · Denser adjacency** · M
+  A paged file is ~1.4× the old snapshot image: one B+tree entry per
+  (node, direction, edge). Delta-encoded blocks of edges per node (the plan
+  in `adj`'s comment) or leaf prefix compression would close most of it.
+
+- [ ] **PAGED-2 · Faster writes and bulk build** · M
+  Autocommit writes pay a log write and a page copy each; batch small
+  commits (group commit) and add sequential readahead to scans.
+
+- [ ] **PAGED-3 · Query working memory for sorts, DISTINCT and grouping** · M
+  Write statements spool their matches to disk, algorithms spill, and
+  `ORDER BY … LIMIT` keeps only the top k, but `ORDER BY` without a limit,
+  `DISTINCT` and `GROUP BY` hold their output in memory — as a
+  `QueryResult` must, since it returns every row. A streaming result API
+  (cursor over the executor) is what makes spilling those worthwhile.
+
+- [ ] **PAGED-4 · Free list is held in memory** · M
+  Free page numbers are a `Vec<u64>`, 8 bytes per free page. Fine until a
+  mass delete frees billions of pages; an extent tree would bound it.
+
+- [ ] **PAGED-5 · Dijkstra's heap, betweenness and closeness at scale** · M
+  Dijkstra's priority queue is in memory (O(frontier)); betweenness and
+  closeness are O(n·m) by nature — use `samples:`.
+
+- [ ] **PAGED-6 · Incremental bases and glider-stream** · M
+  A new replica base copies every page; ship only pages changed since the
+  previous base. `glider-stream` (built-in S3/HTTP) still replicates only
+  pre-paged files; paged ones use `wal tail --exec`.
+
+- [ ] **PAGED-7 · Concurrent readers** · L
+  Copy-on-write already gives every checkpoint a consistent snapshot; a
+  reader could hold an epoch while the writer continues (as LMDB does),
+  using the same hold mechanism replication uses.
 
 ---
 
@@ -241,6 +289,8 @@ These produce wrong results or lost data. Nothing else should go first.
   before building.
 
 - [ ] **PERF-5 · CSR projections are rebuilt on every `CALL`** · **new** · M
+  (Now only when the projection fits the working memory; otherwise the
+  algorithm reads the pages directly and there is nothing to rebuild.)
   Each algorithm invocation builds a fresh CSR, O(V+E). Running five
   algorithms over the same projection pays it five times. Cache by
   (direction, edge type, weight property) and invalidate on write.

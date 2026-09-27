@@ -29,3 +29,11 @@ path = "src/bin/loadgen.rs"
 [[bin]]
 name = "stress-gen"
 path = "src/bin/stress-gen.rs"
+
+[[bin]]
+name = "scale-gen"
+path = "src/bin/scale-gen.rs"
+
+[[bin]]
+name = "pagebench"
+path = "src/bin/pagebench.rs"

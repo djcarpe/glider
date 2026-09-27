@@ -23,3 +23,6 @@ dist-standalone/
 .idea/
 .vscode/
 *.gldb.lock
+
+# Python
+__pycache__/

@@ -186,6 +186,33 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
+    /// Step over a value without checking string contents. For data whose
+    /// integrity is already established — a checksummed image — where
+    /// re-validating UTF-8 in every skipped text would dominate a lookup.
+    pub fn skip_value_trusted(&mut self) -> Result<(), String> {
+        match self.u8()? {
+            0 => Ok(()),
+            1 => self.advance(1),
+            2 => self.ivarint().map(|_| ()),
+            3 => self.advance(8),
+            4 => {
+                let len = self.varint()? as usize;
+                self.advance(len)
+            }
+            5 => {
+                let n = self.varint()? as usize;
+                if n > self.remaining() + 1 {
+                    return Err("list length exceeds record".into());
+                }
+                for _ in 0..n {
+                    self.skip_value_trusted()?;
+                }
+                Ok(())
+            }
+            other => Err(format!("unknown value tag {}", other)),
+        }
+    }
+
     /// Step over a value without allocating it. Accepts exactly what
     /// `value` accepts.
     pub fn skip_value(&mut self) -> Result<(), String> {
@@ -242,7 +269,9 @@ pub fn read_prop_ids(buf: &[u8]) -> Result<Vec<(u32, Value)>, String> {
 }
 
 /// One property out of a run, decoding only the value that matches. The
-/// others are stepped over without allocating.
+/// others are stepped over without allocating. Runs come from checksummed
+/// images, so skipped strings are not re-validated; the matching value is
+/// decoded, and so checked, in full.
 pub fn find_prop(buf: &[u8], key: u32) -> Result<Option<Value>, String> {
     if buf.is_empty() {
         return Ok(None);
@@ -254,7 +283,7 @@ pub fn find_prop(buf: &[u8], key: u32) -> Result<Option<Value>, String> {
         if k == key as u64 {
             return r.value().map(Some);
         }
-        r.skip_value()?;
+        r.skip_value_trusted()?;
     }
     Ok(None)
 }

@@ -249,6 +249,14 @@ impl Replicator {
         force_snapshot: bool,
         enforce_retention: bool,
     ) -> io::Result<Synced> {
+        if crate::replica::is_paged(&self.db) {
+            return Err(io::Error::other(format!(
+                "{} uses paged storage, which glider-stream does not replicate yet; \
+                 use `glider {} wal tail --to <dir> --exec '<upload command>'` instead",
+                self.db.display(),
+                self.db.display()
+            )));
+        }
         let header = store::read_header(&self.db)?;
         if !header.has_generation() {
             return Err(io::Error::other(
@@ -582,7 +590,7 @@ mod tests {
     /// back a database that opens cleanly and has silently lost data.
     #[test]
     fn a_missing_segment_fails_the_restore() {
-        use crate::graph::Graph;
+        use crate::legacy::graph::Graph;
         use crate::store::Sync;
         use crate::stream::backend::FileBackend;
         use crate::stream::config::ReplicaConfig;

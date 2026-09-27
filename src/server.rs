@@ -29,6 +29,19 @@ pub fn serve(graph: Graph, addr: &str) -> std::io::Result<()> {
 /// — before any request can race the listener.
 pub fn serve_on(listener: TcpListener, graph: Graph) -> std::io::Result<()> {
     let shared = Arc::new(Mutex::new(graph));
+    // An idle server still answers a replicator's request for a base
+    // snapshot (which otherwise waits for the next commit).
+    {
+        let graph = Arc::downgrade(&shared);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let Some(g) = graph.upgrade() else { return };
+            let mut g = lock(&g);
+            if let Err(e) = g.poll_replication() {
+                eprintln!("replication: {e}");
+            }
+        });
+    }
 
     for stream in listener.incoming() {
         let stream = match stream {

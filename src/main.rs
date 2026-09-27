@@ -19,9 +19,11 @@ usage:
   glider <db> browser [--addr HOST:PORT] [--no-open]
   glider <db> import <file.jsonl>
   glider <db> export [file.jsonl]
-  glider <db> stats | compact | verify | bench [n]
+  glider <db> stats | verify | bench [n]
+  glider <db> compact              checkpoint: fold the write-ahead log into the pages
+  glider <db> migrate              convert a file from before paged storage
 
-replication (see docs/MOBILE.md / README for the full story):
+replication (see docs/REPLICATION.md):
   glider <db> wal tail --to <dir> [--exec CMD] [--interval S] [--once]
   glider <db> wal status --to <dir>
   glider wal verify --from <dir>
@@ -31,12 +33,18 @@ replication (see docs/MOBILE.md / README for the full story):
 
 options:
   --sync always|normal|off   durability (default normal)
-  --props memory|disk[:MB]   where property values live after the snapshot
-                             image loads: in RAM (default), or read from disk
-                             on demand through an MB-sized cache (default 64)
-  --auto-compact MB|off      rewrite the file as a fresh image once the log
-                             after it passes MB (or the image size, if larger);
-                             default 64
+  --cache-size SIZE          page cache for a file-backed database (default
+                             1G). RAM use stays near this however large the
+                             database grows; the database is limited by disk
+  --max-memory SIZE          :memory: only: the most memory the graph may use
+                             (default: physical RAM). Past it, writes fail
+                             cleanly and roll back
+  --work-mem SIZE            memory algorithms may use before spilling to
+                             <db>-tmp/ (default 256M; :memory: uses the
+                             headroom under --max-memory)
+  --checkpoint SIZE|off      fold the write-ahead log into the database pages
+                             after this much log (default 256M); bounds crash
+                             recovery time
   --force                    open despite a lock left by a dead writer
   --json                     print results as JSON instead of a table
   --addr HOST:PORT           bind address for serve/browser (default 127.0.0.1:7878)
@@ -61,8 +69,10 @@ struct Options {
     force: bool,
     /// `browser` only: skip launching the user's browser.
     no_open: bool,
-    residency: glider::Residency,
-    auto_compact: Option<u64>,
+    cache_size: u64,
+    max_memory: Option<u64>,
+    checkpoint_bytes: u64,
+    work_mem: u64,
 }
 
 enum Mode {
@@ -99,6 +109,23 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
+    // `glider wal ...` and `glider <db> wal ...`.
+    if let Some(at) = args.iter().position(|a| a == "wal") {
+        return run_wal(&args, at);
+    }
+
+    if args.len() >= 2 && (args[1] == "verify" || args[1] == "migrate") && !Path::new(&args[0]).exists() {
+        return Err(format!("{}: no such database", args[0]));
+    }
+
+    if args.len() >= 2 && args[1] == "migrate" {
+        return migrate(&args[0]);
+    }
+
+    if args.len() >= 2 && args[1] == "verify" && glider::legacy::detect(Path::new(&args[0])).is_none() {
+        return verify_paged(&args[0]);
+    }
+
     if args.len() >= 2 && args[1] == "verify" {
         let r = glider::store::verify(Path::new(&args[0])).map_err(|e| e.to_string())?;
         println!("records       {}", r.records);
@@ -130,10 +157,6 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
-    if let Some(at) = args.iter().position(|a| a == "wal") {
-        return run_wal(&args, at);
-    }
-
     let mut opts = Options {
         force: false,
         no_open: false,
@@ -145,8 +168,10 @@ fn run() -> Result<(), String> {
         json: false,
         addr: "127.0.0.1:7878".into(),
         bench: 50_000,
-        residency: glider::Residency::Memory,
-        auto_compact: Some(glider::DEFAULT_AUTO_COMPACT),
+        cache_size: glider::storage::pager::DEFAULT_CACHE_BYTES,
+        max_memory: None,
+        checkpoint_bytes: 256 << 20,
+        work_mem: glider::graph::DEFAULT_WORK_MEM,
     };
 
     let mut i = 0;
@@ -173,33 +198,29 @@ fn run() -> Result<(), String> {
                     _ => return Err("--sync takes always, normal or off".into()),
                 };
             }
-            "--props" => {
+            "--cache-size" => {
                 i += 1;
-                let v = args.get(i).map(|s| s.as_str()).unwrap_or("");
-                opts.residency = match v.split_once(':') {
-                    None if v == "memory" => glider::Residency::Memory,
-                    None if v == "disk" => glider::Residency::OnDisk {
-                        cache_bytes: 64 << 20,
-                    },
-                    Some(("disk", mb)) => glider::Residency::OnDisk {
-                        cache_bytes: mb
-                            .parse::<usize>()
-                            .map_err(|_| "--props disk:MB needs a number")?
-                            << 20,
-                    },
-                    _ => return Err("--props takes memory, disk or disk:MB".into()),
-                };
+                opts.cache_size = parse_size(args.get(i).map(|s| s.as_str()).unwrap_or(""))
+                    .ok_or("--cache-size takes a size, like 512M or 2G")?;
             }
-            "--auto-compact" => {
+            "--max-memory" => {
                 i += 1;
-                opts.auto_compact = match args.get(i).map(|s| s.as_str()) {
-                    Some("off") => None,
-                    Some(mb) => Some(
-                        mb.parse::<u64>()
-                            .map_err(|_| "--auto-compact takes MB or off")?
-                            << 20,
-                    ),
-                    None => return Err("--auto-compact takes MB or off".into()),
+                opts.max_memory = Some(
+                    parse_size(args.get(i).map(|s| s.as_str()).unwrap_or(""))
+                        .ok_or("--max-memory takes a size, like 512M or 4G")?,
+                );
+            }
+            "--work-mem" => {
+                i += 1;
+                opts.work_mem = parse_size(args.get(i).map(|s| s.as_str()).unwrap_or(""))
+                    .ok_or("--work-mem takes a size, like 256M or 1G")?;
+            }
+            "--checkpoint" => {
+                i += 1;
+                opts.checkpoint_bytes = match args.get(i).map(|s| s.as_str()) {
+                    Some("off") => u64::MAX,
+                    Some(v) => parse_size(v).ok_or("--checkpoint takes a size or off")?,
+                    None => return Err("--checkpoint takes a size or off".into()),
                 };
             }
             "--addr" => {
@@ -281,13 +302,12 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         Mode::Export(path) => {
-            let text = query::export_jsonl(&graph);
-            match path {
-                Some(p) => {
-                    std::fs::write(&p, text).map_err(|e| format!("{}: {}", p.display(), e))?;
-                    println!("exported to {}", p.display());
-                }
-                None => print!("{}", text),
+            export(&graph, path.as_deref()).map_err(|e| match &path {
+                Some(p) => format!("{}: {}", p.display(), e),
+                None => e.to_string(),
+            })?;
+            if let Some(p) = path {
+                println!("exported to {}", p.display());
             }
             Ok(())
         }
@@ -296,17 +316,104 @@ fn run() -> Result<(), String> {
     }
 }
 
+/// Stream the dump to a file or stdout without holding it in memory.
+fn export(graph: &Graph, path: Option<&Path>) -> std::io::Result<()> {
+    match path {
+        Some(p) => {
+            let mut w = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(p)?);
+            query::export_jsonl_to(graph, &mut w)
+        }
+        None => {
+            let mut w = std::io::BufWriter::with_capacity(1 << 20, std::io::stdout().lock());
+            query::export_jsonl_to(graph, &mut w)
+        }
+    }
+}
+
 fn open_graph(opts: &Options) -> Result<Graph, String> {
     if opts.db == ":memory:" {
-        return Ok(Graph::memory());
+        return Ok(match opts.max_memory {
+            Some(m) => Graph::memory_with_limit(m),
+            None => Graph::memory(),
+        });
     }
     let o = glider::OpenOptions {
         sync: opts.sync,
         force: opts.force,
-        residency: opts.residency,
-        auto_compact: opts.auto_compact,
+        cache_size: opts.cache_size,
+        checkpoint_bytes: opts.checkpoint_bytes,
+        work_mem: opts.work_mem,
+        ..glider::OpenOptions::default()
     };
     Graph::open_opts(std::path::Path::new(&opts.db), o).map_err(|e| e.to_string())
+}
+
+/// "512M", "2G", "64k", "1.5T" or plain bytes; binary units.
+fn parse_size(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (num, mult) = match s.char_indices().last()? {
+        (i, 'k' | 'K') => (&s[..i], 1u64 << 10),
+        (i, 'm' | 'M') => (&s[..i], 1 << 20),
+        (i, 'g' | 'G') => (&s[..i], 1 << 30),
+        (i, 't' | 'T') => (&s[..i], 1 << 40),
+        _ => (s, 1),
+    };
+    let n: f64 = num.trim().parse().ok()?;
+    (n >= 0.0).then_some((n * mult as f64) as u64)
+}
+
+/// Convert a file from before paged storage (formats v1–v3) in place,
+/// keeping the original as `<db>.legacy.bak`.
+fn migrate(db: &str) -> Result<(), String> {
+    let path = Path::new(db);
+    let Some(kind) = glider::legacy::detect(path) else {
+        return Err(format!("{db} is not a legacy glider file; nothing to migrate"));
+    };
+    let t = std::time::Instant::now();
+    eprintln!("reading {db} ({kind}) ...");
+    let old = glider::legacy::graph::Graph::open(path, Sync::Normal).map_err(|e| e.to_string())?;
+    let tmp = format!("{db}.migrating");
+    let _ = std::fs::remove_file(&tmp);
+    let mut g = Graph::open(Path::new(&tmp), Sync::Off).map_err(|e| e.to_string())?;
+    g.import_legacy(&old).map_err(|e| e.to_string())?;
+    g.checkpoint().map_err(|e| e.to_string())?;
+    let (n, e) = (g.node_count(), g.edge_count());
+    drop(g);
+    drop(old);
+    let bak = format!("{db}.legacy.bak");
+    std::fs::rename(path, &bak).map_err(|e| e.to_string())?;
+    for (from, to) in [
+        (tmp.clone(), db.to_string()),
+        (format!("{tmp}-wal"), format!("{db}-wal")),
+        (format!("{tmp}-data"), format!("{db}-data")),
+    ] {
+        if Path::new(&from).exists() {
+            std::fs::rename(&from, &to).map_err(|e| e.to_string())?;
+        }
+    }
+    let _ = std::fs::remove_file(format!("{tmp}.lock"));
+    println!(
+        "migrated {n} nodes and {e} edges in {:.1} s; the original is kept as {bak}",
+        t.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+/// Integrity check of a paged database: every tree's order, bounds and
+/// ownership, and every page checksum on the way.
+fn verify_paged(db: &str) -> Result<(), String> {
+    let g = Graph::open(Path::new(db), Sync::Normal).map_err(|e| e.to_string())?;
+    let t = std::time::Instant::now();
+    let entries = g.verify_trees().map_err(|e| e.to_string())?;
+    let s = g.stats();
+    println!("format        paged (v4)");
+    println!("nodes         {}", s.nodes);
+    println!("edges         {}", s.edges);
+    println!("tree entries  {entries}");
+    println!("file          {} bytes", s.file_bytes);
+    println!("page size     {} bytes", s.page_size);
+    println!("integrity     ok ({:.2} s)", t.elapsed().as_secs_f64());
+    Ok(())
 }
 
 fn run_script(graph: &mut Graph, text: &str, json: bool) -> Result<(), String> {
@@ -423,7 +530,13 @@ fn shell(mut graph: Graph, mut json: bool) -> Result<(), String> {
             let start = Instant::now();
             match query::execute(&mut graph, stmt.trim()) {
                 Ok(r) => print_result(&r, json, timer, start.elapsed().as_secs_f64()),
-                Err(e) => eprintln!("error: {}", e),
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    // Scripts reading --json output get one line per statement.
+                    if json {
+                        println!("{{\"error\":{}}}", Value::Text(e.to_string()).to_json());
+                    }
+                }
             }
         }
     }
@@ -469,13 +582,9 @@ fn dot_command(
             println!("imported {} nodes, {} edges", n, e);
         }
         ".export" => {
-            let text = query::export_jsonl(graph);
-            match arg {
-                Some(p) => {
-                    std::fs::write(p, text).map_err(|e| e.to_string())?;
-                    println!("exported to {}", p);
-                }
-                None => print!("{}", text),
+            export(graph, arg.map(Path::new)).map_err(|e| e.to_string())?;
+            if let Some(p) = arg {
+                println!("exported to {}", p);
             }
         }
         ".read" => {
@@ -493,6 +602,9 @@ fn dot_command(
 fn print_result(r: &QueryResult, json: bool, timer: bool, secs: f64) {
     if json {
         println!("{}", r.to_json());
+        if timer {
+            println!("{{\"elapsed_ms\":{:.3}}}", secs * 1000.0);
+        }
         return;
     }
     if let Some(m) = &r.message {
@@ -746,7 +858,11 @@ fn run_wal(args: &[String], at: usize) -> Result<(), String> {
             if let Some(s) = flag(args, "--min-bytes") {
                 opts.min_bytes = s.parse().map_err(|_| "--min-bytes takes a number")?;
             }
-            glider::wal::tail(Path::new(&db), Path::new(&dir), &opts).map_err(|e| e.to_string())
+            if glider::replica::is_paged(Path::new(&db)) {
+                glider::replica::tail(Path::new(&db), Path::new(&dir), &opts).map_err(|e| e.to_string())
+            } else {
+                glider::wal::tail(Path::new(&db), Path::new(&dir), &opts).map_err(|e| e.to_string())
+            }
         }
 
         "status" => {
@@ -754,6 +870,39 @@ fn run_wal(args: &[String], at: usize) -> Result<(), String> {
             let dir = flag(args, "--to")
                 .or_else(|| flag(args, "--from"))
                 .ok_or("wal status needs --to <dir>")?;
+            if let Ok(sb) = glider::storage::pager::read_superblock(Path::new(&db)) {
+                let gen: String = sb.generation.iter().map(|b| format!("{b:02x}")).collect();
+                let local = match glider::storage::log::committed_end(Path::new(&db), sb.wal_lsn)
+                    .map_err(|e| e.to_string())?
+                {
+                    glider::storage::log::Committed::To(e) => e,
+                    glider::storage::log::Committed::Gone => sb.wal_lsn,
+                };
+                let bases = glider::replica::bases(Path::new(&dir), &gen).map_err(|e| e.to_string())?;
+                let segs = glider::wal::segments(Path::new(&dir), &gen).map_err(|e| e.to_string())?;
+                let replicated = bases
+                    .last()
+                    .map(|b| glider::replica::reach(&segs, b.lsn))
+                    .unwrap_or(0);
+                println!("database    {}", db);
+                println!("generation  {}", gen);
+                println!("committed   log to {}", local);
+                match bases.last() {
+                    Some(b) => println!(
+                        "base        at log {} ({}), {} bases",
+                        b.lsn,
+                        glider::wal::fmt_unix(b.ts),
+                        bases.len()
+                    ),
+                    None => println!("base        none yet"),
+                }
+                println!("replicated  log to {} in {} segments", replicated, segs.len());
+                println!("lag         {} bytes", local.saturating_sub(replicated));
+                if let Some(last) = segs.last() {
+                    println!("last ship   {}", glider::wal::fmt_unix(last.ts));
+                }
+                return Ok(());
+            }
             let header = glider::store::read_header(Path::new(&db)).map_err(|e| e.to_string())?;
             let local =
                 glider::store::scan_committed_end(Path::new(&db), 0).map_err(|e| e.to_string())?;
@@ -786,7 +935,31 @@ fn run_wal(args: &[String], at: usize) -> Result<(), String> {
             let dir = flag(args, "--from")
                 .or_else(|| flag(args, "--to"))
                 .ok_or("wal verify needs --from <dir>")?;
-            let gens = glider::wal::verify(Path::new(&dir)).map_err(|e| e.to_string())?;
+            let paged = glider::replica::verify(Path::new(&dir)).map_err(|e| e.to_string())?;
+            for g in &paged {
+                println!(
+                    "{}  {} bases (newest at log {}), {} log segments, {} bytes, log complete to {}{}",
+                    g.generation,
+                    g.bases.len(),
+                    g.bases.last().map(|b| b.lsn).unwrap_or(0),
+                    g.segments,
+                    g.log_bytes,
+                    g.complete_to,
+                    match g.gap_at {
+                        Some(at) => format!("  ** GAP at {} — later log is unusable **", at),
+                        None => String::new(),
+                    }
+                );
+                println!("    last activity {}", glider::wal::fmt_unix(g.last_ts));
+            }
+            let gens: Vec<_> = glider::wal::verify(Path::new(&dir))
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .filter(|g| !paged.iter().any(|p| p.generation == g.generation))
+                .collect();
+            if gens.is_empty() && !paged.is_empty() {
+                return Ok(());
+            }
             if gens.is_empty() {
                 println!("no generations in {}", dir);
                 return Ok(());
@@ -826,6 +999,38 @@ fn run_wal(args: &[String], at: usize) -> Result<(), String> {
             if Path::new(&out).exists() {
                 return Err(format!("{} already exists — refusing to overwrite", out));
             }
+            let paged = glider::replica::generations(Path::new(&dir)).map_err(|e| e.to_string())?;
+            let use_paged = match &generation {
+                Some(g) => paged.contains(g),
+                None => {
+                    let legacy = glider::wal::generations(Path::new(&dir)).map_err(|e| e.to_string())?;
+                    // The most recently active lineage decides.
+                    legacy.last().map(|g| paged.contains(g)).unwrap_or(!paged.is_empty())
+                }
+            };
+            if use_paged {
+                let report = glider::replica::restore(
+                    Path::new(&dir),
+                    generation.as_deref(),
+                    as_of,
+                    Path::new(&out),
+                )
+                .map_err(|e| e.to_string())?;
+                // Opening replays the log laid beside the base; a restore
+                // that does not open is not a restore.
+                let g = glider::Graph::open(Path::new(&out), Sync::Normal).map_err(|e| e.to_string())?;
+                g.verify_trees().map_err(|e| e.to_string())?;
+                println!(
+                    "restored generation {} from the base at log {} ({}) and {} log segments, through log {}",
+                    report.generation,
+                    report.base.lsn,
+                    glider::wal::fmt_unix(report.base.ts),
+                    report.segments,
+                    report.through
+                );
+                println!("{} nodes, {} edges", g.node_count(), g.edge_count());
+                return Ok(());
+            }
             let report = glider::wal::restore(
                 Path::new(&dir),
                 generation.as_deref(),
@@ -835,13 +1040,15 @@ fn run_wal(args: &[String], at: usize) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
 
             // A restore that does not open is not a restore.
-            let g =
-                glider::Graph::open(Path::new(&out), Sync::Normal).map_err(|e| e.to_string())?;
+            let g = glider::legacy::graph::Graph::open(Path::new(&out), Sync::Normal)
+                .map_err(|e| e.to_string())?;
             println!(
                 "restored {} bytes from {} segments of generation {}",
                 report.bytes, report.segments, report.generation
             );
             println!("{} nodes, {} edges", g.node_count(), g.edge_count());
+            drop(g);
+            println!("(a database from before paged storage: convert it with `glider {out} migrate`)");
             Ok(())
         }
 

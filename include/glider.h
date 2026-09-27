@@ -31,10 +31,13 @@ typedef struct GliderDb glider_db;
 /* --- lifetime ---------------------------------------------------------- */
 
 glider_db *glider_open(const char *path, int sync);
-/* props_cache_bytes: 0 = property values in RAM (as glider_open); otherwise
-   read from disk on demand through a cache of about that size. */
-glider_db *glider_open_ex(const char *path, int sync, size_t props_cache_bytes);
+/* cache_bytes: the page cache (0 = the default, 1 GiB). RAM use stays near
+   it however large the database grows; the database is limited by disk. */
+glider_db *glider_open_ex(const char *path, int sync, size_t cache_bytes);
 glider_db *glider_open_memory(void);
+/* An in-memory graph of at most max_bytes (0 = physical memory). Past it,
+   writes fail with an error and roll back; the graph stays usable. */
+glider_db *glider_open_memory_ex(uint64_t max_bytes);
 /* An in-memory graph from the bytes of a .gldb file; edits are not written back. */
 glider_db *glider_open_bytes(const unsigned char *bytes, size_t len);
 void       glider_close(glider_db *db);
@@ -48,10 +51,10 @@ char *glider_stats(glider_db *db);
 /* --- durability -------------------------------------------------------- */
 
 int glider_checkpoint(glider_db *db); /* call when the app backgrounds */
-int glider_compact(glider_db *db);    /* slow; not on the UI thread    */
+int glider_compact(glider_db *db);    /* a checkpoint, on paged storage */
 int glider_set_sync(glider_db *db, int sync);
-/* Compact automatically once the log tail passes `bytes`; 0 = off. Default
-   64 MiB. Runs inside the commit that crosses it. */
+/* Checkpoint automatically once the write-ahead log passes `bytes`; 0 = off.
+   Default 256 MiB. Runs inside the commit that crosses it. */
 int glider_set_auto_compact(glider_db *db, uint64_t bytes);
 
 /* --- bulk transfer ----------------------------------------------------- */

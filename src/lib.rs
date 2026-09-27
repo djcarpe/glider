@@ -22,21 +22,24 @@ pub mod api;
 pub mod codec;
 pub mod ffi;
 pub mod graph;
-pub mod image;
+pub mod legacy;
+pub mod ooc;
 mod pread;
 pub mod query;
+pub mod replica;
 pub mod server;
+pub mod storage;
 pub mod store;
 pub mod stream;
+pub mod types;
 pub mod utils;
 pub mod value;
 pub mod wal;
 
 pub use graph::{
-    Csr, Dir, EdgeRef, Error, Graph, NodeRef, OpenOptions, Result, Stats, DEFAULT_AUTO_COMPACT,
+    Csr, Dir, EdgeRef, Error, Graph, NodeRef, OpenOptions, Result, Stats,
 };
-pub use image::Residency;
-pub use query::{execute, export_jsonl, import_jsonl, QueryResult};
+pub use query::{execute, export_jsonl, export_jsonl_to, import_jsonl, QueryResult};
 pub use store::Sync;
 pub use value::Value;
 
