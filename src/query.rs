@@ -14,6 +14,8 @@
 //!   INDEX ON :Person(name)
 //!   STATS / SCHEMA / COMPACT / CLEAR / HELP
 
+use std::collections::BTreeSet;
+use std::rc::Rc;
 use std::collections::HashMap;
 
 use std::collections::BTreeMap;
@@ -280,14 +282,14 @@ impl Parser {
 
 #[derive(Clone, Debug)]
 struct NodePat {
-    var: Option<String>,
+    var: Option<Rc<str>>,
     labels: Vec<String>,
     props: Vec<(String, Expr)>,
 }
 
 #[derive(Clone, Debug)]
 struct RelPat {
-    var: Option<String>,
+    var: Option<Rc<str>>,
     types: Vec<String>,
     dir: Dir,
     props: Vec<(String, Expr)>,
@@ -673,7 +675,7 @@ fn parse_chain(p: &mut Parser) -> Result<Chain> {
             if let Some(Tok::Ident(v)) = p.peek() {
                 let v = v.clone();
                 p.pos += 1;
-                rel.var = Some(v);
+                rel.var = Some(Rc::from(v));
             }
             while p.eat_sym(":") {
                 rel.types.push(p.ident()?);
@@ -737,7 +739,7 @@ fn parse_node_pat(p: &mut Parser) -> Result<NodePat> {
     if let Some(Tok::Ident(v)) = p.peek() {
         let v = v.clone();
         p.pos += 1;
-        pat.var = Some(v);
+        pat.var = Some(Rc::from(v));
     }
     while p.eat_sym(":") {
         pat.labels.push(p.ident()?);
@@ -1009,10 +1011,12 @@ enum Bind {
     Edge(u64),
 }
 
-type Binds = Vec<(String, Bind)>;
+/// Variable bindings for one row. Names are shared with the pattern, so
+/// copying a row copies pointers, not strings.
+type Binds = Vec<(Rc<str>, Bind)>;
 
 fn lookup(binds: &Binds, var: &str) -> Option<Bind> {
-    binds.iter().find(|(k, _)| k == var).map(|(_, v)| *v)
+    binds.iter().find(|(k, _)| &**k == var).map(|(_, v)| *v)
 }
 
 // ------------------------------------------------------------------- results
@@ -1396,7 +1400,7 @@ fn explain(g: &Graph, stmt: &Stmt) -> Result<QueryResult> {
         let plan = plan_chain(g, chain, &binds, &pins);
         let name = |i: usize| -> String {
             let pat = &chain.nodes[i];
-            let var = pat.var.clone().unwrap_or_else(|| format!("_{i}"));
+            let var: Rc<str> = pat.var.clone().unwrap_or_else(|| format!("_{i}").into());
             if pat.labels.is_empty() {
                 format!("({var})")
             } else {
@@ -1404,10 +1408,14 @@ fn explain(g: &Graph, stmt: &Stmt) -> Result<QueryResult> {
             }
         };
 
+        let on = match plan.rel_anchor {
+            Some(i) => format!("{}-[:{}]-{}", name(i), chain.rels[i].types[0], name(i + 1)),
+            None => name(plan.anchor),
+        };
         rows.push(vec![
             Value::Int(pi as i64),
             Value::Text("anchor".into()),
-            Value::Text(name(plan.anchor)),
+            Value::Text(on),
             Value::Text(plan.reason.clone()),
             Value::Int(plan.estimate as i64),
         ]);
@@ -1514,6 +1522,9 @@ fn exec_match(
             skip,
             limit,
         } => {
+            if let Some(r) = count_from_counters(g, patterns, filter, tail) {
+                return Ok(r);
+            }
             let mut proj = Projection::new(kind, *distinct, order, *skip, *limit);
             let mut err = None;
             match_all(g, patterns, 0, Vec::new(), filter, &mut |b| match proj.push(g, b) {
@@ -1538,10 +1549,96 @@ fn exec_match(
     crate::ooc::with_budget(budget, tmp, || exec_write(g, patterns, filter, tail))
 }
 
+/// `RETURN count(..)` over a pattern the store already counts: every node,
+/// one label, one index bucket, or one edge type. Answered from counters
+/// instead of enumerating the matches. `None` when the query needs the
+/// general path.
+fn count_from_counters(g: &Graph, patterns: &[Chain], filter: Option<&Expr>, tail: &Tail) -> Option<QueryResult> {
+    let Tail::Return { kind: ReturnKind::Items(items), distinct: false, skip: 0, limit, .. } = tail else {
+        return None;
+    };
+    if filter.is_some() || patterns.len() != 1 || items.len() != 1 || *limit == Some(0) {
+        return None;
+    }
+    let (expr, alias) = &items[0];
+    let Expr::Func(f, args) = expr else { return None };
+    if !f.eq_ignore_ascii_case("count") || args.len() != 1 {
+        return None;
+    }
+    let counted = match &args[0] {
+        Expr::Lit(Value::Text(s)) if s == "*" => None,
+        Expr::Var(v) => Some(v.as_str()),
+        _ => return None,
+    };
+    let chain = &patterns[0];
+    let plain = |n: &NodePat| n.labels.is_empty() && n.props.is_empty();
+    let n = match (chain.nodes.as_slice(), chain.rels.as_slice()) {
+        ([n], []) => {
+            if counted.is_some_and(|c| n.var.as_deref() != Some(c)) {
+                return None;
+            }
+            match (n.labels.as_slice(), n.props.as_slice()) {
+                ([], []) => g.node_count(),
+                ([l], []) => g.label_count(l),
+                ([l], [(k, Expr::Lit(v))]) if g.has_index(l, k) => g.indexed_lookup(l, k, v)?.len(),
+                _ => return None,
+            }
+        }
+        ([a, b], [r]) if !plain(a) && plain(b) && r.types.len() == 1 && r.props.is_empty() && r.hops.is_none()
+            && a.var.is_some() && a.var != b.var && a.var != r.var && counted.is_none_or(|c| Some(c) != a.var.as_deref()) =>
+        {
+            // count over one typed hop from anchored nodes: the adjacency
+            // range count of each anchor, no rows built.
+            let t = g.strings.lookup(&r.types[0]);
+            let mut n = 0usize;
+            let mut pins = Vec::new();
+            pinned_ids(filter, &mut pins);
+            let binds: Binds = Vec::new();
+            let src = anchor_source(g, a, &binds, &pins);
+            if !matches!(src, Source::Index) {
+                return None;
+            }
+            if let Some(t) = t {
+                for_each_candidate(g, a, &binds, &pins, false, &mut |id| {
+                    if node_matches(g, a, id, &binds) {
+                        n += g.degree_of(id, r.dir, Some(t));
+                    }
+                    Ok(true)
+                })
+                .ok()?;
+            }
+            n
+        }
+        ([a, b], [r]) => {
+            // Distinct variables only: `(e)-[:R]->(e)` is a self-loop filter.
+            let vars = [a.var.as_deref(), r.var.as_deref(), b.var.as_deref()];
+            let named: Vec<_> = vars.iter().flatten().collect();
+            if named.len() != named.iter().collect::<BTreeSet<_>>().len() {
+                return None;
+            }
+            if counted.is_some_and(|c| !named.contains(&&c)) {
+                return None;
+            }
+            if !plain(a) || !plain(b) || !r.props.is_empty() || r.hops.is_some() || r.dir == Dir::Both {
+                return None;
+            }
+            match r.types.as_slice() {
+                [] => g.edge_count(),
+                [t] => g.type_count(t),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    // As the general path: no matches, no rows.
+    let rows = if n == 0 { vec![] } else { vec![vec![Value::Int(n as i64)]] };
+    Some(QueryResult::table(vec![alias.clone()], rows))
+}
+
 /// Matched rows, spooled compactly: variable names once, then per row its
 /// length and (name, node-or-edge id) pairs.
 struct Spool {
-    names: Vec<String>,
+    names: Vec<Rc<str>>,
     q: crate::ooc::SpillQueue<(u64, u64)>,
 }
 
@@ -1753,6 +1850,9 @@ struct Step {
 
 struct Plan {
     anchor: usize,
+    /// Start from the edges of one type instead: this relationship's two
+    /// endpoints are bound together, then the walk goes out both ways.
+    rel_anchor: Option<usize>,
     /// Estimated rows the anchor produces, and why.
     estimate: usize,
     reason: String,
@@ -1798,7 +1898,7 @@ fn estimate(g: &Graph, pat: &NodePat, binds: &Binds, pins: &[(String, u64)]) -> 
         if lookup(binds, v).is_some() {
             return (1, format!("bound variable {v}"));
         }
-        if pins.iter().any(|(name, _)| name == v) {
+        if pins.iter().any(|(name, _)| **name == **v) {
             return (1, format!("id({v}) predicate"));
         }
     }
@@ -1817,6 +1917,11 @@ fn estimate(g: &Graph, pat: &NodePat, binds: &Binds, pins: &[(String, u64)]) -> 
     (g.node_count(), "all nodes".to_string())
 }
 
+/// Whether the planner may anchor on an edge type. Tests turn it off to check
+/// that both plans give the same rows.
+#[doc(hidden)]
+pub static EDGE_ANCHORS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 fn plan_chain(g: &Graph, chain: &Chain, binds: &Binds, pins: &[(String, u64)]) -> Plan {
     let mut anchor = 0;
     let mut best = usize::MAX;
@@ -1830,10 +1935,31 @@ fn plan_chain(g: &Graph, chain: &Chain, binds: &Binds, pins: &[(String, u64)]) -
         }
     }
 
+    // An edge type can be the cheaper place to start: `()-[r:RARE]->()`
+    // should read the RARE edges, not every node's adjacency.
+    let mut rel_anchor = None;
+    let edges_ok = EDGE_ANCHORS.load(std::sync::atomic::Ordering::Relaxed);
+    for (i, rel) in chain.rels.iter().enumerate() {
+        if !edges_ok || rel.hops.is_some() || rel.types.len() != 1 {
+            continue;
+        }
+        let est = g.type_count(&rel.types[0]);
+        if est < best {
+            best = est;
+            rel_anchor = Some(i);
+            reason = format!("edges :{}", rel.types[0]);
+        }
+    }
+
     // Outward from the anchor: right as written, then left with directions
-    // flipped. Every step starts from a node bound by an earlier step.
+    // flipped. Every step starts from a node bound by an earlier step. An
+    // edge anchor binds nodes i and i+1, so the walk starts either side.
+    let (right_from, left_from) = match rel_anchor {
+        Some(i) => (i + 1, i),
+        None => (anchor, anchor),
+    };
     let mut steps = Vec::with_capacity(chain.rels.len());
-    for i in anchor..chain.rels.len() {
+    for i in right_from..chain.rels.len() {
         steps.push(Step {
             from: i,
             rel: i,
@@ -1841,7 +1967,7 @@ fn plan_chain(g: &Graph, chain: &Chain, binds: &Binds, pins: &[(String, u64)]) -
             reversed: false,
         });
     }
-    for i in (0..anchor).rev() {
+    for i in (0..left_from).rev() {
         steps.push(Step {
             from: i + 1,
             rel: i,
@@ -1851,7 +1977,8 @@ fn plan_chain(g: &Graph, chain: &Chain, binds: &Binds, pins: &[(String, u64)]) -
     }
 
     Plan {
-        anchor,
+        anchor: rel_anchor.unwrap_or(anchor),
+        rel_anchor,
         estimate: best,
         reason,
         steps,
@@ -1895,11 +2022,19 @@ fn match_chain_filtered(
     let mut pins = Vec::new();
     pinned_ids(filter, &mut pins);
     let plan = plan_chain(g, chain, &binds, &pins);
+    if let Some(ri) = plan.rel_anchor {
+        return match_from_edges(g, chain, &plan, ri, binds, out);
+    }
     let pat = &chain.nodes[plan.anchor];
+    // A label scan's candidates carry the label already: with nothing else
+    // to check, they need no read. Otherwise read records by scanning.
+    let from_label_scan = matches!(anchor_source(g, pat, &binds, &pins), Source::Label | Source::All);
+    let already = from_label_scan && pat.labels.len() <= 1 && pat.props.is_empty();
+    let prime = from_label_scan && (pat.var.is_some() || filter.is_some() || !already);
 
     let mut go = true;
-    for_each_candidate(g, pat, &binds, &pins, &mut |id| {
-        if !node_matches(g, pat, id, &binds) {
+    for_each_candidate(g, pat, &binds, &pins, prime, &mut |id| {
+        if !already && !node_matches(g, pat, id, &binds) {
             return Ok(true);
         }
         let mut b = binds.clone();
@@ -1912,27 +2047,120 @@ fn match_chain_filtered(
         }
         let mut bound = vec![None; chain.nodes.len()];
         bound[plan.anchor] = Some(id);
-        go = walk(g, chain, &plan.steps, 0, b, bound, out)?;
+        go = walk(g, chain, &plan.steps, 0, b, bound, &[], out)?;
         Ok(go)
     })?;
     Ok(go)
 }
 
+/// Bind a pattern variable, or check it against its existing binding.
+fn bind(b: &mut Binds, var: &Option<Rc<str>>, value: Bind) -> bool {
+    let Some(v) = var else { return true };
+    match lookup(b, v) {
+        Some(existing) => existing == value,
+        None => {
+            b.push((v.clone(), value));
+            true
+        }
+    }
+}
+
+/// Match a chain anchored on the edges of one type, streamed in pages of
+/// edge ids.
+fn match_from_edges(g: &Graph, chain: &Chain, plan: &Plan, ri: usize, binds: Binds, out: &mut Sink<'_>) -> Result<bool> {
+    let rel = &chain.rels[ri];
+    let Some(t) = g.strings.lookup(&rel.types[0]) else {
+        return Ok(true);
+    };
+    let (lp, rp) = (&chain.nodes[ri], &chain.nodes[ri + 1]);
+    let mut result = Ok(true);
+    g.scan_type_edges(t, &mut |e| {
+        if !edge_props_match(g, rel, e.id, &binds) {
+            return true;
+        }
+        // As written, then (undirected) the other way round: the same rows
+        // a walk from either end would produce.
+        let ends: &[(u64, u64)] = match rel.dir {
+            Dir::Out => &[(e.from, e.to)],
+            Dir::In => &[(e.to, e.from)],
+            Dir::Both => &[(e.from, e.to), (e.to, e.from)],
+        };
+        for &(a, b_) in ends {
+            if !node_matches(g, lp, a, &binds) || !node_matches(g, rp, b_, &binds) {
+                continue;
+            }
+            let mut b = binds.clone();
+            if !bind(&mut b, &lp.var, Bind::Node(a))
+                || !bind(&mut b, &rel.var, Bind::Edge(e.id))
+                || !bind(&mut b, &rp.var, Bind::Node(b_))
+            {
+                continue;
+            }
+            let mut bound = vec![None; chain.nodes.len()];
+            bound[ri] = Some(a);
+            bound[ri + 1] = Some(b_);
+            match walk(g, chain, &plan.steps, 0, b, bound, &[e.id], out) {
+                Ok(true) => {}
+                other => {
+                    result = other;
+                    return false;
+                }
+            }
+        }
+        true
+    });
+    result
+}
+
 /// Candidate ids for an anchor, cheapest source first, streamed in pages
 /// of ids so a scan of a huge label or of every node never materialises the
 /// whole list. Stops when `f` returns false.
+#[derive(PartialEq)]
+enum Source {
+    Bound,
+    Pin,
+    Index,
+    Label,
+    All,
+}
+
+/// Where `for_each_candidate` will take an anchor's ids from.
+fn anchor_source(g: &Graph, pat: &NodePat, binds: &Binds, pins: &[(String, u64)]) -> Source {
+    if let Some(v) = &pat.var {
+        if let Some(Bind::Node(_)) = lookup(binds, v) {
+            return Source::Bound;
+        }
+        if pins.iter().any(|(name, _)| **name == **v) {
+            return Source::Pin;
+        }
+    }
+    for label in &pat.labels {
+        for (key, expr) in &pat.props {
+            if matches!(expr, Expr::Lit(_)) && g.has_index(label, key) {
+                return Source::Index;
+            }
+        }
+    }
+    if pat.labels.is_empty() {
+        Source::All
+    } else {
+        Source::Label
+    }
+}
+
 fn for_each_candidate(
     g: &Graph,
     pat: &NodePat,
     binds: &Binds,
     pins: &[(String, u64)],
+    prime: bool,
     f: &mut dyn FnMut(u64) -> Result<bool>,
 ) -> Result<bool> {
     if let Some(v) = &pat.var {
         if let Some(Bind::Node(id)) = lookup(binds, v) {
             return f(id);
         }
-        if let Some((_, id)) = pins.iter().find(|(name, _)| name == v) {
+        if let Some((_, id)) = pins.iter().find(|(name, _)| **name == **v) {
             return if g.node(*id).is_some() { f(*id) } else { Ok(true) };
         }
     }
@@ -1960,6 +2188,22 @@ fn for_each_candidate(
         },
         None => None,
     };
+    if prime {
+        // Read records in id order with one cursor, each left in the read
+        // cache for the pattern check, WHERE and RETURN that follow.
+        let mut err = None;
+        let r = g.scan_nodes(label, 0, usize::MAX, &mut |id| match f(id) {
+            Ok(go) => go,
+            Err(e) => {
+                err = Some(e);
+                false
+            }
+        });
+        if let Some(e) = err {
+            return Err(e);
+        }
+        return Ok(r.is_some());
+    }
     let mut from = 0u64;
     loop {
         let ids = match label {
@@ -1980,6 +2224,9 @@ fn for_each_candidate(
 }
 
 /// Execute the plan, one step at a time, backtracking on failure.
+/// `used` holds the relationships this path has already traversed: as in
+/// Cypher, a match may not use the same relationship twice.
+#[allow(clippy::too_many_arguments)]
 fn walk(
     g: &Graph,
     chain: &Chain,
@@ -1987,6 +2234,7 @@ fn walk(
     i: usize,
     binds: Binds,
     bound: Vec<Option<u64>>,
+    used: &[u64],
     out: &mut Sink<'_>,
 ) -> Result<bool> {
     if i >= steps.len() {
@@ -2020,8 +2268,9 @@ fn walk(
         seen.insert(current);
         for depth in 1..=max {
             let mut next = Vec::new();
+            let only = if type_ids.len() == 1 { Some(type_ids[0]) } else { None };
             for node in &frontier {
-                for adj in g.neighbors(*node, dir, None) {
+                for adj in g.neighbors(*node, dir, only) {
                     if !type_ids.is_empty() && !type_ids.contains(&adj.etype) {
                         continue;
                     }
@@ -2049,7 +2298,7 @@ fn walk(
                     }
                     let mut bound2 = bound.clone();
                     bound2[step.to] = Some(*id);
-                    if !walk(g, chain, steps, i + 1, b, bound2, out)? {
+                    if !walk(g, chain, steps, i + 1, b, bound2, used, out)? {
                         return Ok(false);
                     }
                 }
@@ -2062,8 +2311,13 @@ fn walk(
         return Ok(true);
     }
 
-    for adj in g.neighbors(current, dir, None) {
+    // One type: a range scan of just that type's adjacency.
+    let only = if type_ids.len() == 1 { Some(type_ids[0]) } else { None };
+    for adj in g.neighbors(current, dir, only) {
         if !type_ids.is_empty() && !type_ids.contains(&adj.etype) {
+            continue;
+        }
+        if used.contains(&adj.edge) {
             continue;
         }
         if !edge_props_match(g, rel, adj.edge, &binds) {
@@ -2089,26 +2343,36 @@ fn walk(
         }
         let mut bound2 = bound.clone();
         bound2[step.to] = Some(adj.other);
-        if !walk(g, chain, steps, i + 1, b, bound2, out)? {
+        let mut used2 = Vec::with_capacity(used.len() + 1);
+        used2.extend_from_slice(used);
+        used2.push(adj.edge);
+        if !walk(g, chain, steps, i + 1, b, bound2, &used2, out)? {
             return Ok(false);
         }
     }
     Ok(true)
 }
 
+/// Whether node `id` satisfies a pattern's labels and properties. Ids come
+/// from adjacency, label, index or id scans, all of which only hold live
+/// nodes, so a pattern with neither needs no read at all; otherwise the
+/// record is read once for both checks.
 fn node_matches(g: &Graph, pat: &NodePat, id: u64, binds: &Binds) -> bool {
-    if g.node(id).is_none() {
-        return false;
+    if pat.labels.is_empty() && pat.props.is_empty() {
+        return true;
     }
+    let Some(n) = g.node(id) else {
+        return false;
+    };
     for label in &pat.labels {
         match g.strings.lookup(label) {
-            Some(l) if g.has_label(id, l) => {}
+            Some(l) if n.has_label(l) => {}
             _ => return false,
         }
     }
     for (key, expr) in &pat.props {
         let want = eval(g, expr, binds);
-        match g.node_prop(id, key) {
+        match g.strings.lookup(key).and_then(|k| n.prop(k)) {
             Some(got) if got == want => {}
             _ => return false,
         }
@@ -2406,7 +2670,7 @@ impl<'q> Projection<'q> {
         let items: Vec<(Expr, String)> = match self.kind {
             ReturnKind::Items(items) => items.clone(),
             ReturnKind::All => first
-                .map(|b| b.iter().map(|(k, _)| (Expr::Var(k.clone()), k.clone())).collect())
+                .map(|b| b.iter().map(|(k, _)| (Expr::Var(k.to_string()), k.to_string())).collect())
                 .unwrap_or_default(),
         };
         let columns: Vec<String> = items.iter().map(|(_, a)| a.clone()).collect();
@@ -2962,6 +3226,30 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
             let to = a
                 .u64("to")
                 .ok_or_else(|| Error::Msg("shortestpath needs to:".into()))?;
+            // Unweighted: search from both ends over the adjacency, touching
+            // only what the search reaches. Weighted, or past the memory
+            // budget, falls through to the whole-graph algorithm.
+            if weight.is_none() && tier == Tier::Auto {
+                if g.node(from).is_none() || g.node(to).is_none() {
+                    return Err(Error::Msg("from/to must be existing node ids".into()));
+                }
+                if let Some(found) = crate::traverse::shortest_path(g, from, to, dir, etype, walk_cap(g)) {
+                    return Ok(match found {
+                        None => QueryResult::message("no path"),
+                        Some(path) => {
+                            let hops = path.len() - 1;
+                            let rows = path
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, id)| vec![Value::Int(i as i64), Value::Int(id as i64), label_of(g, id)])
+                                .collect();
+                            let mut r = QueryResult::table(vec!["step".into(), "id".into(), "node".into()], rows);
+                            r.message = Some(format!("{hops} hops, cost {hops}"));
+                            r
+                        }
+                    });
+                }
+            }
             let p = proj!(dir, weight.as_deref());
             let (Some(s), Some(t)) = (p.index_of(from), p.index_of(to)) else {
                 return Err(Error::Msg("from/to must be existing node ids".into()));
@@ -3052,6 +3340,11 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
             let from = a
                 .u64("from")
                 .ok_or_else(|| Error::Msg("traversal needs from:".into()))?;
+            if tier == Tier::Auto {
+                if let Some(r) = local_walk(g, &name, from, dir, etype, &a)? {
+                    return Ok(r);
+                }
+            }
             let p = proj!(dir, weight.as_deref());
             let s = p
                 .index_of(from)
@@ -3118,6 +3411,25 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
             let from = a
                 .u64("from")
                 .ok_or_else(|| Error::Msg("subgraph needs from:".into()))?;
+            let depth = a.u32("depth", 2);
+            if g.node(from).is_none() {
+                return Err(Error::Msg("from: must be an existing node id".into()));
+            }
+            let top = a.top();
+            let mut rows = Vec::new();
+            let cap = if tier == Tier::Auto { walk_cap(g) } else { 0 };
+            let done = crate::traverse::bfs(g, from, dir, etype, Some(depth), cap, &mut |v| {
+                if v.depth > 0 {
+                    if rows.len() >= top {
+                        return false;
+                    }
+                    rows.push(vec![Value::Int(v.node as i64), label_of(g, v.node), Value::Int(v.depth as i64)]);
+                }
+                true
+            });
+            if done.is_some() {
+                return Ok(QueryResult::table(vec!["id".into(), "node".into(), "depth".into()], rows));
+            }
             let p = proj!(dir, weight.as_deref());
             let s = p
                 .index_of(from)
@@ -3204,6 +3516,49 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
             other
         ))),
     }
+}
+
+/// How many nodes a local walk may remember before it gives way to the
+/// whole-graph algorithm, from the algorithm memory budget.
+fn walk_cap(g: &Graph) -> usize {
+    (g.algorithm_memory() / crate::traverse::BYTES_PER_NODE).max(1 << 16) as usize
+}
+
+/// BFS or DFS over the adjacency, keeping state only for what it visits.
+/// `None` when the walk outgrew its budget and the caller should use the
+/// whole-graph version.
+fn local_walk(g: &Graph, name: &str, from: u64, dir: Dir, etype: Option<u32>, a: &Args) -> Result<Option<QueryResult>> {
+    if g.node(from).is_none() {
+        return Err(Error::Msg("from: must be an existing node id".into()));
+    }
+    let depth = a.get("depth").and_then(|v| v.as_i64()).map(|v| v as u32);
+    let top = a.top();
+    let mut visits = Vec::new();
+    if top > 0 {
+        let mut keep = |v: crate::traverse::Visit| {
+            visits.push(v);
+            visits.len() < top
+        };
+        let walk = if name == "bfs" { crate::traverse::bfs } else { crate::traverse::dfs };
+        if walk(g, from, dir, etype, depth, walk_cap(g), &mut keep).is_none() {
+            return Ok(None);
+        }
+    }
+    let rows = visits
+        .into_iter()
+        .map(|v| {
+            vec![
+                Value::Int(v.node as i64),
+                label_of(g, v.node),
+                Value::Int(v.depth as i64),
+                v.parent.map(|q| Value::Int(q as i64)).unwrap_or(Value::Null),
+            ]
+        })
+        .collect();
+    Ok(Some(QueryResult::table(
+        vec!["id".into(), "node".into(), "depth".into(), "parent".into()],
+        rows,
+    )))
 }
 
 fn default_dir(name: &str) -> Dir {

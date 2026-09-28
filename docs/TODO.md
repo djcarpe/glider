@@ -225,6 +225,7 @@ These produce wrong results or lost data. Nothing else should go first.
   reordering *between* comma-separated patterns.
 
 - [ ] **QRY-2 · Variable-length paths use node uniqueness, not relationship uniqueness** [G2] · M
+  - Fixed-length patterns now enforce relationship uniqueness (a match never uses the same relationship twice); variable-length hops still use node uniqueness.
   `query.rs:~1398`. Cycles are unfindable — `MATCH (a)-[:R*2..3]->(a)` returns
   nothing, ever — and each target is yielded once at its shortest depth rather
   than once per path. Decide deliberately: keep reachability semantics as the

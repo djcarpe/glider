@@ -779,12 +779,13 @@ fn a_middle_anchor_expands_in_both_directions() {
     );
     assert_eq!(plan.len(), 3, "one anchor and two expansions");
 
-    // Both people on both sides, including the reflexive pairs.
+    // Both people on both sides. Not the reflexive pairs: (p)->(t)<-(p)
+    // would use p's one IN relationship twice, which a match never does.
     let found = rows(
         &mut g,
-        "MATCH (p:Person)-[:IN]->(t:Team)<-[:IN]-(q:Person) RETURN p.name, q.name",
+        "MATCH (p:Person)-[:IN]->(t:Team)<-[:IN]-(q:Person) RETURN p.name, q.name ORDER BY p.name",
     );
-    assert_eq!(found.len(), 4);
+    assert_eq!(found.len(), 2);
 }
 
 #[test]
@@ -885,4 +886,156 @@ fn parameters_are_values_never_syntax() {
     let e = query::execute_with(&mut g, "MATCH (x:P {name: $nope}) RETURN x", &[]).err().unwrap();
     assert!(e.to_string().contains("missing parameter $nope"));
     assert_eq!(q(&mut g, "MATCH (x:P) RETURN count(x)").rows[0][0], Value::Int(2));
+}
+
+/// The local traversals (default) and the whole-graph ones (`tier:`) must
+/// give the same rows: same visit order, depths and parents. Shortest paths
+/// may pick a different path of the same length.
+#[test]
+fn local_traversals_match_whole_graph_algorithms() {
+    let mut g = Graph::memory();
+    let mut seed = 0x2545_F491_4F6C_DD1Du64;
+    let mut rnd = |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    q(&mut g, "BEGIN");
+    for i in 0..300 {
+        q(&mut g, &format!("CREATE (:N {{i: {i}}})"));
+    }
+    for _ in 0..900 {
+        let (a, b) = (rnd(300), rnd(300));
+        let t = ["A", "B", "C"][rnd(3) as usize];
+        q(&mut g, &format!("MATCH (a:N {{i: {a}}}), (b:N {{i: {b}}}) CREATE (a)-[:{t}]->(b)"));
+    }
+    q(&mut g, "COMMIT");
+    let id_of = |g: &mut Graph, i: u64| match q(g, &format!("MATCH (n:N {{i: {i}}}) RETURN id(n)")).rows[0][0] {
+        Value::Int(v) => v,
+        _ => unreachable!(),
+    };
+    for (k, start) in [0u64, 7, 150, 299].into_iter().enumerate() {
+        let from = id_of(&mut g, start);
+        for dir in ["out", "in", "both"] {
+            for ty in ["", ", type: \"A\""] {
+                for algo in ["bfs", "dfs"] {
+                    for depth in ["", ", depth: 2"] {
+                        let base = format!("CALL {algo}(from: {from}, dir: \"{dir}\"{ty}{depth}");
+                        let local = q(&mut g, &format!("{base})"));
+                        let whole = q(&mut g, &format!("{base}, tier: \"mem\")"));
+                        assert_eq!(local.rows, whole.rows, "{base}");
+                    }
+                }
+                let base = format!("CALL subgraph(from: {from}, dir: \"{dir}\"{ty}, depth: 3");
+                assert_eq!(q(&mut g, &format!("{base})")).rows, q(&mut g, &format!("{base}, tier: \"mem\")")).rows, "{base}");
+
+                let to = id_of(&mut g, (start * 37 + k as u64 * 11 + 5) % 300);
+                let base = format!("CALL shortestpath(from: {from}, to: {to}, dir: \"{dir}\"{ty}");
+                let local = q(&mut g, &format!("{base})"));
+                let whole = q(&mut g, &format!("{base}, tier: \"mem\")"));
+                assert_eq!(local.message, whole.message, "{base}");
+                assert_eq!(local.rows.len(), whole.rows.len(), "{base}");
+                // A real path: every step follows an edge of the right type
+                // in the right direction.
+                let ids: Vec<u64> = local.rows.iter().map(|r| match r[1] { Value::Int(v) => v as u64, _ => 0 }).collect();
+                let d = match dir { "out" => Dir::Out, "in" => Dir::In, _ => Dir::Both };
+                let t = if ty.is_empty() { None } else { g.strings.lookup("A") };
+                for w in ids.windows(2) {
+                    assert!(g.neighbors(w[0], d, t).iter().any(|a| a.other == w[1]), "{base}: {w:?} is not an edge");
+                }
+            }
+        }
+    }
+}
+
+/// Edge-type anchors and counter-answered counts are plans, not semantics:
+/// the rows must match the node-anchored, enumerated answers exactly.
+#[test]
+fn edge_anchors_and_counter_counts_match_the_general_plans() {
+    use std::sync::atomic::Ordering;
+    let mut g = Graph::memory();
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let mut rnd = |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    q(&mut g, "BEGIN");
+    q(&mut g, "INDEX ON :N(k)");
+    for i in 0..400 {
+        let label = if i % 3 == 0 { ":N:M" } else { ":N" };
+        q(&mut g, &format!("CREATE (n{label} {{i: {i}, k: {}}})", i % 7));
+    }
+    for _ in 0..1200 {
+        let (a, b) = (rnd(400), if rnd(10) == 0 { u64::MAX } else { rnd(400) });
+        let b = if b == u64::MAX { a } else { b }; // some self-loops
+        let t = ["A", "A", "A", "B", "R"][rnd(5) as usize];
+        q(&mut g, &format!("MATCH (a:N {{i: {a}}}), (b:N {{i: {b}}}) CREATE (a)-[:{t} {{w: {}}}]->(b)", rnd(4)));
+    }
+    q(&mut g, "COMMIT");
+
+    let reads = [
+        "MATCH ()-[r:R]->() RETURN id(r) ORDER BY id(r)",
+        "MATCH (a)<-[r:R]-(b) RETURN id(a), id(r), id(b) ORDER BY id(r), id(a)",
+        "MATCH (a)-[r:R]-(b) RETURN id(a), id(r), id(b) ORDER BY id(r), id(a)",
+        "MATCH (e)-[:R]->(e) RETURN id(e) ORDER BY id(e)",
+        "MATCH (a:M)-[r:R {w: 2}]->(b) RETURN id(a), id(b) ORDER BY id(a), id(b)",
+        "MATCH (a)-[:A]->(b)-[:R]->(c)<-[:B]-(d) RETURN id(a), id(b), id(c), id(d) ORDER BY id(a), id(b), id(c), id(d)",
+        "MATCH (x)-[:R]->(y) WHERE y.i > 200 RETURN count(*)",
+        "MATCH ()-[r:R]->(b:M) RETURN b.k, count(r) ORDER BY b.k",
+    ];
+    let plans = |g: &mut Graph| reads.iter().map(|s| q(g, s).rows).collect::<Vec<_>>();
+    let explain = q(&mut g, &format!("EXPLAIN {}", reads[0]));
+    assert!(format!("{:?}", explain.rows).contains("edges :R"), "the rare type should anchor: {:?}", explain.rows);
+    glider::query::EDGE_ANCHORS.store(false, Ordering::Relaxed);
+    let by_nodes = plans(&mut g);
+    glider::query::EDGE_ANCHORS.store(true, Ordering::Relaxed);
+    let by_edges = plans(&mut g);
+    for ((a, b), s) in by_nodes.iter().zip(&by_edges).zip(reads) {
+        assert_eq!(a, b, "{s}");
+    }
+
+    // Counts from counters vs the same counts enumerated (WHERE true forces
+    // the general path).
+    for s in [
+        "MATCH (n) RETURN count(n)",
+        "MATCH (n:M) RETURN count(*)",
+        "MATCH (n:N {k: 3}) RETURN count(n)",
+        "MATCH (n:N {k: 99}) RETURN count(n)",
+        "MATCH ()-[r:A]->() RETURN count(r)",
+        "MATCH (a)<-[r:B]-(b) RETURN count(a)",
+        "MATCH ()-[r]->() RETURN count(*)",
+        "MATCH ()-[r:NOPE]->() RETURN count(r)",
+        "MATCH (n:N {k: 3})-[:A]->(x) RETURN count(x)",
+        "MATCH (n:N {k: 3})<-[r:A]-() RETURN count(r)",
+        "MATCH (n:N {k: 3})-[:A]-(x) RETURN count(*)",
+        "MATCH (n:N {k: 99})-[:A]->(x) RETURN count(x)",
+    ] {
+        let fast = q(&mut g, s);
+        let slow = q(&mut g, &s.replace(" RETURN", " WHERE true RETURN"));
+        assert_eq!((fast.columns.clone(), fast.rows.clone()), (slow.columns, slow.rows), "{s}");
+    }
+}
+
+/// Cypher's relationship uniqueness: one match never uses the same
+/// relationship twice, so A->B->A->B needs two distinct A->B edges.
+#[test]
+fn a_match_never_reuses_a_relationship() {
+    let mut g = Graph::memory();
+    q(&mut g, "CREATE (a:P {n: 1})-[:K]->(b:P {n: 2})");
+    q(&mut g, "MATCH (a:P {n: 1}), (b:P {n: 2}) CREATE (b)-[:K]->(a)");
+    let n = |g: &mut Graph, s: &str| match q(g, s).rows.first().map(|r| r[0].clone()) {
+        Some(Value::Int(v)) => v,
+        _ => 0,
+    };
+    // a->b, b->a, then a->b again would reuse the first edge.
+    assert_eq!(n(&mut g, "MATCH (x:P {n: 1})-[:K]->()-[:K]->()-[:K]->(y) RETURN count(y)"), 0);
+    assert_eq!(n(&mut g, "MATCH (x:P {n: 1})-[:K]->()-[:K]->(y) RETURN count(y)"), 1);
+    // With a second a->b edge, both orders of the two parallel edges match.
+    q(&mut g, "MATCH (a:P {n: 1}), (b:P {n: 2}) CREATE (a)-[:K]->(b)");
+    assert_eq!(n(&mut g, "MATCH (x:P {n: 1})-[:K]->()-[:K]->()-[:K]->(y) RETURN count(y)"), 2);
+    // An edge anchor counts as used too.
+    assert_eq!(n(&mut g, "MATCH (x)-[:K]->()-[:K]->()-[:K]->(y) WHERE x.n = 1 RETURN count(y)"), 2);
 }

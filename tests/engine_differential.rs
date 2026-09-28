@@ -178,17 +178,21 @@ macro_rules! impl_g {
                     for k in KEYS {
                         put(format!("prop {n}.{k}"), dbg(g.node_prop(n, k)));
                     }
+                    // Adjacency order is not part of the contract (the paged
+                    // engine groups a node's edges by type), so compare sets.
                     for dir in [Dir::Out, Dir::In, Dir::Both] {
-                        let adj: Vec<_> = g
+                        let mut adj: Vec<_> = g
                             .neighbors(n, dir, None)
                             .iter()
                             .map(|a| (a.edge, a.other, tname(a.etype)))
                             .collect();
+                        adj.sort();
                         put(format!("adj {n} {dir:?}"), dbg(adj));
                         put(format!("deg {n} {dir:?}"), dbg(g.degree(n, dir)));
                     }
                     if let Some(t) = g.strings.lookup("X") {
-                        let adj: Vec<_> = g.neighbors(n, Dir::Both, Some(t)).iter().map(|a| a.edge).collect();
+                        let mut adj: Vec<_> = g.neighbors(n, Dir::Both, Some(t)).iter().map(|a| a.edge).collect();
+                        adj.sort();
                         put(format!("adj {n} X"), dbg(adj));
                     }
                 }
@@ -233,11 +237,17 @@ macro_rules! impl_g {
                 let (sample, _) = g.sample_keys(usize::MAX);
                 put("sample_keys".into(), dbg(sample));
                 let csr = g.csr(Dir::Out, None, Some("w"));
-                put("csr".into(), dbg((&csr.ids, &csr.off, &csr.adj, &csr.eids)));
-                put(
-                    "csr weights".into(),
-                    dbg(csr.weights.iter().map(|w| w.to_bits()).collect::<Vec<_>>()),
-                );
+                // Each node's neighbour list, in edge-id order.
+                let mut rows = Vec::new();
+                for v in 0..csr.ids.len() {
+                    let (a, b) = (csr.off[v] as usize, csr.off[v + 1] as usize);
+                    let mut seg: Vec<_> = (a..b)
+                        .map(|i| (csr.eids[i], csr.adj[i], csr.weights[i].to_bits()))
+                        .collect();
+                    seg.sort();
+                    rows.push(seg);
+                }
+                put("csr".into(), dbg((&csr.ids, &csr.off, rows)));
                 out
             }
         }

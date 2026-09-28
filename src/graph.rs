@@ -14,7 +14,7 @@
 //!          'T' type          -> edges of the type
 //! nodes    id                -> labels, properties
 //! edges    id                -> from, to, type, properties
-//! adj      node dir edge     -> type, other end     (dir 0 out, 1 in)
+//! adj      node dir type edge -> other end          (dir 0 out, 1 in)
 //! labels   label node        -> ()
 //! types    type edge         -> ()
 //! props    index value node  -> truncated?          (order-preserving value)
@@ -57,6 +57,11 @@ const M_NEXT_EDGE: usize = 1;
 const M_NODES: usize = 2;
 const M_EDGES: usize = 3;
 const M_NEXT_INDEX: usize = 4;
+/// On-disk layout version. 0: adjacency keyed (node, dir, edge) with the
+/// type in the value. 1: the type is part of the key, so a typed expansion
+/// or degree is a range scan.
+const M_FORMAT: usize = 5;
+const FORMAT: u64 = 1;
 
 const OUT: u8 = 0;
 const IN: u8 = 1;
@@ -225,17 +230,42 @@ fn props_of(run: &[u8]) -> SResult<Vec<(u32, Value)>> {
     codec::read_prop_ids(run).map_err(SError::Corrupt)
 }
 
-fn adj_key(node: u64, dir: u8, edge: u64) -> [u8; 17] {
-    let mut k = [0u8; 17];
+fn adj_key(node: u64, dir: u8, t: u32, edge: u64) -> [u8; 21] {
+    let mut k = [0u8; 21];
     k[..8].copy_from_slice(&node.to_be_bytes());
     k[8] = dir;
-    k[9..].copy_from_slice(&edge.to_be_bytes());
+    k[9..13].copy_from_slice(&t.to_be_bytes());
+    k[13..].copy_from_slice(&edge.to_be_bytes());
     k
 }
 
-fn adj_val(t: u32, other: u64) -> Vec<u8> {
+/// The prefix of a node's adjacency in one direction, optionally of one type.
+fn adj_prefix(node: u64, dir: u8, t: Option<u32>) -> ([u8; 13], usize) {
+    let mut k = [0u8; 13];
+    k[..8].copy_from_slice(&node.to_be_bytes());
+    k[8] = dir;
+    match t {
+        Some(t) => {
+            k[9..].copy_from_slice(&t.to_be_bytes());
+            (k, 13)
+        }
+        None => (k, 9),
+    }
+}
+
+/// The edge id of an adjacency key: its last eight bytes in every layout,
+/// which is what lets log replay detach nodes before an old file's
+/// adjacency is rebuilt.
+fn adj_edge(k: &[u8]) -> u64 {
+    keys::get_u64(k, k.len() - 8)
+}
+
+fn adj_type(k: &[u8]) -> u32 {
+    u32::from_be_bytes(k[9..13].try_into().unwrap())
+}
+
+fn adj_val(other: u64) -> Vec<u8> {
     let mut v = Vec::with_capacity(10);
-    codec::put_varint(&mut v, t as u64);
     codec::put_varint(&mut v, other);
     v
 }
@@ -509,8 +539,8 @@ fn remove_edge(p: &Pager, id: u64) -> SResult<bool> {
     let Some((from, to, t, _)) = edge_record(p, id)? else {
         return Ok(false);
     };
-    ADJ.delete(p, &adj_key(from, OUT, id))?;
-    ADJ.delete(p, &adj_key(to, IN, id))?;
+    ADJ.delete(p, &adj_key(from, OUT, t, id))?;
+    ADJ.delete(p, &adj_key(to, IN, t, id))?;
     TYPES.delete(p, &pair_key(t, id))?;
     add_count(p, &cat_key(b'T', t), -1)?;
     EDGES.delete(p, &node_key(id))?;
@@ -585,7 +615,7 @@ fn apply(p: &Pager, sch: &mut Schema<'_>, op: &Op) -> SResult<()> {
                 for k in batch {
                     // An entry whose edge is already gone would otherwise
                     // be found again forever: remove it directly.
-                    if !remove_edge(p, keys::get_u64(&k, 9))? {
+                    if !remove_edge(p, adj_edge(&k))? {
                         ADJ.delete(p, &k)?;
                     }
                 }
@@ -619,8 +649,8 @@ fn apply(p: &Pager, sch: &mut Schema<'_>, op: &Op) -> SResult<()> {
             }
             remove_edge(p, *id)?;
             EDGES.put(p, &node_key(*id), &encode_edge(*from, *to, t, &pids))?;
-            ADJ.put(p, &adj_key(*from, OUT, *id), &adj_val(t, *to))?;
-            ADJ.put(p, &adj_key(*to, IN, *id), &adj_val(t, *from))?;
+            ADJ.put(p, &adj_key(*from, OUT, t, *id), &adj_val(*to))?;
+            ADJ.put(p, &adj_key(*to, IN, t, *id), &adj_val(*from))?;
             TYPES.put(p, &pair_key(t, *id), &[])?;
             add_count(p, &cat_key(b'T', t), 1)?;
             p.set_meta(M_EDGES, p.meta(M_EDGES) + 1);
@@ -803,6 +833,59 @@ fn replay(p: &Pager, sch: &mut Option<(Interner, Indexes)>, rec: &[u8]) -> SResu
     apply(p, &mut Schema { strings, indexes }, &op)
 }
 
+/// Rewrite the adjacency tree in the current layout from the edge records,
+/// for a file written before it. Runs once, on open: the edge records are
+/// the source of truth and the layout stamp is checkpointed only after the
+/// new tree is complete, so an interrupted rebuild simply runs again.
+fn rebuild_adjacency(db: &mut Db) -> Result<()> {
+    use crate::storage::btree::Builder;
+    use crate::storage::extsort::Sorter;
+    let p = db.pager();
+    ADJ.clear(p)?;
+    let io = |e: std::io::Error| Error::Io(e);
+    let entries = |f: &mut dyn FnMut(&[u8], &[u8]) -> Result<()>| -> Result<()> {
+        let mut c = EDGES.scan(p)?;
+        while let Some((k, v)) = c.next()? {
+            let id = keys::get_u64(k, 0);
+            let (from, to, t, _) = decode_edge(&v.load(p)?)?;
+            f(&adj_key(from, OUT, t, id), &adj_val(to))?;
+            f(&adj_key(to, IN, t, id), &adj_val(from))?;
+        }
+        Ok(())
+    };
+    match db.path() {
+        Some(path) => {
+            let mut tmp = path.as_os_str().to_os_string();
+            tmp.push("-tmp");
+            let tmp = std::path::PathBuf::from(tmp);
+            let mut sorter = Sorter::new(&tmp, "adj", 64 << 20).map_err(io)?;
+            entries(&mut |k, v| sorter.push(k, v).map_err(io))?;
+            let mut it = sorter.finish().map_err(io)?;
+            let mut b = Builder::new(p, ADJ, 100);
+            while let Some((k, v)) = it.next().map_err(io)? {
+                b.push(&k, &v)?;
+            }
+            b.finish()?;
+        }
+        None => {
+            let mut all = Vec::new();
+            entries(&mut |k, v| {
+                all.push((k.to_vec(), v.to_vec()));
+                Ok(())
+            })?;
+            for (k, v) in all {
+                ADJ.put(p, &k, &v)?;
+            }
+        }
+    }
+    p.set_meta(M_FORMAT, FORMAT);
+    p.commit();
+    if db.path().is_some() {
+        db.checkpoint()?;
+    }
+    Ok(())
+}
+
 // ------------------------------------------------------------------ graph
 
 pub struct Graph {
@@ -816,16 +899,27 @@ pub struct Graph {
     /// The first storage error a read ran into (reads cannot return one).
     read_error: std::sync::Mutex<Option<String>>,
     work_mem: u64,
+    /// The last node read. A query touches the same node several times in
+    /// a row (pattern check, WHERE, each returned property); this makes the
+    /// repeats free. Cleared by every write and rollback.
+    last_node: std::sync::Mutex<Option<std::sync::Arc<NodeRef>>>,
+    /// The same for edges.
+    last_edge: std::sync::Mutex<Option<std::sync::Arc<EdgeRef>>>,
 }
 
 impl Graph {
-    fn init(db: Db) -> Result<Graph> {
+    fn init(mut db: Db) -> Result<Graph> {
         let p = db.pager();
         if p.meta(M_NEXT_NODE) == 0 {
             p.set_meta(M_NEXT_NODE, 1);
             p.set_meta(M_NEXT_EDGE, 1);
+            p.set_meta(M_FORMAT, FORMAT);
             p.commit();
         }
+        if p.meta(M_FORMAT) < FORMAT {
+            rebuild_adjacency(&mut db)?;
+        }
+        let p = db.pager();
         let (strings, indexes) = load_schema(p)?;
         Ok(Graph {
             db,
@@ -835,6 +929,8 @@ impl Graph {
             uncommitted: 0,
             read_error: std::sync::Mutex::new(None),
             work_mem: DEFAULT_WORK_MEM,
+            last_node: std::sync::Mutex::new(None),
+            last_edge: std::sync::Mutex::new(None),
         })
     }
 
@@ -1049,9 +1145,153 @@ impl Graph {
     // -------------------------------------------------------------- reads
 
     pub fn node(&self, id: u64) -> Option<NodeRef> {
-        self.note(node_record(self.pager(), id).map(|r| {
-            r.map(|(labels, props)| NodeRef { id, labels, props })
-        }))
+        self.node_shared(id).map(|n| (*n).clone())
+    }
+
+    /// A node's record, shared with the one-entry read cache: repeated reads
+    /// of the same node (pattern check, WHERE, each returned property) cost
+    /// one lookup and no copies.
+    pub fn node_shared(&self, id: u64) -> Option<std::sync::Arc<NodeRef>> {
+        let mut last = self.last_node.lock().unwrap_or_else(|x| x.into_inner());
+        if let Some(n) = last.as_ref().filter(|n| n.id == id) {
+            return Some(n.clone());
+        }
+        let n = self
+            .note(node_record(self.pager(), id).map(|r| r.map(|(labels, props)| NodeRef { id, labels, props })))
+            .map(std::sync::Arc::new);
+        last.clone_from(&n);
+        n
+    }
+
+    /// Visit node ids from `from` upward, all of them or one label's, up to
+    /// `limit`, reading each record with one cursor walking the node tree in
+    /// id order (a scan instead of a lookup per node) and leaving it in the
+    /// read cache for whatever the caller does next. Returns how many ids
+    /// were visited and the last one, or None when `f` stopped.
+    pub fn scan_nodes(&self, label: Option<u32>, from: u64, limit: usize, f: &mut dyn FnMut(u64) -> bool) -> Option<(usize, u64)> {
+        self.note((|| -> SResult<Option<(usize, u64)>> {
+            let p = self.pager();
+            let mut nodes = NODES.seek(p, &node_key(from))?;
+            let mut at: Option<u64> = None; // the node cursor's current key
+            let mut seen = 0usize;
+            let mut last = from;
+            // Ids to visit: the label tree's members, or the node tree itself.
+            let mut members = match label {
+                Some(l) => Some(LABELS.seek(p, &pair_key(l, from))?),
+                None => None,
+            };
+            loop {
+                if seen >= limit {
+                    return Ok(Some((seen, last)));
+                }
+                let want = match members.as_mut() {
+                    Some(c) => match c.next()? {
+                        Some((k, _)) if k[..4] == label.unwrap().to_be_bytes() => keys::get_u64(k, 4),
+                        _ => return Ok(Some((seen, last))),
+                    },
+                    None => match at {
+                        None => 0,
+                        Some(a) => a + 1,
+                    },
+                };
+                // Walk the node cursor forward to `want`; a long way ahead,
+                // seek instead.
+                if label.is_some() && at.map_or(true, |a| want > a + 64 || want <= a) {
+                    nodes = NODES.seek(p, &node_key(want))?;
+                }
+                let rec = loop {
+                    match nodes.next()? {
+                        None => return Ok(Some((seen, last))),
+                        Some((k, v)) => {
+                            let id = keys::get_u64(k, 0);
+                            at = Some(id);
+                            if id < want {
+                                continue;
+                            }
+                            break (id, v.load(p)?.into_owned());
+                        }
+                    }
+                };
+                let (id, bytes) = rec;
+                if label.is_some() && id != want {
+                    // A label entry without a record cannot happen; skip it.
+                    continue;
+                }
+                let (labels, props) = decode_node(&bytes)?;
+                *self.last_node.lock().unwrap_or_else(|x| x.into_inner()) =
+                    Some(std::sync::Arc::new(NodeRef { id, labels, props }));
+                seen += 1;
+                last = id;
+                if !f(id) {
+                    return Ok(None);
+                }
+            }
+        })())
+    }
+
+    fn forget_reads(&self) {
+        *self.last_node.lock().unwrap_or_else(|x| x.into_inner()) = None;
+        *self.last_edge.lock().unwrap_or_else(|x| x.into_inner()) = None;
+    }
+
+    /// An edge's record, shared with the one-entry read cache.
+    pub fn edge_shared(&self, id: u64) -> Option<std::sync::Arc<EdgeRef>> {
+        let mut last = self.last_edge.lock().unwrap_or_else(|x| x.into_inner());
+        if let Some(e) = last.as_ref().filter(|e| e.id == id) {
+            return Some(e.clone());
+        }
+        let e = self
+            .note(edge_record(self.pager(), id).map(|r| {
+                r.map(|(from, to, etype, props)| EdgeRef { id, from, to, etype, props })
+            }))
+            .map(std::sync::Arc::new);
+        last.clone_from(&e);
+        e
+    }
+
+    /// Visit the edges of one type in id order, reading each record with one
+    /// cursor over the edge tree and leaving it in the read cache. Stops
+    /// when `f` returns false.
+    pub fn scan_type_edges(&self, t: u32, f: &mut dyn FnMut(&EdgeRef) -> bool) {
+        self.note((|| -> SResult<()> {
+            let p = self.pager();
+            let mut members = TYPES.seek(p, &pair_key(t, 0))?;
+            let mut edges: Option<crate::storage::btree::Cursor<'_>> = None;
+            let mut at: Option<u64> = None;
+            while let Some((k, _)) = members.next()? {
+                if k[..4] != t.to_be_bytes() {
+                    break;
+                }
+                let want = keys::get_u64(k, 4);
+                if at.map_or(true, |a| want > a + 64 || want <= a) {
+                    edges = Some(EDGES.seek(p, &node_key(want))?);
+                }
+                let c = edges.as_mut().expect("positioned");
+                let rec = loop {
+                    match c.next()? {
+                        None => return Ok(()),
+                        Some((k, v)) => {
+                            let id = keys::get_u64(k, 0);
+                            at = Some(id);
+                            if id < want {
+                                continue;
+                            }
+                            break (id, v.load(p)?.into_owned());
+                        }
+                    }
+                };
+                if rec.0 != want {
+                    continue;
+                }
+                let (from, to, etype, props) = decode_edge(&rec.1)?;
+                let e = std::sync::Arc::new(EdgeRef { id: want, from, to, etype, props });
+                *self.last_edge.lock().unwrap_or_else(|x| x.into_inner()) = Some(e.clone());
+                if !f(&e) {
+                    return Ok(());
+                }
+            }
+            Ok(())
+        })())
     }
 
     pub fn edge(&self, id: u64) -> Option<EdgeRef> {
@@ -1120,44 +1360,80 @@ impl Graph {
         })())
     }
 
-    /// Visit a node's adjacency: outgoing then incoming, each in ascending
-    /// edge id.
+    /// Visit a node's adjacency: outgoing then incoming, each ordered by
+    /// (type, edge id). With `etype`, only that type's entries are read.
     pub fn for_each_adj(&self, id: u64, dir: Dir, etype: Option<u32>, mut f: impl FnMut(Adj)) {
+        self.for_each_adj_while(id, dir, etype, |a| {
+            f(a);
+            true
+        });
+    }
+
+    /// `for_each_adj`, stopping as soon as `f` returns false. Returns false
+    /// if it was stopped.
+    pub fn for_each_adj_while(&self, id: u64, dir: Dir, etype: Option<u32>, mut f: impl FnMut(Adj) -> bool) -> bool {
         let sides: &[u8] = match dir {
             Dir::Out => &[OUT],
             Dir::In => &[IN],
             Dir::Both => &[OUT, IN],
         };
         for &d in sides {
-            let r = (|| -> SResult<()> {
-                let mut prefix = [0u8; 9];
-                prefix[..8].copy_from_slice(&id.to_be_bytes());
-                prefix[8] = d;
-                let mut c = ADJ.seek(self.pager(), &prefix)?;
+            let r = (|| -> SResult<bool> {
+                let (prefix, n) = adj_prefix(id, d, etype);
+                let prefix = &prefix[..n];
+                let mut c = ADJ.seek(self.pager(), prefix)?;
                 while let Some((k, v)) = c.next()? {
-                    if !k.starts_with(&prefix) {
+                    if !k.starts_with(prefix) {
                         break;
                     }
                     let v = match v {
                         crate::storage::btree::Val::Inline(b) => b,
                         _ => return Err(SError::Corrupt("adjacency value overflowed".into())),
                     };
-                    let mut r = codec::Reader::new(v);
-                    let t = r.varint().map_err(SError::Corrupt)? as u32;
-                    if etype.map(|x| x != t).unwrap_or(false) {
-                        continue;
-                    }
-                    let other = r.varint().map_err(SError::Corrupt)?;
-                    f(Adj {
-                        edge: keys::get_u64(k, 9),
+                    let other = codec::Reader::new(v).varint().map_err(SError::Corrupt)?;
+                    if !f(Adj {
+                        edge: adj_edge(k),
                         other,
-                        etype: t,
-                    });
+                        etype: adj_type(k),
+                    }) {
+                        return Ok(false);
+                    }
                 }
-                Ok(())
+                Ok(true)
             })();
-            self.note(r);
+            if !self.note(r.map(|go| !go)) {
+                continue;
+            }
+            return false;
         }
+        true
+    }
+
+    /// How many adjacency entries a node has in `dir`, optionally of one
+    /// type. Counts keys without decoding them.
+    pub fn degree_of(&self, id: u64, dir: Dir, etype: Option<u32>) -> usize {
+        let sides: &[u8] = match dir {
+            Dir::Out => &[OUT],
+            Dir::In => &[IN],
+            Dir::Both => &[OUT, IN],
+        };
+        let mut n = 0;
+        for &d in sides {
+            n += self.note((|| -> SResult<usize> {
+                let (prefix, len) = adj_prefix(id, d, etype);
+                let prefix = &prefix[..len];
+                let mut c = ADJ.seek(self.pager(), prefix)?;
+                let mut n = 0;
+                while let Some((k, _)) = c.next()? {
+                    if !k.starts_with(prefix) {
+                        break;
+                    }
+                    n += 1;
+                }
+                Ok(n)
+            })());
+        }
+        n
     }
 
     pub fn neighbors(&self, id: u64, dir: Dir, etype: Option<u32>) -> Vec<Adj> {
@@ -1167,9 +1443,7 @@ impl Graph {
     }
 
     pub fn degree(&self, id: u64, dir: Dir) -> usize {
-        let mut n = 0;
-        self.for_each_adj(id, dir, None, |_| n += 1);
-        n
+        self.degree_of(id, dir, None)
     }
 
     pub fn nodes_with_label(&self, label: &str) -> Vec<u64> {
@@ -1232,22 +1506,19 @@ impl Graph {
         };
         for d in sides {
             let r = (|| -> SResult<()> {
-                let mut prefix = [0u8; 9];
-                prefix[..8].copy_from_slice(&id.to_be_bytes());
-                prefix[8] = if matches!(d, Dir::Out) { OUT } else { IN };
-                let mut c = ADJ.seek(self.pager(), &prefix)?;
+                let (prefix, n) = adj_prefix(id, if matches!(d, Dir::Out) { OUT } else { IN }, None);
+                let prefix = &prefix[..n];
+                let mut c = ADJ.seek(self.pager(), prefix)?;
                 while let Some((k, v)) = c.next()? {
-                    if !k.starts_with(&prefix) || out.len() >= limit {
+                    if !k.starts_with(prefix) || out.len() >= limit {
                         break;
                     }
                     let v = v.load(self.pager())?;
-                    let mut r = codec::Reader::new(&v);
-                    let etype = r.varint().map_err(SError::Corrupt)? as u32;
-                    let other = r.varint().map_err(SError::Corrupt)?;
+                    let other = codec::Reader::new(&v).varint().map_err(SError::Corrupt)?;
                     out.push(Adj {
-                        edge: keys::get_u64(k, 9),
+                        edge: adj_edge(k),
                         other,
-                        etype,
+                        etype: adj_type(k),
                     });
                 }
                 Ok(())
@@ -1351,12 +1622,12 @@ impl Graph {
 
     pub fn node_prop(&self, id: u64, key: &str) -> Option<Value> {
         let k = self.strings.lookup(key)?;
-        self.node(id)?.prop(k)
+        self.node_shared(id)?.prop(k)
     }
 
     pub fn edge_prop(&self, id: u64, key: &str) -> Option<Value> {
         let k = self.strings.lookup(key)?;
-        self.edge(id)?.prop(k)
+        self.edge_shared(id)?.prop(k)
     }
 
     pub fn node_labels(&self, id: u64) -> Vec<String> {
@@ -1371,7 +1642,7 @@ impl Graph {
     }
 
     pub fn has_label(&self, id: u64, label: u32) -> bool {
-        self.node(id).map(|n| n.has_label(label)).unwrap_or(false)
+        self.node_shared(id).map(|n| n.has_label(label)).unwrap_or(false)
     }
 
     pub fn node_props(&self, id: u64) -> Vec<(String, Value)> {
@@ -1488,6 +1759,7 @@ impl Graph {
 
     /// Abandon everything since the last commit.
     pub fn rollback(&mut self) -> Result<()> {
+        self.forget_reads();
         self.db.rollback()?;
         (self.strings, self.indexes) = load_schema(self.pager())?;
         self.uncommitted = 0;
@@ -1495,6 +1767,7 @@ impl Graph {
     }
 
     fn rollback_quietly(&mut self) {
+        self.forget_reads();
         let _ = self.db.rollback();
         if let Ok(s) = load_schema(self.pager()) {
             (self.strings, self.indexes) = s;
@@ -1513,6 +1786,7 @@ impl Graph {
     /// Log and apply one op. A failure rolls the whole open transaction
     /// back, so nothing is left half-done.
     fn exec(&mut self, op: Op) -> Result<()> {
+        self.forget_reads();
         let rec = op_record(&op);
         let r = self
             .db
@@ -1645,8 +1919,8 @@ impl Graph {
                 }
                 let r = (|| -> Result<()> {
                     b.push(&node_key(id), &encode_edge(from, to, t, props))?;
-                    adj_s.push(&adj_key(from, OUT, id), &adj_val(t, to)).map_err(io)?;
-                    adj_s.push(&adj_key(to, IN, id), &adj_val(t, from)).map_err(io)?;
+                    adj_s.push(&adj_key(from, OUT, t, id), &adj_val(to)).map_err(io)?;
+                    adj_s.push(&adj_key(to, IN, t, id), &adj_val(from)).map_err(io)?;
                     types_s.push(&pair_key(t, id), &[]).map_err(io)?;
                     *type_counts.entry(t).or_default() += 1;
                     m += 1;

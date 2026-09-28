@@ -60,3 +60,11 @@ codegen-units = 1
 # NOT panic = "abort": the C ABI layer catches panics and returns them as
 # errors, which needs unwinding. A database bug must not kill the host app.
 strip = true
+
+# Release with symbols and line tables, for profilers (flamegraphs of the
+# benchmarks). Build with RUSTFLAGS="-C force-frame-pointers=yes" so stack
+# walkers like eBPF can unwind it.
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = "line-tables-only"

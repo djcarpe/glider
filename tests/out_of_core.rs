@@ -126,6 +126,17 @@ fn show(r: &QueryResult) -> String {
     format!("{:?} {:?} {}", r.columns, r.rows, msg)
 }
 
+/// Shortest path is "a shortest path": the tiers may pick different paths
+/// of the same length (the default one searches from both ends), so for it
+/// only the hop count must agree. Everything else must match exactly.
+fn same(call: &str, a: &str, b: &str) -> bool {
+    if call.starts_with("shortestpath") {
+        let tail = |s: &str| s.rsplit(']').next().unwrap_or("").trim().to_string();
+        return tail(a) == tail(b);
+    }
+    a == b
+}
+
 fn first_two(g: &Graph) -> (u64, u64) {
     let ids = g.node_ids();
     (ids[3], ids[ids.len() / 2])
@@ -158,7 +169,7 @@ fn file_backed_out_of_core_matches_in_memory() {
             assert_eq!(mem, ooc, "seed {seed}: {call}");
             // And auto picks the paged tier here, with the same answer.
             let auto = run(&mut g, &call, "auto");
-            assert_eq!(mem, auto, "seed {seed}: {call} (auto)");
+            assert!(same(&call, &mem, &auto), "seed {seed}: {call} (auto)\n  mem: {mem}\n auto: {auto}");
         }
         // Spill files are gone.
         let mut tmp = path.as_os_str().to_os_string();
@@ -184,7 +195,7 @@ fn memory_graph_near_its_limit_spills_instead_of_failing() {
     for call in calls(a, b) {
         let want = run(&mut reference, &call, "mem");
         let got = run(&mut g, &call, "auto");
-        assert_eq!(want, got, "{call}");
+        assert!(same(&call, &want, &got), "{call}\n want: {want}\n  got: {got}");
     }
 }
 
