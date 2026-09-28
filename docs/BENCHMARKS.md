@@ -448,3 +448,24 @@ of disk for every size and engine at once.
 | `bench/suite_report.py`, `bench/suite.html` | the interactive report |
 | `bench/wasm/` | glider and SQLite as WebAssembly in a browser worker |
 | `bench/results/` | raw results of every run described here |
+
+## Neo4j, on its own example graphs
+
+`bench/neo4j_bench.py` loads Neo4j's `recommendations` (28,863 nodes /
+166,261 relationships) and `stackoverflow` (6,193 / 11,540) example dumps
+into Neo4j 5 with Graph Data Science, pulls the same graphs into glider with
+`bench/convert.py`, and runs Neo4j's own example queries, algorithms and
+single-statement writes on both, checking every answer. Reports:
+`bench/neo4j-recommendations.html`, `bench/neo4j-stackoverflow.html`;
+method in `bench/NEO4J.md`.
+
+In short: every answer agreed on both graphs (41/41 and 18/18, PageRank
+top ten 10/10). Point lookups, short traversals and shortest paths are
+under Neo4j's whole-millisecond timer resolution on the Neo4j side and tens
+of microseconds on glider's; the full "users who rated this also rated"
+recommendation is 1.2–1.6× faster on glider; whole-graph grouped
+aggregations over 100k edges are 1.4–2× faster on Neo4j, as is weakly
+connected components on the larger graph; single-statement writes are
+3–18× faster on glider. Neo4j's numbers are its server-side times as the
+Bolt driver reports them, glider's are its engine time; neither includes a
+client.

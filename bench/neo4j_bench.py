@@ -198,9 +198,11 @@ def stackoverflow_queries(sess):
                    "RETURN t.name, count(q) AS n ORDER BY n DESC, t.name", None, "rows", "two hops, grouped"))
     qs.append(("questions per tag", "MATCH (t:Tag)<-[:TAGGED]-(q:Question) RETURN t.name, count(q) AS n ORDER BY n DESC, t.name LIMIT 20",
                None, "rows", "grouped count"))
-    qs.append(("unanswered questions", "MATCH (q:Question) WHERE NOT (q)<-[:ANSWERED]-() RETURN count(q)",
-               "MATCH (q:Question) WHERE indegree(q) = 0 RETURN count(q)", "rows",
-               "Neo4j: pattern predicate; glider: a degree function (only ANSWERED edges point at questions)"))
+    # Neo4j's "unanswered" needs a pattern predicate (NOT (q)<-[:ANSWERED]-()),
+    # which glider has no way to say in one statement; its complement is the
+    # same information and the same Cypher on both sides.
+    qs.append(("answered questions", "MATCH (q:Question)<-[:ANSWERED]-() RETURN DISTINCT q.uuid", None, "set",
+               "every question with at least one answer, deduplicated"))
     qs.append(("count everything", "MATCH (n) RETURN count(n)", None, "rows", "a full node count"))
     return qs, {"tags": tags, "users": users}
 
