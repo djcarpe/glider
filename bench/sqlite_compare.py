@@ -512,6 +512,7 @@ class Shell:
         """-> (engine seconds, rows, error)"""
         self.send(q + ";")
         d = json.loads(self.readline(timeout))
+        self.last_message = d.get("message")
         if "error" in d:
             return None, None, str(d["error"])[:300]
         e = json.loads(self.readline(timeout))

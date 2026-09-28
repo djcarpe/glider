@@ -1,0 +1,224 @@
+[09:24:45] == build 500MiB
+[09:24:55]    {"phase": "build", "engine": "glider", "size": "500MiB", "wall_s": 10.52, "peak_rss_mb": 495.9, "ok": true, "file_bytes": 723697664, "gen": {"mode": "paged-bulk", "ids": 615437, "nodes": 609111, "edges": 3890438, "bytes": 723697664, "second
+[09:25:38]    {"phase": "build", "engine": "sqlite", "size": "500MiB", "wall_s": 42.54, "ok": true, "file_bytes": 580022272, "loader_peak_rss_mb": 723.3, "nodes": 609111, "edges": 3890438, "index_s": 2.77, "fk_check_s": 1.22, "fk_violations": 0, "t": "20
+[09:25:38] == query 500MiB
+[09:26:17]    {"phase": "query", "size": "500MiB", "name": "point: indexed text (Person.email)", "shape": "point lookup", "cypher": "MATCH (p:Person {email:\"user0000123088@example.org\"}) RETURN p.name, p.age, p.country", "sql": "SELECT name, age, count
+[09:26:17]    {"phase": "query", "size": "500MiB", "name": "point: indexed text (Order.ref)", "shape": "point lookup", "cypher": "MATCH (o:Order {ref:\"ORD-0000381569\"}) RETURN o.total, o.status", "sql": "SELECT total, status FROM orders WHERE ref = ?",
+[09:26:17]    {"phase": "query", "size": "500MiB", "name": "point: by id", "shape": "point lookup", "cypher": "MATCH (d:Document) WHERE id(d) = 498502 RETURN d.title", "sql": "SELECT title FROM document WHERE id = ?", "params": [498502], "glider": {"cold
+[09:26:17]    {"phase": "query", "size": "500MiB", "name": "1-hop out: community (KNOWS)", "shape": "1 hop", "cypher": "MATCH (p:Person {email:\"user0000123088@example.org\"})-[:KNOWS]->(f) RETURN count(f), avg(f.age)", "sql": "SELECT count(*), avg(f.age
+[09:26:17]    {"phase": "query", "size": "500MiB", "name": "1-hop in: power-law hub (KNOWS)", "shape": "1 hop", "cypher": "MATCH (h:Person {email:\"user0000000001@example.org\"})<-[:KNOWS]-(f) RETURN count(f)", "sql": "SELECT count(*) FROM person h JOIN 
+[09:26:17]    {"phase": "query", "size": "500MiB", "name": "1-hop in: hub followers' average age", "shape": "1 hop", "cypher": "MATCH (h:Person {email:\"user0000000001@example.org\"})<-[:KNOWS]-(f) RETURN avg(f.age)", "sql": "SELECT avg(f.age) FROM perso
+[09:26:17]    {"phase": "query", "size": "500MiB", "name": "2-hop: friends of friends", "shape": "2 hops", "cypher": "MATCH (p:Person {email:\"user0000123088@example.org\"})-[:KNOWS]->()-[:KNOWS]->(x) RETURN count(x)", "sql": "SELECT count(*) FROM person
+[09:26:17]    {"phase": "query", "size": "500MiB", "name": "2-hop: distinct friends of friends", "shape": "2 hops", "cypher": "MATCH (p:Person {email:\"user0000123088@example.org\"})-[:KNOWS]->()-[:KNOWS]->(x) RETURN DISTINCT id(x)", "sql": "SELECT DISTI
+[09:26:17]    {"phase": "query", "size": "500MiB", "name": "3-hop: KNOWS out to depth 3", "shape": "3 hops", "cypher": "MATCH (p:Person {email:\"user0000123088@example.org\"})-[:KNOWS]->()-[:KNOWS]->()-[:KNOWS]->(x) RETURN count(x)", "sql": "SELECT count
+[09:26:17]    {"phase": "query", "size": "500MiB", "name": "2-hop bipartite: buyer -> orders -> products", "shape": "2 hops", "cypher": "MATCH (p:Person {email:\"user0000000074@example.org\"})-[:PLACED]->(o)-[:CONTAINS]->(pr) RETURN count(pr)", "sql": "S
+[09:26:17]    {"phase": "query", "size": "500MiB", "name": "recommendation: co-purchased products", "shape": "3 hops", "cypher": "MATCH (p:Product {sku:\"SKU-0000280023\"})<-[:CONTAINS]-(o)-[:CONTAINS]->(other) WHERE id(other) <> id(p) RETURN DISTINCT id
+[09:26:17]    {"phase": "query", "size": "500MiB", "name": "1-hop fetch: friends' names, sorted page", "shape": "1 hop", "cypher": "MATCH (p:Person {email:\"user0000123088@example.org\"})-[:KNOWS]->(f) RETURN f.name, f.city ORDER BY f.name, f.city LIMIT 
+[09:26:17]    {"phase": "query", "size": "500MiB", "name": "BFS: everyone within 2 KNOWS hops, with depth", "shape": "traversal", "cypher": "CALL bfs(from: 123088, depth: 2, dir: \"out\", type: \"KNOWS\")", "sql": "WITH RECURSIVE r(id, d) AS (SELECT ?, 0
+[09:26:17]    {"phase": "query", "size": "500MiB", "name": "BFS: everyone within 3 KNOWS hops, with depth", "shape": "traversal", "cypher": "CALL bfs(from: 123088, depth: 3, dir: \"out\", type: \"KNOWS\")", "sql": "WITH RECURSIVE r(id, d) AS (SELECT ?, 0
+[09:26:17]    {"phase": "query", "size": "500MiB", "name": "shortest path: person to person (KNOWS, <= 8 hops)", "shape": "traversal", "cypher": "CALL shortestpath(from: 123088, to: 221557, dir: \"out\", type: \"KNOWS\")", "sql": "WITH RECURSIVE r(id, d)
+[09:26:17]    {"phase": "query", "size": "500MiB", "name": "multi-edges: order lines", "shape": "1 hop", "cypher": "MATCH (o:Order {ref:\"ORD-0000381569\"})-[c:CONTAINS]->(pr) RETURN pr.sku, count(c) ORDER BY pr.sku", "sql": "SELECT pr.sku, count(*) FROM
+[09:26:17]    {"phase": "query", "size": "500MiB", "name": "dense clique: SIMILAR 2-hop", "shape": "2 hops", "cypher": "MATCH (p:Product {sku:\"SKU-0000280023\"})-[:SIMILAR]->()-[:SIMILAR]->(r) RETURN count(r)", "sql": "SELECT count(*) FROM product p JOI
+[09:26:17]    {"phase": "query", "size": "500MiB", "name": "tree: category ancestors (var-length)", "shape": "variable length", "cypher": "MATCH (p:Product {sku:\"SKU-0000280023\"})-[:IN_CATEGORY]->(c)<-[:PARENT_OF*1..10]-(a) RETURN count(a)", "sql": "WI
+[09:26:17]    {"phase": "query", "size": "500MiB", "name": "chain: NEXT*1..200", "shape": "variable length", "cypher": "MATCH (e:Event {seq:578510})-[:NEXT*1..200]->(x) RETURN count(x)", "sql": "WITH RECURSIVE walk(id, depth) AS ( SELECT n.dst, 1 FROM ev
+[09:26:17]    {"phase": "query", "size": "500MiB", "name": "DAG: CITES*1..3 from a document", "shape": "variable length", "cypher": "MATCH (d:Document)-[:CITES*1..3]->(x) WHERE id(d) = 498502 RETURN count(x)", "sql": "WITH RECURSIVE walk(id, depth) AS ( 
+[09:26:17]    {"phase": "query", "size": "500MiB", "name": "heterogeneous: MENTIONS by label", "shape": "1 hop", "cypher": "MATCH (d:Document)-[:MENTIONS]->(x) WHERE id(d) = 498502 RETURN labels(x), count(x)", "sql": "SELECT coalesce(p.labels, c.labels, 
+[09:26:17]    {"phase": "query", "size": "500MiB", "name": "index, low cardinality (country)", "shape": "index scan", "cypher": "MATCH (p:Person {country:\"JP\"}) RETURN count(p)", "sql": "SELECT count(*) FROM person WHERE country = 'JP'", "params": [], 
+[09:26:17]    {"phase": "query", "size": "500MiB", "name": "index + property filter", "shape": "index scan", "cypher": "MATCH (p:Person {age:42}) WHERE p.active = true RETURN count(p)", "sql": "SELECT count(*) FROM person WHERE age = 42 AND active = 1", 
+[09:26:17]    {"phase": "query", "size": "500MiB", "name": "self-loops: RETRY", "shape": "edge scan", "cypher": "MATCH (e:Event)-[:RETRY]->(e) RETURN count(e)", "sql": "SELECT count(*) FROM retry WHERE src = dst", "params": [], "glider": {"cold_ms": 89.5
+[09:26:17]    {"phase": "query", "size": "500MiB", "name": "label scan + unindexed filter", "shape": "label scan", "cypher": "MATCH (o:Order) WHERE o.total > 1990 RETURN count(o)", "sql": "SELECT count(*) FROM orders WHERE total > 1990", "params": [], "g
+[09:26:17]    {"phase": "query", "size": "500MiB", "name": "aggregate: group by", "shape": "label scan", "cypher": "MATCH (o:Order) RETURN o.status, count(o), avg(o.total) ORDER BY o.status", "sql": "SELECT status, count(*), avg(total) FROM orders GROUP 
+[09:26:17]    {"phase": "query", "size": "500MiB", "name": "top-k: ORDER BY LIMIT over big rows", "shape": "label scan", "cypher": "MATCH (d:Document) RETURN d.title, d.score ORDER BY d.score DESC LIMIT 5", "sql": "SELECT title, score FROM document ORDER
+[09:26:17]    {"phase": "query", "size": "500MiB", "name": "edge scan + edge-property filter", "shape": "edge scan", "cypher": "MATCH ()-[r:REVIEWED]->() WHERE r.rating = 5 RETURN count(r)", "sql": "SELECT count(*) FROM reviewed WHERE rating = 5", "param
+[09:26:17]    {"phase": "query", "size": "500MiB", "name": "degree: top 5 KNOWS in-degree", "shape": "global", "cypher": "MATCH (p:Person)<-[:KNOWS]-() RETURN id(p), count(*) AS d ORDER BY d DESC, id(p) LIMIT 5", "sql": "SELECT dst, count(*) AS d FROM kn
+[09:26:17]    {"phase": "query", "size": "500MiB", "name": "count all nodes", "shape": "global", "cypher": "MATCH (n) RETURN count(n)", "sql": "SELECT (SELECT count(*) FROM person) + (SELECT count(*) FROM company) + (SELECT count(*) FROM product) + (SELE
+[09:26:17]    {"phase": "memory", "size": "500MiB", "glider_peak_rss_mb": 707.3, "sqlite_peak_rss_mb": 611.0, "t": "2026-09-27T09:26:17"}
+[09:26:17] == build 1GiB
+[09:26:38]    {"phase": "build", "engine": "glider", "size": "1GiB", "wall_s": 20.6, "peak_rss_mb": 611.0, "ok": true, "file_bytes": 1488486400, "gen": {"mode": "paged-bulk", "ids": 1260415, "nodes": 1247371, "edges": 8027661, "bytes": 1488486400, "secon
+[09:27:34]     loaded 1,247,371 nodes, 3,752,629 edges
+[09:28:08]    {"phase": "build", "engine": "sqlite", "size": "1GiB", "wall_s": 90.18, "ok": true, "file_bytes": 1195233280, "loader_peak_rss_mb": 1318.0, "nodes": 1247371, "edges": 8027661, "index_s": 6.02, "fk_check_s": 3.0, "fk_violations": 0, "t": "20
+[09:28:08] == query 1GiB
+[09:29:24]    {"phase": "query", "size": "1GiB", "name": "point: indexed text (Person.email)", "shape": "point lookup", "cypher": "MATCH (p:Person {email:\"user0000252084@example.org\"}) RETURN p.name, p.age, p.country", "sql": "SELECT name, age, country
+[09:29:24]    {"phase": "query", "size": "1GiB", "name": "point: indexed text (Order.ref)", "shape": "point lookup", "cypher": "MATCH (o:Order {ref:\"ORD-0000781457\"}) RETURN o.total, o.status", "sql": "SELECT total, status FROM orders WHERE ref = ?", "
+[09:29:24]    {"phase": "query", "size": "1GiB", "name": "point: by id", "shape": "point lookup", "cypher": "MATCH (d:Document) WHERE id(d) = 1020935 RETURN d.title", "sql": "SELECT title FROM document WHERE id = ?", "params": [1020935], "glider": {"cold
+[09:29:24]    {"phase": "query", "size": "1GiB", "name": "1-hop out: community (KNOWS)", "shape": "1 hop", "cypher": "MATCH (p:Person {email:\"user0000252084@example.org\"})-[:KNOWS]->(f) RETURN count(f), avg(f.age)", "sql": "SELECT count(*), avg(f.age) 
+[09:29:24]    {"phase": "query", "size": "1GiB", "name": "1-hop in: power-law hub (KNOWS)", "shape": "1 hop", "cypher": "MATCH (h:Person {email:\"user0000000001@example.org\"})<-[:KNOWS]-(f) RETURN count(f)", "sql": "SELECT count(*) FROM person h JOIN kn
+[09:29:24]    {"phase": "query", "size": "1GiB", "name": "1-hop in: hub followers' average age", "shape": "1 hop", "cypher": "MATCH (h:Person {email:\"user0000000001@example.org\"})<-[:KNOWS]-(f) RETURN avg(f.age)", "sql": "SELECT avg(f.age) FROM person 
+[09:29:24]    {"phase": "query", "size": "1GiB", "name": "2-hop: friends of friends", "shape": "2 hops", "cypher": "MATCH (p:Person {email:\"user0000252084@example.org\"})-[:KNOWS]->()-[:KNOWS]->(x) RETURN count(x)", "sql": "SELECT count(*) FROM person p
+[09:29:24]    {"phase": "query", "size": "1GiB", "name": "2-hop: distinct friends of friends", "shape": "2 hops", "cypher": "MATCH (p:Person {email:\"user0000252084@example.org\"})-[:KNOWS]->()-[:KNOWS]->(x) RETURN DISTINCT id(x)", "sql": "SELECT DISTINC
+[09:29:24]    {"phase": "query", "size": "1GiB", "name": "3-hop: KNOWS out to depth 3", "shape": "3 hops", "cypher": "MATCH (p:Person {email:\"user0000252084@example.org\"})-[:KNOWS]->()-[:KNOWS]->()-[:KNOWS]->(x) RETURN count(x)", "sql": "SELECT count(*
+[09:29:24]    {"phase": "query", "size": "1GiB", "name": "2-hop bipartite: buyer -> orders -> products", "shape": "2 hops", "cypher": "MATCH (p:Person {email:\"user0000000152@example.org\"})-[:PLACED]->(o)-[:CONTAINS]->(pr) RETURN count(pr)", "sql": "SEL
+[09:29:24]    {"phase": "query", "size": "1GiB", "name": "recommendation: co-purchased products", "shape": "3 hops", "cypher": "MATCH (p:Product {sku:\"SKU-0000573489\"})<-[:CONTAINS]-(o)-[:CONTAINS]->(other) WHERE id(other) <> id(p) RETURN DISTINCT id(o
+[09:29:24]    {"phase": "query", "size": "1GiB", "name": "1-hop fetch: friends' names, sorted page", "shape": "1 hop", "cypher": "MATCH (p:Person {email:\"user0000252084@example.org\"})-[:KNOWS]->(f) RETURN f.name, f.city ORDER BY f.name, f.city LIMIT 20
+[09:29:24]    {"phase": "query", "size": "1GiB", "name": "BFS: everyone within 2 KNOWS hops, with depth", "shape": "traversal", "cypher": "CALL bfs(from: 252084, depth: 2, dir: \"out\", type: \"KNOWS\")", "sql": "WITH RECURSIVE r(id, d) AS (SELECT ?, 0 U
+[09:29:24]    {"phase": "query", "size": "1GiB", "name": "BFS: everyone within 3 KNOWS hops, with depth", "shape": "traversal", "cypher": "CALL bfs(from: 252084, depth: 3, dir: \"out\", type: \"KNOWS\")", "sql": "WITH RECURSIVE r(id, d) AS (SELECT ?, 0 U
+[09:29:24]    {"phase": "query", "size": "1GiB", "name": "shortest path: person to person (KNOWS, <= 8 hops)", "shape": "traversal", "cypher": "CALL shortestpath(from: 252084, to: 453750, dir: \"out\", type: \"KNOWS\")", "sql": "WITH RECURSIVE r(id, d) A
+[09:29:24]    {"phase": "query", "size": "1GiB", "name": "multi-edges: order lines", "shape": "1 hop", "cypher": "MATCH (o:Order {ref:\"ORD-0000781457\"})-[c:CONTAINS]->(pr) RETURN pr.sku, count(c) ORDER BY pr.sku", "sql": "SELECT pr.sku, count(*) FROM o
+[09:29:24]    {"phase": "query", "size": "1GiB", "name": "dense clique: SIMILAR 2-hop", "shape": "2 hops", "cypher": "MATCH (p:Product {sku:\"SKU-0000573489\"})-[:SIMILAR]->()-[:SIMILAR]->(r) RETURN count(r)", "sql": "SELECT count(*) FROM product p JOIN 
+[09:29:24]    {"phase": "query", "size": "1GiB", "name": "tree: category ancestors (var-length)", "shape": "variable length", "cypher": "MATCH (p:Product {sku:\"SKU-0000573489\"})-[:IN_CATEGORY]->(c)<-[:PARENT_OF*1..10]-(a) RETURN count(a)", "sql": "WITH
+[09:29:24]    {"phase": "query", "size": "1GiB", "name": "chain: NEXT*1..200", "shape": "variable length", "cypher": "MATCH (e:Event {seq:1184790})-[:NEXT*1..200]->(x) RETURN count(x)", "sql": "WITH RECURSIVE walk(id, depth) AS ( SELECT n.dst, 1 FROM eve
+[09:29:24]    {"phase": "query", "size": "1GiB", "name": "DAG: CITES*1..3 from a document", "shape": "variable length", "cypher": "MATCH (d:Document)-[:CITES*1..3]->(x) WHERE id(d) = 1020935 RETURN count(x)", "sql": "WITH RECURSIVE walk(id, depth) AS ( S
+[09:29:24]    {"phase": "query", "size": "1GiB", "name": "heterogeneous: MENTIONS by label", "shape": "1 hop", "cypher": "MATCH (d:Document)-[:MENTIONS]->(x) WHERE id(d) = 1020935 RETURN labels(x), count(x)", "sql": "SELECT coalesce(p.labels, c.labels, p
+[09:29:24]    {"phase": "query", "size": "1GiB", "name": "index, low cardinality (country)", "shape": "index scan", "cypher": "MATCH (p:Person {country:\"JP\"}) RETURN count(p)", "sql": "SELECT count(*) FROM person WHERE country = 'JP'", "params": [], "g
+[09:29:24]    {"phase": "query", "size": "1GiB", "name": "index + property filter", "shape": "index scan", "cypher": "MATCH (p:Person {age:42}) WHERE p.active = true RETURN count(p)", "sql": "SELECT count(*) FROM person WHERE age = 42 AND active = 1", "p
+[09:29:24]    {"phase": "query", "size": "1GiB", "name": "self-loops: RETRY", "shape": "edge scan", "cypher": "MATCH (e:Event)-[:RETRY]->(e) RETURN count(e)", "sql": "SELECT count(*) FROM retry WHERE src = dst", "params": [], "glider": {"cold_ms": 197.06
+[09:29:24]    {"phase": "query", "size": "1GiB", "name": "label scan + unindexed filter", "shape": "label scan", "cypher": "MATCH (o:Order) WHERE o.total > 1990 RETURN count(o)", "sql": "SELECT count(*) FROM orders WHERE total > 1990", "params": [], "gli
+[09:29:24]    {"phase": "query", "size": "1GiB", "name": "aggregate: group by", "shape": "label scan", "cypher": "MATCH (o:Order) RETURN o.status, count(o), avg(o.total) ORDER BY o.status", "sql": "SELECT status, count(*), avg(total) FROM orders GROUP BY
+[09:29:24]    {"phase": "query", "size": "1GiB", "name": "top-k: ORDER BY LIMIT over big rows", "shape": "label scan", "cypher": "MATCH (d:Document) RETURN d.title, d.score ORDER BY d.score DESC LIMIT 5", "sql": "SELECT title, score FROM document ORDER B
+[09:29:24]    {"phase": "query", "size": "1GiB", "name": "edge scan + edge-property filter", "shape": "edge scan", "cypher": "MATCH ()-[r:REVIEWED]->() WHERE r.rating = 5 RETURN count(r)", "sql": "SELECT count(*) FROM reviewed WHERE rating = 5", "params"
+[09:29:24]    {"phase": "query", "size": "1GiB", "name": "degree: top 5 KNOWS in-degree", "shape": "global", "cypher": "MATCH (p:Person)<-[:KNOWS]-() RETURN id(p), count(*) AS d ORDER BY d DESC, id(p) LIMIT 5", "sql": "SELECT dst, count(*) AS d FROM know
+[09:29:24]    {"phase": "query", "size": "1GiB", "name": "count all nodes", "shape": "global", "cypher": "MATCH (n) RETURN count(n)", "sql": "SELECT (SELECT count(*) FROM person) + (SELECT count(*) FROM company) + (SELECT count(*) FROM product) + (SELECT
+[09:29:24]    {"phase": "memory", "size": "1GiB", "glider_peak_rss_mb": 1351.1, "sqlite_peak_rss_mb": 1030.4, "t": "2026-09-27T09:29:24"}
+[09:29:24] == build 5GiB
+[09:31:08]    {"phase": "build", "engine": "glider", "size": "5GiB", "wall_s": 104.06, "peak_rss_mb": 1029.4, "ok": true, "file_bytes": 7540457472, "error": "{\"mode\":\"paged-bulk\",\"ids\":6302075,\"nodes\":6237595,\"edges\":40209610,\"bytes\":75404574
+[09:33:47]     loaded 5,000,000 nodes, 0 edges
+[09:34:30]     loaded 6,237,595 nodes, 3,762,405 edges
+[09:34:59]     loaded 6,237,595 nodes, 8,762,405 edges
+[09:35:28]     loaded 6,237,595 nodes, 13,762,405 edges
+[09:35:57]     loaded 6,237,595 nodes, 18,762,405 edges
+[09:36:25]     loaded 6,237,595 nodes, 23,762,405 edges
+[09:36:51]     loaded 6,237,595 nodes, 28,762,405 edges
+[09:37:17]     loaded 6,237,595 nodes, 33,762,405 edges
+[09:37:42]     loaded 6,237,595 nodes, 38,762,405 edges
+[09:39:06]    {"phase": "build", "engine": "sqlite", "size": "5GiB", "wall_s": 477.6, "ok": true, "file_bytes": 6072487936, "loader_peak_rss_mb": 1829.5, "nodes": 6237595, "edges": 40209610, "index_s": 39.33, "fk_check_s": 24.78, "fk_violations": 0, "t":
+[09:39:06] == query 5GiB
+Traceback (most recent call last):
+  File "/home/dj/Work/glider/bench/sqlite_compare.py", line 623, in <module>
+    main()
+    ~~~~^^
+  File "/home/dj/Work/glider/bench/sqlite_compare.py", line 619, in main
+    {"build": phase_build, "query": phase_query}[ph](size)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/home/dj/Work/glider/bench/sqlite_compare.py", line 438, in phase_query
+    qs = queries(layout(size))
+                 ~~~~~~^^^^^^
+  File "/home/dj/Work/glider/bench/sqlite_compare.py", line 433, in layout
+    return Layout(ids)
+                  ^^^
+UnboundLocalError: cannot access local variable 'ids' where it is not associated with a value
+[09:39:40] == build 5GiB
+[09:39:40] == query 5GiB
+[09:45:05]    {"phase": "query", "size": "5GiB", "name": "point: indexed text (Person.email)", "shape": "point lookup", "cypher": "MATCH (p:Person {email:\"user0001260416@example.org\"}) RETURN p.name, p.age, p.country", "sql": "SELECT name, age, country
+[09:45:05]    {"phase": "query", "size": "5GiB", "name": "point: indexed text (Order.ref)", "shape": "point lookup", "cypher": "MATCH (o:Order {ref:\"ORD-0003907287\"}) RETURN o.total, o.status", "sql": "SELECT total, status FROM orders WHERE ref = ?", "
+[09:45:05]    {"phase": "query", "size": "5GiB", "name": "point: by id", "shape": "point lookup", "cypher": "MATCH (d:Document) WHERE id(d) = 5104680 RETURN d.title", "sql": "SELECT title FROM document WHERE id = ?", "params": [5104680], "glider": {"cold
+[09:45:05]    {"phase": "query", "size": "5GiB", "name": "1-hop out: community (KNOWS)", "shape": "1 hop", "cypher": "MATCH (p:Person {email:\"user0001260416@example.org\"})-[:KNOWS]->(f) RETURN count(f), avg(f.age)", "sql": "SELECT count(*), avg(f.age) 
+[09:45:05]    {"phase": "query", "size": "5GiB", "name": "1-hop in: power-law hub (KNOWS)", "shape": "1 hop", "cypher": "MATCH (h:Person {email:\"user0000000001@example.org\"})<-[:KNOWS]-(f) RETURN count(f)", "sql": "SELECT count(*) FROM person h JOIN kn
+[09:45:05]    {"phase": "query", "size": "5GiB", "name": "1-hop in: hub followers' average age", "shape": "1 hop", "cypher": "MATCH (h:Person {email:\"user0000000001@example.org\"})<-[:KNOWS]-(f) RETURN avg(f.age)", "sql": "SELECT avg(f.age) FROM person 
+[09:45:05]    {"phase": "query", "size": "5GiB", "name": "2-hop: friends of friends", "shape": "2 hops", "cypher": "MATCH (p:Person {email:\"user0001260416@example.org\"})-[:KNOWS]->()-[:KNOWS]->(x) RETURN count(x)", "sql": "SELECT count(*) FROM person p
+[09:45:05]    {"phase": "query", "size": "5GiB", "name": "2-hop: distinct friends of friends", "shape": "2 hops", "cypher": "MATCH (p:Person {email:\"user0001260416@example.org\"})-[:KNOWS]->()-[:KNOWS]->(x) RETURN DISTINCT id(x)", "sql": "SELECT DISTINC
+[09:45:05]    {"phase": "query", "size": "5GiB", "name": "3-hop: KNOWS out to depth 3", "shape": "3 hops", "cypher": "MATCH (p:Person {email:\"user0001260416@example.org\"})-[:KNOWS]->()-[:KNOWS]->()-[:KNOWS]->(x) RETURN count(x)", "sql": "SELECT count(*
+[09:45:05]    {"phase": "query", "size": "5GiB", "name": "2-hop bipartite: buyer -> orders -> products", "shape": "2 hops", "cypher": "MATCH (p:Person {email:\"user0000000757@example.org\"})-[:PLACED]->(o)-[:CONTAINS]->(pr) RETURN count(pr)", "sql": "SEL
+[09:45:05]    {"phase": "query", "size": "5GiB", "name": "recommendation: co-purchased products", "shape": "3 hops", "cypher": "MATCH (p:Product {sku:\"SKU-0002867445\"})<-[:CONTAINS]-(o)-[:CONTAINS]->(other) WHERE id(other) <> id(p) RETURN DISTINCT id(o
+[09:45:05]    {"phase": "query", "size": "5GiB", "name": "1-hop fetch: friends' names, sorted page", "shape": "1 hop", "cypher": "MATCH (p:Person {email:\"user0001260416@example.org\"})-[:KNOWS]->(f) RETURN f.name, f.city ORDER BY f.name, f.city LIMIT 20
+[09:45:05]    {"phase": "query", "size": "5GiB", "name": "BFS: everyone within 2 KNOWS hops, with depth", "shape": "traversal", "cypher": "CALL bfs(from: 1260416, depth: 2, dir: \"out\", type: \"KNOWS\")", "sql": "WITH RECURSIVE r(id, d) AS (SELECT ?, 0 
+[09:45:05]    {"phase": "query", "size": "5GiB", "name": "BFS: everyone within 3 KNOWS hops, with depth", "shape": "traversal", "cypher": "CALL bfs(from: 1260416, depth: 3, dir: \"out\", type: \"KNOWS\")", "sql": "WITH RECURSIVE r(id, d) AS (SELECT ?, 0 
+[09:45:05]    {"phase": "query", "size": "5GiB", "name": "shortest path: person to person (KNOWS, <= 12 hops)", "shape": "traversal", "cypher": "CALL shortestpath(from: 1260416, to: 2268748, dir: \"out\", type: \"KNOWS\")", "sql": "WITH RECURSIVE r(id, d
+[09:45:05]    {"phase": "query", "size": "5GiB", "name": "multi-edges: order lines", "shape": "1 hop", "cypher": "MATCH (o:Order {ref:\"ORD-0003907287\"})-[c:CONTAINS]->(pr) RETURN pr.sku, count(c) ORDER BY pr.sku", "sql": "SELECT pr.sku, count(*) FROM o
+[09:45:05]    {"phase": "query", "size": "5GiB", "name": "dense clique: SIMILAR 2-hop", "shape": "2 hops", "cypher": "MATCH (p:Product {sku:\"SKU-0002867445\"})-[:SIMILAR]->()-[:SIMILAR]->(r) RETURN count(r)", "sql": "SELECT count(*) FROM product p JOIN 
+[09:45:05]    {"phase": "query", "size": "5GiB", "name": "tree: category ancestors (var-length)", "shape": "variable length", "cypher": "MATCH (p:Product {sku:\"SKU-0002867445\"})-[:IN_CATEGORY]->(c)<-[:PARENT_OF*1..10]-(a) RETURN count(a)", "sql": "WITH
+[09:45:05]    {"phase": "query", "size": "5GiB", "name": "chain: NEXT*1..200", "shape": "variable length", "cypher": "MATCH (e:Event {seq:5923950})-[:NEXT*1..200]->(x) RETURN count(x)", "sql": "WITH RECURSIVE walk(id, depth) AS ( SELECT n.dst, 1 FROM eve
+[09:45:05]    {"phase": "query", "size": "5GiB", "name": "DAG: CITES*1..3 from a document", "shape": "variable length", "cypher": "MATCH (d:Document)-[:CITES*1..3]->(x) WHERE id(d) = 5104680 RETURN count(x)", "sql": "WITH RECURSIVE walk(id, depth) AS ( S
+[09:45:05]    {"phase": "query", "size": "5GiB", "name": "heterogeneous: MENTIONS by label", "shape": "1 hop", "cypher": "MATCH (d:Document)-[:MENTIONS]->(x) WHERE id(d) = 5104680 RETURN labels(x), count(x)", "sql": "SELECT coalesce(p.labels, c.labels, p
+[09:45:05]    {"phase": "query", "size": "5GiB", "name": "index, low cardinality (country)", "shape": "index scan", "cypher": "MATCH (p:Person {country:\"JP\"}) RETURN count(p)", "sql": "SELECT count(*) FROM person WHERE country = 'JP'", "params": [], "g
+[09:45:05]    {"phase": "query", "size": "5GiB", "name": "index + property filter", "shape": "index scan", "cypher": "MATCH (p:Person {age:42}) WHERE p.active = true RETURN count(p)", "sql": "SELECT count(*) FROM person WHERE age = 42 AND active = 1", "p
+[09:45:05]    {"phase": "query", "size": "5GiB", "name": "self-loops: RETRY", "shape": "edge scan", "cypher": "MATCH (e:Event)-[:RETRY]->(e) RETURN count(e)", "sql": "SELECT count(*) FROM retry WHERE src = dst", "params": [], "glider": {"cold_ms": 1061.4
+[09:45:05]    {"phase": "query", "size": "5GiB", "name": "label scan + unindexed filter", "shape": "label scan", "cypher": "MATCH (o:Order) WHERE o.total > 1990 RETURN count(o)", "sql": "SELECT count(*) FROM orders WHERE total > 1990", "params": [], "gli
+[09:45:05]    {"phase": "query", "size": "5GiB", "name": "aggregate: group by", "shape": "label scan", "cypher": "MATCH (o:Order) RETURN o.status, count(o), avg(o.total) ORDER BY o.status", "sql": "SELECT status, count(*), avg(total) FROM orders GROUP BY
+[09:45:05]    {"phase": "query", "size": "5GiB", "name": "top-k: ORDER BY LIMIT over big rows", "shape": "label scan", "cypher": "MATCH (d:Document) RETURN d.title, d.score ORDER BY d.score DESC LIMIT 5", "sql": "SELECT title, score FROM document ORDER B
+[09:45:05]    {"phase": "query", "size": "5GiB", "name": "edge scan + edge-property filter", "shape": "edge scan", "cypher": "MATCH ()-[r:REVIEWED]->() WHERE r.rating = 5 RETURN count(r)", "sql": "SELECT count(*) FROM reviewed WHERE rating = 5", "params"
+[09:45:05]    {"phase": "query", "size": "5GiB", "name": "degree: top 5 KNOWS in-degree", "shape": "global", "cypher": "MATCH (p:Person)<-[:KNOWS]-() RETURN id(p), count(*) AS d ORDER BY d DESC, id(p) LIMIT 5", "sql": "SELECT dst, count(*) AS d FROM know
+[09:45:05]    {"phase": "query", "size": "5GiB", "name": "count all nodes", "shape": "global", "cypher": "MATCH (n) RETURN count(n)", "sql": "SELECT (SELECT count(*) FROM person) + (SELECT count(*) FROM company) + (SELECT count(*) FROM product) + (SELECT
+[09:45:05]    {"phase": "memory", "size": "5GiB", "glider_peak_rss_mb": 2552.2, "sqlite_peak_rss_mb": 1090.4, "t": "2026-09-27T09:45:05"}
+[09:45:05] == build 10GiB
+[09:48:40]    {"phase": "build", "engine": "glider", "size": "10GiB", "wall_s": 214.53, "peak_rss_mb": 553.6, "ok": true, "file_bytes": 15152398336, "gen": {"mode": "paged-bulk", "ids": 12604150, "nodes": 12474662, "edges": 80387292, "bytes": 15152398336
+memory allocation of 1073741824 bytes failed
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+[09:50:51]    {"phase": "build", "engine": "sqlite", "size": "10GiB", "wall_s": 131.66, "ok": false, "file_bytes": 270336, "loader_peak_rss_mb": 27.5, "nodes": 0, "edges": 0, "index_s": 0.29, "fk_check_s": 0.0, "fk_violations": 0, "t": "2026-09-27T09:50:
+[09:50:51] == query 10GiB
+[09:58:14]    {"phase": "query", "size": "10GiB", "name": "point: indexed text (Person.email)", "shape": "point lookup", "cypher": "MATCH (p:Person {email:\"user0002520831@example.org\"}) RETURN p.name, p.age, p.country", "sql": "SELECT name, age, countr
+[09:58:14]    {"phase": "query", "size": "10GiB", "name": "point: indexed text (Order.ref)", "shape": "point lookup", "cypher": "MATCH (o:Order {ref:\"ORD-0007814573\"}) RETURN o.total, o.status", "sql": "SELECT total, status FROM orders WHERE ref = ?", 
+[09:58:14]    {"phase": "query", "size": "10GiB", "name": "point: by id", "shape": "point lookup", "cypher": "MATCH (d:Document) WHERE id(d) = 10209361 RETURN d.title", "sql": "SELECT title FROM document WHERE id = ?", "params": [10209361], "glider": {"c
+[09:58:14]    {"phase": "query", "size": "10GiB", "name": "1-hop out: community (KNOWS)", "shape": "1 hop", "cypher": "MATCH (p:Person {email:\"user0002520831@example.org\"})-[:KNOWS]->(f) RETURN count(f), avg(f.age)", "sql": "SELECT count(*), avg(f.age)
+[09:58:14]    {"phase": "query", "size": "10GiB", "name": "1-hop in: power-law hub (KNOWS)", "shape": "1 hop", "cypher": "MATCH (h:Person {email:\"user0000000001@example.org\"})<-[:KNOWS]-(f) RETURN count(f)", "sql": "SELECT count(*) FROM person h JOIN k
+[09:58:14]    {"phase": "query", "size": "10GiB", "name": "1-hop in: hub followers' average age", "shape": "1 hop", "cypher": "MATCH (h:Person {email:\"user0000000001@example.org\"})<-[:KNOWS]-(f) RETURN avg(f.age)", "sql": "SELECT avg(f.age) FROM person
+[09:58:14]    {"phase": "query", "size": "10GiB", "name": "2-hop: friends of friends", "shape": "2 hops", "cypher": "MATCH (p:Person {email:\"user0002520831@example.org\"})-[:KNOWS]->()-[:KNOWS]->(x) RETURN count(x)", "sql": "SELECT count(*) FROM person 
+[09:58:14]    {"phase": "query", "size": "10GiB", "name": "2-hop: distinct friends of friends", "shape": "2 hops", "cypher": "MATCH (p:Person {email:\"user0002520831@example.org\"})-[:KNOWS]->()-[:KNOWS]->(x) RETURN DISTINCT id(x)", "sql": "SELECT DISTIN
+[09:58:14]    {"phase": "query", "size": "10GiB", "name": "3-hop: KNOWS out to depth 3", "shape": "3 hops", "cypher": "MATCH (p:Person {email:\"user0002520831@example.org\"})-[:KNOWS]->()-[:KNOWS]->()-[:KNOWS]->(x) RETURN count(x)", "sql": "SELECT count(
+[09:58:14]    {"phase": "query", "size": "10GiB", "name": "2-hop bipartite: buyer -> orders -> products", "shape": "2 hops", "cypher": "MATCH (p:Person {email:\"user0000001513@example.org\"})-[:PLACED]->(o)-[:CONTAINS]->(pr) RETURN count(pr)", "sql": "SE
+[09:58:14]    {"phase": "query", "size": "10GiB", "name": "recommendation: co-purchased products", "shape": "3 hops", "cypher": "MATCH (p:Product {sku:\"SKU-0005734889\"})<-[:CONTAINS]-(o)-[:CONTAINS]->(other) WHERE id(other) <> id(p) RETURN DISTINCT id(
+[09:58:14]    {"phase": "query", "size": "10GiB", "name": "1-hop fetch: friends' names, sorted page", "shape": "1 hop", "cypher": "MATCH (p:Person {email:\"user0002520831@example.org\"})-[:KNOWS]->(f) RETURN f.name, f.city ORDER BY f.name, f.city LIMIT 2
+[09:58:14]    {"phase": "query", "size": "10GiB", "name": "BFS: everyone within 2 KNOWS hops, with depth", "shape": "traversal", "cypher": "CALL bfs(from: 2520831, depth: 2, dir: \"out\", type: \"KNOWS\")", "sql": "WITH RECURSIVE r(id, d) AS (SELECT ?, 0
+[09:58:14]    {"phase": "query", "size": "10GiB", "name": "BFS: everyone within 3 KNOWS hops, with depth", "shape": "traversal", "cypher": "CALL bfs(from: 2520831, depth: 3, dir: \"out\", type: \"KNOWS\")", "sql": "WITH RECURSIVE r(id, d) AS (SELECT ?, 0
+[09:58:14]    {"phase": "query", "size": "10GiB", "name": "shortest path: person to person (KNOWS, <= 12 hops)", "shape": "traversal", "cypher": "CALL shortestpath(from: 2520831, to: 4537495, dir: \"out\", type: \"KNOWS\")", "sql": "WITH RECURSIVE r(id, 
+[09:58:14]    {"phase": "query", "size": "10GiB", "name": "multi-edges: order lines", "shape": "1 hop", "cypher": "MATCH (o:Order {ref:\"ORD-0007814573\"})-[c:CONTAINS]->(pr) RETURN pr.sku, count(c) ORDER BY pr.sku", "sql": "SELECT pr.sku, count(*) FROM 
+[09:58:14]    {"phase": "query", "size": "10GiB", "name": "dense clique: SIMILAR 2-hop", "shape": "2 hops", "cypher": "MATCH (p:Product {sku:\"SKU-0005734889\"})-[:SIMILAR]->()-[:SIMILAR]->(r) RETURN count(r)", "sql": "SELECT count(*) FROM product p JOIN
+[09:58:14]    {"phase": "query", "size": "10GiB", "name": "tree: category ancestors (var-length)", "shape": "variable length", "cypher": "MATCH (p:Product {sku:\"SKU-0005734889\"})-[:IN_CATEGORY]->(c)<-[:PARENT_OF*1..10]-(a) RETURN count(a)", "sql": "WIT
+[09:58:14]    {"phase": "query", "size": "10GiB", "name": "chain: NEXT*1..200", "shape": "variable length", "cypher": "MATCH (e:Event {seq:11847901})-[:NEXT*1..200]->(x) RETURN count(x)", "sql": "WITH RECURSIVE walk(id, depth) AS ( SELECT n.dst, 1 FROM e
+[09:58:14]    {"phase": "query", "size": "10GiB", "name": "DAG: CITES*1..3 from a document", "shape": "variable length", "cypher": "MATCH (d:Document)-[:CITES*1..3]->(x) WHERE id(d) = 10209361 RETURN count(x)", "sql": "WITH RECURSIVE walk(id, depth) AS (
+[09:58:14]    {"phase": "query", "size": "10GiB", "name": "heterogeneous: MENTIONS by label", "shape": "1 hop", "cypher": "MATCH (d:Document)-[:MENTIONS]->(x) WHERE id(d) = 10209361 RETURN labels(x), count(x)", "sql": "SELECT coalesce(p.labels, c.labels,
+[09:58:14]    {"phase": "query", "size": "10GiB", "name": "index, low cardinality (country)", "shape": "index scan", "cypher": "MATCH (p:Person {country:\"JP\"}) RETURN count(p)", "sql": "SELECT count(*) FROM person WHERE country = 'JP'", "params": [], "
+[09:58:14]    {"phase": "query", "size": "10GiB", "name": "index + property filter", "shape": "index scan", "cypher": "MATCH (p:Person {age:42}) WHERE p.active = true RETURN count(p)", "sql": "SELECT count(*) FROM person WHERE age = 42 AND active = 1", "
+[09:58:14]    {"phase": "query", "size": "10GiB", "name": "self-loops: RETRY", "shape": "edge scan", "cypher": "MATCH (e:Event)-[:RETRY]->(e) RETURN count(e)", "sql": "SELECT count(*) FROM retry WHERE src = dst", "params": [], "glider": {"cold_ms": 2148.
+[09:58:14]    {"phase": "query", "size": "10GiB", "name": "label scan + unindexed filter", "shape": "label scan", "cypher": "MATCH (o:Order) WHERE o.total > 1990 RETURN count(o)", "sql": "SELECT count(*) FROM orders WHERE total > 1990", "params": [], "gl
+[09:58:14]    {"phase": "query", "size": "10GiB", "name": "aggregate: group by", "shape": "label scan", "cypher": "MATCH (o:Order) RETURN o.status, count(o), avg(o.total) ORDER BY o.status", "sql": "SELECT status, count(*), avg(total) FROM orders GROUP B
+[09:58:14]    {"phase": "query", "size": "10GiB", "name": "top-k: ORDER BY LIMIT over big rows", "shape": "label scan", "cypher": "MATCH (d:Document) RETURN d.title, d.score ORDER BY d.score DESC LIMIT 5", "sql": "SELECT title, score FROM document ORDER 
+[09:58:14]    {"phase": "query", "size": "10GiB", "name": "edge scan + edge-property filter", "shape": "edge scan", "cypher": "MATCH ()-[r:REVIEWED]->() WHERE r.rating = 5 RETURN count(r)", "sql": "SELECT count(*) FROM reviewed WHERE rating = 5", "params
+[09:58:14]    {"phase": "query", "size": "10GiB", "name": "degree: top 5 KNOWS in-degree", "shape": "global", "cypher": "MATCH (p:Person)<-[:KNOWS]-() RETURN id(p), count(*) AS d ORDER BY d DESC, id(p) LIMIT 5", "sql": "SELECT dst, count(*) AS d FROM kno
+[09:58:14]    {"phase": "query", "size": "10GiB", "name": "count all nodes", "shape": "global", "cypher": "MATCH (n) RETURN count(n)", "sql": "SELECT (SELECT count(*) FROM person) + (SELECT count(*) FROM company) + (SELECT count(*) FROM product) + (SELEC
+[09:58:14]    {"phase": "memory", "size": "10GiB", "glider_peak_rss_mb": 4087.8, "sqlite_peak_rss_mb": 26.9, "t": "2026-09-27T09:58:14"}
+[09:58:14] == query 500MiB
+[09:59:00]    {"phase": "query", "size": "500MiB", "name": "shortest path: person to person (KNOWS, <= 12 hops)", "shape": "traversal", "cypher": "CALL shortestpath(from: 123088, to: 221557, dir: \"out\", type: \"KNOWS\")", "sql": "WITH RECURSIVE r(id, d
+[09:59:00] == query 1GiB
+[10:00:37]    {"phase": "query", "size": "1GiB", "name": "shortest path: person to person (KNOWS, <= 12 hops)", "shape": "traversal", "cypher": "CALL shortestpath(from: 252084, to: 453750, dir: \"out\", type: \"KNOWS\")", "sql": "WITH RECURSIVE r(id, d) 
+[10:05:43] == build 10GiB
+[10:07:30]     loaded 5,000,000 nodes, 0 edges
+[10:08:41]     loaded 10,000,000 nodes, 0 edges
+[10:09:52]     loaded 12,474,662 nodes, 2,525,338 edges
+[10:10:26]     loaded 12,474,662 nodes, 7,525,338 edges
+[10:10:59]     loaded 12,474,662 nodes, 12,525,338 edges
+[10:11:33]     loaded 12,474,662 nodes, 17,525,338 edges
+[10:12:07]     loaded 12,474,662 nodes, 22,525,338 edges
+[10:12:40]     loaded 12,474,662 nodes, 27,525,338 edges
+[10:13:14]     loaded 12,474,662 nodes, 32,525,338 edges
+[10:13:48]     loaded 12,474,662 nodes, 37,525,338 edges
+[10:14:22]     loaded 12,474,662 nodes, 42,525,338 edges
+[10:14:55]     loaded 12,474,662 nodes, 47,525,338 edges
+[10:15:26]     loaded 12,474,662 nodes, 52,525,338 edges
+[10:15:57]     loaded 12,474,662 nodes, 57,525,338 edges
+[10:16:28]     loaded 12,474,662 nodes, 62,525,338 edges
+[10:17:00]     loaded 12,474,662 nodes, 67,525,338 edges
+[10:17:29]     loaded 12,474,662 nodes, 72,525,338 edges
+[10:17:59]     loaded 12,474,662 nodes, 77,525,338 edges
+[10:21:36]    {"phase": "build", "engine": "sqlite", "size": "10GiB", "wall_s": 953.26, "ok": true, "file_bytes": 12246081536, "loader_peak_rss_mb": 1826.7, "nodes": 12474662, "edges": 80387292, "index_s": 84.87, "fk_check_s": 92.72, "fk_violations": 0, 
+[10:21:36] == query 10GiB
+[10:32:59]    {"phase": "query", "size": "10GiB", "name": "point: indexed text (Person.email)", "shape": "point lookup", "cypher": "MATCH (p:Person {email:\"user0002520831@example.org\"}) RETURN p.name, p.age, p.country", "sql": "SELECT name, age, countr
+[10:32:59]    {"phase": "query", "size": "10GiB", "name": "point: indexed text (Order.ref)", "shape": "point lookup", "cypher": "MATCH (o:Order {ref:\"ORD-0007814573\"}) RETURN o.total, o.status", "sql": "SELECT total, status FROM orders WHERE ref = ?", 
+[10:32:59]    {"phase": "query", "size": "10GiB", "name": "point: by id", "shape": "point lookup", "cypher": "MATCH (d:Document) WHERE id(d) = 10209361 RETURN d.title", "sql": "SELECT title FROM document WHERE id = ?", "params": [10209361], "glider": {"c
+[10:32:59]    {"phase": "query", "size": "10GiB", "name": "1-hop out: community (KNOWS)", "shape": "1 hop", "cypher": "MATCH (p:Person {email:\"user0002520831@example.org\"})-[:KNOWS]->(f) RETURN count(f), avg(f.age)", "sql": "SELECT count(*), avg(f.age)
+[10:32:59]    {"phase": "query", "size": "10GiB", "name": "1-hop in: power-law hub (KNOWS)", "shape": "1 hop", "cypher": "MATCH (h:Person {email:\"user0000000001@example.org\"})<-[:KNOWS]-(f) RETURN count(f)", "sql": "SELECT count(*) FROM person h JOIN k
+[10:32:59]    {"phase": "query", "size": "10GiB", "name": "1-hop in: hub followers' average age", "shape": "1 hop", "cypher": "MATCH (h:Person {email:\"user0000000001@example.org\"})<-[:KNOWS]-(f) RETURN avg(f.age)", "sql": "SELECT avg(f.age) FROM person
+[10:32:59]    {"phase": "query", "size": "10GiB", "name": "2-hop: friends of friends", "shape": "2 hops", "cypher": "MATCH (p:Person {email:\"user0002520831@example.org\"})-[:KNOWS]->()-[:KNOWS]->(x) RETURN count(x)", "sql": "SELECT count(*) FROM person 
+[10:32:59]    {"phase": "query", "size": "10GiB", "name": "2-hop: distinct friends of friends", "shape": "2 hops", "cypher": "MATCH (p:Person {email:\"user0002520831@example.org\"})-[:KNOWS]->()-[:KNOWS]->(x) RETURN DISTINCT id(x)", "sql": "SELECT DISTIN
+[10:32:59]    {"phase": "query", "size": "10GiB", "name": "3-hop: KNOWS out to depth 3", "shape": "3 hops", "cypher": "MATCH (p:Person {email:\"user0002520831@example.org\"})-[:KNOWS]->()-[:KNOWS]->()-[:KNOWS]->(x) RETURN count(x)", "sql": "SELECT count(
+[10:32:59]    {"phase": "query", "size": "10GiB", "name": "2-hop bipartite: buyer -> orders -> products", "shape": "2 hops", "cypher": "MATCH (p:Person {email:\"user0000001513@example.org\"})-[:PLACED]->(o)-[:CONTAINS]->(pr) RETURN count(pr)", "sql": "SE
+[10:32:59]    {"phase": "query", "size": "10GiB", "name": "recommendation: co-purchased products", "shape": "3 hops", "cypher": "MATCH (p:Product {sku:\"SKU-0005734889\"})<-[:CONTAINS]-(o)-[:CONTAINS]->(other) WHERE id(other) <> id(p) RETURN DISTINCT id(
+[10:32:59]    {"phase": "query", "size": "10GiB", "name": "1-hop fetch: friends' names, sorted page", "shape": "1 hop", "cypher": "MATCH (p:Person {email:\"user0002520831@example.org\"})-[:KNOWS]->(f) RETURN f.name, f.city ORDER BY f.name, f.city LIMIT 2
+[10:32:59]    {"phase": "query", "size": "10GiB", "name": "BFS: everyone within 2 KNOWS hops, with depth", "shape": "traversal", "cypher": "CALL bfs(from: 2520831, depth: 2, dir: \"out\", type: \"KNOWS\")", "sql": "WITH RECURSIVE r(id, d) AS (SELECT ?, 0
+[10:32:59]    {"phase": "query", "size": "10GiB", "name": "BFS: everyone within 3 KNOWS hops, with depth", "shape": "traversal", "cypher": "CALL bfs(from: 2520831, depth: 3, dir: \"out\", type: \"KNOWS\")", "sql": "WITH RECURSIVE r(id, d) AS (SELECT ?, 0
+[10:32:59]    {"phase": "query", "size": "10GiB", "name": "shortest path: person to person (KNOWS, <= 12 hops)", "shape": "traversal", "cypher": "CALL shortestpath(from: 2520831, to: 4537495, dir: \"out\", type: \"KNOWS\")", "sql": "WITH RECURSIVE r(id, 
+[10:32:59]    {"phase": "query", "size": "10GiB", "name": "multi-edges: order lines", "shape": "1 hop", "cypher": "MATCH (o:Order {ref:\"ORD-0007814573\"})-[c:CONTAINS]->(pr) RETURN pr.sku, count(c) ORDER BY pr.sku", "sql": "SELECT pr.sku, count(*) FROM 
+[10:32:59]    {"phase": "query", "size": "10GiB", "name": "dense clique: SIMILAR 2-hop", "shape": "2 hops", "cypher": "MATCH (p:Product {sku:\"SKU-0005734889\"})-[:SIMILAR]->()-[:SIMILAR]->(r) RETURN count(r)", "sql": "SELECT count(*) FROM product p JOIN
+[10:32:59]    {"phase": "query", "size": "10GiB", "name": "tree: category ancestors (var-length)", "shape": "variable length", "cypher": "MATCH (p:Product {sku:\"SKU-0005734889\"})-[:IN_CATEGORY]->(c)<-[:PARENT_OF*1..10]-(a) RETURN count(a)", "sql": "WIT
+[10:32:59]    {"phase": "query", "size": "10GiB", "name": "chain: NEXT*1..200", "shape": "variable length", "cypher": "MATCH (e:Event {seq:11847901})-[:NEXT*1..200]->(x) RETURN count(x)", "sql": "WITH RECURSIVE walk(id, depth) AS ( SELECT n.dst, 1 FROM e
+[10:32:59]    {"phase": "query", "size": "10GiB", "name": "DAG: CITES*1..3 from a document", "shape": "variable length", "cypher": "MATCH (d:Document)-[:CITES*1..3]->(x) WHERE id(d) = 10209361 RETURN count(x)", "sql": "WITH RECURSIVE walk(id, depth) AS (
+[10:32:59]    {"phase": "query", "size": "10GiB", "name": "heterogeneous: MENTIONS by label", "shape": "1 hop", "cypher": "MATCH (d:Document)-[:MENTIONS]->(x) WHERE id(d) = 10209361 RETURN labels(x), count(x)", "sql": "SELECT coalesce(p.labels, c.labels,
+[10:32:59]    {"phase": "query", "size": "10GiB", "name": "index, low cardinality (country)", "shape": "index scan", "cypher": "MATCH (p:Person {country:\"JP\"}) RETURN count(p)", "sql": "SELECT count(*) FROM person WHERE country = 'JP'", "params": [], "
+[10:32:59]    {"phase": "query", "size": "10GiB", "name": "index + property filter", "shape": "index scan", "cypher": "MATCH (p:Person {age:42}) WHERE p.active = true RETURN count(p)", "sql": "SELECT count(*) FROM person WHERE age = 42 AND active = 1", "
+[10:32:59]    {"phase": "query", "size": "10GiB", "name": "self-loops: RETRY", "shape": "edge scan", "cypher": "MATCH (e:Event)-[:RETRY]->(e) RETURN count(e)", "sql": "SELECT count(*) FROM retry WHERE src = dst", "params": [], "glider": {"cold_ms": 2232.
+[10:32:59]    {"phase": "query", "size": "10GiB", "name": "label scan + unindexed filter", "shape": "label scan", "cypher": "MATCH (o:Order) WHERE o.total > 1990 RETURN count(o)", "sql": "SELECT count(*) FROM orders WHERE total > 1990", "params": [], "gl
+[10:32:59]    {"phase": "query", "size": "10GiB", "name": "aggregate: group by", "shape": "label scan", "cypher": "MATCH (o:Order) RETURN o.status, count(o), avg(o.total) ORDER BY o.status", "sql": "SELECT status, count(*), avg(total) FROM orders GROUP B
+[10:32:59]    {"phase": "query", "size": "10GiB", "name": "top-k: ORDER BY LIMIT over big rows", "shape": "label scan", "cypher": "MATCH (d:Document) RETURN d.title, d.score ORDER BY d.score DESC LIMIT 5", "sql": "SELECT title, score FROM document ORDER 
+[10:32:59]    {"phase": "query", "size": "10GiB", "name": "edge scan + edge-property filter", "shape": "edge scan", "cypher": "MATCH ()-[r:REVIEWED]->() WHERE r.rating = 5 RETURN count(r)", "sql": "SELECT count(*) FROM reviewed WHERE rating = 5", "params
+[10:32:59]    {"phase": "query", "size": "10GiB", "name": "degree: top 5 KNOWS in-degree", "shape": "global", "cypher": "MATCH (p:Person)<-[:KNOWS]-() RETURN id(p), count(*) AS d ORDER BY d DESC, id(p) LIMIT 5", "sql": "SELECT dst, count(*) AS d FROM kno
+[10:32:59]    {"phase": "query", "size": "10GiB", "name": "count all nodes", "shape": "global", "cypher": "MATCH (n) RETURN count(n)", "sql": "SELECT (SELECT count(*) FROM person) + (SELECT count(*) FROM company) + (SELECT count(*) FROM product) + (SELEC
+[10:32:59]    {"phase": "memory", "size": "10GiB", "glider_peak_rss_mb": 4085.6, "sqlite_peak_rss_mb": 1241.7, "t": "2026-09-27T10:32:59"}

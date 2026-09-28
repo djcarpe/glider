@@ -1,0 +1,274 @@
+[12:32:21] == build 500MiB
+[12:32:32]    {"phase": "build", "engine": "glider", "size": "500MiB", "wall_s": 10.71, "peak_rss_mb": 468.2, "ok": true, "file_bytes": 747241472, "gen": {"mode": "paged-bulk", "ids": 615437, "nodes": 609111, "edges": 3890438, "bytes"
+[12:33:15]    {"phase": "build", "engine": "sqlite", "size": "500MiB", "wall_s": 42.87, "ok": true, "file_bytes": 580022272, "nodes": 609111, "edges": 3890438, "index_s": 2.77, "fk_check_s": 1.23, "fk_violations": 0, "t": "2026-09-27T
+[12:33:15] == reads 500MiB
+[12:35:57]    {"phase": "read", "size": "500MiB", "name": "point: indexed text (Person.email)", "shape": "point lookup", "params": ["user0000123088@example.org"], "match": true, "telemetry": {"trace_id": "e268f69dec1db202162d3b9765f94
+[12:35:57]    {"phase": "read", "size": "500MiB", "name": "point: indexed text (Order.ref)", "shape": "point lookup", "params": ["ORD-0000381569"], "match": true, "telemetry": {"trace_id": "7c782c9a54eb736a2b4396cc35769b41", "start_ms
+[12:35:57]    {"phase": "read", "size": "500MiB", "name": "point: by id", "shape": "point lookup", "params": [498502], "match": true, "telemetry": {"trace_id": "c581de47086ac4fa53c336537a020f28", "start_ms": 1790530395234, "end_ms": 1
+[12:35:57]    {"phase": "read", "size": "500MiB", "name": "1-hop out: community (KNOWS)", "shape": "1 hop", "params": ["user0000123088@example.org"], "match": true, "telemetry": {"trace_id": "41c894d023233932e39a92aa76787f61", "start_
+[12:35:57]    {"phase": "read", "size": "500MiB", "name": "1-hop in: power-law hub (KNOWS)", "shape": "1 hop", "params": ["user0000000001@example.org"], "match": true, "telemetry": {"trace_id": "af7314f3336899fe4a0b462663eb2cda", "sta
+[12:35:57]    {"phase": "read", "size": "500MiB", "name": "1-hop in: hub followers' average age", "shape": "1 hop", "params": ["user0000000001@example.org"], "match": true, "telemetry": {"trace_id": "d577287436741918f78c0e6716da184b",
+[12:35:57]    {"phase": "read", "size": "500MiB", "name": "2-hop: friends of friends", "shape": "2 hops", "params": ["user0000123088@example.org"], "match": true, "telemetry": {"trace_id": "89306fb7124bd2014cb78012fb9aefa8", "start_ms
+[12:35:57]    {"phase": "read", "size": "500MiB", "name": "2-hop: distinct friends of friends", "shape": "2 hops", "params": ["user0000123088@example.org"], "match": true, "telemetry": {"trace_id": "57f7d9c1f151e12b51ce9dca813fe879", 
+[12:35:57]    {"phase": "read", "size": "500MiB", "name": "3-hop: KNOWS out to depth 3", "shape": "3 hops", "params": ["user0000123088@example.org"], "match": true, "telemetry": {"trace_id": "7fbe0bae22e44a5ffcddb94c2d6fd156", "start_
+[12:35:57]    {"phase": "read", "size": "500MiB", "name": "2-hop bipartite: buyer -> orders -> products", "shape": "2 hops", "params": ["user0000000074@example.org"], "match": true, "telemetry": {"trace_id": "112bf0556e3bd6e09969e8294
+[12:35:57]    {"phase": "read", "size": "500MiB", "name": "recommendation: co-purchased products", "shape": "3 hops", "params": ["SKU-0000280023"], "match": true, "telemetry": {"trace_id": "342f3323cc8a07c70c31e25ef3605454", "start_ms
+[12:35:57]    {"phase": "read", "size": "500MiB", "name": "1-hop fetch: friends' names, sorted page", "shape": "1 hop", "params": ["user0000123088@example.org"], "match": true, "telemetry": {"trace_id": "5ee77fb7a23603370c1374bbd60f3d
+[12:35:57]    {"phase": "read", "size": "500MiB", "name": "BFS: everyone within 2 KNOWS hops, with depth", "shape": "traversal", "params": [123088], "match": true, "telemetry": {"trace_id": "473932dd118e2b3b63cb9b0994b62216", "start_m
+[12:35:57]    {"phase": "read", "size": "500MiB", "name": "BFS: everyone within 3 KNOWS hops, with depth", "shape": "traversal", "params": [123088], "match": true, "telemetry": {"trace_id": "f0677de9693a717b88ecd86d50510fec", "start_m
+[12:35:57]    {"phase": "read", "size": "500MiB", "name": "shortest path: person to person (KNOWS, <= 12 hops)", "shape": "traversal", "params": [123088, 221557, 221557], "match": true, "telemetry": {"trace_id": "b516067fc7a105263a0a2
+[12:35:57]    {"phase": "read", "size": "500MiB", "name": "multi-edges: order lines", "shape": "1 hop", "params": ["ORD-0000381569"], "match": true, "telemetry": {"trace_id": "cca6fb775a051fa03cf6201002f475fa", "start_ms": 17905303952
+[12:35:57]    {"phase": "read", "size": "500MiB", "name": "dense clique: SIMILAR 2-hop", "shape": "2 hops", "params": ["SKU-0000280023"], "match": true, "telemetry": {"trace_id": "24e9fac112a036f722b88418110d2974", "start_ms": 1790530
+[12:35:57]    {"phase": "read", "size": "500MiB", "name": "tree: category ancestors (var-length)", "shape": "variable length", "params": ["SKU-0000280023"], "match": true, "telemetry": {"trace_id": "2852b0cc0511cad6e736e3f89bbf4c23", 
+[12:35:57]    {"phase": "read", "size": "500MiB", "name": "chain: NEXT*1..200", "shape": "variable length", "params": [578510], "match": true, "telemetry": {"trace_id": "af2ad89712299c1a4beeb4e6b1a0ba00", "start_ms": 1790530395234, "e
+[12:35:57]    {"phase": "read", "size": "500MiB", "name": "DAG: CITES*1..3 from a document", "shape": "variable length", "params": [498502], "match": true, "telemetry": {"trace_id": "145e81c68bca606f9edd319ec419dcac", "start_ms": 1790
+[12:35:57]    {"phase": "read", "size": "500MiB", "name": "heterogeneous: MENTIONS by label", "shape": "1 hop", "params": [498502], "match": true, "telemetry": {"trace_id": "c09e2952341c58d3ec7e8c3aedde7a5a", "start_ms": 1790530395234
+[12:35:57]    {"phase": "read", "size": "500MiB", "name": "index, low cardinality (country)", "shape": "index scan", "params": [], "match": true, "telemetry": {"trace_id": "93a528d19c6e3a11dbc93ac7d3aa6b04", "start_ms": 1790530395234,
+[12:35:57]    {"phase": "read", "size": "500MiB", "name": "index + property filter", "shape": "index scan", "params": [], "match": true, "telemetry": {"trace_id": "1e25b897696a2ffa3a126c8c998a6dd1", "start_ms": 1790530395234, "end_ms"
+[12:35:57]    {"phase": "read", "size": "500MiB", "name": "self-loops: RETRY", "shape": "edge scan", "params": [], "match": true, "telemetry": {"trace_id": "5f50fdb03d56e836b64e2a0bb3bc09df", "start_ms": 1790530395234, "end_ms": 17905
+[12:35:57]    {"phase": "read", "size": "500MiB", "name": "label scan + unindexed filter", "shape": "label scan", "params": [], "match": true, "telemetry": {"trace_id": "f09ff445f0d7121407556803f5b57cc3", "start_ms": 1790530395234, "e
+[12:35:57]    {"phase": "read", "size": "500MiB", "name": "aggregate: group by", "shape": "label scan", "params": [], "match": true, "telemetry": {"trace_id": "cfa1ea6e272bfd1030379cb7e6a7b25e", "start_ms": 1790530395234, "end_ms": 17
+[12:35:57]    {"phase": "read", "size": "500MiB", "name": "top-k: ORDER BY LIMIT over big rows", "shape": "label scan", "params": [], "match": true, "telemetry": {"trace_id": "31dda0e5ded81926269b1148b6abb0e0", "start_ms": 17905303952
+[12:35:57]    {"phase": "read", "size": "500MiB", "name": "edge scan + edge-property filter", "shape": "edge scan", "params": [], "match": true, "telemetry": {"trace_id": "719a5a3648a7f38f087637c2fa025928", "start_ms": 1790530395234, 
+[12:35:57]    {"phase": "read", "size": "500MiB", "name": "degree: top 5 KNOWS in-degree", "shape": "global", "params": [], "match": true, "telemetry": {"trace_id": "980b6f31cf27422386e78ced9dc046dd", "start_ms": 1790530395234, "end_m
+[12:35:57]    {"phase": "read", "size": "500MiB", "name": "count all nodes", "shape": "global", "params": [], "match": true, "telemetry": {"trace_id": "35a035748fadc6477f0c4cb89a085988", "start_ms": 1790530395234, "end_ms": 1790530557
+[12:35:57]    {"phase": "memory", "size": "500MiB", "glider_peak_rss_mb": 632.8, "sqlite_peak_rss_mb": 617.1, "t": "2026-09-27T12:35:57"}
+[12:35:57] == algos 500MiB
+[12:39:30]    {"phase": "algo", "size": "500MiB", "name": "degree centrality: top 10 KNOWS in-degree", "kind": "degree", "match": true, "telemetry": {"trace_id": "6bd9a4ff4e9ee02871df0870b8eef204", "start_ms": 1790530557249, "end_ms":
+[12:39:30]    {"phase": "algo", "size": "500MiB", "name": "PageRank: 5 iterations over KNOWS", "kind": "pagerank", "match": true, "telemetry": {"trace_id": "512e404428d358879b38e215d2ed3612", "start_ms": 1790530557249, "end_ms": 17905
+[12:39:30]    {"phase": "algo", "size": "500MiB", "name": "weakly connected components over KNOWS", "kind": "wcc", "match": true, "telemetry": {"trace_id": "0c20046765c0756a99b202839274f778", "start_ms": 1790530557249, "end_ms": 17905
+[12:39:30]    {"phase": "algo", "size": "500MiB", "name": "BFS: 3 hops over KNOWS", "kind": "bfs3", "match": true, "telemetry": {"trace_id": "f2e6496e9e6cd41c73eab801545c3d81", "start_ms": 1790530557249, "end_ms": 1790530770520, "glid
+[12:39:30]    {"phase": "algo", "size": "500MiB", "name": "shortest path over KNOWS", "kind": "path", "match": true, "telemetry": {"trace_id": "eeae6bf38a801106253ac05fb203f64e", "start_ms": 1790530557249, "end_ms": 1790530770521, "gl
+[12:39:30] == writes 500MiB
+[12:39:31]    {"phase": "write", "size": "500MiB", "name": "insert a node, autocommit (x1000)", "ops": 1000, "sync": "normal", "transaction": false, "telemetry": {"trace_id": "ac278a30afa3a5b01d69421794acb4f5", "start_ms": 17905307706
+[12:39:32]    {"phase": "write", "size": "500MiB", "name": "insert a node, fsync every commit (x200)", "ops": 200, "sync": "always", "transaction": false, "telemetry": {"trace_id": "25281e4225ac78e57a0b4913a763418c", "start_ms": 17905
+[12:39:34]    {"phase": "write", "size": "500MiB", "name": "bulk insert 50,000 nodes, one transaction", "ops": 50000, "sync": "normal", "transaction": true, "telemetry": {"trace_id": "6ed59058605cd9fb021680173ae34f18", "start_ms": 179
+[12:39:38]    {"phase": "write", "size": "500MiB", "name": "insert 5,000 edges between indexed nodes, one transaction", "ops": 5000, "sync": "normal", "transaction": true, "telemetry": {"trace_id": "70153e0367d0e3c9262349cee8188bb3", 
+[12:39:41]    {"phase": "write", "size": "500MiB", "name": "update 10,000 properties by index, one transaction", "ops": 10000, "sync": "normal", "transaction": true, "telemetry": {"trace_id": "7cd5908ac7524409f8d39cdc6b1c5c50", "start
+[12:39:45]    {"phase": "write", "size": "500MiB", "name": "delete 500 nodes with their edges, one transaction", "ops": 500, "sync": "normal", "transaction": true, "telemetry": {"trace_id": "11835ede7093798bee2d2a3bda511cd1", "start_m
+[12:39:45] == build 1GiB
+[12:40:06]    {"phase": "build", "engine": "glider", "size": "1GiB", "wall_s": 21.02, "peak_rss_mb": 619.4, "ok": true, "file_bytes": 1537032192, "gen": {"mode": "paged-bulk", "ids": 1260415, "nodes": 1247371, "edges": 8027661, "bytes
+[12:40:06]    {"phase": "build", "engine": "sqlite", "size": "1GiB", "wall_s": 90.18, "ok": true, "file_bytes": 1195233280, "loader_peak_rss_mb": 1318.0, "nodes": 1247371, "edges": 8027661, "index_s": 6.02, "fk_check_s": 3.0, "fk_viol
+[12:40:06] == reads 1GiB
+[12:44:02]    {"phase": "read", "size": "1GiB", "name": "point: indexed text (Person.email)", "shape": "point lookup", "params": ["user0000252084@example.org"], "match": true, "telemetry": {"trace_id": "ec29c3443c17c022c0cc798105c09ff
+[12:44:02]    {"phase": "read", "size": "1GiB", "name": "point: indexed text (Order.ref)", "shape": "point lookup", "params": ["ORD-0000781457"], "match": true, "telemetry": {"trace_id": "13971dffdc26eb2ed82d42f7229eb632", "start_ms":
+[12:44:02]    {"phase": "read", "size": "1GiB", "name": "point: by id", "shape": "point lookup", "params": [1020935], "match": true, "telemetry": {"trace_id": "bc9afb60cc64373f0cc29f7626b6a359", "start_ms": 1790530806818, "end_ms": 17
+[12:44:02]    {"phase": "read", "size": "1GiB", "name": "1-hop out: community (KNOWS)", "shape": "1 hop", "params": ["user0000252084@example.org"], "match": true, "telemetry": {"trace_id": "b43ad74bf3a731a5ef3b0dadbb46638f", "start_ms
+[12:44:02]    {"phase": "read", "size": "1GiB", "name": "1-hop in: power-law hub (KNOWS)", "shape": "1 hop", "params": ["user0000000001@example.org"], "match": true, "telemetry": {"trace_id": "a9f3026cf9f2967ded7c160a9d5267f4", "start
+[12:44:02]    {"phase": "read", "size": "1GiB", "name": "1-hop in: hub followers' average age", "shape": "1 hop", "params": ["user0000000001@example.org"], "match": true, "telemetry": {"trace_id": "61529f544ebf8ffe1211d3f16edb7401", "
+[12:44:02]    {"phase": "read", "size": "1GiB", "name": "2-hop: friends of friends", "shape": "2 hops", "params": ["user0000252084@example.org"], "match": true, "telemetry": {"trace_id": "0bc3e7968107e122213745a691a4d353", "start_ms":
+[12:44:02]    {"phase": "read", "size": "1GiB", "name": "2-hop: distinct friends of friends", "shape": "2 hops", "params": ["user0000252084@example.org"], "match": true, "telemetry": {"trace_id": "52c0750b5d3dc02effd8bda25d604cf3", "s
+[12:44:02]    {"phase": "read", "size": "1GiB", "name": "3-hop: KNOWS out to depth 3", "shape": "3 hops", "params": ["user0000252084@example.org"], "match": true, "telemetry": {"trace_id": "10832ddda0bc7bba36ed97508f677b9e", "start_ms
+[12:44:02]    {"phase": "read", "size": "1GiB", "name": "2-hop bipartite: buyer -> orders -> products", "shape": "2 hops", "params": ["user0000000152@example.org"], "match": true, "telemetry": {"trace_id": "bc9b121d56f7dac872852676b2a
+[12:44:02]    {"phase": "read", "size": "1GiB", "name": "recommendation: co-purchased products", "shape": "3 hops", "params": ["SKU-0000573489"], "match": true, "telemetry": {"trace_id": "97d177e4f6b6cf581d17cb66e8975677", "start_ms":
+[12:44:02]    {"phase": "read", "size": "1GiB", "name": "1-hop fetch: friends' names, sorted page", "shape": "1 hop", "params": ["user0000252084@example.org"], "match": true, "telemetry": {"trace_id": "367bf5c6d34402deb4a84831d3c79e29
+[12:44:02]    {"phase": "read", "size": "1GiB", "name": "BFS: everyone within 2 KNOWS hops, with depth", "shape": "traversal", "params": [252084], "match": true, "telemetry": {"trace_id": "6f38d75b1c5eda71484ec43e3d704d18", "start_ms"
+[12:44:02]    {"phase": "read", "size": "1GiB", "name": "BFS: everyone within 3 KNOWS hops, with depth", "shape": "traversal", "params": [252084], "match": true, "telemetry": {"trace_id": "cfe836c21364033df5695799ebf5bf64", "start_ms"
+[12:44:02]    {"phase": "read", "size": "1GiB", "name": "shortest path: person to person (KNOWS, <= 12 hops)", "shape": "traversal", "params": [252084, 453750, 453750], "match": true, "telemetry": {"trace_id": "821a2206a4d74ea8e6d02bd
+[12:44:02]    {"phase": "read", "size": "1GiB", "name": "multi-edges: order lines", "shape": "1 hop", "params": ["ORD-0000781457"], "match": true, "telemetry": {"trace_id": "27ecd822e18210984868f3de3abaacec", "start_ms": 1790530806819
+[12:44:02]    {"phase": "read", "size": "1GiB", "name": "dense clique: SIMILAR 2-hop", "shape": "2 hops", "params": ["SKU-0000573489"], "match": true, "telemetry": {"trace_id": "26cc3074180cbc1a91c5a794523bf76e", "start_ms": 179053080
+[12:44:02]    {"phase": "read", "size": "1GiB", "name": "tree: category ancestors (var-length)", "shape": "variable length", "params": ["SKU-0000573489"], "match": true, "telemetry": {"trace_id": "f5051e0ca60d50fe7741179bc94d8566", "s
+[12:44:02]    {"phase": "read", "size": "1GiB", "name": "chain: NEXT*1..200", "shape": "variable length", "params": [1184790], "match": true, "telemetry": {"trace_id": "e6f073275cb8584785f4a0b9b48b3f18", "start_ms": 1790530806819, "en
+[12:44:02]    {"phase": "read", "size": "1GiB", "name": "DAG: CITES*1..3 from a document", "shape": "variable length", "params": [1020935], "match": true, "telemetry": {"trace_id": "450b276e48f749220201796e0b1bb27d", "start_ms": 17905
+[12:44:02]    {"phase": "read", "size": "1GiB", "name": "heterogeneous: MENTIONS by label", "shape": "1 hop", "params": [1020935], "match": true, "telemetry": {"trace_id": "b964df74b8f5512f2917d398f126bbc3", "start_ms": 1790530806819,
+[12:44:02]    {"phase": "read", "size": "1GiB", "name": "index, low cardinality (country)", "shape": "index scan", "params": [], "match": true, "telemetry": {"trace_id": "39a0c98d7c70535ec1c64aa34c5ade29", "start_ms": 1790530806819, "
+[12:44:02]    {"phase": "read", "size": "1GiB", "name": "index + property filter", "shape": "index scan", "params": [], "match": true, "telemetry": {"trace_id": "9db91c099927e56bc340f3d2a7d8fa29", "start_ms": 1790530806819, "end_ms": 
+[12:44:02]    {"phase": "read", "size": "1GiB", "name": "self-loops: RETRY", "shape": "edge scan", "params": [], "match": true, "telemetry": {"trace_id": "8a6d44f8fcc87068e1426c9e3af443cc", "start_ms": 1790530806819, "end_ms": 1790531
+[12:44:02]    {"phase": "read", "size": "1GiB", "name": "label scan + unindexed filter", "shape": "label scan", "params": [], "match": true, "telemetry": {"trace_id": "60a680a80d8dda99ede641ed2d6a91e4", "start_ms": 1790530806819, "end
+[12:44:02]    {"phase": "read", "size": "1GiB", "name": "aggregate: group by", "shape": "label scan", "params": [], "match": true, "telemetry": {"trace_id": "bd9e3c85a17059a5085fd3c0a8969ea6", "start_ms": 1790530806819, "end_ms": 1790
+[12:44:02]    {"phase": "read", "size": "1GiB", "name": "top-k: ORDER BY LIMIT over big rows", "shape": "label scan", "params": [], "match": true, "telemetry": {"trace_id": "f57af7e1715771aaffb1843d6d18eacd", "start_ms": 1790530806819
+[12:44:02]    {"phase": "read", "size": "1GiB", "name": "edge scan + edge-property filter", "shape": "edge scan", "params": [], "match": true, "telemetry": {"trace_id": "19750b65c28ebc04a2e40862f9c7eaba", "start_ms": 1790530806819, "e
+[12:44:02]    {"phase": "read", "size": "1GiB", "name": "degree: top 5 KNOWS in-degree", "shape": "global", "params": [], "match": true, "telemetry": {"trace_id": "ba39c2459dae3465c05a5c8dad9323f5", "start_ms": 1790530806819, "end_ms"
+[12:44:02]    {"phase": "read", "size": "1GiB", "name": "count all nodes", "shape": "global", "params": [], "match": true, "telemetry": {"trace_id": "5c3f3a4bc0a2b241b6d2d7179c692fa2", "start_ms": 1790530806819, "end_ms": 179053104247
+[12:44:02]    {"phase": "memory", "size": "1GiB", "glider_peak_rss_mb": 1276.5, "sqlite_peak_rss_mb": 712.7, "t": "2026-09-27T12:44:02"}
+[12:44:02] == algos 1GiB
+[12:49:23]    {"phase": "algo", "size": "1GiB", "name": "degree centrality: top 10 KNOWS in-degree", "kind": "degree", "match": true, "telemetry": {"trace_id": "9f464e1cc3f95a9f33ab0ee60c372565", "start_ms": 1790531042712, "end_ms": 1
+[12:49:23]    {"phase": "algo", "size": "1GiB", "name": "PageRank: 5 iterations over KNOWS", "kind": "pagerank", "match": true, "telemetry": {"trace_id": "bf96824ca4b85ead5e676271a3253256", "start_ms": 1790531042712, "end_ms": 1790531
+[12:49:23]    {"phase": "algo", "size": "1GiB", "name": "weakly connected components over KNOWS", "kind": "wcc", "match": true, "telemetry": {"trace_id": "850ababee2c689db1773079aa3303a9c", "start_ms": 1790531042712, "end_ms": 1790531
+[12:49:23]    {"phase": "algo", "size": "1GiB", "name": "BFS: 3 hops over KNOWS", "kind": "bfs3", "match": true, "telemetry": {"trace_id": "27dd62bd659f798d8e75332ec2d93822", "start_ms": 1790531042712, "end_ms": 1790531363634, "glider
+[12:49:23]    {"phase": "algo", "size": "1GiB", "name": "shortest path over KNOWS", "kind": "path", "match": true, "telemetry": {"trace_id": "0857b527905da09c9ab0226407ace7ec", "start_ms": 1790531042712, "end_ms": 1790531363634, "glid
+[12:49:23] == writes 1GiB
+[12:49:24]    {"phase": "write", "size": "1GiB", "name": "insert a node, autocommit (x1000)", "ops": 1000, "sync": "normal", "transaction": false, "telemetry": {"trace_id": "9d727a356e05588515ffc441432cc121", "start_ms": 1790531363740
+[12:49:25]    {"phase": "write", "size": "1GiB", "name": "insert a node, fsync every commit (x200)", "ops": 200, "sync": "always", "transaction": false, "telemetry": {"trace_id": "7bb2265868969a6f7362190ccc386415", "start_ms": 1790531
+[12:49:27]    {"phase": "write", "size": "1GiB", "name": "bulk insert 50,000 nodes, one transaction", "ops": 50000, "sync": "normal", "transaction": true, "telemetry": {"trace_id": "2b49d3f96a919a0742cd1cc39f5a1218", "start_ms": 17905
+[12:49:33]    {"phase": "write", "size": "1GiB", "name": "insert 5,000 edges between indexed nodes, one transaction", "ops": 5000, "sync": "normal", "transaction": true, "telemetry": {"trace_id": "dd8b7d7b40581d3db377e1dd2ac0dabf", "s
+[12:49:38]    {"phase": "write", "size": "1GiB", "name": "update 10,000 properties by index, one transaction", "ops": 10000, "sync": "normal", "transaction": true, "telemetry": {"trace_id": "3473c8bc346fe7454b9aadb97c3cced6", "start_m
+[12:49:45]    {"phase": "write", "size": "1GiB", "name": "delete 500 nodes with their edges, one transaction", "ops": 500, "sync": "normal", "transaction": true, "telemetry": {"trace_id": "c852a82f8e7e19bf6e4af49f4c08c2bb", "start_ms"
+[12:49:45] == build 5GiB
+[12:51:35]    {"phase": "build", "engine": "glider", "size": "5GiB", "wall_s": 109.25, "peak_rss_mb": 615.4, "ok": true, "file_bytes": 7783530496, "gen": {"mode": "paged-bulk", "ids": 6302075, "nodes": 6237595, "edges": 40209610, "byt
+[12:51:35]    {"phase": "build", "engine": "sqlite", "size": "5GiB", "wall_s": 477.6, "ok": true, "file_bytes": 6072487936, "loader_peak_rss_mb": 1829.5, "nodes": 6237595, "edges": 40209610, "index_s": 39.33, "fk_check_s": 24.78, "fk_
+[12:51:35] == reads 5GiB
+[12:57:12]    {"phase": "read", "size": "5GiB", "name": "point: indexed text (Person.email)", "shape": "point lookup", "params": ["user0001260416@example.org"], "match": true, "telemetry": {"trace_id": "7fdc1aba137e7f1654fd3a6ed4278fe
+[12:57:12]    {"phase": "read", "size": "5GiB", "name": "point: indexed text (Order.ref)", "shape": "point lookup", "params": ["ORD-0003907287"], "match": true, "telemetry": {"trace_id": "20082eb10b457783cb1f43158ac46a80", "start_ms":
+[12:57:12]    {"phase": "read", "size": "5GiB", "name": "point: by id", "shape": "point lookup", "params": [5104680], "match": true, "telemetry": {"trace_id": "e891ee0120d1d38609c694a8b13ce86b", "start_ms": 1790531496434, "end_ms": 17
+[12:57:12]    {"phase": "read", "size": "5GiB", "name": "1-hop out: community (KNOWS)", "shape": "1 hop", "params": ["user0001260416@example.org"], "match": true, "telemetry": {"trace_id": "0aa7988239127c066b7e681a82dda5a7", "start_ms
+[12:57:12]    {"phase": "read", "size": "5GiB", "name": "1-hop in: power-law hub (KNOWS)", "shape": "1 hop", "params": ["user0000000001@example.org"], "match": true, "telemetry": {"trace_id": "4e8698f86b9aa93959fc8a5562a26eba", "start
+[12:57:12]    {"phase": "read", "size": "5GiB", "name": "1-hop in: hub followers' average age", "shape": "1 hop", "params": ["user0000000001@example.org"], "match": true, "telemetry": {"trace_id": "78ed5a3dfd9293c1d537bfc7e469c527", "
+[12:57:12]    {"phase": "read", "size": "5GiB", "name": "2-hop: friends of friends", "shape": "2 hops", "params": ["user0001260416@example.org"], "match": true, "telemetry": {"trace_id": "9cc04ee3d40d1f120b4db0a3bb3fc0f5", "start_ms":
+[12:57:12]    {"phase": "read", "size": "5GiB", "name": "2-hop: distinct friends of friends", "shape": "2 hops", "params": ["user0001260416@example.org"], "match": true, "telemetry": {"trace_id": "88ddd63e72c2623db2ec1ad9b024d9b6", "s
+[12:57:12]    {"phase": "read", "size": "5GiB", "name": "3-hop: KNOWS out to depth 3", "shape": "3 hops", "params": ["user0001260416@example.org"], "match": true, "telemetry": {"trace_id": "d465412f11db888ec17412ba06a4d7a3", "start_ms
+[12:57:12]    {"phase": "read", "size": "5GiB", "name": "2-hop bipartite: buyer -> orders -> products", "shape": "2 hops", "params": ["user0000000757@example.org"], "match": true, "telemetry": {"trace_id": "1dea7bfeb0d900987afaed563a6
+[12:57:12]    {"phase": "read", "size": "5GiB", "name": "recommendation: co-purchased products", "shape": "3 hops", "params": ["SKU-0002867445"], "match": true, "telemetry": {"trace_id": "e348d322f297023e180836237bca13cc", "start_ms":
+[12:57:12]    {"phase": "read", "size": "5GiB", "name": "1-hop fetch: friends' names, sorted page", "shape": "1 hop", "params": ["user0001260416@example.org"], "match": true, "telemetry": {"trace_id": "8723f3a7a323d066260d11de86644800
+[12:57:12]    {"phase": "read", "size": "5GiB", "name": "BFS: everyone within 2 KNOWS hops, with depth", "shape": "traversal", "params": [1260416], "match": true, "telemetry": {"trace_id": "5631df9bb167713929f0f1df5a1b9657", "start_ms
+[12:57:12]    {"phase": "read", "size": "5GiB", "name": "BFS: everyone within 3 KNOWS hops, with depth", "shape": "traversal", "params": [1260416], "match": true, "telemetry": {"trace_id": "964c7e30224aed10da6b316b0cc8b3c9", "start_ms
+[12:57:12]    {"phase": "read", "size": "5GiB", "name": "shortest path: person to person (KNOWS, <= 12 hops)", "shape": "traversal", "params": [1260416, 2268748, 2268748], "match": true, "telemetry": {"trace_id": "ce7dddf8911c9e3c2a73
+[12:57:12]    {"phase": "read", "size": "5GiB", "name": "multi-edges: order lines", "shape": "1 hop", "params": ["ORD-0003907287"], "match": true, "telemetry": {"trace_id": "51b0e274c81e2ae69824eabeefa8a6ce", "start_ms": 1790531496434
+[12:57:12]    {"phase": "read", "size": "5GiB", "name": "dense clique: SIMILAR 2-hop", "shape": "2 hops", "params": ["SKU-0002867445"], "match": true, "telemetry": {"trace_id": "051c44861afa4ebd5dfba46efce7cf1e", "start_ms": 179053149
+[12:57:12]    {"phase": "read", "size": "5GiB", "name": "tree: category ancestors (var-length)", "shape": "variable length", "params": ["SKU-0002867445"], "match": true, "telemetry": {"trace_id": "30a62099c6c5421062cdbdff191bfa00", "s
+[12:57:12]    {"phase": "read", "size": "5GiB", "name": "chain: NEXT*1..200", "shape": "variable length", "params": [5923950], "match": true, "telemetry": {"trace_id": "f7eabc2f384188a7999844baa8f9337f", "start_ms": 1790531496434, "en
+[12:57:12]    {"phase": "read", "size": "5GiB", "name": "DAG: CITES*1..3 from a document", "shape": "variable length", "params": [5104680], "match": true, "telemetry": {"trace_id": "dd94aaa4af505b3519c1929db7b9c748", "start_ms": 17905
+[12:57:12]    {"phase": "read", "size": "5GiB", "name": "heterogeneous: MENTIONS by label", "shape": "1 hop", "params": [5104680], "match": true, "telemetry": {"trace_id": "4ccfdc7c079d611331995b060513f94d", "start_ms": 1790531496434,
+[12:57:12]    {"phase": "read", "size": "5GiB", "name": "index, low cardinality (country)", "shape": "index scan", "params": [], "match": true, "telemetry": {"trace_id": "e4a7710a845856f27e3056efd9183d29", "start_ms": 1790531496434, "
+[12:57:12]    {"phase": "read", "size": "5GiB", "name": "index + property filter", "shape": "index scan", "params": [], "match": true, "telemetry": {"trace_id": "6eb0d61a7626e46539bdf530fc4775fe", "start_ms": 1790531496434, "end_ms": 
+[12:57:12]    {"phase": "read", "size": "5GiB", "name": "self-loops: RETRY", "shape": "edge scan", "params": [], "match": true, "telemetry": {"trace_id": "09393c094b460a279726273558b04cef", "start_ms": 1790531496434, "end_ms": 1790531
+[12:57:12]    {"phase": "read", "size": "5GiB", "name": "label scan + unindexed filter", "shape": "label scan", "params": [], "match": true, "telemetry": {"trace_id": "d9fcf329abe76861a5dc1284162369b5", "start_ms": 1790531496434, "end
+[12:57:12]    {"phase": "read", "size": "5GiB", "name": "aggregate: group by", "shape": "label scan", "params": [], "match": true, "telemetry": {"trace_id": "9626bdf5a18ca552b589a64b3630e84b", "start_ms": 1790531496434, "end_ms": 1790
+[12:57:12]    {"phase": "read", "size": "5GiB", "name": "top-k: ORDER BY LIMIT over big rows", "shape": "label scan", "params": [], "match": true, "telemetry": {"trace_id": "0796dee09e9799b1e6a1cf032c8b7954", "start_ms": 1790531496434
+[12:57:12]    {"phase": "read", "size": "5GiB", "name": "edge scan + edge-property filter", "shape": "edge scan", "params": [], "match": true, "telemetry": {"trace_id": "1e966af4906d4f49e011a0f88ff6412f", "start_ms": 1790531496434, "e
+[12:57:12]    {"phase": "read", "size": "5GiB", "name": "degree: top 5 KNOWS in-degree", "shape": "global", "params": [], "match": true, "telemetry": {"trace_id": "ec3a5cc587977d6e3eff834af6fd8363", "start_ms": 1790531496434, "end_ms"
+[12:57:12]    {"phase": "read", "size": "5GiB", "name": "count all nodes", "shape": "global", "params": [], "match": true, "telemetry": {"trace_id": "afb020460cfbf634cb7c35131521b7fb", "start_ms": 1790531496434, "end_ms": 179053183230
+[12:57:12]    {"phase": "memory", "size": "5GiB", "glider_peak_rss_mb": 2576.3, "sqlite_peak_rss_mb": 1093.0, "t": "2026-09-27T12:57:12"}
+[12:57:12] == algos 5GiB
+[13:04:51]    {"phase": "algo", "size": "5GiB", "name": "degree centrality: top 10 KNOWS in-degree", "kind": "degree", "match": true, "telemetry": {"trace_id": "deb2d262572633d7ef68d9e068930e3c", "start_ms": 1790531833141, "end_ms": 1
+[13:04:51]    {"phase": "algo", "size": "5GiB", "name": "PageRank: 5 iterations over KNOWS", "kind": "pagerank", "match": true, "telemetry": {"trace_id": "32f59a3a4d14b3de5f1058a0b893ff8a", "start_ms": 1790531833141, "end_ms": 1790532
+[13:04:51]    {"phase": "algo", "size": "5GiB", "name": "weakly connected components over KNOWS", "kind": "wcc", "match": true, "telemetry": {"trace_id": "ccf62f810b4cf79e05673691bd3e26ce", "start_ms": 1790531833141, "end_ms": 1790532
+[13:04:51]    {"phase": "algo", "size": "5GiB", "name": "BFS: 3 hops over KNOWS", "kind": "bfs3", "match": true, "telemetry": {"trace_id": "9a80300741de651e94d8cd0bf24443b8", "start_ms": 1790531833141, "end_ms": 1790532291694, "glider
+[13:04:51]    {"phase": "algo", "size": "5GiB", "name": "shortest path over KNOWS", "kind": "path", "match": true, "telemetry": {"trace_id": "9c826daa1ec2de3f087fb5c0c414980e", "start_ms": 1790531833141, "end_ms": 1790532291695, "glid
+[13:04:51] == writes 5GiB
+[13:04:52]    {"phase": "write", "size": "5GiB", "name": "insert a node, autocommit (x1000)", "ops": 1000, "sync": "normal", "transaction": false, "telemetry": {"trace_id": "e65ac84118d5ae45be53a8ca2e85accf", "start_ms": 1790532291812
+[13:04:55]    {"phase": "write", "size": "5GiB", "name": "insert a node, fsync every commit (x200)", "ops": 200, "sync": "always", "transaction": false, "telemetry": {"trace_id": "57801b90769e84e444b42b52d908f5c9", "start_ms": 1790532
+[13:04:58]    {"phase": "write", "size": "5GiB", "name": "bulk insert 50,000 nodes, one transaction", "ops": 50000, "sync": "normal", "transaction": true, "telemetry": {"trace_id": "4b67f345b4ec072f8f8927110e2571dd", "start_ms": 17905
+[13:05:11]    {"phase": "write", "size": "5GiB", "name": "insert 5,000 edges between indexed nodes, one transaction", "ops": 5000, "sync": "normal", "transaction": true, "telemetry": {"trace_id": "874dab2b8a865e0e246c3855ec983e64", "s
+[13:05:22]    {"phase": "write", "size": "5GiB", "name": "update 10,000 properties by index, one transaction", "ops": 10000, "sync": "normal", "transaction": true, "telemetry": {"trace_id": "f4dbb1612bbc951ecc5c1d8000fba537", "start_m
+[13:05:31]    {"phase": "write", "size": "5GiB", "name": "delete 500 nodes with their edges, one transaction", "ops": 500, "sync": "normal", "transaction": true, "telemetry": {"trace_id": "583ff9fefb63d6a0711ef18f0f1fda72", "start_ms"
+[13:05:31] == build 10GiB
+[13:09:04]    {"phase": "build", "engine": "glider", "size": "10GiB", "wall_s": 212.72, "peak_rss_mb": 616.4, "ok": true, "file_bytes": 15638511616, "gen": {"mode": "paged-bulk", "ids": 12604150, "nodes": 12474662, "edges": 80387292, 
+[13:09:04]    {"phase": "build", "engine": "sqlite", "size": "10GiB", "wall_s": 953.26, "ok": true, "file_bytes": 12246081536, "loader_peak_rss_mb": 1826.7, "nodes": 12474662, "edges": 80387292, "index_s": 84.87, "fk_check_s": 92.72, 
+[13:09:04] == reads 10GiB
+[13:16:07]    {"phase": "read", "size": "10GiB", "name": "point: indexed text (Person.email)", "shape": "point lookup", "params": ["user0002520831@example.org"], "match": true, "telemetry": {"trace_id": "9916525c100af0ab90b8737db39043
+[13:16:07]    {"phase": "read", "size": "10GiB", "name": "point: indexed text (Order.ref)", "shape": "point lookup", "params": ["ORD-0007814573"], "match": true, "telemetry": {"trace_id": "4a358a66dcf5161a905761bc954b13db", "start_ms"
+[13:16:07]    {"phase": "read", "size": "10GiB", "name": "point: by id", "shape": "point lookup", "params": [10209361], "match": true, "telemetry": {"trace_id": "80806967a5acf21ec393c05c8f12bc14", "start_ms": 1790532544779, "end_ms": 
+[13:16:07]    {"phase": "read", "size": "10GiB", "name": "1-hop out: community (KNOWS)", "shape": "1 hop", "params": ["user0002520831@example.org"], "match": true, "telemetry": {"trace_id": "fb488356a5c69c6f05731ad79047428c", "start_m
+[13:16:07]    {"phase": "read", "size": "10GiB", "name": "1-hop in: power-law hub (KNOWS)", "shape": "1 hop", "params": ["user0000000001@example.org"], "match": true, "telemetry": {"trace_id": "71f6efb101f9717e81a90e3b19011760", "star
+[13:16:07]    {"phase": "read", "size": "10GiB", "name": "1-hop in: hub followers' average age", "shape": "1 hop", "params": ["user0000000001@example.org"], "match": true, "telemetry": {"trace_id": "c3ff6d91702681242ba766420ee2704b", 
+[13:16:07]    {"phase": "read", "size": "10GiB", "name": "2-hop: friends of friends", "shape": "2 hops", "params": ["user0002520831@example.org"], "match": true, "telemetry": {"trace_id": "87da95cca6c870958f822dff4cc34323", "start_ms"
+[13:16:07]    {"phase": "read", "size": "10GiB", "name": "2-hop: distinct friends of friends", "shape": "2 hops", "params": ["user0002520831@example.org"], "match": true, "telemetry": {"trace_id": "6f8e1b71d5c9fc94568de90a40d7c699", "
+[13:16:07]    {"phase": "read", "size": "10GiB", "name": "3-hop: KNOWS out to depth 3", "shape": "3 hops", "params": ["user0002520831@example.org"], "match": true, "telemetry": {"trace_id": "c3d62cb440bb03e77bcbbf3e09317d45", "start_m
+[13:16:07]    {"phase": "read", "size": "10GiB", "name": "2-hop bipartite: buyer -> orders -> products", "shape": "2 hops", "params": ["user0000001513@example.org"], "match": true, "telemetry": {"trace_id": "37de45e4ee05345e1643f275de
+[13:16:07]    {"phase": "read", "size": "10GiB", "name": "recommendation: co-purchased products", "shape": "3 hops", "params": ["SKU-0005734889"], "match": true, "telemetry": {"trace_id": "945178a5905407803456ee556a45a771", "start_ms"
+[13:16:07]    {"phase": "read", "size": "10GiB", "name": "1-hop fetch: friends' names, sorted page", "shape": "1 hop", "params": ["user0002520831@example.org"], "match": true, "telemetry": {"trace_id": "c854d1c1adf413fbf349be69a92745e
+[13:16:07]    {"phase": "read", "size": "10GiB", "name": "BFS: everyone within 2 KNOWS hops, with depth", "shape": "traversal", "params": [2520831], "match": true, "telemetry": {"trace_id": "226a7272aac4fb7c2e831cd039659cc3", "start_m
+[13:16:07]    {"phase": "read", "size": "10GiB", "name": "BFS: everyone within 3 KNOWS hops, with depth", "shape": "traversal", "params": [2520831], "match": true, "telemetry": {"trace_id": "40bf0e5b0201f4afbac51fe249154576", "start_m
+[13:16:07]    {"phase": "read", "size": "10GiB", "name": "shortest path: person to person (KNOWS, <= 12 hops)", "shape": "traversal", "params": [2520831, 4537495, 4537495], "match": true, "telemetry": {"trace_id": "1b0183294b9662df8c9
+[13:16:07]    {"phase": "read", "size": "10GiB", "name": "multi-edges: order lines", "shape": "1 hop", "params": ["ORD-0007814573"], "match": true, "telemetry": {"trace_id": "5081ca0f967ad4a8a33172d3acbab8b7", "start_ms": 179053254477
+[13:16:07]    {"phase": "read", "size": "10GiB", "name": "dense clique: SIMILAR 2-hop", "shape": "2 hops", "params": ["SKU-0005734889"], "match": true, "telemetry": {"trace_id": "981933717d0ef99ee85b17db00770f9c", "start_ms": 17905325
+[13:16:07]    {"phase": "read", "size": "10GiB", "name": "tree: category ancestors (var-length)", "shape": "variable length", "params": ["SKU-0005734889"], "match": true, "telemetry": {"trace_id": "238d3099d9911ce63a7134ceca5e193c", "
+[13:16:07]    {"phase": "read", "size": "10GiB", "name": "chain: NEXT*1..200", "shape": "variable length", "params": [11847901], "match": true, "telemetry": {"trace_id": "962ebf3042f14097cfa2ade8e086a598", "start_ms": 1790532544779, "
+[13:16:07]    {"phase": "read", "size": "10GiB", "name": "DAG: CITES*1..3 from a document", "shape": "variable length", "params": [10209361], "match": true, "telemetry": {"trace_id": "513e19c7bb5f0796ad98b099819bda40", "start_ms": 179
+[13:16:07]    {"phase": "read", "size": "10GiB", "name": "heterogeneous: MENTIONS by label", "shape": "1 hop", "params": [10209361], "match": true, "telemetry": {"trace_id": "431a0d17776d601df6451a99f6cd4f16", "start_ms": 179053254477
+[13:16:07]    {"phase": "read", "size": "10GiB", "name": "index, low cardinality (country)", "shape": "index scan", "params": [], "match": true, "telemetry": {"trace_id": "59ea68d318b1844cea2929a65489aaf5", "start_ms": 1790532544779, 
+[13:16:07]    {"phase": "read", "size": "10GiB", "name": "index + property filter", "shape": "index scan", "params": [], "match": true, "telemetry": {"trace_id": "25dc113a23fa30d58d6f55f8d374bf92", "start_ms": 1790532544779, "end_ms":
+[13:16:07]    {"phase": "read", "size": "10GiB", "name": "self-loops: RETRY", "shape": "edge scan", "params": [], "match": true, "telemetry": {"trace_id": "8cf08a3485ed48ab8313dedb255f384d", "start_ms": 1790532544779, "end_ms": 179053
+[13:16:07]    {"phase": "read", "size": "10GiB", "name": "label scan + unindexed filter", "shape": "label scan", "params": [], "match": true, "telemetry": {"trace_id": "b6212781ff78c12b6db53f885fb12f92", "start_ms": 1790532544779, "en
+[13:16:07]    {"phase": "read", "size": "10GiB", "name": "aggregate: group by", "shape": "label scan", "params": [], "match": true, "telemetry": {"trace_id": "8134d1a962f7cf283558c117f24a95a2", "start_ms": 1790532544779, "end_ms": 179
+[13:16:07]    {"phase": "read", "size": "10GiB", "name": "top-k: ORDER BY LIMIT over big rows", "shape": "label scan", "params": [], "match": true, "telemetry": {"trace_id": "c0c4325e5abb1b9dec14191df8149dde", "start_ms": 179053254477
+[13:16:07]    {"phase": "read", "size": "10GiB", "name": "edge scan + edge-property filter", "shape": "edge scan", "params": [], "match": true, "telemetry": {"trace_id": "30001d7a2fb1cdd56a439e89bb3c8218", "start_ms": 1790532544779, "
+[13:16:07]    {"phase": "read", "size": "10GiB", "name": "degree: top 5 KNOWS in-degree", "shape": "global", "params": [], "match": true, "telemetry": {"trace_id": "2ad3a216c4ccb44b39b8123c190776e5", "start_ms": 1790532544779, "end_ms
+[13:16:07]    {"phase": "read", "size": "10GiB", "name": "count all nodes", "shape": "global", "params": [], "match": true, "telemetry": {"trace_id": "46c3bef29125b9d2416f8f2704ce711a", "start_ms": 1790532544779, "end_ms": 17905329674
+[13:16:07]    {"phase": "memory", "size": "10GiB", "glider_peak_rss_mb": 4063.4, "sqlite_peak_rss_mb": 1210.1, "t": "2026-09-27T13:16:07"}
+[13:16:07] == algos 10GiB
+[13:33:09]    {"phase": "algo", "size": "10GiB", "name": "degree centrality: top 10 KNOWS in-degree", "kind": "degree", "match": true, "telemetry": {"trace_id": "9451533078b3925fafeed7e4b50bc7e6", "start_ms": 1790532968462, "end_ms": 
+[13:33:09]    {"phase": "algo", "size": "10GiB", "name": "PageRank: 5 iterations over KNOWS", "kind": "pagerank", "match": true, "telemetry": {"trace_id": "3fb8407a2108d7fb16b1a88751003811", "start_ms": 1790532968462, "end_ms": 179053
+[13:33:09]    {"phase": "algo", "size": "10GiB", "name": "weakly connected components over KNOWS", "kind": "wcc", "match": true, "telemetry": {"trace_id": "0deb4f48091c5e56b1e384801987ea17", "start_ms": 1790532968462, "end_ms": 179053
+[13:33:09]    {"phase": "algo", "size": "10GiB", "name": "BFS: 3 hops over KNOWS", "kind": "bfs3", "match": true, "telemetry": {"trace_id": "f00701c373237ab3653191b9b904b2d6", "start_ms": 1790532968462, "end_ms": 1790533989160, "glide
+[13:33:09]    {"phase": "algo", "size": "10GiB", "name": "shortest path over KNOWS", "kind": "path", "match": true, "telemetry": {"trace_id": "a6627e62ad23d275ba12dda9500672f4", "start_ms": 1790532968462, "end_ms": 1790533989162, "gli
+[13:33:09] == writes 10GiB
+[13:33:10]    {"phase": "write", "size": "10GiB", "name": "insert a node, autocommit (x1000)", "ops": 1000, "sync": "normal", "transaction": false, "telemetry": {"trace_id": "23ba0078272c42cc89cf68d5a0d2f733", "start_ms": 179053398928
+[13:33:12]    {"phase": "write", "size": "10GiB", "name": "insert a node, fsync every commit (x200)", "ops": 200, "sync": "always", "transaction": false, "telemetry": {"trace_id": "f3a7e2377bb63b13984213d13244e7dc", "start_ms": 179053
+[13:33:15]    {"phase": "write", "size": "10GiB", "name": "bulk insert 50,000 nodes, one transaction", "ops": 50000, "sync": "normal", "transaction": true, "telemetry": {"trace_id": "cf6a65dce318669aad3b275498bef8fb", "start_ms": 1790
+[13:33:36]    {"phase": "write", "size": "10GiB", "name": "insert 5,000 edges between indexed nodes, one transaction", "ops": 5000, "sync": "normal", "transaction": true, "telemetry": {"trace_id": "e5505845a7647ecf0f4c8f9e9e3ab09a", "
+[13:33:57]    {"phase": "write", "size": "10GiB", "name": "update 10,000 properties by index, one transaction", "ops": 10000, "sync": "normal", "transaction": true, "telemetry": {"trace_id": "b0a59a9b5b964e205c8530850872c42b", "start_
+[13:34:10]    {"phase": "write", "size": "10GiB", "name": "delete 500 nodes with their edges, one transaction", "ops": 500, "sync": "normal", "transaction": true, "telemetry": {"trace_id": "b4adb7741015d8fa0f8ba4f096ce21a8", "start_ms
+[13:34:10] == build 25GiB
+[13:44:35]    {"phase": "build", "engine": "glider", "size": "25GiB", "wall_s": 625.3, "peak_rss_mb": 618.3, "ok": true, "file_bytes": 39186563072, "gen": {"mode": "paged-bulk", "ids": 31510376, "nodes": 31186200, "edges": 200772785, 
+[13:46:27]     loaded 5,000,000 nodes, 0 edges
+[13:48:22]     loaded 10,000,000 nodes, 0 edges
+[13:49:53]     loaded 15,000,000 nodes, 0 edges
+[13:50:37]     loaded 20,000,000 nodes, 0 edges
+[13:52:31]     loaded 25,000,000 nodes, 0 edges
+[13:54:47]     loaded 30,000,000 nodes, 0 edges
+[13:55:25]     loaded 31,186,200 nodes, 3,813,800 edges
+[13:56:03]     loaded 31,186,200 nodes, 8,813,800 edges
+[13:56:41]     loaded 31,186,200 nodes, 13,813,800 edges
+[13:57:19]     loaded 31,186,200 nodes, 18,813,800 edges
+[13:57:56]     loaded 31,186,200 nodes, 23,813,800 edges
+[13:58:34]     loaded 31,186,200 nodes, 28,813,800 edges
+[13:59:13]     loaded 31,186,200 nodes, 33,813,800 edges
+[13:59:51]     loaded 31,186,200 nodes, 38,813,800 edges
+[14:00:30]     loaded 31,186,200 nodes, 43,813,800 edges
+[14:01:08]     loaded 31,186,200 nodes, 48,813,800 edges
+[14:01:46]     loaded 31,186,200 nodes, 53,813,800 edges
+[14:02:24]     loaded 31,186,200 nodes, 58,813,800 edges
+[14:03:03]     loaded 31,186,200 nodes, 63,813,800 edges
+[14:03:41]     loaded 31,186,200 nodes, 68,813,800 edges
+[14:04:19]     loaded 31,186,200 nodes, 73,813,800 edges
+[14:04:57]     loaded 31,186,200 nodes, 78,813,800 edges
+[14:05:36]     loaded 31,186,200 nodes, 83,813,800 edges
+[14:06:14]     loaded 31,186,200 nodes, 88,813,800 edges
+[14:06:52]     loaded 31,186,200 nodes, 93,813,800 edges
+[14:07:31]     loaded 31,186,200 nodes, 98,813,800 edges
+[14:08:09]     loaded 31,186,200 nodes, 103,813,800 edges
+[14:08:47]     loaded 31,186,200 nodes, 108,813,800 edges
+[14:09:25]     loaded 31,186,200 nodes, 113,813,800 edges
+[14:09:58]     loaded 31,186,200 nodes, 118,813,800 edges
+[14:10:31]     loaded 31,186,200 nodes, 123,813,800 edges
+[14:11:05]     loaded 31,186,200 nodes, 128,813,800 edges
+[14:11:41]     loaded 31,186,200 nodes, 133,813,800 edges
+[14:12:15]     loaded 31,186,200 nodes, 138,813,800 edges
+[14:12:50]     loaded 31,186,200 nodes, 143,813,800 edges
+[14:13:25]     loaded 31,186,200 nodes, 148,813,800 edges
+[14:13:59]     loaded 31,186,200 nodes, 153,813,800 edges
+[14:14:34]     loaded 31,186,200 nodes, 158,813,800 edges
+[14:15:09]     loaded 31,186,200 nodes, 163,813,800 edges
+[14:15:44]     loaded 31,186,200 nodes, 168,813,800 edges
+[14:16:17]     loaded 31,186,200 nodes, 173,813,800 edges
+[14:16:51]     loaded 31,186,200 nodes, 178,813,800 edges
+[14:17:25]     loaded 31,186,200 nodes, 183,813,800 edges
+[14:17:58]     loaded 31,186,200 nodes, 188,813,800 edges
+[14:18:31]     loaded 31,186,200 nodes, 193,813,800 edges
+[14:19:03]     loaded 31,186,200 nodes, 198,813,800 edges
+[15:22:16]    {"phase": "build", "engine": "sqlite", "size": "25GiB", "wall_s": 5860.46, "ok": true, "file_bytes": 31212711936, "nodes": 31186200, "edges": 200772785, "index_s": 300.93, "fk_check_s": 3372.01, "fk_violations": 0, "t": 
+[15:22:16] == reads 25GiB
+[15:40:36]    {"phase": "read", "size": "25GiB", "name": "point: indexed text (Person.email)", "shape": "point lookup", "params": ["user0006302076@example.org"], "match": true, "telemetry": {"trace_id": "ea4393a5e6dd94bc1be2539a80155e
+[15:40:36]    {"phase": "read", "size": "25GiB", "name": "point: indexed text (Order.ref)", "shape": "point lookup", "params": ["ORD-0019536433"], "match": true, "telemetry": {"trace_id": "bd9d83ac346a03833fd3db346a31837e", "start_ms"
+[15:40:36]    {"phase": "read", "size": "25GiB", "name": "point: by id", "shape": "point lookup", "params": [25523404], "match": true, "telemetry": {"trace_id": "7eefdfd3921056e02d8506e5d1173f3b", "start_ms": 1790540537545, "end_ms": 
+[15:40:36]    {"phase": "read", "size": "25GiB", "name": "1-hop out: community (KNOWS)", "shape": "1 hop", "params": ["user0006302076@example.org"], "match": true, "telemetry": {"trace_id": "f04d7c637b7aa0263086e01495230380", "start_m
+[15:40:36]    {"phase": "read", "size": "25GiB", "name": "1-hop in: power-law hub (KNOWS)", "shape": "1 hop", "params": ["user0000000001@example.org"], "match": true, "telemetry": {"trace_id": "da43a0af1892131df7779a1e402fc962", "star
+[15:40:36]    {"phase": "read", "size": "25GiB", "name": "1-hop in: hub followers' average age", "shape": "1 hop", "params": ["user0000000001@example.org"], "match": true, "telemetry": {"trace_id": "61066bb6bd7766e467fdf830a3ccf0d2", 
+[15:40:36]    {"phase": "read", "size": "25GiB", "name": "2-hop: friends of friends", "shape": "2 hops", "params": ["user0006302076@example.org"], "match": true, "telemetry": {"trace_id": "0a6e19fe090ef3354a817ddd26be2b5c", "start_ms"
+[15:40:36]    {"phase": "read", "size": "25GiB", "name": "2-hop: distinct friends of friends", "shape": "2 hops", "params": ["user0006302076@example.org"], "match": true, "telemetry": {"trace_id": "8f101950dea1787798cdfe70e2f58931", "
+[15:40:36]    {"phase": "read", "size": "25GiB", "name": "3-hop: KNOWS out to depth 3", "shape": "3 hops", "params": ["user0006302076@example.org"], "match": true, "telemetry": {"trace_id": "e82eea5ed756efae5c33aa2fd6f71a99", "start_m
+[15:40:36]    {"phase": "read", "size": "25GiB", "name": "2-hop bipartite: buyer -> orders -> products", "shape": "2 hops", "params": ["user0000003782@example.org"], "match": true, "telemetry": {"trace_id": "6dd2c584a1f01f42215adb78cb
+[15:40:36]    {"phase": "read", "size": "25GiB", "name": "recommendation: co-purchased products", "shape": "3 hops", "params": ["SKU-0014337221"], "match": true, "telemetry": {"trace_id": "05d9731647395e7e8c83a89fe87418dd", "start_ms"
+[15:40:36]    {"phase": "read", "size": "25GiB", "name": "1-hop fetch: friends' names, sorted page", "shape": "1 hop", "params": ["user0006302076@example.org"], "match": true, "telemetry": {"trace_id": "3f463a35057ca69de0ff587c155445b
+[15:40:36]    {"phase": "read", "size": "25GiB", "name": "BFS: everyone within 2 KNOWS hops, with depth", "shape": "traversal", "params": [6302076], "match": true, "telemetry": {"trace_id": "32e7264b8c1a5bc333f91b2dffe5aaff", "start_m
+[15:40:36]    {"phase": "read", "size": "25GiB", "name": "BFS: everyone within 3 KNOWS hops, with depth", "shape": "traversal", "params": [6302076], "match": true, "telemetry": {"trace_id": "75f90fc6f645dc2d06b1c25af0733968", "start_m
+[15:40:36]    {"phase": "read", "size": "25GiB", "name": "shortest path: person to person (KNOWS, <= 12 hops)", "shape": "traversal", "params": [6302076, 11343736, 11343736], "match": true, "telemetry": {"trace_id": "708dfc021be18884d
+[15:40:36]    {"phase": "read", "size": "25GiB", "name": "multi-edges: order lines", "shape": "1 hop", "params": ["ORD-0019536433"], "match": true, "telemetry": {"trace_id": "e40f177a2a6e607b9f5068e478b7ccbd", "start_ms": 179054053754
+[15:40:36]    {"phase": "read", "size": "25GiB", "name": "dense clique: SIMILAR 2-hop", "shape": "2 hops", "params": ["SKU-0014337221"], "match": true, "telemetry": {"trace_id": "4861ee8471a2096fbf8f1ef3484128db", "start_ms": 17905405
+[15:40:36]    {"phase": "read", "size": "25GiB", "name": "tree: category ancestors (var-length)", "shape": "variable length", "params": ["SKU-0014337221"], "match": true, "telemetry": {"trace_id": "47fbecdf45e04c03a3fa55e54bace83a", "
+[15:40:36]    {"phase": "read", "size": "25GiB", "name": "chain: NEXT*1..200", "shape": "variable length", "params": [29619753], "match": true, "telemetry": {"trace_id": "ba235d2d35103a492ce9d0e1f9299d44", "start_ms": 1790540537545, "
+[15:40:36]    {"phase": "read", "size": "25GiB", "name": "DAG: CITES*1..3 from a document", "shape": "variable length", "params": [25523404], "match": true, "telemetry": {"trace_id": "7140766092751355c12e9cca18c0b234", "start_ms": 179
+[15:40:36]    {"phase": "read", "size": "25GiB", "name": "heterogeneous: MENTIONS by label", "shape": "1 hop", "params": [25523404], "match": true, "telemetry": {"trace_id": "70785b06003cc928e51870e3d7100ef9", "start_ms": 179054053754
+[15:40:36]    {"phase": "read", "size": "25GiB", "name": "index, low cardinality (country)", "shape": "index scan", "params": [], "match": true, "telemetry": {"trace_id": "5179ef377da94cc8daf3a191097736c0", "start_ms": 1790540537545, 
+[15:40:36]    {"phase": "read", "size": "25GiB", "name": "index + property filter", "shape": "index scan", "params": [], "match": true, "telemetry": {"trace_id": "c0f020c5b901eaeeb04849e78ebe0b52", "start_ms": 1790540537545, "end_ms":
+[15:40:36]    {"phase": "read", "size": "25GiB", "name": "self-loops: RETRY", "shape": "edge scan", "params": [], "match": true, "telemetry": {"trace_id": "aab8442ca4d1c7062f1d4ff59ce9e357", "start_ms": 1790540537545, "end_ms": 179054
+[15:40:36]    {"phase": "read", "size": "25GiB", "name": "label scan + unindexed filter", "shape": "label scan", "params": [], "match": true, "telemetry": {"trace_id": "b77389a6547a9f5fb7680dc8befa189e", "start_ms": 1790540537545, "en
+[15:40:36]    {"phase": "read", "size": "25GiB", "name": "aggregate: group by", "shape": "label scan", "params": [], "match": true, "telemetry": {"trace_id": "d73261e3fea9e62a7e05ace68ccd1dc5", "start_ms": 1790540537545, "end_ms": 179
+[15:40:36]    {"phase": "read", "size": "25GiB", "name": "top-k: ORDER BY LIMIT over big rows", "shape": "label scan", "params": [], "match": true, "telemetry": {"trace_id": "c184c1cfdffd0daf059d0034a5a77638", "start_ms": 179054053754
+[15:40:36]    {"phase": "read", "size": "25GiB", "name": "edge scan + edge-property filter", "shape": "edge scan", "params": [], "match": true, "telemetry": {"trace_id": "56309de2fa4d3b8195b6cdbb41684522", "start_ms": 1790540537545, "
+[15:40:36]    {"phase": "read", "size": "25GiB", "name": "degree: top 5 KNOWS in-degree", "shape": "global", "params": [], "match": true, "telemetry": {"trace_id": "f5611e80fe787eae751b02d0984b912e", "start_ms": 1790540537545, "end_ms
+[15:40:36]    {"phase": "read", "size": "25GiB", "name": "count all nodes", "shape": "global", "params": [], "match": true, "telemetry": {"trace_id": "a46b907ca6bd46be42d0ea89e2bc61a2", "start_ms": 1790540537545, "end_ms": 17905416362
+[15:40:36]    {"phase": "memory", "size": "25GiB", "glider_peak_rss_mb": 8614.8, "sqlite_peak_rss_mb": 1386.8, "t": "2026-09-27T15:40:36"}
+[15:40:36] == algos 25GiB

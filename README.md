@@ -262,13 +262,21 @@ implementation bit for bit. `tier: "mem"` or `tier: "ooc"` forces one.
 
 ## Performance
 
-See [`bench/PAGED.md`](bench/PAGED.md): every query shape, the browsing API,
-algorithms, writes in each sync mode, crash recovery, checkpoint,
-replication and export at 1, 5, 10 and 25 GiB, with a 1 GiB and a 64 MiB page
-cache, compared with the previous engine ([`bench/SCALE.md`](bench/SCALE.md)).
-In short: opening takes milliseconds at any size; RAM stays at the page cache
-plus working memory however large the file; point queries cost a few page
-reads. A 100 GB B+tree (`pagebench`) was built in 15 minutes at 1.1 GB of
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) compares glider with SQLite (a
+normalized schema with foreign keys and indexes) and Memgraph (in memory) at
+500 MiB, 1, 5, 10 and 25 GiB: 30 reads, 5 graph algorithms and 6 write
+workloads, every answer checked across engines, with the methodology, raw
+results and the Grafana/eBPF observability setup used to profile them.
+glider was the fastest of the three on 18 to 21 of the 30 reads at every size,
+by orders of magnitude on shortest paths, traversals and counts; SQLite stays
+faster on whole-label scans, aggregates and bulk writes.
+
+Opening takes milliseconds at any size and point queries cost a few page
+reads. Reads through the paged engine keep the page cache bounded, though
+peak memory still grows with the graph (8.6 GB while reading the 25 GiB
+graph with a 1 GiB cache), which is being tracked down.
+[`bench/SCALE.md`](bench/SCALE.md) has the earlier snapshot-image engine's
+numbers. A 100 GB B+tree (`pagebench`) was built in 15 minutes at 1.1 GB of
 RAM, answered cold point lookups in 0.5 ms (1.35 disk reads each), scanned at
 450 MB/s, and recovered from 50 kill -9s in a row.
 

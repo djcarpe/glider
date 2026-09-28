@@ -1,0 +1,13 @@
+[17:21:29] == algos 25GiB
+[18:30:49]    {"phase": "algo", "size": "25GiB", "name": "degree centrality: top 10 KNOWS in-degree", "kind": "degree", "match": true, "telemetry": {"trace_id": "f046f06b8fbbaf8072f086b665c9979d", "start_ms": 1790547690366, "end_ms": 
+[18:30:49]    {"phase": "algo", "size": "25GiB", "name": "PageRank: 5 iterations over KNOWS", "kind": "pagerank", "match": null, "telemetry": {"trace_id": "3934f08c601bff093b2ee2b982ddfd9e", "start_ms": 1790547690366, "end_ms": 179055
+[18:30:49]    {"phase": "algo", "size": "25GiB", "name": "weakly connected components over KNOWS", "kind": "wcc", "match": true, "telemetry": {"trace_id": "9760825900e51117f1a790ec6b959174", "start_ms": 1790547690366, "end_ms": 179055
+[18:30:49]    {"phase": "algo", "size": "25GiB", "name": "BFS: 3 hops over KNOWS", "kind": "bfs3", "match": true, "telemetry": {"trace_id": "fae8ded7609675fc0291639e995a06b2", "start_ms": 1790547690366, "end_ms": 1790551849588, "glide
+[18:30:49]    {"phase": "algo", "size": "25GiB", "name": "shortest path over KNOWS", "kind": "path", "match": true, "telemetry": {"trace_id": "df1d35614aa4fe54d1620c82509274dc", "start_ms": 1790547690366, "end_ms": 1790551849589, "gli
+[18:30:49] == writes 25GiB
+[18:30:51]    {"phase": "write", "size": "25GiB", "name": "insert a node, autocommit (x1000)", "ops": 1000, "sync": "normal", "transaction": false, "telemetry": {"trace_id": "3fd2c7b47b2577020f226c31402b5d3a", "start_ms": 179055184970
+[18:30:53]    {"phase": "write", "size": "25GiB", "name": "insert a node, fsync every commit (x200)", "ops": 200, "sync": "always", "transaction": false, "telemetry": {"trace_id": "6ed5cd8cc7c1e1b82021d913efd97f48", "start_ms": 179055
+[18:30:58]    {"phase": "write", "size": "25GiB", "name": "bulk insert 50,000 nodes, one transaction", "ops": 50000, "sync": "normal", "transaction": true, "telemetry": {"trace_id": "cbfe23664e1d64c926daed583df0bd0b", "start_ms": 1790
+[18:31:29]    {"phase": "write", "size": "25GiB", "name": "insert 5,000 edges between indexed nodes, one transaction", "ops": 5000, "sync": "normal", "transaction": true, "telemetry": {"trace_id": "c4a1203f94a46dbe997e7f6a6b83559a", "
+[18:32:04]    {"phase": "write", "size": "25GiB", "name": "update 10,000 properties by index, one transaction", "ops": 10000, "sync": "normal", "transaction": true, "telemetry": {"trace_id": "482ffe48a80899df96135d1b537fde44", "start_
+[18:32:19]    {"phase": "write", "size": "25GiB", "name": "delete 500 nodes with their edges, one transaction", "ops": 500, "sync": "normal", "transaction": true, "telemetry": {"trace_id": "35db4aaa0027897e418e6e42655f7bae", "start_ms

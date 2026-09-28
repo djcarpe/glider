@@ -1,0 +1,50 @@
+// CPU profiles of the benchmark's own processes, via eBPF, to Pyroscope.
+// glider runs as its own binary; SQLite runs inside the Python worker that
+// bench/suite.py starts with --sqlite-worker, so that is what is kept.
+// Memgraph (bench/memgraph_bench.py) runs in its container as /usr/lib/memgraph/memgraph.
+discovery.process "all" {
+  refresh_interval = "2s"
+}
+
+discovery.relabel "bench" {
+  targets = discovery.process.all.targets
+
+  rule {
+    source_labels = ["__meta_process_exe", "__meta_process_commandline"]
+    separator     = ";"
+    regex         = "(.*/glider;.*|.*;.*--sqlite-worker.*|.*/memgraph;.*)"
+    action        = "keep"
+  }
+  rule {
+    source_labels = ["__meta_process_exe"]
+    regex         = ".*/glider"
+    target_label  = "service_name"
+    replacement   = "glider"
+  }
+  rule {
+    source_labels = ["__meta_process_exe"]
+    regex         = ".*/memgraph"
+    target_label  = "service_name"
+    replacement   = "memgraph"
+  }
+  rule {
+    source_labels = ["__meta_process_commandline"]
+    regex         = ".*--sqlite-worker.*"
+    target_label  = "service_name"
+    replacement   = "sqlite"
+  }
+}
+
+pyroscope.ebpf "bench" {
+  targets          = discovery.relabel.bench.output
+  forward_to       = [pyroscope.write.lgtm.receiver]
+  collect_interval = "1s"
+  sample_rate      = 97
+  demangle         = "full"
+}
+
+pyroscope.write "lgtm" {
+  endpoint {
+    url = "http://127.0.0.1:4040"
+  }
+}

@@ -1,0 +1,636 @@
+<title>Glider vs SQLite vs Memgraph</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root {
+  --bg: #f6f7f8; --surface: #fdfdfc; --sunken: #eef0f1; --line: #dadee1; --grid: #e6e9eb;
+  --ink: #111417; --ink-2: #4c5359; --ink-3: #737a80;
+  --glider: #2a78d6; --sqlite: #eb6834; --memgraph: #1baf7a; --good: #1a7f37; --bad: #c62828; --focus: #2a78d6;
+  --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #121416; --surface: #1a1c1e; --sunken: #222528; --line: #33383c; --grid: #2a2e32;
+    --ink: #f3f4f5; --ink-2: #b9bfc4; --ink-3: #8b9298;
+    --glider: #3987e5; --sqlite: #d95926; --memgraph: #199e70; --good: #4cc36b; --bad: #ef6b6b; --focus: #6da7ec;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #121416; --surface: #1a1c1e; --sunken: #222528; --line: #33383c; --grid: #2a2e32;
+  --ink: #f3f4f5; --ink-2: #b9bfc4; --ink-3: #8b9298;
+  --glider: #3987e5; --sqlite: #d95926; --memgraph: #199e70; --good: #4cc36b; --bad: #ef6b6b; --focus: #6da7ec;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--ink); font: 15px/1.5 var(--sans); padding-inline: 16px; padding-block: 28px 64px; }
+.wrap { max-width: 1160px; margin: 0 auto; display: grid; gap: 26px; }
+h1, h2, h3 { text-wrap: balance; margin: 0; font-weight: 600; }
+h1 { font-size: 30px; letter-spacing: -0.01em; }
+h2 { font-size: 19px; }
+h3 { font-size: 15px; }
+p { margin: 0; max-width: 74ch; color: var(--ink-2); }
+code, .mono { font-family: var(--mono); font-size: 0.92em; }
+.eyebrow { font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-3); font-weight: 500; }
+header { display: grid; gap: 10px; }
+.legend { display: flex; gap: 18px; flex-wrap: wrap; font-size: 14px; color: var(--ink-2); align-items: center; }
+.key { display: inline-flex; align-items: center; gap: 7px; }
+.dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex: none; }
+.dot.g { background: var(--glider); } .dot.s { background: var(--sqlite); } .dot.m { background: var(--memgraph); }
+a { color: var(--glider); }
+a:hover { text-decoration-thickness: 2px; }
+
+.obs { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; justify-content: space-between; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; }
+.obs p { font-size: 14px; }
+.btn { appearance: none; display: inline-flex; align-items: center; gap: 6px; font: inherit; font-size: 14px; font-weight: 500; padding: 7px 14px; border-radius: 6px; border: 1px solid var(--ink); background: var(--ink); color: var(--bg); cursor: pointer; text-decoration: none; white-space: nowrap; }
+.btn.quiet { background: var(--surface); color: var(--ink); border-color: var(--line); }
+.btn:disabled { opacity: .5; cursor: default; }
+
+details.box { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; }
+details.box summary { cursor: pointer; font-weight: 500; }
+details.box ul { margin: 10px 0 0; padding-left: 20px; color: var(--ink-2); display: grid; gap: 6px; max-width: 92ch; }
+
+.tabs { display: flex; gap: 2px; flex-wrap: wrap; border-bottom: 1px solid var(--line); }
+.tab { appearance: none; border: 0; background: none; font: inherit; color: var(--ink-2); padding: 10px 13px; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; font-weight: 500; }
+.tab:hover { color: var(--ink); }
+.tab[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--ink); }
+.tab small { color: var(--ink-3); font-weight: 400; margin-left: 4px; }
+button:focus-visible, summary:focus-visible, [tabindex]:focus-visible, a:focus-visible, select:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 4px; }
+
+.panel { display: grid; gap: 26px; }
+section.block { display: grid; gap: 12px; }
+.block-head { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: baseline; justify-content: space-between; }
+.facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 12px; }
+.fact { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; display: grid; gap: 6px; align-content: start; }
+.fact .rows { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; font-size: 14px; }
+.fact .rows span:nth-child(odd) { color: var(--ink-2); display: inline-flex; align-items: center; gap: 6px; }
+.fact .rows span:nth-child(even) { text-align: right; font-variant-numeric: tabular-nums; }
+.fact .big { font-size: 24px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.fact .sub { font-size: 13px; color: var(--ink-3); }
+
+.toolbar { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; background: var(--surface); }
+.seg button { appearance: none; border: 0; background: none; font: inherit; font-size: 13px; padding: 5px 12px; color: var(--ink-2); cursor: pointer; }
+.seg button + button { border-left: 1px solid var(--line); }
+.seg button[aria-pressed="true"] { background: var(--ink); color: var(--bg); }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { appearance: none; font: inherit; font-size: 13px; border: 1px solid var(--line); background: var(--surface); color: var(--ink-2); border-radius: 999px; padding: 3px 10px; cursor: pointer; }
+.chip[aria-pressed="true"] { border-color: var(--ink); color: var(--ink); background: var(--sunken); }
+select { font: inherit; font-size: 14px; padding: 5px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--surface); color: var(--ink); }
+
+.chartbox { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 14px 8px 8px; overflow-x: auto; position: relative; }
+.chartbox svg { display: block; min-width: 680px; width: 100%; }
+.chartbox text { fill: var(--ink-2); font-family: var(--sans); font-size: 12px; }
+.chartbox .axis text { fill: var(--ink-3); font-size: 11px; }
+.chartbox .gridline { stroke: var(--grid); stroke-width: 1; }
+.chartbox .conn { stroke: var(--ink-3); stroke-width: 2; opacity: 0.45; }
+.chartbox .row-hit { fill: transparent; }
+.chartbox .row-hit:hover, .chartbox .row-hit.on { fill: var(--sunken); }
+.tip { position: absolute; pointer-events: none; background: var(--ink); color: var(--bg); font-size: 12.5px; line-height: 1.45; padding: 8px 10px; border-radius: 6px; max-width: 340px; box-shadow: 0 4px 16px rgba(0,0,0,.18); z-index: 3; }
+.tip .dot { width: 8px; height: 8px; margin-right: 5px; box-shadow: 0 0 0 1.5px var(--bg); }
+
+.tablebox { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; min-width: 860px; font-size: 14px; }
+th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-size: 12px; font-weight: 500; color: var(--ink-3); letter-spacing: 0.04em; text-transform: uppercase; background: var(--surface); }
+td.r, th.r { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+tr.q { cursor: pointer; }
+tr.q:hover td { background: var(--sunken); }
+.qname { display: flex; gap: 8px; align-items: baseline; }
+.caret { color: var(--ink-3); width: 10px; display: inline-block; transition: transform .15s; flex: none; }
+tr.q[aria-expanded="true"] .caret { transform: rotate(90deg); }
+.shape { font-size: 12px; color: var(--ink-3); white-space: nowrap; }
+.winner { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.muted { color: var(--ink-3); }
+.ok { color: var(--good); font-weight: 500; white-space: nowrap; }
+.no { color: var(--bad); font-weight: 500; white-space: nowrap; }
+.links { display: flex; flex-wrap: wrap; gap: 2px 10px; font-size: 13px; white-space: nowrap; }
+.links a { text-decoration: none; }
+.links a:hover { text-decoration: underline; }
+tr.detail td { background: var(--bg); padding: 16px; cursor: default; }
+.detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+.pane { display: grid; gap: 8px; align-content: start; min-width: 0; }
+.pane h4 { margin: 0; font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 7px; }
+pre { margin: 0; background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; font: 12.5px/1.55 var(--mono); white-space: pre-wrap; word-break: break-word; color: var(--ink); }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; font-size: 13px; }
+.kv span:nth-child(odd) { color: var(--ink-3); }
+.kv span:nth-child(even) { font-variant-numeric: tabular-nums; }
+.err { color: var(--bad); font-size: 13px; }
+.note { font-size: 13px; color: var(--ink-3); }
+.empty { padding: 32px; text-align: center; color: var(--ink-3); }
+.status { font-size: 14px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.bar { display: inline-block; height: 8px; border-radius: 2px; vertical-align: middle; }
+@media (max-width: 520px) { h1 { font-size: 24px; } }
+@media (prefers-reduced-motion: reduce) { .caret { transition: none; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <span class="eyebrow">Reads · graph algorithms · writes · 500 MiB to 25 GiB</span>
+    <h1>Glider vs SQLite vs Memgraph</h1>
+    <p>The same graph in three engines: glider as a property graph on disk, SQLite as a normalized schema with foreign keys and indexes, and Memgraph, an in-memory graph database. Every read and algorithm is written for each engine and checked against glider's answer. Pick a size below; open any row for the queries, answers, SQLite's plan, and links to that run's trace, logs and flamegraphs.</p>
+    <div class="legend">
+      <span class="key"><span class="dot g"></span>glider (paged engine)</span>
+      <span class="key"><span class="dot s"></span>SQLite <span class="mono" id="sqlite-ver"></span></span>
+      <span class="key"><span class="dot m"></span>Memgraph 3.13 (in memory)</span>
+    </div>
+  </header>
+
+  <div class="obs">
+    <p>Traces, logs, metrics and CPU flamegraphs of every run live in the Grafana LGTM stack on the machine that ran the suite. The links open <span class="mono" id="gf-host"></span>, started with <code>bench/lgtm/up.sh</code>.</p>
+    <a class="btn" id="dash-link" target="_blank" rel="noopener">Open the Grafana dashboard</a>
+  </div>
+
+  <details class="box">
+    <summary>How this was measured</summary>
+    <ul>
+      <li><b>Data.</b> <code>scale-gen</code> writes a deterministic graph: people, companies, products, orders, documents, a category tree and an event chain, with 16 relationship types covering power-law hubs, communities, bipartite, multi-edges, cliques, trees, a DAG, a long chain and self-loops. The size names the generator's target; each engine's on-disk size is in its tab.</li>
+      <li><b>SQLite schema.</b> A table per label and per relationship type, <code>FOREIGN KEY</code>s to each end, <code>(src, dst)</code> and <code>(dst, src)</code> indexes on every relationship table, and glider's property indexes (Person email / age / country, Order ref, Product sku, Event seq). Built from <code>glider export</code>, indexed, <code>foreign_key_check</code>ed and <code>ANALYZE</code>d; WAL mode, <code>synchronous=NORMAL</code> (FULL for the fsync workload), 1 GiB page cache.</li>
+      <li><b>Timing.</b> Inside each engine's process: glider's shell <code>.timer</code>, SQLite around <code>execute</code> + <code>fetchall</code> in a Python worker. <b>Cold</b> is the first run in a fresh process after evicting both files from the OS page cache; <b>warm</b> is the median of the next five. Anything slower than 20 s ran once.</li>
+      <li><b>Algorithms.</b> glider's built-in <code>CALL</code>s against hand-written SQL doing the same thing: PageRank with glider's formula (all nodes, dangling mass shared evenly, five iterations), connected components by minimum-label propagation, degree by <code>GROUP BY</code>, BFS and shortest path by recursive CTEs. Answers are checked; PageRank to a relative 1e-6.</li>
+      <li><b>Writes.</b> The same operations through each engine's query language, run last because they change the data. Glider sync <code>normal</code> against SQLite <code>synchronous=NORMAL</code>; the fsync row is glider <code>always</code> against SQLite <code>FULL</code>. Afterwards both engines' Person and KNOWS counts must agree.</li>
+      <li><b>Profiles.</b> Grafana Alloy samples both processes with eBPF at 97 Hz. glider runs as its <code>profiling</code> build (release plus symbols and frame pointers). After its timed runs each read repeats for 1.5 s, so even microsecond queries have a flamegraph.</li>
+      <li><b>Memgraph.</b> <code>memgraph/memgraph-mage</code> 3.13 in Docker, capped at 24 GB. Each size is regenerated fresh, split into CSV and bulk-loaded with <code>LOAD CSV</code> (analytical mode, then transactional), with a <code>gid</code> property carrying glider's id and the same indexes. Queries are glider's Cypher with glider-only syntax translated (<code>id(x)</code> to <code>x.gid</code>, <code>CALL bfs</code> and <code>shortestpath</code> to Memgraph's <code>*BFS</code> expansions, the algorithms through MAGE on the KNOWS subgraph). Times are Memgraph's own parse + plan + execution from the query summary; writes use parameters, as SQLite does, and autocommit writes are timed from the client because the commit is not in the summary. Memgraph holds the whole graph in RAM, so sizes that do not fit are marked instead of run. The first read after loading is Memgraph's "cold": its data never leaves memory.</li>
+      <li><b>Machine.</b> 8 cores, 31 GiB RAM, NVMe, Linux; each process under a 12 GiB address-space cap.</li>
+    </ul>
+  </details>
+
+  <nav class="tabs" role="tablist" id="tabs"></nav>
+  <main id="panel" class="panel" role="tabpanel"></main>
+</div>
+
+<script>
+const DATA = /*__DATA__*/null;
+
+const $ = (s, el = document) => el.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const slug = s => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+const SIZE_LABEL = s => s.replace("MiB", " MiB").replace("GiB", " GiB");
+
+function fmtMs(ms) {
+  if (ms == null) return "—";
+  if (ms < 1) return (ms * 1000).toFixed(ms < 0.01 ? 2 : ms < 0.1 ? 1 : 0) + " µs";
+  if (ms < 100) return ms.toFixed(ms < 10 ? 2 : 1) + " ms";
+  if (ms < 1000) return ms.toFixed(0) + " ms";
+  if (ms < 60000) return (ms / 1000).toFixed(ms < 10000 ? 2 : 1) + " s";
+  return (ms / 60000).toFixed(1) + " min";
+}
+function fmtBytes(b) { if (!b) return "—"; const u = ["B", "KB", "MB", "GB", "TB"]; let i = 0; while (b >= 1000 && i < 4) { b /= 1000; i++; } return b.toFixed(b < 10 ? 2 : 1) + " " + u[i]; }
+const fmtInt = n => n == null ? "—" : Number(n).toLocaleString("en-US");
+const fmtSecs = s => s == null ? "—" : s < 60 ? s.toFixed(1) + " s" : (s / 60).toFixed(1) + " min";
+const fmtMB = mb => mb == null ? "—" : mb >= 1000 ? (mb / 1000).toFixed(2) + " GB" : mb.toFixed(0) + " MB";
+const fmtX = x => x >= 100 ? Math.round(x).toLocaleString("en-US") + "×" : x >= 10 ? x.toFixed(0) + "×" : x.toFixed(1) + "×";
+
+// ------------------------------------------------------------------ grafana
+const GF = (DATA && DATA.grafana) || "http://localhost:3000";
+function explore(uid, type, query, from, to) {
+  const panes = { a: { datasource: uid, queries: [Object.assign({ refId: "A", datasource: { type, uid } }, query)], range: { from: String(Math.round(from)), to: String(Math.round(to)) } } };
+  return `${GF}/explore?schemaVersion=1&orgId=1&panes=${encodeURIComponent(JSON.stringify(panes))}`;
+}
+function linksHTML(t) {
+  if (!t || !t.trace_id) return '<span class="muted">—</span>';
+  const pad = 60000;
+  const out = [
+    `<a target="_blank" rel="noopener" href="${esc(explore("tempo", "tempo", { queryType: "traceql", query: t.trace_id, limit: 20 }, t.start_ms - pad, t.end_ms + pad))}">Trace</a>`,
+    `<a target="_blank" rel="noopener" href="${esc(explore("loki", "loki", { expr: `{service_name="glider-bench"} | trace_id="${t.trace_id}"` }, t.start_ms - 5000, t.end_ms + 5000))}">Logs</a>`,
+  ];
+  if (t.mg_trace_id) out.push(`<a target="_blank" rel="noopener" href="${esc(explore("tempo", "tempo", { queryType: "traceql", query: t.mg_trace_id, limit: 20 }, t.memgraph_window[0] - pad, t.memgraph_window[1] + pad))}">Trace: Memgraph</a>`);
+  for (const [eng, label] of [["glider", "glider"], ["sqlite", "SQLite"], ["memgraph", "Memgraph"]]) {
+    const w = t[eng + "_window"];
+    if (!w) continue;
+    out.push(`<a target="_blank" rel="noopener" href="${esc(explore("pyroscope", "grafana-pyroscope-datasource",
+      { queryType: "profile", profileTypeId: "process_cpu:cpu:nanoseconds:cpu:nanoseconds", labelSelector: `{service_name="${eng}"}`, groupBy: [] },
+      w[0] - 500, w[1] + 1500))}">Flame: ${label}</a>`);
+  }
+  return `<span class="links">${out.join("")}</span>`;
+}
+
+// ------------------------------------------------------------------ state
+let state = { tab: null, mode: "warm", shape: "all", open: new Set(), beforeSize: null };
+try { const m = localStorage.getItem("gvs2-mode"); if (m) state.mode = m; } catch (e) {}
+
+function val(r, mode) { const v = r[mode + "_ms"]; return v == null && mode === "warm" ? r.cold_ms : v; }
+function status(r) { if (!r.error) return null; return /timeout/i.test(r.error) ? "timeout" : "error"; }
+function ratio(g, s) { if (g == null || s == null || g <= 0 || s <= 0) return null; return s / g; }
+const ENG = [["glider", "g", "glider"], ["sqlite", "s", "SQLite"], ["memgraph", "m", "Memgraph"]];
+function fastest(times) {
+  const have = ENG.map(([k, c, n]) => ({ k, c, n, v: times[k] })).filter(e => e.v != null && e.v > 0).sort((a, b) => a.v - b.v);
+  if (have.length < 2) return '<span class="muted">—</span>';
+  const [a, b] = have, x = b.v / a.v;
+  if (x < 1.1) return `<span class="winner muted">${a.n} and ${b.n} about even</span>`;
+  return `<span class="winner"><span class="dot ${a.c}"></span>${a.n}, ${fmtX(x)} ahead of ${b.n}</span>`;
+}
+function winnerHTML(r) {
+  if (r == null) return '<span class="muted">—</span>';
+  if (r >= 1.1) return `<span class="winner"><span class="dot g"></span>glider ${fmtX(r)} faster</span>`;
+  if (r <= 1 / 1.1) return `<span class="winner"><span class="dot s"></span>SQLite ${fmtX(1 / r)} faster</span>`;
+  return '<span class="winner muted">about even</span>';
+}
+const NONE = {};
+function mgOf(q) { return q.memgraph || NONE; }
+function agreeHTML(q) {
+  const a = q.match, m = q.mg_match;
+  if (a === false || m === false) {
+    const who = [a === false ? "SQLite" : null, m === false ? "Memgraph" : null].filter(Boolean).join(", ");
+    return `<span class="no">✕ ${who} differs</span>`;
+  }
+  if (a == null && m == null) return '<span class="muted">not compared</span>';
+  const n = [a, m].filter(x => x === true).length + 1;
+  return `<span class="ok">✓ ${n} agree</span>`;
+}
+function cell(r, mode) { if (r === NONE) return '<span class="muted">—</span>'; const st = status(r); return st ? `<span class="no">${st}</span>` : fmtMs(val(r, mode)); }
+function answerCell(m) { return m === true ? '<span class="ok">✓ same</span>' : m === false ? '<span class="no">✕ differs</span>' : '<span class="muted">not compared</span>'; }
+
+// ------------------------------------------------------------------ tabs
+function buildTabs() {
+  const nav = $("#tabs");
+  const tabs = DATA.sizes.map(s => {
+    const b = DATA.builds[s] || {}, n = b.sqlite && b.sqlite.nodes || b.glider && b.glider.gen && b.glider.gen.nodes;
+    return { id: slug(s), label: SIZE_LABEL(s), sub: n ? (n / 1e6).toFixed(1) + "M nodes" : "", size: s };
+  });
+  if (DATA.sizes.length > 1) tabs.push({ id: "scaling", label: "Across sizes", sub: "" });
+  tabs.push({ id: "browser", label: "In your browser", sub: "WebAssembly" });
+  nav.innerHTML = tabs.map(t => `<button class="tab" role="tab" data-id="${t.id}" aria-selected="false">${esc(t.label)}${t.sub ? `<small>${esc(t.sub)}</small>` : ""}</button>`).join("");
+  nav.addEventListener("click", e => { const b = e.target.closest(".tab"); if (b) select(b.dataset.id, true); });
+  nav.addEventListener("keydown", e => {
+    if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
+    const all = [...nav.querySelectorAll(".tab")], i = all.findIndex(b => b.dataset.id === state.tab);
+    const next = all[(i + (e.key === "ArrowRight" ? 1 : all.length - 1)) % all.length];
+    select(next.dataset.id, true); next.focus();
+  });
+  const hash = location.hash.slice(1);
+  select(tabs.some(t => t.id === hash) ? hash : tabs[0].id, false);
+}
+function select(id, push) {
+  state.tab = id; state.open.clear(); state.shape = "all";
+  document.querySelectorAll(".tab").forEach(b => { b.setAttribute("aria-selected", b.dataset.id === id); b.tabIndex = b.dataset.id === id ? 0 : -1; });
+  if (push) { try { history.replaceState(null, "", "#" + id); } catch (e) {} }
+  render();
+}
+function render() {
+  if (state.tab === "scaling") return renderScaling();
+  if (state.tab === "browser") return renderBrowser();
+  renderSize(DATA.sizes.find(s => slug(s) === state.tab));
+}
+
+// ------------------------------------------------------------------ size tab
+function renderSize(size) {
+  const reads = DATA.reads[size] || [], algos = DATA.algos[size] || [], writes = DATA.writes[size] || [];
+  const b = DATA.builds[size] || {}, g = b.glider || {}, s = b.sqlite || {}, m = DATA.memory[size] || {}, mgb = b.memgraph;
+  const checked = [...reads, ...algos, ...writes];
+  const compared = checked.filter(q => q.match != null), matched = compared.filter(q => q.match === true);
+  const mism = compared.filter(q => q.match === false);
+  const mgCompared = checked.filter(q => q.mg_match != null), mgMatched = mgCompared.filter(q => q.mg_match === true);
+  const mgMism = mgCompared.filter(q => q.mg_match === false);
+  const wins = { glider: 0, sqlite: 0, memgraph: 0 }; let even = 0;
+  for (const q of reads) {
+    const have = ENG.map(([k]) => [k, val(k === "memgraph" ? mgOf(q) : q[k], state.mode)]).filter(([, v]) => v != null && v > 0).sort((a, b) => a[1] - b[1]);
+    if (have.length < 2) continue;
+    if (have[1][1] / have[0][1] < 1.1) even++; else wins[have[0][0]]++;
+  }
+  const mgStatus = (DATA.mg_status || {})[size];
+  const mgNote = !mgb ? "not run (see below)" : mgb.ok === false ? "does not fit in memory" : null;
+  const shapes = ["all", ...new Set(reads.map(q => q.shape))];
+  const list = reads.filter(q => state.shape === "all" || q.shape === state.shape);
+
+  $("#panel").innerHTML = `
+    <section class="facts">
+      <div class="fact"><span class="eyebrow">Graph</span><div class="rows">
+        <span>Nodes</span><span>${fmtInt(s.nodes ?? g.gen?.nodes)}</span>
+        <span>Relationships</span><span>${fmtInt(s.edges ?? g.gen?.edges)}</span>
+        <span>Benchmarks</span><span>${reads.length} reads · ${algos.length} algorithms · ${writes.length} writes</span></div></div>
+      <div class="fact"><span class="eyebrow">On disk</span><div class="rows">
+        <span><span class="dot g"></span>glider</span><span>${fmtBytes(g.file_bytes)}</span>
+        <span><span class="dot s"></span>SQLite</span><span>${fmtBytes(s.file_bytes)}</span>
+        <span><span class="dot m"></span>Memgraph (in RAM)</span><span>${mgNote || esc(mgb.memory || "—")}</span></div>
+        <span class="sub">SQLite includes 32 relationship indexes and 6 property indexes</span></div>
+      <div class="fact"><span class="eyebrow">Build</span><div class="rows">
+        <span><span class="dot g"></span>glider bulk load</span><span>${fmtSecs(g.wall_s)}</span>
+        <span><span class="dot s"></span>SQLite load + index</span><span>${fmtSecs(s.wall_s)}</span>
+        <span class="muted">of which indexes</span><span class="muted">${fmtSecs(s.index_s)}</span>
+        <span class="muted">FK check</span><span class="muted">${fmtSecs(s.fk_check_s)} · ${s.fk_violations === 0 ? "0 violations" : (s.fk_violations ?? "—") + " violations"}</span>
+        <span><span class="dot m"></span>Memgraph LOAD CSV</span><span>${mgNote || fmtSecs(mgb.wall_s)}</span></div></div>
+      <div class="fact"><span class="eyebrow">Peak memory while reading</span><div class="rows">
+        <span><span class="dot g"></span>glider</span><span>${fmtMB(m.glider_peak_rss_mb)}</span>
+        <span><span class="dot s"></span>SQLite (Python worker)</span><span>${fmtMB(m.sqlite_peak_rss_mb)}</span>
+        <span><span class="dot m"></span>Memgraph (resident)</span><span>${mgNote || esc(mgb.memory || "—")}</span></div>
+        <span class="sub">glider and SQLite read through a 1 GiB page cache; Memgraph holds the whole graph in memory</span></div>
+      <div class="fact"><span class="eyebrow">Answers</span>
+        <span class="big ${mism.length ? "no" : "ok"}">${matched.length} / ${compared.length} agree</span>
+        <span class="sub">glider and SQLite. ${mism.length ? "Differs: " + esc(mism.map(q => q.name).join(", ")) : "Every compared check agreed"}${checked.length > compared.length ? ` · ${checked.length - compared.length} not compared (error or timeout)` : ""}</span>
+        <span class="sub">${mgCompared.length ? `Memgraph: ${mgMatched.length} / ${mgCompared.length} agree with glider${mgMism.length ? " · differs: " + esc(mgMism.map(q => q.name).join(", ")) : ""}` : `Memgraph: ${mgNote || "no checks"}`}</span></div>
+      <div class="fact"><span class="eyebrow">Fastest read (${state.mode})</span><div class="rows">
+        <span><span class="dot g"></span>glider</span><span>${wins.glider} of ${reads.length}</span>
+        <span><span class="dot s"></span>SQLite</span><span>${wins.sqlite} of ${reads.length}</span>
+        <span><span class="dot m"></span>Memgraph</span><span>${wins.memgraph} of ${reads.length}</span>
+        <span class="muted">top two within 10%</span><span class="muted">${even}</span></div></div>
+      ${mgStatus ? `<div class="fact" style="grid-column: 1 / -1"><span class="eyebrow"><span class="dot m"></span> Memgraph at this size</span><span class="sub" style="font-size:14px;color:var(--ink-2)">${esc(mgStatus[0].toUpperCase() + mgStatus.slice(1))}.</span></div>` : ""}
+    </section>
+
+    <section class="block">
+      <div class="block-head"><h2>Reads</h2>
+        <div class="toolbar">
+          <div class="seg" role="group" aria-label="Cache state">
+            <button data-mode="warm" aria-pressed="${state.mode === "warm"}">Warm</button>
+            <button data-mode="cold" aria-pressed="${state.mode === "cold"}">Cold</button>
+          </div>
+        </div>
+      </div>
+      <div class="chips" role="group" aria-label="Query shape">
+        ${shapes.map(sh => `<button class="chip" data-shape="${esc(sh)}" aria-pressed="${state.shape === sh}">${sh === "all" ? "All shapes" : esc(sh)}</button>`).join("")}
+      </div>
+      <div class="chartbox" id="chart"></div>
+      <p class="note">${state.mode === "warm" ? "Median of five warm runs" : "First run after evicting the files from the OS page cache (Memgraph: first run after loading)"}; log scale. The number is how many times faster the quickest engine was than the slowest.</p>
+      <div class="tablebox"><table>
+        <thead><tr><th>Query</th><th>Shape</th><th class="r">glider</th><th class="r">SQLite</th><th class="r">Memgraph</th><th>Fastest</th><th>Answers</th><th>Observability</th></tr></thead>
+        <tbody id="reads"></tbody></table></div>
+    </section>
+
+    <section class="block">
+      <div class="block-head"><h2>Graph algorithms</h2><p class="note">glider's built-in procedures against the same algorithm in SQL. First run; warm median where the first run took under 20 s.</p></div>
+      <div class="tablebox"><table>
+        <thead><tr><th>Algorithm</th><th class="r">glider</th><th class="r">SQLite</th><th class="r">Memgraph</th><th>Fastest</th><th>Answers</th><th>Observability</th></tr></thead>
+        <tbody id="algos"></tbody></table></div>
+    </section>
+
+    <section class="block">
+      <div class="block-head"><h2>Writes</h2><p class="note">Each workload through each engine's query language, statement by statement. The check compares Person and KNOWS counts afterwards.</p></div>
+      <div class="tablebox"><table>
+        <thead><tr><th>Workload</th><th>Durability</th><th class="r">glider</th><th class="r">SQLite</th><th class="r">Memgraph</th><th>Fastest</th><th>Counts</th><th>Observability</th></tr></thead>
+        <tbody id="writes"></tbody></table></div>
+    </section>`;
+
+  $("#panel .seg").addEventListener("click", e => { const b = e.target.closest("button"); if (!b) return; state.mode = b.dataset.mode; try { localStorage.setItem("gvs2-mode", state.mode); } catch (err) {} render(); });
+  $("#panel .chips").addEventListener("click", e => { const b = e.target.closest(".chip"); if (!b) return; state.shape = b.dataset.shape; render(); });
+  drawChart($("#chart"), list.map(q => ({ name: q.name, g: val(q.glider, state.mode), s: val(q.sqlite, state.mode), m: q.memgraph ? val(q.memgraph, state.mode) : null, gs: status(q.glider), ss: status(q.sqlite), ms: q.memgraph ? status(q.memgraph) : null })), i => openRow("reads", list[i].name));
+  drawReads(list); drawAlgos(algos); drawWrites(writes);
+}
+
+function rowsBlock(r) {
+  if (r.error) return `<div class="err">${esc(r.error)}</div>`;
+  const rows = r.rows ?? (r.answer != null ? [[typeof r.answer === "object" ? JSON.stringify(r.answer) : r.answer]] : null);
+  if (!rows || !rows.length) return '<span class="muted">no rows</span>';
+  const fmt = v => { if (v === null) return "null"; if (typeof v === "number" && !Number.isInteger(v)) return String(+v.toPrecision(8)); const t = typeof v === "object" ? JSON.stringify(v) : String(v); return t.length > 70 ? t.slice(0, 67) + "…" : t; };
+  const shown = rows.slice(0, 8).map(row => (Array.isArray(row) ? row : [row]).map(fmt).join("  |  ")).join("\n");
+  const more = r.row_count > rows.length ? `\n… ${fmtInt(r.row_count - Math.min(rows.length, 8))} more rows (${fmtInt(r.row_count)} total)` : "";
+  return `<pre>${esc(shown + more)}</pre>`;
+}
+function timings(r) {
+  return `<div class="kv"><span>cold / first</span><span>${fmtMs(r.cold_ms)}</span><span>warm (median)</span><span>${r.warm_ms == null ? "ran once" : fmtMs(r.warm_ms)}</span>${r.row_count != null ? `<span>rows</span><span>${fmtInt(r.row_count)}</span>` : ""}</div>`;
+}
+function detail(q, cols) {
+  const plan = q.sqlite.plan && q.sqlite.plan.length ? `<h4>Query plan</h4><pre>${esc(q.sqlite.plan.join("\n"))}</pre>` : "";
+  const params = q.params && q.params.length ? `<div class="note">parameters: <code>${esc(JSON.stringify(q.params))}</code></div>` : "";
+  return `<tr class="detail"><td colspan="${cols}"><div class="detail-grid">
+    <div class="pane"><h4><span class="dot g"></span>glider · Cypher</h4><pre>${esc(q.cypher)}</pre>${timings(q.glider)}<h4>Answer</h4>${rowsBlock(q.glider)}</div>
+    <div class="pane"><h4><span class="dot s"></span>SQLite · SQL</h4><pre>${esc(q.sql || "")}</pre>${params}${timings(q.sqlite)}<h4>Answer</h4>${rowsBlock(q.sqlite)}${plan}</div>
+    ${q.memgraph ? `<div class="pane"><h4><span class="dot m"></span>Memgraph · Cypher</h4><pre>${esc(q.mg_cypher || "")}</pre>${timings(q.memgraph)}<h4>Answer</h4>${rowsBlock(q.memgraph)}</div>` : ""}
+  </div></td></tr>`;
+}
+function openRow(kind, name) {
+  state.open.add(kind + name);
+  render();
+  const tr = document.querySelector(`tr.q[data-key="${CSS.escape(kind + name)}"]`);
+  if (tr) { tr.scrollIntoView({ block: "center" }); tr.focus({ preventScroll: true }); }
+}
+function wireToggle(tbody) {
+  const toggle = tr => { const k = tr.dataset.key; state.open.has(k) ? state.open.delete(k) : state.open.add(k); render(); const again = document.querySelector(`tr.q[data-key="${CSS.escape(k)}"]`); if (again) again.focus({ preventScroll: true }); };
+  tbody.onclick = e => { if (e.target.closest("a")) return; const tr = e.target.closest("tr.q"); if (tr && !String(window.getSelection())) toggle(tr); };
+  tbody.onkeydown = e => { const tr = e.target.closest("tr.q"); if (tr && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); toggle(tr); } };
+}
+function drawReads(list) {
+  const tb = $("#reads");
+  tb.innerHTML = list.map(q => {
+    const k = "reads" + q.name, open = state.open.has(k);
+    return `<tr class="q" tabindex="0" data-key="${esc(k)}" aria-expanded="${open}">
+      <td><span class="qname"><span class="caret">▸</span><span>${esc(q.name)}</span></span></td><td class="shape">${esc(q.shape)}</td>
+      <td class="r">${cell(q.glider, state.mode)}</td><td class="r">${cell(q.sqlite, state.mode)}</td><td class="r">${cell(mgOf(q), state.mode)}</td>
+      <td>${fastest({ glider: val(q.glider, state.mode), sqlite: val(q.sqlite, state.mode), memgraph: q.memgraph ? val(q.memgraph, state.mode) : null })}</td><td>${agreeHTML(q)}</td><td>${linksHTML(q.telemetry)}</td></tr>${open ? detail(q, 8) : ""}`;
+  }).join("") || '<tr><td colspan="8" class="empty">No reads recorded at this size yet.</td></tr>';
+  wireToggle(tb);
+}
+function drawAlgos(list) {
+  const tb = $("#algos");
+  tb.innerHTML = list.map(q => {
+    const k = "algos" + q.name, open = state.open.has(k);
+    const one = r => r ? (r.warm_ms ?? r.cold_ms) : null;
+    const show = r => !r ? '<span class="muted">—</span>' : status(r) ? `<span class="no">${status(r)}</span>` : fmtMs(one(r));
+    return `<tr class="q" tabindex="0" data-key="${esc(k)}" aria-expanded="${open}">
+      <td><span class="qname"><span class="caret">▸</span><span>${esc(q.name)}</span></span></td>
+      <td class="r">${show(q.glider)}</td><td class="r">${show(q.sqlite)}</td><td class="r">${show(q.memgraph)}</td>
+      <td>${fastest({ glider: one(q.glider), sqlite: one(q.sqlite), memgraph: one(q.memgraph) })}</td><td>${agreeHTML(q)}</td><td>${linksHTML(q.telemetry)}</td></tr>${open ? detail(q, 7) : ""}`;
+  }).join("") || '<tr><td colspan="7" class="empty">No algorithms recorded at this size yet.</td></tr>';
+  wireToggle(tb);
+}
+function drawWrites(list) {
+  const tb = $("#writes");
+  const one = r => !r ? '<span class="muted">—</span>' : r.error ? `<span class="no">${/timeout/i.test(r.error) ? "timeout" : "error"}</span>` : `${fmtMs(r.ms)}<div class="note">${fmtInt(r.ops_per_s)} ops/s${r.note ? "*" : ""}</div>`;
+  tb.innerHTML = list.map(q => {
+    const k = "writes" + q.name, open = state.open.has(k);
+    const counts = q.counts && q.counts.glider ? `${agreeHTML(q)}<div class="note">${fmtInt(q.counts.glider.person)} people · ${fmtInt(q.counts.glider.knows)} KNOWS</div>` : '<span class="muted">—</span>';
+    const dur = q.sync === "always" ? "fsync each commit" : "normal";
+    const det = open ? `<tr class="detail"><td colspan="8"><div class="detail-grid">
+      <div class="pane"><h4><span class="dot g"></span>glider · first of ${fmtInt(q.ops)} statements</h4><pre>${esc((q.transaction ? "BEGIN\n" : "") + q.cypher + (q.transaction ? "\n…\nCOMMIT" : "\n…"))}</pre><div class="kv"><span>total</span><span>${fmtMs(q.glider.ms)}</span><span>per statement</span><span>${fmtMs(q.glider.ms / q.ops)}</span></div>${q.glider.error ? `<div class="err">${esc(q.glider.error)}</div>` : ""}</div>
+      ${q.memgraph ? `<div class="pane"><h4><span class="dot m"></span>Memgraph · the same Cypher, with parameters</h4><div class="kv"><span>total</span><span>${fmtMs(q.memgraph.ms)}</span><span>per statement</span><span>${fmtMs(q.memgraph.ms / q.ops)}</span></div>${q.memgraph.note ? `<div class="note">* ${esc(q.memgraph.note)}</div>` : ""}${q.transaction ? "" : '<div class="note">Autocommit statements are timed from the client (the commit is not in Memgraph\'s query summary), so they include a Bolt round trip each.</div>'}${q.memgraph.error ? `<div class="err">${esc(q.memgraph.error)}</div>` : ""}</div>` : ""}
+      <div class="pane"><h4><span class="dot s"></span>SQLite · first of ${fmtInt(q.ops)} statements</h4><pre>${esc((q.transaction ? "BEGIN\n" : "") + (q.sql === "DELETE_PERSON" ? "DELETE FROM knows WHERE src = ?; DELETE FROM knows WHERE dst = ?; … (every relationship table)\nDELETE FROM person WHERE id = ?" : q.sql) + (q.transaction ? "\n…\nCOMMIT" : "\n…"))}</pre><div class="kv"><span>total</span><span>${fmtMs(q.sqlite.ms)}</span><span>per statement</span><span>${fmtMs(q.sqlite.ms / q.ops)}</span></div>${q.sqlite.error ? `<div class="err">${esc(q.sqlite.error)}</div>` : ""}</div>
+    </div></td></tr>` : "";
+    return `<tr class="q" tabindex="0" data-key="${esc(k)}" aria-expanded="${open}">
+      <td><span class="qname"><span class="caret">▸</span><span>${esc(q.name)}</span></span></td><td class="shape">${dur}${q.transaction ? " · one transaction" : " · autocommit"}</td>
+      <td class="r">${one(q.glider)}</td><td class="r">${one(q.sqlite)}</td><td class="r">${one(q.memgraph)}</td><td>${fastest({ glider: q.glider.ms, sqlite: q.sqlite.ms, memgraph: q.memgraph && !q.memgraph.error ? q.memgraph.ms : null })}</td><td>${counts}</td><td>${linksHTML(q.telemetry)}</td></tr>${det}`;
+  }).join("") || '<tr><td colspan="8" class="empty">No writes recorded at this size yet.</td></tr>';
+  wireToggle(tb);
+}
+
+// ------------------------------------------------------------------ chart
+function drawChart(box, rows, onPick) {
+  const W = Math.max(680, box.clientWidth - 16), rowH = 26, top = 26, labelW = Math.min(310, W * 0.36), right = 72;
+  const H = top + rows.length * rowH + 8;
+  const vals = rows.flatMap(r => [r.g, r.s]).filter(v => v > 0);
+  if (!vals.length) { box.innerHTML = '<div class="empty">No timings for this selection.</div>'; return; }
+  const lo = Math.floor(Math.log10(Math.min(...vals))), hi = Math.ceil(Math.log10(Math.max(...vals)));
+  const x0 = labelW + 12, x1 = W - right;
+  const x = v => x0 + (Math.log10(v) - lo) / Math.max(1, hi - lo) * (x1 - x0);
+  let svg = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" aria-label="Query times, glider vs SQLite, log scale"><g class="axis">`;
+  for (let d = lo; d <= hi; d++) {
+    const xv = x(10 ** d);
+    svg += `<line class="gridline" x1="${xv}" x2="${xv}" y1="${top - 6}" y2="${H - 4}"/><text x="${xv}" y="${top - 12}" text-anchor="middle">${d >= 3 ? (10 ** (d - 3)).toLocaleString("en-US") + " s" : fmtMs(10 ** d)}</text>`;
+  }
+  svg += "</g>";
+  rows.forEach((r, i) => {
+    const y = top + i * rowH + rowH / 2, name = r.name.length > 46 ? r.name.slice(0, 44) + "…" : r.name;
+    svg += `<rect class="row-hit" data-i="${i}" x="0" y="${y - rowH / 2}" width="${W}" height="${rowH}"/><text x="${labelW}" y="${y + 4}" text-anchor="end" pointer-events="none">${esc(name)}</text>`;
+    const pts = [r.g, r.s, r.m].filter(v => v > 0);
+    if (pts.length > 1) svg += `<line class="conn" x1="${x(Math.min(...pts))}" x2="${x(Math.max(...pts))}" y1="${y}" y2="${y}" pointer-events="none"/>`;
+    [["memgraph", r.m, r.ms], ["sqlite", r.s, r.ss], ["glider", r.g, r.gs]].forEach(([eng, v, st]) => {
+      if (v > 0) svg += `<circle cx="${x(v)}" cy="${y}" r="5.5" fill="var(--${eng})" stroke="var(--surface)" stroke-width="2" pointer-events="none"/>`;
+        else if (st) svg += `<text x="${x1 + 6}" y="${y + 4}" style="fill:var(--bad)" pointer-events="none">${eng} ${st}</text>`;
+    });
+    if (pts.length > 1) { const hx = x(Math.max(...pts)), rr = Math.max(...pts) / Math.min(...pts); svg += `<text x="${Math.min(hx + 10, W - 4)}" y="${y + 4}" text-anchor="${hx + 10 > W - 56 ? "end" : "start"}" pointer-events="none" style="fill:var(--ink-3)">${fmtX(rr)}</text>`; }
+  });
+  box.innerHTML = svg + "</svg>" + '<div class="tip" hidden></div>';
+  const tip = $(".tip", box);
+  box.querySelectorAll(".row-hit").forEach(rect => {
+    rect.addEventListener("mousemove", e => {
+      const r = rows[+rect.dataset.i];
+      box.querySelectorAll(".row-hit.on").forEach(q => q.classList.remove("on")); rect.classList.add("on");
+      tip.innerHTML = `<b>${esc(r.name)}</b><br><span class="dot g"></span>glider ${r.gs || fmtMs(r.g)}<br><span class="dot s"></span>SQLite ${r.ss || fmtMs(r.s)}${r.m != null || r.ms ? `<br><span class="dot m"></span>Memgraph ${r.ms || fmtMs(r.m)}` : ""}<br>${fastest({ glider: r.g, sqlite: r.s, memgraph: r.m }).replace(/<span class="dot [gsm]"><\/span>/, "")}`;
+      tip.hidden = false;
+      const bb = box.getBoundingClientRect();
+      let left = e.clientX - bb.left + box.scrollLeft + 14; if (left + 350 > box.scrollLeft + bb.width) left -= 370;
+      tip.style.left = Math.max(4, left) + "px"; tip.style.top = (e.clientY - bb.top + 14) + "px";
+    });
+    rect.addEventListener("mouseleave", () => { tip.hidden = true; rect.classList.remove("on"); });
+    if (onPick) rect.addEventListener("click", () => onPick(+rect.dataset.i));
+  });
+}
+
+// ------------------------------------------------------------------ across sizes
+function renderScaling() {
+  const sizes = DATA.sizes;
+  const matrix = (kind, get) => {
+    const names = [...new Set(sizes.flatMap(s => (DATA[kind][s] || []).map(q => q.name)))];
+    const by = Object.fromEntries(sizes.map(s => [s, Object.fromEntries((DATA[kind][s] || []).map(q => [q.name, q]))]));
+    return `<div class="tablebox"><table><thead><tr><th rowspan="2">${kind === "reads" ? "Query" : kind === "algos" ? "Algorithm" : "Workload"}</th>${sizes.map(s => `<th class="r" colspan="3">${SIZE_LABEL(s)}</th>`).join("")}</tr>
+      <tr>${sizes.map(() => '<th class="r"><span class="dot g"></span></th><th class="r"><span class="dot s"></span></th><th class="r"><span class="dot m"></span></th>').join("")}</tr></thead><tbody>
+      ${names.map(n => `<tr><td>${esc(n)}</td>${sizes.map(s => { const q = by[s][n]; if (!q) return '<td class="r muted">—</td>'.repeat(3);
+        const cells = ["glider", "sqlite", "memgraph"].map(k => q[k] ? get(q[k]) : { v: null, t: '<span class="muted">—</span>' });
+        const best = Math.min(...cells.map(c => c.v).filter(v => v > 0));
+        return cells.map(c => `<td class="r"${c.v > 0 && c.v === best ? ' style="font-weight:600"' : ""}>${c.t}</td>`).join(""); }).join("")}</tr>`).join("")}
+      </tbody></table></div>`;
+  };
+  const rv = r => ({ v: val(r, state.mode), t: status(r) ? `<span class="no">${status(r)}</span>` : fmtMs(val(r, state.mode)) });
+  const av = r => { const v = r.warm_ms ?? r.cold_ms; return { v, t: status(r) ? `<span class="no">${status(r)}</span>` : fmtMs(v) }; };
+  const wv = r => ({ v: r.ms, t: r.error ? '<span class="no">error</span>' : fmtMs(r.ms) });
+  const beforeSizes = sizes.filter(s => DATA.before[s]);
+  if (!state.beforeSize || !beforeSizes.includes(state.beforeSize)) state.beforeSize = beforeSizes[beforeSizes.length - 1];
+  $("#panel").innerHTML = `
+    <section class="block">
+      <div class="block-head"><h2>Reads at every size</h2>
+        <div class="seg" role="group" aria-label="Cache state"><button data-mode="warm" aria-pressed="${state.mode === "warm"}">Warm</button><button data-mode="cold" aria-pressed="${state.mode === "cold"}">Cold</button></div></div>
+      <p class="note">The fastest engine's time is bold. Memgraph has no numbers at sizes that do not fit in memory.</p>${matrix("reads", rv)}
+    </section>
+    <section class="block"><h2>Algorithms at every size</h2>${matrix("algos", av)}</section>
+    <section class="block"><h2>Writes at every size</h2>${matrix("writes", wv)}</section>
+    ${beforeSizes.length ? `<section class="block">
+      <div class="block-head"><h2>glider before and after the engine changes</h2>
+        <label class="status">Size <select id="before-size">${beforeSizes.map(s => `<option value="${s}"${s === state.beforeSize ? " selected" : ""}>${SIZE_LABEL(s)}</option>`).join("")}</select></label></div>
+      <p>Warm reads from the first comparison, against the same reads now. The changes: traversals that walk only what they reach, edge-type anchors, counts answered from stored counters, record reads by scanning instead of lookups (with a read cache), and the relationship type in the adjacency key so typed expansions are range scans.</p>
+      <div id="before"></div></section>` : ""}`;
+  $("#panel .seg").addEventListener("click", e => { const b = e.target.closest("button"); if (!b) return; state.mode = b.dataset.mode; render(); });
+  const sel = $("#before-size");
+  if (sel) { sel.addEventListener("change", () => { state.beforeSize = sel.value; drawBefore(); }); drawBefore(); }
+}
+function drawBefore() {
+  const s = state.beforeSize, before = DATA.before[s] || {}, now = Object.fromEntries((DATA.reads[s] || []).map(q => [q.name, q]));
+  const names = Object.keys(before).filter(n => now[n]);
+  const rows = names.map(n => {
+    const b = before[n].glider_warm_ms, a = val(now[n].glider, "warm"), sq = val(now[n].sqlite, "warm");
+    return { n, b, a, sq, gain: b && a ? b / a : null };
+  }).sort((x, y) => (y.gain || 0) - (x.gain || 0));
+  $("#before").innerHTML = `<div class="tablebox"><table><thead><tr><th>Query</th><th class="r">glider before</th><th class="r">glider now</th><th class="r">Change</th><th class="r">SQLite now</th><th>Now vs SQLite</th></tr></thead><tbody>
+    ${rows.map(r => `<tr><td>${esc(r.n)}</td><td class="r">${fmtMs(r.b)}</td><td class="r">${fmtMs(r.a)}</td>
+      <td class="r">${r.gain == null ? "—" : r.gain >= 1.1 ? `<span class="ok">${fmtX(r.gain)} faster</span>` : r.gain <= 1 / 1.1 ? `<span class="no">${fmtX(1 / r.gain)} slower</span>` : '<span class="muted">same</span>'}</td>
+      <td class="r">${fmtMs(r.sq)}</td><td>${winnerHTML(ratio(r.a, r.sq))}</td></tr>`).join("")}</tbody></table></div>`;
+}
+
+// ------------------------------------------------------------------ in your browser
+let worker = null, wasm = { ready: false, built: false, list: [], results: {}, busy: false, info: null, graph: null, error: null };
+function renderBrowser() {
+  $("#panel").innerHTML = `
+    <section class="block">
+      <h2>Both engines, compiled to WebAssembly, in this tab</h2>
+      <p>glider's <code>wasm32</code> build and SQLite's official WebAssembly build run the same generated graph. (Memgraph is a server with no WebAssembly build, so it is not in this tab.) Both run it in a Web Worker on your machine: people in communities with power-law hubs, products in a category tree, orders. SQLite gets the same normalized schema with foreign keys and indexes as the native runs. Each benchmark repeats for 0.4 s and reports the median; writes run once. Answers are checked.</p>
+      <div class="toolbar">
+        <label class="status">People <select id="wasm-size">
+          <option value="2000">2,000</option><option value="10000" selected>10,000</option><option value="50000">50,000</option><option value="100000">100,000</option></select></label>
+        <button class="btn" id="wasm-build">Build the graph</button>
+        <button class="btn quiet" id="wasm-run" disabled>Run every benchmark</button>
+        <span class="status" id="wasm-status" role="status" aria-live="polite"></span>
+      </div>
+    </section>
+    <section class="facts" id="wasm-facts"></section>
+    <section class="block"><div class="chartbox" id="wasm-chart"></div>
+      <div class="tablebox"><table><thead><tr><th>Benchmark</th><th class="r">glider</th><th class="r">SQLite</th><th>Faster</th><th>Answer</th><th></th></tr></thead><tbody id="wasm-rows"></tbody></table></div>
+    </section>`;
+  $("#wasm-build").addEventListener("click", () => wasmBuild());
+  $("#wasm-run").addEventListener("click", () => wasmRunAll());
+  $("#wasm-rows").addEventListener("click", e => { const b = e.target.closest("button[data-run]"); if (b) wasmRun([b.dataset.run]); });
+  if (!worker) wasmInit(); else wasmPaint();
+}
+function wasmStatus(t) { const el = $("#wasm-status"); if (el) el.textContent = t; }
+function wasmInit() {
+  wasmStatus("Loading both WebAssembly engines…");
+  try { worker = new Worker(new URL("wasm/bench-worker.mjs", location.href), { type: "module" }); }
+  catch (e) { wasm.error = "This browser could not start a module worker: " + e.message; wasmPaint(); return; }
+  worker.onerror = e => { wasm.error = "The benchmark worker failed to load: " + (e.message || "unknown error"); wasm.busy = false; wasmPaint(); };
+  worker.onmessage = e => {
+    const m = e.data;
+    if (m.op === "ready") { wasm.ready = true; wasm.info = m; wasmStatus(""); wasmBuild(); }
+    else if (m.op === "built") { wasm.built = true; wasm.graph = m; wasm.list = m.list; wasm.results = {}; wasm.busy = false; wasmPaint(); wasmRunAll(); }
+    else if (m.op === "result") { wasm.results[m.id] = m; wasmNext(); }
+    else if (m.op === "error") { if (m.id) wasm.results[m.id] = { id: m.id, error: m.message }; else wasm.error = m.message; wasmNext(); }
+  };
+  worker.postMessage({ op: "init" });
+}
+let queue = [];
+function wasmBuild() {
+  if (!wasm.ready || wasm.busy) return;
+  wasm.busy = true; wasm.built = false; wasm.error = null;
+  const people = +(($("#wasm-size") || {}).value || 10000);
+  wasmStatus(`Generating ${people.toLocaleString("en-US")} people and loading both engines…`);
+  wasmPaint();
+  worker.postMessage({ op: "build", people });
+}
+function wasmRunAll() { wasmRun(wasm.list.map(b => b.id)); }
+function wasmRun(ids) {
+  if (!wasm.built || wasm.busy) return;
+  queue = ids.slice(); wasm.busy = true; wasmNext();
+}
+function wasmNext() {
+  if (!queue.length) { wasm.busy = false; wasmStatus(Object.keys(wasm.results).length ? "Done." : ""); wasmPaint(); return; }
+  const id = queue.shift(), b = wasm.list.find(x => x.id === id);
+  wasmStatus(`Running: ${b ? b.name : id}`);
+  wasmPaint();
+  worker.postMessage({ op: "run", id });
+}
+function wasmPaint() {
+  if (state.tab !== "browser") return;
+  const bb = $("#wasm-build"), rb = $("#wasm-run");
+  if (bb) bb.disabled = !wasm.ready || wasm.busy;
+  if (rb) rb.disabled = !wasm.built || wasm.busy;
+  const g = wasm.graph, info = wasm.info;
+  if (wasm.error) { $("#wasm-facts").innerHTML = `<div class="fact"><span class="eyebrow">Could not run</span><span class="err">${esc(wasm.error)}</span></div>`; return; }
+  $("#wasm-facts").innerHTML = info ? `
+    <div class="fact"><span class="eyebrow">Engines</span><div class="rows"><span><span class="dot g"></span>glider</span><span>${esc(info.glider_version)} · ready in ${fmtMs(info.glider_init_ms)}</span><span><span class="dot s"></span>SQLite</span><span>${esc(info.sqlite_version)} · ready in ${fmtMs(info.sqlite_init_ms)}</span></div></div>
+    ${g ? `<div class="fact"><span class="eyebrow">Graph</span><div class="rows"><span>Nodes</span><span>${fmtInt(g.nodes)}</span><span>Relationships</span><span>${fmtInt(g.edges)}</span></div></div>
+    <div class="fact"><span class="eyebrow">Load</span><div class="rows"><span><span class="dot g"></span>glider (JSONL import)</span><span>${fmtMs(g.glider_load_ms)}</span><span><span class="dot s"></span>SQLite (inserts + indexes)</span><span>${fmtMs(g.sqlite_load_ms)}</span></div></div>` : ""}` : "";
+  const list = wasm.list;
+  const rows = list.map(b => ({ b, r: wasm.results[b.id] }));
+  const done = rows.filter(x => x.r && !x.r.error);
+  drawChart($("#wasm-chart"), done.map(({ b, r }) => ({ name: b.name, g: r.glider_ms, s: r.sqlite_ms })));
+  let group = null;
+  $("#wasm-rows").innerHTML = rows.map(({ b, r }) => {
+    const head = b.group !== group ? `<tr><td colspan="6" class="eyebrow" style="background:var(--sunken)">${esc(b.group)}</td></tr>` : "";
+    group = b.group;
+    const g_ = r && !r.error ? fmtMs(r.glider_ms) : "—", s_ = r && !r.error ? fmtMs(r.sqlite_ms) : "—";
+    const ans = !r ? '<span class="muted">not run</span>' : r.error ? `<span class="err">${esc(r.error)}</span>` : r.match == null ? '<span class="muted">not compared</span>' : answerCell(r.match);
+    return `${head}<tr><td>${esc(b.name)}<div class="note mono">${esc(b.cypher)}</div></td><td class="r">${g_}</td><td class="r">${s_}</td><td>${r && !r.error ? winnerHTML(ratio(r.glider_ms, r.sqlite_ms)) : ""}</td><td>${ans}</td>
+      <td><button class="btn quiet" data-run="${esc(b.id)}" ${!wasm.built || wasm.busy ? "disabled" : ""}>Run</button></td></tr>`;
+  }).join("") || '<tr><td colspan="6" class="empty">Loading…</td></tr>';
+}
+
+// ------------------------------------------------------------------ boot
+if (!DATA) {
+  $("#panel").innerHTML = '<div class="empty">No results yet. Run bench/suite.py.</div>';
+} else {
+  $("#sqlite-ver").textContent = DATA.sqlite_version || "";
+  $("#gf-host").textContent = GF.replace(/^https?:\/\//, "");
+  const allT = ["reads", "algos", "writes"].flatMap(k => Object.values(DATA[k]).flat()).map(q => q.telemetry).filter(Boolean);
+  const from = allT.length ? Math.min(...allT.map(t => t.start_ms)) - 60000 : "now-12h", to = allT.length ? Math.max(...allT.map(t => t.end_ms)) + 60000 : "now";
+  $("#dash-link").href = `${GF}/d/glider-vs-sqlite/glider-vs-sqlite-benchmarks?orgId=1&from=${from}&to=${to}`;
+  buildTabs();
+  let rw; window.addEventListener("resize", () => { clearTimeout(rw); rw = setTimeout(() => { if (state.tab !== "browser") render(); else wasmPaint(); }, 150); });
+}
+</script>

@@ -26,3 +26,7 @@ dist-standalone/
 
 # Python
 __pycache__/
+
+# staged by bench/wasm/prepare.sh
+/bench/wasm/glider/
+/bench/wasm/sqlite/

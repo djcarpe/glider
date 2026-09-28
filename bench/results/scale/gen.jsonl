@@ -1,0 +1,6 @@
+{"mode": "image", "ids": 1260415, "bytes": 1072474888, "seconds": 8.248, "wall_s": 9.467, "peak_rss_kb": 416252, "size": "img-1GiB.gldb"}
+{"mode": "image", "ids": 6302075, "bytes": 5370695684, "seconds": 44.508, "wall_s": 46.049, "peak_rss_kb": 1856980, "size": "img-5GiB.gldb"}
+{"mode": "image", "ids": 12604150, "bytes": 10739923113, "seconds": 88.88, "wall_s": 91.344, "peak_rss_kb": 3680448, "size": "img-10GiB.gldb"}
+{"mode": "image", "ids": 31510376, "bytes": 26837263636, "seconds": 240.594, "wall_s": 242.123, "peak_rss_kb": 9191244, "size": "img-25GiB.gldb"}
+{"mode": "log", "ids": 1260415, "nodes": 1247371, "edges": 8027661, "bytes": 981503927, "seconds": 6.97, "wall_s": 6.972, "peak_rss_kb": 14260, "size": "log-1GiB.gldb"}
+{"mode": "log", "ids": 6302075, "nodes": 6237595, "edges": 40209610, "bytes": 4971586664, "seconds": 30.943, "wall_s": 30.945, "peak_rss_kb": 14344, "size": "log-5GiB.gldb"}

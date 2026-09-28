@@ -1,0 +1,39 @@
+{
+  "dashboard": {
+    "uid": "glider-vs-sqlite",
+    "title": "glider vs SQLite benchmarks",
+    "tags": ["glider", "benchmark"],
+    "timezone": "browser",
+    "time": {"from": "now-12h", "to": "now"},
+    "templating": {"list": [
+      {"name": "size", "type": "query", "datasource": {"type": "prometheus", "uid": "prometheus"},
+       "query": "label_values(bench_duration_milliseconds, size)", "includeAll": true, "multi": true, "current": {"text": "All", "value": "$__all"}, "refresh": 2},
+      {"name": "benchmark", "type": "query", "datasource": {"type": "prometheus", "uid": "prometheus"},
+       "query": "label_values(bench_duration_milliseconds{size=~\"$size\"}, benchmark)", "includeAll": true, "multi": true, "current": {"text": "All", "value": "$__all"}, "refresh": 2}
+    ]},
+    "panels": [
+      {"id": 1, "type": "table", "title": "Latest timing per benchmark (ms, first run)", "gridPos": {"x": 0, "y": 0, "w": 24, "h": 10},
+       "datasource": {"type": "prometheus", "uid": "prometheus"},
+       "targets": [{"refId": "A", "instant": true, "format": "table",
+         "expr": "max by (size, kind, benchmark, engine) (last_over_time(bench_duration_milliseconds{size=~\"$size\", benchmark=~\"$benchmark\", run=~\"cold|run 1|run\"}[$__range]))"}],
+       "transformations": [{"id": "groupingToMatrix", "options": {"columnField": "engine", "rowField": "benchmark", "valueField": "Value"}}]},
+      {"id": 2, "type": "timeseries", "title": "Every timed run (ms)", "gridPos": {"x": 0, "y": 10, "w": 24, "h": 9},
+       "datasource": {"type": "prometheus", "uid": "prometheus"},
+       "fieldConfig": {"defaults": {"unit": "ms", "custom": {"drawStyle": "points", "pointSize": 5, "scaleDistribution": {"type": "log", "log": 10}}}},
+       "targets": [{"refId": "A", "expr": "bench_duration_milliseconds{size=~\"$size\", benchmark=~\"$benchmark\"}", "legendFormat": "{{engine}} {{size}} {{benchmark}}"}]},
+      {"id": 3, "type": "flamegraph", "title": "glider CPU (eBPF)", "gridPos": {"x": 0, "y": 19, "w": 12, "h": 14},
+       "datasource": {"type": "grafana-pyroscope-datasource", "uid": "pyroscope"},
+       "targets": [{"refId": "A", "queryType": "profile", "profileTypeId": "process_cpu:cpu:nanoseconds:cpu:nanoseconds", "labelSelector": "{service_name=\"glider\"}", "groupBy": []}]},
+      {"id": 4, "type": "flamegraph", "title": "SQLite CPU (eBPF, Python worker)", "gridPos": {"x": 12, "y": 19, "w": 12, "h": 14},
+       "datasource": {"type": "grafana-pyroscope-datasource", "uid": "pyroscope"},
+       "targets": [{"refId": "A", "queryType": "profile", "profileTypeId": "process_cpu:cpu:nanoseconds:cpu:nanoseconds", "labelSelector": "{service_name=\"sqlite\"}", "groupBy": []}]},
+      {"id": 5, "type": "logs", "title": "Benchmark log", "gridPos": {"x": 0, "y": 33, "w": 12, "h": 12},
+       "datasource": {"type": "loki", "uid": "loki"},
+       "targets": [{"refId": "A", "expr": "{service_name=\"glider-bench\", size=~\"$size\"}"}]},
+      {"id": 6, "type": "table", "title": "Traces", "gridPos": {"x": 12, "y": 33, "w": 12, "h": 12},
+       "datasource": {"type": "tempo", "uid": "tempo"},
+       "targets": [{"refId": "A", "queryType": "traceql", "query": "{resource.service.name=\"glider-bench\" && span.size=~\"$size\"}", "limit": 50, "tableType": "traces"}]}
+    ]
+  },
+  "overwrite": true
+}
