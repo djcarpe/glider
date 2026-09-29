@@ -6,6 +6,11 @@
 //!   POST /query   body is the query text     -> JSON {columns, rows, message}
 //!   GET  /stats                              -> JSON
 //!   GET  /health                             -> ok
+//!   GET  /metrics                            -> Prometheus text
+//!
+//! Every request honours an incoming W3C `traceparent`: with an OTLP
+//! exporter installed (see telemetry.rs), the request becomes a server span
+//! and its statements child spans under it.
 //!   GET  /                                   -> the browser console
 //!   /api/*                                   -> typed JSON, see api.rs
 
@@ -16,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use crate::api;
 use crate::graph::Graph;
 use crate::query;
+use crate::telemetry::{self, Attr, Span, TraceContext};
 use crate::value::write_json_string;
 
 pub fn serve(graph: Graph, addr: &str) -> std::io::Result<()> {
@@ -72,6 +78,7 @@ fn handle(mut stream: TcpStream, graph: Arc<Mutex<Graph>>) -> std::io::Result<()
     let path = parts.next().unwrap_or("/").to_string();
 
     let mut content_length = 0usize;
+    let mut traceparent: Option<TraceContext> = None;
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 {
@@ -81,8 +88,11 @@ fn handle(mut stream: TcpStream, graph: Arc<Mutex<Graph>>) -> std::io::Result<()
         if trimmed.is_empty() {
             break;
         }
-        if let Some(rest) = trimmed.to_lowercase().strip_prefix("content-length:") {
+        let lower = trimmed.to_lowercase();
+        if let Some(rest) = lower.strip_prefix("content-length:") {
             content_length = rest.trim().parse().unwrap_or(0);
+        } else if let Some(rest) = lower.strip_prefix("traceparent:") {
+            traceparent = TraceContext::parse(rest);
         }
     }
 
@@ -92,7 +102,9 @@ fn handle(mut stream: TcpStream, graph: Arc<Mutex<Graph>>) -> std::io::Result<()
     }
     let body = String::from_utf8_lossy(&body).to_string();
 
-    let (status, content_type, payload) = route(&method, &path, &body, &graph);
+    let (status, content_type, payload) = traced(&method, &path, traceparent, || {
+        route(&method, &path, &body, &graph)
+    });
 
     let response = format!(
         "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
@@ -103,6 +115,63 @@ fn handle(mut stream: TcpStream, graph: Arc<Mutex<Graph>>) -> std::io::Result<()
     stream.write_all(response.as_bytes())?;
     stream.write_all(payload.as_bytes())?;
     stream.flush()
+}
+
+/// Run a request inside a server span when an exporter is installed: the
+/// span's context becomes the thread's, so the statements the request runs
+/// are its children. Without an exporter this is just `f()`.
+fn traced(
+    method: &str,
+    path: &str,
+    parent: Option<TraceContext>,
+    f: impl FnOnce() -> (&'static str, &'static str, String),
+) -> (&'static str, &'static str, String) {
+    #[cfg(not(target_arch = "wasm32"))]
+    let exporter = telemetry::otlp::installed().filter(|e| e.traces_enabled());
+    // No exporter under wasm, which has no sockets to serve on anyway.
+    #[cfg(target_arch = "wasm32")]
+    let exporter: Option<&std::sync::Arc<NoExporter>> = None;
+    let sampled = parent.map(|p| p.sampled).unwrap_or(true);
+    let (Some(exp), true) = (exporter, sampled) else {
+        let prev = telemetry::set_context(parent);
+        let out = f();
+        telemetry::set_context(prev);
+        return out;
+    };
+    let route = path.split('?').next().unwrap_or("/").to_string();
+    let watch = telemetry::Stopwatch::start();
+    let (trace_id, span_id, parent_id) = Span::ids(parent);
+    let prev = telemetry::set_context(Some(TraceContext { trace_id, span_id, sampled: true }));
+    let out = f();
+    telemetry::set_context(prev);
+    let start = watch.started_unix_ns().unwrap_or(0);
+    let code: i64 = out.0.split(' ').next().and_then(|c| c.parse().ok()).unwrap_or(0);
+    exp.span(Span {
+        trace_id,
+        span_id,
+        parent: parent_id,
+        name: format!("{method} {route}"),
+        kind: telemetry::KIND_SERVER,
+        start_unix_ns: start,
+        end_unix_ns: start + watch.elapsed_ns().unwrap_or(0),
+        attrs: vec![
+            ("http.request.method".into(), method.into()),
+            ("http.route".into(), route.into()),
+            ("url.path".into(), path.split('?').next().unwrap_or("/").into()),
+            ("http.response.status_code".into(), Attr::Int(code)),
+        ],
+        // Per the HTTP conventions, only 5xx marks a server span as failed.
+        error: (code >= 500).then(|| out.0.to_string()),
+    });
+    out
+}
+
+#[cfg(target_arch = "wasm32")]
+struct NoExporter;
+
+#[cfg(target_arch = "wasm32")]
+impl NoExporter {
+    fn span(&self, _: Span) {}
 }
 
 /// Take the graph lock, recovering from a poisoned mutex rather than
@@ -123,6 +192,16 @@ fn route(
     let route = path.split('?').next().unwrap_or("/");
     match (method, route) {
         ("GET", "/health") => ("200 OK", "text/plain", "ok".to_string()),
+        ("GET", "/metrics") => {
+            let g = lock(graph);
+            let dbs = vec![(g.telemetry_name(), g.telemetry())];
+            drop(g);
+            (
+                "200 OK",
+                "text/plain; version=0.0.4",
+                telemetry::prometheus(&dbs),
+            )
+        }
         ("GET", "/") | ("GET", "/index.html") => {
             ("200 OK", "text/html; charset=utf-8", CONSOLE.to_string())
         }

@@ -14,6 +14,11 @@
  * an operating system. The consequence is that it runs unchanged in Node,
  * Deno, Bun, browsers, and edge runtimes.
  *
+ * Telemetry: pass an OpenTelemetry tracer and meter to `loadGlider` and every
+ * call becomes a span with the engine's per-statement report on it, and the
+ * engine's counters become metrics. Or push the engine's own OTLP metrics
+ * with `exportOtlp`. See telemetry.ts.
+ *
  * What does not work under wasm: anything file-backed. `wasm32-unknown-unknown`
  * has no filesystem, so graphs are in-memory only. Persist by exporting JSONL
  * and storing that yourself (IndexedDB, OPFS, a fetch to your server).
@@ -31,7 +36,31 @@ import {
   type Schema,
 } from './types.js'
 
+import {
+  DURATION_BOUNDS,
+  SPAN_KIND_CLIENT,
+  STATUS_ERROR,
+  monoMs,
+  nowMs,
+  queryAttributes,
+  type Attributes,
+  type DbMetrics,
+  type HistogramLike,
+  type MeterLike,
+  type OpReport,
+  type OtlpExportOptions,
+  type TelemetryOptions,
+  type TelemetrySnapshot,
+  type TracerLike,
+} from './telemetry.js'
+
 export * from './types.js'
+export * from './telemetry.js'
+
+/** Options for `loadGlider`. */
+export interface LoadOptions {
+  telemetry?: TelemetryOptions
+}
 
 /** The raw exports glider's wasm module provides. */
 interface Exports {
@@ -54,6 +83,12 @@ interface Exports {
   glider_alloc(len: number): number
   glider_dealloc(p: number, len: number): void
   glider_version(): number
+  glider_telemetry_json(): number
+  glider_last_op_json(): number
+  glider_db_metrics_json(db: number): number
+  glider_metrics_otlp(dbs: number, n: number, service: number, nowUnixMs: number): number
+  glider_metrics_prometheus(dbs: number, n: number): number
+  glider_observe_duration_ms(ms: number): void
 }
 
 /** Anything we know how to turn into wasm bytes. */
@@ -72,9 +107,9 @@ export type WasmSource =
  * the published package is laid out. Pass a source explicitly when bundling,
  * or when serving the binary from somewhere else.
  */
-export async function loadGlider(source?: WasmSource): Promise<GliderModule> {
+export async function loadGlider(source?: WasmSource, options: LoadOptions = {}): Promise<GliderModule> {
   const instance = await instantiate(source ?? new URL('./glider.wasm', import.meta.url))
-  return new GliderModule(instance.exports as unknown as Exports)
+  return new GliderModule(instance.exports as unknown as Exports, options)
 }
 
 async function instantiate(source: WasmSource): Promise<WebAssembly.Instance> {
@@ -129,9 +164,220 @@ export class GliderModule {
   readonly #e: Exports
   readonly #dec = new TextDecoder()
   readonly #enc = new TextEncoder()
+  /** Open graphs, for per-database metrics. */
+  readonly #open = new Set<GliderDb>()
+  readonly #tracer: TracerLike | undefined
+  readonly #duration: HistogramLike | undefined
+  readonly #queryText: boolean
+  /** Metrics read for the current collection; dropped when graphs come and go. */
+  #cached: { at: number; snap: TelemetrySnapshot; dbs: [string, DbMetrics][] } | undefined
 
-  constructor(exports: Exports) {
+  constructor(exports: Exports, options: LoadOptions = {}) {
     this.#e = exports
+    const t = options.telemetry ?? {}
+    this.#tracer = t.tracer
+    this.#queryText = t.queryText ?? true
+    if (t.meter) {
+      this.#duration = t.meter.createHistogram('glider.query.duration', {
+        unit: 's',
+        description: 'Statement duration.',
+        advice: { explicitBucketBoundaries: DURATION_BOUNDS },
+      })
+      this.#observe(t.meter)
+    }
+  }
+
+  // ---- telemetry -----------------------------------------------------
+
+  /** Process-wide counters: statements by operation and outcome, rows,
+   *  pages, and the duration histogram (fed by this wrapper's timings). */
+  telemetry(): TelemetrySnapshot {
+    return JSON.parse(this.take(this.#e.glider_telemetry_json()) ?? '{}') as TelemetrySnapshot
+  }
+
+  /** The engine's report on the most recent statement. */
+  lastOp(): OpReport | null {
+    const j = this.take(this.#e.glider_last_op_json())
+    return j === null ? null : (JSON.parse(j) as OpReport)
+  }
+
+  /** Process counters and every open graph's state as an OTLP/HTTP JSON
+   *  metrics request, ready to POST to `<collector>/v1/metrics`. */
+  otlpMetrics(service = 'glider'): string {
+    const out = this.#withHandles((p, n) =>
+      this.withCString(service, (sp) => this.take(this.#e.glider_metrics_otlp(p, n, sp, nowMs()))),
+    )
+    if (out === null) throw new GliderError(this.#lastError() ?? 'could not render metrics')
+    return out
+  }
+
+  /** The same in the Prometheus text format. */
+  prometheus(): string {
+    const out = this.#withHandles((p, n) => this.take(this.#e.glider_metrics_prometheus(p, n)))
+    if (out === null) throw new GliderError(this.#lastError() ?? 'could not render metrics')
+    return out
+  }
+
+  /**
+   * POST `otlpMetrics()` to an OTLP/HTTP collector — metrics without an
+   * OpenTelemetry SDK. Call it on an interval; the counters are cumulative.
+   */
+  async exportOtlp(opts: OtlpExportOptions): Promise<void> {
+    const f = opts.fetch ?? fetch
+    const url = opts.endpoint.replace(/\/+$/, '') + '/v1/metrics'
+    const res = await f(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...(opts.headers ?? {}) },
+      body: this.otlpMetrics(opts.service ?? 'glider'),
+    })
+    if (!res.ok) throw new GliderError(`OTLP export to ${url} failed: ${res.status}`)
+  }
+
+  /** Every open graph's handle, as a u32 array in wasm memory. */
+  #withHandles<T>(fn: (ptr: number, n: number) => T): T {
+    const handles = [...this.#open].map((db) => db.handle).filter((h) => h !== 0)
+    if (handles.length === 0) return fn(0, 0)
+    const len = handles.length * 4
+    const ptr = this.#e.glider_alloc(len)
+    if (!ptr) throw new GliderError(`could not allocate ${len} bytes in wasm memory`)
+    try {
+      const view = new DataView(this.#e.memory.buffer)
+      handles.forEach((h, i) => view.setUint32(ptr + 4 * i, h, true))
+      return fn(ptr, handles.length)
+    } finally {
+      this.#e.glider_dealloc(ptr, len)
+    }
+  }
+
+  /** Observable instruments over the engine's counters and open graphs. */
+  #observe(meter: MeterLike): void {
+    // One snapshot per collection, shared by every callback in it.
+    const read = () => {
+      const at = monoMs()
+      let cached = this.#cached
+      if (!cached || at - cached.at > 50) {
+        cached = this.#cached = {
+          at,
+          snap: this.telemetry(),
+          dbs: [...this.#open].filter((d) => d.handle !== 0).map((d) => {
+            const m = d.metrics()
+            return [m.name, m]
+          }),
+        }
+      }
+      return cached
+    }
+    const counter = (name: string, unit: string, description: string, v: (s: TelemetrySnapshot) => number) =>
+      meter.createObservableCounter(name, { unit, description }).addCallback((r) => r.observe(v(read().snap)))
+    meter
+      .createObservableCounter('glider.queries', { unit: '{statement}', description: 'Statements executed.' })
+      .addCallback((r) => {
+        for (const q of read().snap.queries) {
+          if (q.ok) r.observe(q.ok, { 'db.operation.name': q.op, 'glider.outcome': 'ok' })
+          if (q.error) r.observe(q.error, { 'db.operation.name': q.op, 'glider.outcome': 'error' })
+        }
+      })
+    counter('glider.rows', '{row}', 'Rows returned by statements.', (s) => s.rows)
+    counter('glider.touched', '{entity}', 'Nodes and relationships written by statements.', (s) => s.touched)
+    counter('glider.page.reads', '{page}', 'Pages read from storage by statements.', (s) => s.page_reads)
+    counter('glider.page.writes', '{page}', 'Pages written to storage by statements.', (s) => s.page_writes)
+    counter('glider.page.hits', '{page}', 'Page-cache hits during statements.', (s) => s.page_hits)
+    counter('glider.page.misses', '{page}', 'Page-cache misses during statements.', (s) => s.page_misses)
+
+    const perDb = (
+      kind: 'gauge' | 'counter',
+      name: string,
+      unit: string,
+      description: string,
+      v: (d: DbMetrics) => number | null,
+    ) => {
+      const inst =
+        kind === 'gauge'
+          ? meter.createObservableGauge(name, { unit, description })
+          : meter.createObservableCounter(name, { unit, description })
+      inst.addCallback((r) => {
+        for (const [db, m] of read().dbs) {
+          const x = v(m)
+          if (x !== null) r.observe(x, { 'glider.db': db })
+        }
+      })
+    }
+    perDb('gauge', 'glider.db.nodes', '{node}', 'Nodes in the database.', (d) => d.nodes)
+    perDb('gauge', 'glider.db.edges', '{relationship}', 'Relationships in the database.', (d) => d.edges)
+    perDb('gauge', 'glider.db.size', 'By', 'Bytes the database occupies.', (d) => d.bytes)
+    perDb('gauge', 'glider.db.memory.limit', 'By', 'Memory limit of an in-memory database.', (d) => d.memory_limit)
+    perDb('gauge', 'glider.db.log.size', 'By', 'Write-ahead log a crash would replay.', (d) => d.log_bytes)
+    perDb('gauge', 'glider.db.cache.resident', '{page}', 'Pages resident in the cache.', (d) => d.resident_pages)
+    perDb('gauge', 'glider.db.pages.allocated', '{page}', 'Pages in use.', (d) => d.allocated_pages)
+    perDb('counter', 'glider.db.cache.hits', '{page}', 'Page-cache hits since open.', (d) => d.page_hits)
+    perDb('counter', 'glider.db.cache.misses', '{page}', 'Page-cache misses since open.', (d) => d.page_misses)
+    perDb('counter', 'glider.db.cache.evictions', '{page}', 'Pages evicted since open.', (d) => d.evictions)
+    perDb('counter', 'glider.db.io.reads', '{page}', 'Pages read from storage since open.', (d) => d.page_reads)
+    perDb('counter', 'glider.db.io.writes', '{page}', 'Pages written to storage since open.', (d) => d.page_writes)
+    perDb('counter', 'glider.db.commits', '{transaction}', 'Transactions committed since open.', (d) => d.commits)
+    perDb('counter', 'glider.db.rollbacks', '{transaction}', 'Transactions rolled back since open.', (d) => d.rollbacks)
+    perDb('counter', 'glider.db.checkpoints', '{checkpoint}', 'Checkpoints since open.', (d) => d.checkpoints)
+  }
+
+  /**
+   * Run one call against the engine under telemetry: time it, feed the
+   * engine's histogram (it has no clock under wasm), and — with a tracer or
+   * meter — record a span and a duration from the engine's report.
+   * `statement` is the text for calls that run one, which have a report.
+   * @internal
+   */
+  instrument<T>(name: string, statement: string | undefined, fn: () => T): T {
+    const tracer = this.#tracer
+    const span = tracer?.startSpan(`glider ${name}`, {
+      kind: SPAN_KIND_CLIENT,
+      attributes: { 'db.system.name': 'glider' },
+    })
+    const t0 = monoMs()
+    let failure: unknown
+    try {
+      return fn()
+    } catch (e) {
+      failure = e
+      throw e
+    } finally {
+      const ms = monoMs() - t0
+      let attrs: Attributes = { 'db.system.name': 'glider', 'db.operation.name': name }
+      if (statement !== undefined) {
+        this.#e.glider_observe_duration_ms(ms)
+        const r = span || this.#duration ? this.lastOp() : null
+        if (r) attrs = queryAttributes(r, this.#queryText ? statement : undefined)
+      }
+      this.#duration?.record(ms / 1000, {
+        'db.system.name': 'glider',
+        'db.operation.name': attrs['db.operation.name'] ?? name,
+        'glider.outcome': failure === undefined ? 'ok' : 'error',
+      })
+      if (span) {
+        // `glider MATCH`, like the other runtimes, once the engine has said.
+        if (statement !== undefined && attrs['db.operation.name'] !== name) {
+          span.updateName?.(`glider ${attrs['db.operation.name']}`)
+        }
+        span.setAttributes(attrs)
+        if (failure !== undefined) {
+          const msg = failure instanceof Error ? failure.message : String(failure)
+          span.recordException(failure instanceof Error ? failure : msg)
+          span.setStatus({ code: STATUS_ERROR, message: msg })
+        }
+        span.end()
+      }
+    }
+  }
+
+  /** @internal */
+  opened(db: GliderDb): void {
+    this.#open.add(db)
+    this.#cached = undefined
+  }
+
+  /** @internal */
+  closed(db: GliderDb): void {
+    this.#open.delete(db)
+    this.#cached = undefined
   }
 
   /** glider's version string. */
@@ -143,7 +389,9 @@ export class GliderModule {
   open(): GliderDb {
     const handle = this.#e.glider_open_memory()
     if (!handle) throw new GliderError(this.#lastError() ?? 'could not open a graph')
-    return new GliderDb(this, handle)
+    const db = new GliderDb(this, handle)
+    this.opened(db)
+    return db
   }
 
   /**
@@ -170,7 +418,9 @@ export class GliderModule {
       this.#e.glider_dealloc(ptr, cap)
     }
     if (!handle) throw new GliderError(this.#lastError() ?? 'could not open that file')
-    return new GliderDb(this, handle)
+    const db = new GliderDb(this, handle)
+    this.opened(db)
+    return db
   }
 
   // ---- internals used by GliderDb ------------------------------------
@@ -258,13 +508,15 @@ export class GliderDb {
   /** Run a query and return the typed result, including the graph payload. */
   query(cypher: string): QueryResult {
     const db = this.#alive()
-    const json = this.mod.withCString(cypher, (p) =>
-      this.mod.take(this.mod.raw.glider_query_json(db, p)),
-    )
-    if (json === null) {
-      throw new GliderError(this.mod.lastError() ?? 'query failed', cypher)
-    }
-    return JSON.parse(json) as QueryResult
+    const t0 = monoMs()
+    const json = this.mod.instrument('query', cypher, () => {
+      const j = this.mod.withCString(cypher, (p) => this.mod.take(this.mod.raw.glider_query_json(db, p)))
+      if (j === null) throw new GliderError(this.mod.lastError() ?? 'query failed', cypher)
+      return j
+    })
+    const r = JSON.parse(json) as QueryResult
+    // The engine has no clock under wasm and reports 0; fill in ours.
+    return r.ms ? r : { ...r, ms: monoMs() - t0 }
   }
 
   /**
@@ -283,7 +535,7 @@ export class GliderDb {
   /** Labels, relationship types and indexes, with counts. */
   schema(): Schema {
     const db = this.#alive()
-    const json = this.mod.take(this.mod.raw.glider_schema_json(db))
+    const json = this.mod.instrument('SCHEMA', 'SCHEMA', () => this.mod.take(this.mod.raw.glider_schema_json(db)))
     if (json === null) throw new GliderError(this.mod.lastError() ?? 'schema failed')
     return JSON.parse(json) as Schema
   }
@@ -291,7 +543,9 @@ export class GliderDb {
   /** Neighbours of one node, both directions, capped by `limit`. */
   expand(id: number, limit = 50): QueryResult['graph'] {
     const db = this.#alive()
-    const json = this.mod.take(this.mod.raw.glider_expand_json(db, BigInt(id), limit))
+    const json = this.mod.instrument('expand', undefined, () =>
+      this.mod.take(this.mod.raw.glider_expand_json(db, BigInt(id), limit)),
+    )
     if (json === null) throw new GliderError(this.mod.lastError() ?? `could not expand node ${id}`)
     return (JSON.parse(json) as { graph: QueryResult['graph'] }).graph
   }
@@ -302,10 +556,12 @@ export class GliderDb {
    */
   nodes(opts: PageOptions = {}): NodePage {
     const db = this.#alive()
-    const json = this.mod.withOptCString(opts.label, (lp) =>
-      this.mod.withOptCString(opts.q, (qp) =>
-        this.mod.take(
-          this.mod.raw.glider_nodes_json(db, lp, qp, BigInt(opts.from ?? 0), opts.limit ?? 50),
+    const json = this.mod.instrument('nodes', undefined, () =>
+      this.mod.withOptCString(opts.label, (lp) =>
+        this.mod.withOptCString(opts.q, (qp) =>
+          this.mod.take(
+            this.mod.raw.glider_nodes_json(db, lp, qp, BigInt(opts.from ?? 0), opts.limit ?? 50),
+          ),
         ),
       ),
     )
@@ -316,10 +572,12 @@ export class GliderDb {
   /** A page of relationships with their endpoints. Same contract as `nodes`. */
   edges(opts: PageOptions = {}): EdgePage {
     const db = this.#alive()
-    const json = this.mod.withOptCString(opts.type, (tp) =>
-      this.mod.withOptCString(opts.q, (qp) =>
-        this.mod.take(
-          this.mod.raw.glider_edges_json(db, tp, qp, BigInt(opts.from ?? 0), opts.limit ?? 50),
+    const json = this.mod.instrument('edges', undefined, () =>
+      this.mod.withOptCString(opts.type, (tp) =>
+        this.mod.withOptCString(opts.q, (qp) =>
+          this.mod.take(
+            this.mod.raw.glider_edges_json(db, tp, qp, BigInt(opts.from ?? 0), opts.limit ?? 50),
+          ),
         ),
       ),
     )
@@ -330,7 +588,9 @@ export class GliderDb {
   /** Bulk load JSON Lines. Returns the number of entities imported. */
   importJsonl(jsonl: string): number {
     const db = this.#alive()
-    const rc = this.mod.withCString(jsonl, (p) => this.mod.raw.glider_import_jsonl(db, p))
+    const rc = this.mod.instrument('import', undefined, () =>
+      this.mod.withCString(jsonl, (p) => this.mod.raw.glider_import_jsonl(db, p)),
+    )
     if (rc < 0) throw new GliderError(this.mod.lastError() ?? 'import failed')
     return rc
   }
@@ -341,7 +601,7 @@ export class GliderDb {
    */
   exportJsonl(): string {
     const db = this.#alive()
-    const s = this.mod.take(this.mod.raw.glider_export_jsonl(db))
+    const s = this.mod.instrument('export', undefined, () => this.mod.take(this.mod.raw.glider_export_jsonl(db)))
     if (s === null) throw new GliderError(this.mod.lastError() ?? 'export failed')
     return s
   }
@@ -349,7 +609,7 @@ export class GliderDb {
   /** Node, edge, label and index counts. */
   stats(): QueryResult {
     const db = this.#alive()
-    const json = this.mod.take(this.mod.raw.glider_stats(db))
+    const json = this.mod.instrument('STATS', 'STATS', () => this.mod.take(this.mod.raw.glider_stats(db)))
     if (json === null) throw new GliderError(this.mod.lastError() ?? 'stats failed')
     // glider_stats predates the typed API and returns the flat shape, so give
     // it the same surface as everything else rather than leaking the
@@ -358,11 +618,24 @@ export class GliderDb {
     return { ...flat, graph: { nodes: [], edges: [] }, ms: 0 }
   }
 
+  /** This graph's counts, size, cache and commit counters. */
+  metrics(): DbMetrics {
+    const json = this.mod.take(this.mod.raw.glider_db_metrics_json(this.#alive()))
+    if (json === null) throw new GliderError(this.mod.lastError() ?? 'metrics failed')
+    return JSON.parse(json) as DbMetrics
+  }
+
+  /** @internal The raw handle, 0 once closed. */
+  get handle(): number {
+    return this.#handle
+  }
+
   /** Release the graph. Safe to call twice. */
   close(): void {
     if (this.#handle) {
       this.mod.raw.glider_close(this.#handle)
       this.#handle = 0
+      this.mod.closed(this)
     }
   }
 

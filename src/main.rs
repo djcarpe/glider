@@ -88,6 +88,11 @@ enum Mode {
 }
 
 fn main() {
+    // OTLP export when the environment asks for it (OTEL_EXPORTER_OTLP_ENDPOINT
+    // and friends; see docs/OBSERVABILITY.md). Off, and free, otherwise.
+    if let Err(e) = glider::telemetry::otlp::install_from_env("glider") {
+        eprintln!("telemetry: {e}");
+    }
     let code = match run() {
         Ok(()) => 0,
         Err(e) => {
@@ -95,6 +100,7 @@ fn main() {
             1
         }
     };
+    glider::telemetry::otlp::flush();
     std::process::exit(code);
 }
 

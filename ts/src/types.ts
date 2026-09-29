@@ -46,6 +46,9 @@ export interface QueryResult {
   readonly ms: number
   readonly message?: string
   readonly touched: number
+  /** The engine's report on the statement: operation, rows, pages read and
+   *  hit. Absent from `stats()`. */
+  readonly op?: import('./telemetry.js').OpReport
 }
 
 export interface SchemaEntry {

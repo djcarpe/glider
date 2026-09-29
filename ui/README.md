@@ -31,6 +31,14 @@ httpTransport   wasmTransport
   /api/*          in-process
 ```
 
+## Telemetry
+
+Every query response carries the engine's report on the statement as `op`
+(see `../docs/OBSERVABILITY.md`). The frame footer shows it as pages read and
+the share served from the page cache, next to the time. Over HTTP the time is
+the server's; under wasm it is measured in the tab, because the engine has no
+clock there.
+
 ## Embedding in the binary
 
 The embedded build is inlined to a single `index.html` by

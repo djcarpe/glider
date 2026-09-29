@@ -31,6 +31,7 @@ pub mod server;
 pub mod storage;
 pub mod store;
 pub mod stream;
+pub mod telemetry;
 pub mod traverse;
 pub mod types;
 pub mod utils;

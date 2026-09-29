@@ -89,11 +89,25 @@ export default function Frame({ frame, onClose, onRunQuery }) {
           )}
           {frame.result.touched > 0 && <span>{frame.result.touched} touched</span>}
           <span className="spacer" />
+          {pagesLabel(frame.result.op) && (
+            <span title="Pages the statement read; how many came from the page cache">
+              {pagesLabel(frame.result.op)}
+            </span>
+          )}
           <span>{fmtMs(frame.result.ms)}</span>
         </div>
       )}
     </div>
   )
+}
+
+/** "24 pages · 100% cached", from the engine's report on the statement. */
+function pagesLabel(op) {
+  if (!op) return ''
+  const pages = op.page_hits + op.page_misses
+  if (pages === 0) return ''
+  const cached = Math.round((100 * op.page_hits) / pages)
+  return `${pages} ${pages === 1 ? 'page' : 'pages'} · ${cached}% cached`
 }
 
 function fmtMs(ms) {

@@ -519,6 +519,165 @@ pub unsafe extern "C" fn glider_edges_json(
     }
 }
 
+// ------------------------------------------------------------------ telemetry
+//
+// The engine keeps the numbers; the host exports them (see
+// docs/OBSERVABILITY.md). Everything here is available on every target,
+// wasm included, except starting the built-in OTLP exporter, which needs
+// threads and sockets.
+
+/// The process-wide counters as JSON: statements by operation and outcome,
+/// rows, touched, page traffic, and the duration histogram.
+#[no_mangle]
+pub extern "C" fn glider_telemetry_json() -> *mut c_char {
+    guard(std::ptr::null_mut(), || out_string(crate::telemetry::snapshot().to_json()))
+}
+
+/// The calling thread's most recent statement as JSON — operation, rows,
+/// touched, page reads/hits/misses, duration where the target has a clock,
+/// error — or NULL if this thread has run none. Read it right after a call to
+/// annotate the host's own span for that call.
+#[no_mangle]
+pub extern "C" fn glider_last_op_json() -> *mut c_char {
+    guard(std::ptr::null_mut(), || match crate::telemetry::last_op() {
+        Some(r) => out_string(r.to_json()),
+        None => Ok(std::ptr::null_mut()),
+    })
+}
+
+/// One database's state as JSON: its telemetry name, counts, size, cache and
+/// I/O counters, log.
+///
+/// # Safety
+/// `db` must be a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn glider_db_metrics_json(db: *mut GliderDb) -> *mut c_char {
+    unsafe {
+        guard(std::ptr::null_mut(), || {
+            let db = as_db(db)?;
+            let mut out = String::from("{\"name\":");
+            crate::value::write_json_string(&db.graph.telemetry_name(), &mut out);
+            out.push(',');
+            out.push_str(&db.graph.telemetry().to_json()[1..]);
+            out_string(out)
+        })
+    }
+}
+
+/// `(name, metrics)` for each non-NULL handle in `dbs[..n]`.
+unsafe fn db_list(dbs: *const *mut GliderDb, n: usize) -> Vec<(String, crate::telemetry::DbMetrics)> {
+    unsafe {
+        if dbs.is_null() {
+            return Vec::new();
+        }
+        std::slice::from_raw_parts(dbs, n)
+            .iter()
+            .filter(|db| !db.is_null())
+            .map(|db| {
+                let g = &(**db).graph;
+                (g.telemetry_name(), g.telemetry())
+            })
+            .collect()
+    }
+}
+
+/// Process counters, plus the state of the `n` databases at `dbs` (NULL
+/// and 0 for none), as an OTLP/HTTP JSON metrics request ready to POST to
+/// `<collector>/v1/metrics`. `service` (NULL for "glider") becomes
+/// `service.name`. `now_unix_ms` is the host's clock; pass 0 to use the
+/// engine's (not available under wasm).
+///
+/// # Safety
+/// `dbs` must be NULL or point to `n` handles, each NULL or live; `service`
+/// NULL or a NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn glider_metrics_otlp(
+    dbs: *const *mut GliderDb,
+    n: usize,
+    service: *const c_char,
+    now_unix_ms: f64,
+) -> *mut c_char {
+    unsafe {
+        guard(std::ptr::null_mut(), || {
+            let service = as_opt_str(service, "service")?.unwrap_or("glider");
+            let now = if now_unix_ms > 0.0 {
+                (now_unix_ms * 1e6) as u64
+            } else {
+                crate::telemetry::now_unix_ns().ok_or("no clock on this target: pass now_unix_ms")?
+            };
+            let res = crate::telemetry::default_resource(service);
+            out_string(crate::telemetry::otlp_metrics_json(&res, now, &db_list(dbs, n)))
+        })
+    }
+}
+
+/// Process counters, plus the state of the `n` databases at `dbs`, in the
+/// Prometheus text format.
+///
+/// # Safety
+/// As `glider_metrics_otlp`.
+#[no_mangle]
+pub unsafe extern "C" fn glider_metrics_prometheus(dbs: *const *mut GliderDb, n: usize) -> *mut c_char {
+    unsafe { guard(std::ptr::null_mut(), || out_string(crate::telemetry::prometheus(&db_list(dbs, n)))) }
+}
+
+/// Add a duration the host measured to the statement-duration histogram.
+/// For hosts where the engine has no clock (wasm); native builds time
+/// statements themselves, so calling this there counts them twice.
+#[no_mangle]
+pub extern "C" fn glider_observe_duration_ms(ms: f64) {
+    if ms.is_finite() && ms >= 0.0 {
+        crate::telemetry::observe_duration((ms * 1e6) as u64);
+    }
+}
+
+/// Start the built-in OTLP/HTTP exporter from the standard `OTEL_*`
+/// environment variables, with `service` (NULL for "glider") as the default
+/// `service.name`. Returns 1 if an exporter is running, 0 if the environment
+/// asks for none (no endpoint, or `OTEL_SDK_DISABLED`), -1 on a bad
+/// configuration. Once started, every statement becomes a span and every
+/// open database is reported with the metrics. Idempotent.
+///
+/// # Safety
+/// `service` must be NULL or a NUL-terminated UTF-8 string.
+#[cfg(not(target_arch = "wasm32"))]
+#[no_mangle]
+pub unsafe extern "C" fn glider_telemetry_start(service: *const c_char) -> c_int {
+    unsafe {
+        guard(-1, || {
+            let service = as_opt_str(service, "service")?.unwrap_or("glider");
+            crate::telemetry::otlp::install_from_env(service).map(|on| on as c_int)
+        })
+    }
+}
+
+/// Push pending spans and metrics now. Call before the process exits.
+#[cfg(not(target_arch = "wasm32"))]
+#[no_mangle]
+pub extern "C" fn glider_telemetry_flush() {
+    crate::telemetry::otlp::flush();
+}
+
+/// Parent the calling thread's following statements under a W3C
+/// `traceparent` (e.g. the incoming request's). NULL clears it. Returns 0,
+/// or -1 if the header does not parse.
+///
+/// # Safety
+/// `traceparent` must be NULL or a NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn glider_trace_context(traceparent: *const c_char) -> c_int {
+    unsafe {
+        guard(-1, || {
+            let ctx = match as_opt_str(traceparent, "traceparent")? {
+                None => None,
+                Some(s) => Some(crate::telemetry::TraceContext::parse(s).ok_or("not a valid traceparent")?),
+            };
+            crate::telemetry::set_context(ctx);
+            Ok(0)
+        })
+    }
+}
+
 // ------------------------------------------------------- guest-side memory
 //
 // A C caller has malloc. A WebAssembly caller does not: JavaScript cannot put

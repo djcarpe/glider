@@ -62,6 +62,33 @@ int glider_set_auto_compact(glider_db *db, uint64_t bytes);
 int   glider_import_jsonl(glider_db *db, const char *jsonl);
 char *glider_export_jsonl(glider_db *db);
 
+/* --- telemetry (docs/OBSERVABILITY.md) --------------------------------- */
+
+/* Process-wide counters and duration histogram, as JSON. */
+char *glider_telemetry_json(void);
+/* The calling thread's last statement: op, rows, touched, page reads/hits/
+   misses, duration_ns, error. NULL if none yet. */
+char *glider_last_op_json(void);
+/* One database's counts, size, cache and I/O counters, as JSON. */
+char *glider_db_metrics_json(glider_db *db);
+/* OTLP/HTTP JSON for <collector>/v1/metrics: process counters plus the n
+   databases at dbs (NULL, 0 for none). service may be NULL; now_unix_ms 0
+   uses the engine's clock. */
+char *glider_metrics_otlp(glider_db *const *dbs, size_t n, const char *service,
+                          double now_unix_ms);
+/* The same in the Prometheus text exposition format. */
+char *glider_metrics_prometheus(glider_db *const *dbs, size_t n);
+/* Parent this thread's following statements under a W3C traceparent; NULL
+   clears. Returns 0, or -1 if it does not parse. */
+int   glider_trace_context(const char *traceparent);
+/* Start the built-in OTLP exporter from OTEL_* environment variables.
+   1 = running, 0 = not configured, -1 = bad configuration. Not in wasm. */
+int   glider_telemetry_start(const char *service);
+/* Push pending spans and metrics now; call before exit. Not in wasm. */
+void  glider_telemetry_flush(void);
+/* Feed a host-measured duration into the histogram (wasm hosts only). */
+void  glider_observe_duration_ms(double ms);
+
 /* --- misc -------------------------------------------------------------- */
 
 const char *glider_last_error(void); /* borrowed, thread-local, may be NULL */

@@ -154,14 +154,47 @@ glider implements a Cypher-flavoured subset. Three divergences bite most often:
 
 ## Timing
 
-`QueryResult.ms` is always `0` under wasm — the target has no clock, so
-`Instant::now()` would trap. Time it from the host:
+The engine has no clock under wasm, so the wrapper times each call itself.
+`QueryResult.ms` is that host-measured time, and it also feeds the engine's
+duration histogram.
+
+## Telemetry
+
+Pass an OpenTelemetry tracer and meter, and every call becomes a client span
+(`glider MATCH`, `glider CALL`, ...). Its parent is the active span, and it
+carries the engine's report on the statement: `db.operation.name`,
+`db.query.text`, `db.response.returned_rows`, `db.stored_procedure.name`,
+`glider.touched`, and `glider.page.{reads,writes,hits,misses}`. The engine's
+counters and each open graph's state become metrics.
 
 ```ts
-const t0 = performance.now()
-const r = db.query(q)
-const ms = performance.now() - t0
+import { trace, metrics } from '@opentelemetry/api'
+
+const glider = await loadGlider(undefined, {
+  telemetry: {
+    tracer: trace.getTracer('glider'),
+    meter: metrics.getMeter('glider'),
+    queryText: true, // default; false leaves db.query.text off
+  },
+})
 ```
+
+The package does not depend on `@opentelemetry/api`. The tracer and meter are
+typed by shape, so any compatible object works.
+
+Without an SDK, pull or push the engine's numbers directly:
+
+| | |
+|---|---|
+| `glider.exportOtlp({ endpoint, service?, headers? })` | POST OTLP/HTTP JSON metrics to `<endpoint>/v1/metrics` with `fetch` |
+| `glider.otlpMetrics(service?)` | the same payload as a string |
+| `glider.prometheus()` | Prometheus text |
+| `glider.telemetry()` | process counters and the duration histogram |
+| `glider.lastOp()` | the engine's report on the last statement |
+| `db.metrics()` | one graph's counts, size, cache and commit counters |
+
+The names match glider's native and BEAM runtimes; see
+[docs/OBSERVABILITY.md](../docs/OBSERVABILITY.md).
 
 ## Threads
 

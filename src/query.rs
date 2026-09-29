@@ -22,6 +22,7 @@ use std::collections::BTreeMap;
 use crate::algo::{self, Adjacency};
 use crate::graph::{Dir, Error, Graph, Projection as AlgoView, Result, Tier};
 use crate::ooc::StateVec;
+use crate::telemetry;
 use crate::value::{parse_json, write_json_string, Value};
 
 // ------------------------------------------------------------------- tokens
@@ -404,6 +405,27 @@ enum Stmt {
     Commit,
     Rollback,
     Help,
+}
+
+impl Stmt {
+    /// The statement kind, as `db.operation.name` in telemetry.
+    fn op(&self) -> &'static str {
+        match self {
+            Stmt::Explain(_) => "EXPLAIN",
+            Stmt::Match { .. } => "MATCH",
+            Stmt::Create(_) => "CREATE",
+            Stmt::Call { .. } => "CALL",
+            Stmt::Index { .. } => "INDEX",
+            Stmt::Stats => "STATS",
+            Stmt::Schema => "SCHEMA",
+            Stmt::Compact => "COMPACT",
+            Stmt::Clear => "CLEAR",
+            Stmt::Begin => "BEGIN",
+            Stmt::Commit => "COMMIT",
+            Stmt::Rollback => "ROLLBACK",
+            Stmt::Help => "HELP",
+        }
+    }
 }
 
 fn parse(src: &str) -> Result<Stmt> {
@@ -1144,7 +1166,38 @@ pub fn execute(g: &mut Graph, src: &str) -> Result<QueryResult> {
 /// assert_eq!(r.rows[0][0], Value::from("Ada"));
 /// ```
 pub fn execute_with(g: &mut Graph, src: &str, params: &[(String, Value)]) -> Result<QueryResult> {
-    let stmt = parse_with(src, params)?;
+    let watch = telemetry::Stopwatch::start();
+    let before = g.pager_stats();
+    let mut report = telemetry::OpReport { op: "INVALID", ..Default::default() };
+    let result = match parse_with(src, params) {
+        Ok(stmt) => {
+            report.op = stmt.op();
+            if let Stmt::Call { name, .. } = &stmt {
+                report.procedure = Some(name.clone());
+            }
+            execute_stmt(g, stmt)
+        }
+        Err(e) => Err(e),
+    };
+    let after = g.pager_stats();
+    report.page_reads = after.reads.saturating_sub(before.reads);
+    report.page_writes = after.writes.saturating_sub(before.writes);
+    report.page_hits = after.hits.saturating_sub(before.hits);
+    report.page_misses = after.misses.saturating_sub(before.misses);
+    report.duration_ns = watch.elapsed_ns();
+    match &result {
+        Ok(r) => {
+            report.rows = r.rows.len() as u64;
+            report.touched = r.touched as u64;
+        }
+        Err(e) => report.error = Some(e.to_string()),
+    }
+    let db = telemetry::wants_db_metrics().then(|| (g.telemetry_id(), g.telemetry_name(), g.telemetry()));
+    telemetry::finish(report, src, &watch, db);
+    result
+}
+
+fn execute_stmt(g: &mut Graph, stmt: Stmt) -> Result<QueryResult> {
     // STATS reports the damage itself; everything else must not return
     // results computed from an image that failed a checksum along the way.
     let reports_damage = matches!(stmt, Stmt::Stats);

@@ -331,9 +331,10 @@ server does.
 POST /query    body is the query text   -> {"columns":[...],"rows":[...],"message":"..."}
 GET  /stats
 GET  /health
+GET  /metrics                           -> Prometheus text
 GET  /                                  -> the browser console
 
-POST /api/query                         -> typed result + graph:{nodes,edges}
+POST /api/query                         -> typed result + graph:{nodes,edges} + op (engine report)
 GET  /api/schema                        -> node/edge totals; labels, rel types, indexes with counts
 GET  /api/expand?id=N&limit=K           -> neighbours of one node
 GET  /api/nodes?label=&q=&from=&limit=  -> a page of nodes:  {nodes, next, total}
@@ -350,6 +351,17 @@ against labels (or the relationship type), every property value, and the id.
 objects tagged `"_e":"node"` / `"_e":"rel"` and adds the drawable graph
 payload. Use `/api/*` for anything that renders a graph, `/query` for anything
 already written against it.
+
+## Observability
+
+Every runtime — native, wasm, BEAM — reports the same metrics and spans under
+the same names (`glider.queries`, `glider.query.duration`, `glider MATCH`
+spans with `db.operation.name`, rows and page-cache hits). Natively, set
+`OTEL_EXPORTER_OTLP_ENDPOINT` and glider pushes OTLP itself, std only;
+`glider serve` also honours `traceparent` and serves `/metrics`. The wasm
+wrapper takes an OpenTelemetry tracer and meter; glider_ex emits `:telemetry`
+events and has `Glider.OpenTelemetry.setup/0`. See
+[docs/OBSERVABILITY.md](docs/OBSERVABILITY.md).
 
 ## Import / export
 

@@ -905,6 +905,14 @@ pub struct Graph {
     last_node: std::sync::Mutex<Option<std::sync::Arc<NodeRef>>>,
     /// The same for edges.
     last_edge: std::sync::Mutex<Option<std::sync::Arc<EdgeRef>>>,
+    /// Identifies this graph to the telemetry exporter's registry.
+    tel_id: u64,
+}
+
+impl Drop for Graph {
+    fn drop(&mut self) {
+        crate::telemetry::forget_db(self.tel_id);
+    }
 }
 
 impl Graph {
@@ -931,6 +939,7 @@ impl Graph {
             work_mem: DEFAULT_WORK_MEM,
             last_node: std::sync::Mutex::new(None),
             last_edge: std::sync::Mutex::new(None),
+            tel_id: crate::telemetry::next_db_id(),
         })
     }
 
@@ -2299,6 +2308,46 @@ impl Graph {
     /// Page-cache and transaction statistics.
     pub fn pager_stats(&self) -> pager::Stats {
         self.pager().stats()
+    }
+
+    /// Cheap state for telemetry: counts, cache and I/O counters, log and
+    /// memory. Unlike `stats()` this walks nothing.
+    pub fn telemetry(&self) -> crate::telemetry::DbMetrics {
+        let p = self.pager();
+        let ps = p.stats();
+        crate::telemetry::DbMetrics {
+            nodes: self.node_count() as u64,
+            edges: self.edge_count() as u64,
+            bytes: self.file_len(),
+            // u64::MAX is "no limit" (wasm, where physical memory is unknown).
+            memory_limit: p.memory_usage().map(|(_, max)| max).filter(|m| *m != u64::MAX),
+            page_size: p.page_size() as u64,
+            resident_pages: ps.resident_pages,
+            allocated_pages: ps.allocated_pages,
+            log_bytes: self.db.log_since_checkpoint(),
+            page_reads: ps.reads,
+            page_writes: ps.writes,
+            page_hits: ps.hits,
+            page_misses: ps.misses,
+            evictions: ps.evictions,
+            commits: ps.commits,
+            rollbacks: ps.rollbacks,
+            checkpoints: ps.checkpoints,
+        }
+    }
+
+    /// This graph's process-unique telemetry id.
+    pub fn telemetry_id(&self) -> u64 {
+        self.tel_id
+    }
+
+    /// How telemetry names this graph (`glider.db`): its path, or
+    /// `:memory:<id>` for an in-memory graph.
+    pub fn telemetry_name(&self) -> String {
+        match self.path() {
+            Some(p) => p.display().to_string(),
+            None => format!(":memory:{}", self.tel_id),
+        }
     }
 }
 

@@ -265,6 +265,12 @@ pub fn query_json(g: &mut Graph, src: &str) -> Result<String, String> {
         write_json_string(m, &mut out);
     }
     out.push_str(&format!(",\"touched\":{},\"ms\":{:.4}", r.touched, ms));
+    // The engine's report on the statement (same thread, just recorded):
+    // operation, pages read and hit. See docs/OBSERVABILITY.md.
+    if let Some(op) = crate::telemetry::last_op() {
+        out.push_str(",\"op\":");
+        out.push_str(&op.to_json());
+    }
     out.push('}');
     Ok(out)
 }

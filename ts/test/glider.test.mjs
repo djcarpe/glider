@@ -273,3 +273,111 @@ describe('opening a database file', () => {
     assert.throws(() => glider.openBytes(new Uint8Array(0)), /too short/)
   })
 })
+
+describe('telemetry', () => {
+  /** A tracer and meter with the @opentelemetry/api shape, recording calls. */
+  function fakes() {
+    const spans = []
+    const tracer = {
+      startSpan(name, options = {}) {
+        const s = { name, kind: options.kind, attributes: { ...options.attributes }, status: null, exceptions: [], ended: false }
+        spans.push(s)
+        return {
+          updateName: (n) => (s.name = n),
+          setAttributes: (a) => Object.assign(s.attributes, a),
+          setStatus: (st) => (s.status = st),
+          recordException: (e) => s.exceptions.push(e),
+          end: () => (s.ended = true),
+        }
+      },
+    }
+    const recorded = []
+    const callbacks = new Map()
+    const observable = (name) => ({ addCallback: (cb) => callbacks.set(name, cb) })
+    const meter = {
+      createHistogram: (name) => ({ record: (v, a) => recorded.push({ name, v, a }) }),
+      createObservableCounter: observable,
+      createObservableGauge: observable,
+    }
+    /** Run one instrument's callback, as a metric reader would. */
+    const collect = (name) => {
+      const out = []
+      callbacks.get(name)({ observe: (v, a) => out.push({ v, a }) })
+      return out
+    }
+    return { spans, tracer, meter, recorded, collect }
+  }
+
+  test('each statement is a span carrying the engine report', async () => {
+    const f = fakes()
+    const g = await loadGlider(undefined, { telemetry: { tracer: f.tracer, meter: f.meter } })
+    const db = g.open()
+    db.run('CREATE (:Person {name:"Ada"})-[:KNOWS]->(:Person {name:"Bob"})')
+    const r = db.query('MATCH (p:Person) RETURN p.name')
+    assert.ok(r.ms >= 0)
+    assert.equal(r.op.op, 'MATCH')
+    assert.equal(r.op.rows, 2)
+    const span = f.spans.at(-1)
+    assert.equal(span.name, 'glider MATCH')
+    assert.equal(span.kind, 2)
+    assert.ok(span.ended)
+    assert.equal(span.attributes['db.system.name'], 'glider')
+    assert.equal(span.attributes['db.operation.name'], 'MATCH')
+    assert.equal(span.attributes['db.response.returned_rows'], 2)
+    assert.equal(span.attributes['db.query.text'], 'MATCH (p:Person) RETURN p.name')
+    assert.equal(f.spans[0].attributes['glider.touched'], 3)
+    assert.equal(f.recorded.at(-1).name, 'glider.query.duration')
+    assert.equal(f.recorded.at(-1).a['db.operation.name'], 'MATCH')
+
+    assert.throws(() => db.query('MATCH (n RETURN n'), GliderError)
+    const bad = f.spans.at(-1)
+    assert.equal(bad.status.code, 2)
+    assert.equal(bad.attributes['db.operation.name'], 'INVALID')
+    assert.equal(bad.exceptions.length, 1)
+    assert.equal(f.recorded.at(-1).a['glider.outcome'], 'error')
+
+    const queries = f.collect('glider.queries')
+    assert.ok(queries.some((q) => q.a['db.operation.name'] === 'MATCH' && q.a['glider.outcome'] === 'ok' && q.v >= 1))
+    const nodes = f.collect('glider.db.nodes')
+    assert.deepEqual(nodes.map((n) => n.v), [2])
+    assert.match(nodes[0].a['glider.db'], /^:memory:\d+$/)
+    db.close()
+    assert.deepEqual(f.collect('glider.db.nodes'), [])
+  })
+
+  test('the engine exposes its counters, reports and OTLP metrics without an SDK', async () => {
+    const g = await loadGlider()
+    const db = g.open()
+    db.run('CREATE (:City {name:"Oslo"})')
+    const last = g.lastOp()
+    assert.equal(last.op, 'CREATE')
+    assert.equal(last.touched, 1)
+    assert.equal(last.duration_ns, undefined, 'no clock inside wasm')
+    const snap = g.telemetry()
+    assert.ok(snap.duration.count >= 1, 'the wrapper feeds host timings into the histogram')
+    assert.equal(db.metrics().nodes, 1)
+
+    const otlp = JSON.parse(g.otlpMetrics('browser-app'))
+    const res = otlp.resourceMetrics[0]
+    assert.deepEqual(res.resource.attributes[0], { key: 'service.name', value: { stringValue: 'browser-app' } })
+    const names = res.scopeMetrics[0].metrics.map((m) => m.name)
+    for (const n of ['glider.queries', 'glider.db.nodes', 'glider.query.duration']) assert.ok(names.includes(n), n)
+    const t = Number(res.scopeMetrics[0].metrics[0].sum.dataPoints[0].timeUnixNano)
+    assert.ok(Math.abs(t / 1e6 - Date.now()) < 60_000, 'timestamps come from the host clock')
+    assert.match(g.prometheus(), /glider_db_nodes\{glider_db=":memory:\d+"\} 1/)
+
+    const posts = []
+    await g.exportOtlp({
+      endpoint: 'http://collector:4318/',
+      headers: { authorization: 'Bearer t' },
+      fetch: async (url, init) => {
+        posts.push({ url, init })
+        return { ok: true, status: 200 }
+      },
+    })
+    assert.equal(posts[0].url, 'http://collector:4318/v1/metrics')
+    assert.equal(posts[0].init.headers.authorization, 'Bearer t')
+    assert.ok(JSON.parse(posts[0].init.body).resourceMetrics)
+    db.close()
+  })
+})
