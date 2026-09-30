@@ -320,6 +320,10 @@ enum Expr {
     In(Box<Expr>, Vec<Expr>),
     Func(String, Vec<Expr>),
     List(Vec<Expr>),
+    /// `list[i]` (negative counts from the end); `text[i]` is a character.
+    Index(Box<Expr>, Box<Expr>),
+    /// `list[a..b]`, either end optional, end exclusive.
+    Slice(Box<Expr>, Option<Box<Expr>>, Option<Box<Expr>>),
 }
 
 impl Expr {
@@ -334,6 +338,13 @@ impl Expr {
                 format!("{}({})", name.to_lowercase(), inner.join(", "))
             }
             Expr::Lit(v) => v.to_string(),
+            Expr::Index(e, i) => format!("{}[{}]", e.alias(), i.alias()),
+            Expr::Slice(e, a, b) => format!(
+                "{}[{}..{}]",
+                e.alias(),
+                a.as_ref().map(|x| x.alias()).unwrap_or_default(),
+                b.as_ref().map(|x| x.alias()).unwrap_or_default()
+            ),
             _ => "expr".to_string(),
         }
     }
@@ -438,6 +449,31 @@ fn parse_with(src: &str, params: &[(String, Value)]) -> Result<Stmt> {
         return Err(Error::Msg("empty statement".into()));
     }
     let mut p = Parser { toks, pos: 0 };
+    let stmt = parse_stmt(&mut p, src)?;
+    // Whatever the grammar didn't consume is a mistake, not something to drop:
+    // `RETURN x LIMIT 10, count(n)` used to run as `RETURN x`, ignoring the rest.
+    if !matches!(stmt, Stmt::Explain(_)) && !p.at_end() {
+        return Err(Error::Msg(format!(
+            "unexpected {} after the end of the statement",
+            describe_tok(p.peek())
+        )));
+    }
+    Ok(stmt)
+}
+
+fn describe_tok(t: Option<&Tok>) -> String {
+    match t {
+        Some(Tok::Ident(s)) => format!("'{}'", s),
+        Some(Tok::Sym(s)) => format!("'{}'", s),
+        Some(Tok::Int(v)) => format!("'{}'", v),
+        Some(Tok::Float(v)) => format!("'{}'", v),
+        Some(Tok::Str(s)) => format!("'\"{}\"'", s),
+        other => format!("{:?}", other),
+    }
+}
+
+fn parse_stmt(p: &mut Parser, src: &str) -> Result<Stmt> {
+    let mut p = p;
 
     if p.eat_kw("EXPLAIN") {
         let rest: String = src
@@ -916,7 +952,31 @@ fn parse_multiplicative(p: &mut Parser) -> Result<Expr> {
     }
 }
 
+/// An atom followed by any number of subscripts: `labels(n)[0]`,
+/// `n.tags[1..3]`, `[1, 2, 3][-1]`.
 fn parse_atom(p: &mut Parser) -> Result<Expr> {
+    let mut e = parse_primary(p)?;
+    while p.eat_sym("[") {
+        if p.eat_sym("..") {
+            let end = if p.is_sym("]") { None } else { Some(Box::new(parse_expr(p)?)) };
+            p.expect_sym("]")?;
+            e = Expr::Slice(Box::new(e), None, end);
+            continue;
+        }
+        let first = parse_expr(p)?;
+        if p.eat_sym("..") {
+            let end = if p.is_sym("]") { None } else { Some(Box::new(parse_expr(p)?)) };
+            p.expect_sym("]")?;
+            e = Expr::Slice(Box::new(e), Some(Box::new(first)), end);
+        } else {
+            p.expect_sym("]")?;
+            e = Expr::Index(Box::new(e), Box::new(first));
+        }
+    }
+    Ok(e)
+}
+
+fn parse_primary(p: &mut Parser) -> Result<Expr> {
     match p.peek().cloned() {
         Some(Tok::Int(v)) => {
             p.pos += 1;
@@ -2941,7 +3001,56 @@ fn eval(g: &Graph, e: &Expr, binds: &Binds) -> Value {
             }
         }
         Expr::Func(name, args) => eval_func(g, name, args, binds),
+        Expr::Index(e, i) => {
+            let (v, i) = (eval(g, e, binds), eval(g, i, binds));
+            let Value::Int(i) = i else { return Value::Null };
+            match v {
+                Value::List(items) => position(i, items.len()).map(|k| items[k].clone()).unwrap_or(Value::Null),
+                Value::Text(t) => {
+                    let chars: Vec<char> = t.chars().collect();
+                    position(i, chars.len()).map(|k| Value::Text(chars[k].to_string())).unwrap_or(Value::Null)
+                }
+                _ => Value::Null,
+            }
+        }
+        Expr::Slice(e, a, b) => {
+            let v = eval(g, e, binds);
+            let bound = |x: &Option<Box<Expr>>, len: usize, default: usize| -> Option<usize> {
+                match x.as_ref().map(|x| eval(g, x, binds)) {
+                    None => Some(default),
+                    Some(Value::Int(i)) if i < 0 => Some(len.saturating_sub(i.unsigned_abs() as usize)),
+                    Some(Value::Int(i)) => Some((i as usize).min(len)),
+                    Some(_) => None,
+                }
+            };
+            match v {
+                Value::List(items) => {
+                    let len = items.len();
+                    match (bound(a, len, 0), bound(b, len, len)) {
+                        (Some(x), Some(y)) if x < y => Value::List(items[x..y].to_vec()),
+                        (Some(_), Some(_)) => Value::List(Vec::new()),
+                        _ => Value::Null,
+                    }
+                }
+                Value::Text(t) => {
+                    let chars: Vec<char> = t.chars().collect();
+                    let len = chars.len();
+                    match (bound(a, len, 0), bound(b, len, len)) {
+                        (Some(x), Some(y)) if x < y => Value::Text(chars[x..y].iter().collect()),
+                        (Some(_), Some(_)) => Value::Text(String::new()),
+                        _ => Value::Null,
+                    }
+                }
+                _ => Value::Null,
+            }
+        }
     }
+}
+
+/// A Cypher index into a sequence of `len`: negative counts from the end.
+fn position(i: i64, len: usize) -> Option<usize> {
+    let k = if i < 0 { len as i64 + i } else { i };
+    (k >= 0 && (k as usize) < len).then_some(k as usize)
 }
 
 fn eval_func(g: &Graph, name: &str, args: &[Expr], binds: &Binds) -> Value {

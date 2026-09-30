@@ -1039,3 +1039,40 @@ fn a_match_never_reuses_a_relationship() {
     // An edge anchor counts as used too.
     assert_eq!(n(&mut g, "MATCH (x)-[:K]->()-[:K]->()-[:K]->(y) WHERE x.n = 1 RETURN count(y)"), 2);
 }
+
+#[test]
+fn subscripts_group_and_limit_and_trailing_tokens_are_errors() {
+    let path = temp("subscripts");
+    let mut g = Graph::open(&path, Sync::Always).unwrap();
+    for i in 0..30 {
+        let label = if i % 3 == 0 { "Order" } else if i % 3 == 1 { "Customer" } else { "Venue" };
+        q(&mut g, &format!("CREATE (n:{} {{i: {}, tags: [\"a\", \"b\", \"c\"]}})", label, i));
+    }
+
+    // a subscript no longer ends the RETURN: grouping, ORDER BY and LIMIT all apply
+    let r = q(&mut g, "MATCH (n) RETURN labels(n)[0] AS label, count(n) AS nodes ORDER BY nodes DESC LIMIT 2");
+    assert_eq!(r.columns, vec!["label".to_string(), "nodes".to_string()]);
+    assert_eq!(r.rows.len(), 2);
+    assert_eq!(r.rows[0][1], Value::Int(10));
+    assert!(matches!(&r.rows[0][0], Value::Text(_)));
+
+    let r = q(&mut g, "MATCH (n:Order) RETURN n.tags[0], n.tags[-1], n.tags[1..], n.tags[..2], [10, 20, 30][1] LIMIT 1");
+    assert_eq!(r.rows[0][0], Value::Text("a".into()));
+    assert_eq!(r.rows[0][1], Value::Text("c".into()));
+    assert_eq!(r.rows[0][2], Value::List(vec![Value::Text("b".into()), Value::Text("c".into())]));
+    assert_eq!(r.rows[0][3], Value::List(vec![Value::Text("a".into()), Value::Text("b".into())]));
+    assert_eq!(r.rows[0][4], Value::Int(20));
+    let r = q(&mut g, "MATCH (n:Order) RETURN n.tags[9] LIMIT 1");
+    assert_eq!(r.rows[0][0], Value::Null);
+
+    // leftovers after the statement are an error, not silently dropped
+    let err = match query::execute(&mut g, "MATCH (n) RETURN labels(n)[0] AS label LIMIT 10, count(n) AS nodes") {
+        Ok(_) => panic!("a statement with leftovers ran"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("unexpected ','"), "{}", err);
+    assert!(query::execute(&mut g, "MATCH (n) RETURN n LIMIT 5 garbage").is_err());
+    let r = q(&mut g, "MATCH (n) RETURN n LIMIT 10");
+    assert_eq!(r.rows.len(), 10);
+    let _ = std::fs::remove_file(&path);
+}
