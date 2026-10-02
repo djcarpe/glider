@@ -1,0 +1,104 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  rust:
+    name: rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # Windows has not been verified yet; it reports without blocking.
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build
+        run: cargo build --workspace --all-targets --locked
+      - name: test
+        run: cargo test --workspace --all-targets --locked
+      - name: release binaries
+        run: cargo build --release --bins --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: glider-${{ matrix.os }}
+          path: |
+            target/release/glider
+            target/release/glider-stream
+            target/release/glider.exe
+            target/release/glider-stream.exe
+          if-no-files-found: ignore
+
+  msrv:
+    # Cargo.toml promises rust-version 1.74; informational until confirmed.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.74
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --lib --locked
+
+  lint:
+    # Informational until the tree is rustfmt/clippy clean.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  wasm:
+    name: wasm + TypeScript + UI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            ts/package-lock.json
+            ui/package-lock.json
+      - name: "@glider/wasm"
+        working-directory: ts
+        run: |
+          npm ci
+          mkdir -p dist
+          ./build.sh
+          npm test
+      - name: console UI
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build
+          npm run build:standalone
+      - uses: actions/upload-artifact@v4
+        with:
+          name: glider-wasm
+          path: |
+            ts/dist
+            ui/dist-standalone

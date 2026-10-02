@@ -30,3 +30,18 @@ __pycache__/
 # staged by bench/wasm/prepare.sh
 /bench/wasm/glider/
 /bench/wasm/sqlite/
+
+# Build outputs from scripts/build-all.sh and wasm/ffi builds
+/dist/
+*.wasm
+!/ts/test/fixtures/*.wasm
+*.tsbuildinfo
+
+# Profiling and crash output
+*.profraw
+perf.data*
+flamegraph*.svg
+erl_crash.dump
+
+# Graph exports and dumps dropped at the repo root (bench/results/ keeps its own)
+/*.jsonl
