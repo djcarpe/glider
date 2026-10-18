@@ -135,15 +135,14 @@ impl Extension for Context {
             }
             "index" => {
                 let c = text::Config { labels: a.strs("labels").into_iter().chain(a.strs("label")).collect(), keys: a.strs("keys") };
-                let t = std::time::Instant::now();
+                // No clock under wasm: the summary then leaves the time out.
+                let t = crate::telemetry::Stopwatch::start();
                 let flush = (g.algorithm_memory() / 128).max(1 << 14) as usize;
                 let b = text::build(g, &c, flush)?;
+                let took = t.elapsed_ns().map(|ns| format!(" in {:.1}s", ns as f64 / 1e9)).unwrap_or_default();
                 let mut r = QueryResult::message(format!(
-                    "indexed {} nodes: {} terms, {} postings in {:.1}s",
-                    b.docs,
-                    b.terms,
-                    b.postings,
-                    t.elapsed().as_secs_f64()
+                    "indexed {} nodes: {} terms, {} postings{took}",
+                    b.docs, b.terms, b.postings
                 ));
                 r.touched = b.docs as usize;
                 Ok(r)

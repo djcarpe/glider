@@ -72,8 +72,8 @@ isolated graph.
 | `glider.open()` | a fresh in-memory graph |
 | `glider.openBytes(bytes)` | an in-memory graph loaded from a `.gldb` file's bytes |
 | `glider.version` | engine version |
-| `db.query(q)` | typed `QueryResult` — columns, rows, graph payload |
-| `db.run(q)` | run for effect, returns entities touched |
+| `db.query(q, params?)` | typed `QueryResult` — columns, rows, graph payload; `params` fill `$name` as literals |
+| `db.run(q, params?)` | run for effect, returns entities touched |
 | `db.graph(q)` | just the `{nodes, edges}` projection |
 | `db.schema()` | labels, relationship types, indexes, with counts; sampled property keys per label and type |
 | `db.expand(id, limit?)` | neighbours of one node, both directions |
@@ -82,7 +82,31 @@ isolated graph.
 | `db.importJsonl(text)` | bulk load |
 | `db.exportJsonl()` | dump the whole graph |
 | `db.stats()` | node/edge/label/index counts |
+| `db.extensions()`, `db.createExtension(name)`, `db.dropExtension(name)` | engine extensions available and installed |
+| `db.context` | the `context` extension, below |
 | `db.close()` | release it (also via `Symbol.dispose`) |
+
+### Context for language models
+
+`db.context` wraps the engine's `context` extension (glider's
+`docs/EXTENSIONS.md`): full-text search for entry points, a relevance-ranked
+connected subgraph that fits a token budget, path explanations and a schema
+card, in a compact text form. It runs entirely in the tab.
+
+```ts
+db.context.install()
+db.context.index()                                  // optional: search becomes an index lookup
+const card = db.context.schema()                    // for the system prompt
+const ctx = db.context.retrieve({ query: 'Ada Lovelace', budget: 1500 })
+ctx.text   // '# context: 4 nodes, 4 edges; seeds n1\nn1:Person name="Ada Lovelace" …'
+db.context.retrieve({ seeds: ['n2'], seen: ctx.refs, budget: 800 })   // a follow-up
+db.context.paths('n1', 'n9')
+db.context.search('lovelace')                       // [{ id, ref, name, score }]
+```
+
+Options are sent as query parameters, never spliced into the statement.
+`retrieveJson` and `retrieveRows` return the same selection as JSON or as
+one row per node.
 
 ### Typed results
 

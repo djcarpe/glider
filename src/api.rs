@@ -218,8 +218,23 @@ fn elapsed_ms(_t: Option<()>) -> f64 {
 
 /// Run a query and render the typed response.
 pub fn query_json(g: &mut Graph, src: &str) -> Result<String, String> {
+    query_json_with(g, src, &[])
+}
+
+/// Parameters for a statement from a JSON object, `{"name": value, ...}`.
+/// Nested objects become their JSON text, as properties do.
+pub fn params_from_json(json: &str) -> Result<Vec<(String, Value)>, String> {
+    match crate::value::parse_json(json)? {
+        crate::value::Json::Object(fields) => Ok(fields.into_iter().map(|(k, v)| (k, v.to_value())).collect()),
+        crate::value::Json::Null => Ok(Vec::new()),
+        _ => Err("parameters must be a JSON object".into()),
+    }
+}
+
+/// `query_json` with `$name` parameters, substituted as literals.
+pub fn query_json_with(g: &mut Graph, src: &str, params: &[(String, Value)]) -> Result<String, String> {
     let started = timer();
-    let r: QueryResult = query::execute(g, src).map_err(|e| e.to_string())?;
+    let r: QueryResult = query::execute_with(g, src, params).map_err(|e| e.to_string())?;
     let ms = elapsed_ms(started);
 
     let mut proj = Projection::default();

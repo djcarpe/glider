@@ -381,3 +381,58 @@ describe('telemetry', () => {
     db.close()
   })
 })
+
+describe('parameters and extensions', () => {
+  test('parameters are literals, never syntax', () => {
+    const db = seeded()
+    const r = db.query('MATCH (p:Person) WHERE p.name = $n RETURN p.age', { n: 'Ada' })
+    assert.deepEqual(r.rows, [[36]])
+    // A value that looks like Cypher stays a value.
+    assert.deepEqual(db.query('MATCH (p:Person) WHERE p.name = $n RETURN p', { n: '" OR 1=1 //' }).rows, [])
+    db.run('CREATE (:Tag {names: $l})', { l: ['a', 'b'] })
+    assert.deepEqual(db.query('MATCH (t:Tag) RETURN t.names').rows, [[['a', 'b']]])
+    db.close()
+  })
+
+  test('extensions install per graph', () => {
+    const db = seeded()
+    assert.equal(db.extensions().find((e) => e.name === 'context').installed, null)
+    assert.throws(() => db.context.retrieve({ seeds: [1] }), /CREATE EXTENSION context/)
+    db.context.install()
+    db.context.install()
+    assert.equal(db.extensions().find((e) => e.name === 'context').installed, '1.0')
+    assert.throws(() => db.createExtension('x; CLEAR'), TypeError)
+    db.dropExtension('context')
+    assert.equal(db.extensions().find((e) => e.name === 'context').installed, null)
+    db.close()
+  })
+
+  test('context: search, retrieve, paths, schema under wasm', () => {
+    const db = seeded()
+    db.context.install()
+    const hits = db.context.search('ada')
+    assert.equal(hits[0].ref, 'n1')
+    assert.match(db.context.index(), /indexed 3 nodes/)
+    assert.equal(db.context.search('london')[0].name, 'London')
+    // The write hook keeps the index current.
+    db.run('CREATE (:City {name: $n})', { n: 'Paris' })
+    assert.equal(db.context.search('paris').length, 1)
+
+    const ctx = db.context.retrieve({ query: 'Ada', budget: 300 })
+    assert.match(ctx.text, /^# context: /)
+    assert.match(ctx.text, /n1:Person name="Ada" age=36/)
+    assert.match(ctx.text, /n1 -KNOWS\{since=2019\}-> n2/)
+    assert.ok(ctx.tokens <= 300)
+    assert.deepEqual(new Set(ctx.refs), new Set(['n1', 'n2', 'n3']))
+    const again = db.context.retrieve({ seeds: ['n2'], seen: ctx.refs, budget: 300 })
+    assert.doesNotMatch(again.text, /n1:Person/)
+
+    const json = db.context.retrieveJson({ seeds: [1] })
+    assert.ok(json.nodes.some((n) => n.id === 1))
+    assert.equal(db.context.retrieveRows({ seeds: [1] })[0].hops, 0)
+    assert.match(db.context.paths('n2', 'n3').text, /n2 <-KNOWS\{since=2019\}- n1 -LIVES_IN-> n3/)
+    assert.match(db.context.schema(), /\(:Person\)-\[:KNOWS \{since:int\}\]->\(:Person\)/)
+    assert.deepEqual(db.query('MATCH (p:Person {name: "Bob"}) RETURN context.card(p)').rows, [['n2:Person name="Bob" age=41']])
+    db.close()
+  })
+})

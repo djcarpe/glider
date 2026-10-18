@@ -420,6 +420,29 @@ pub unsafe extern "C" fn glider_query_json(db: *mut GliderDb, q: *const c_char) 
     }
 }
 
+/// `glider_query_json` with parameters: `params` is a JSON object whose
+/// values fill the query's `$name` placeholders, as literals that can never
+/// become syntax. A null `params` means none.
+///
+/// # Safety
+/// `q` must be a NUL-terminated UTF-8 string, `params` one or null. Free
+/// the result with `glider_free`.
+#[no_mangle]
+pub unsafe extern "C" fn glider_query_params_json(db: *mut GliderDb, q: *const c_char, params: *const c_char) -> *mut c_char {
+    unsafe {
+        guard(std::ptr::null_mut(), || {
+            let db = as_db(db)?;
+            let src = as_str(q, "query")?;
+            let params = if params.is_null() {
+                Vec::new()
+            } else {
+                crate::api::params_from_json(as_str(params, "params")?)?
+            };
+            out_string(crate::api::query_json_with(&mut db.graph, src, &params)?)
+        })
+    }
+}
+
 /// Labels, relationship types and indexes with counts, as JSON.
 ///
 /// # Safety

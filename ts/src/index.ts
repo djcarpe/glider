@@ -36,6 +36,8 @@ import {
   type Schema,
 } from './types.js'
 
+import { GliderContext } from './context.js'
+
 import {
   DURATION_BOUNDS,
   SPAN_KIND_CLIENT,
@@ -70,6 +72,7 @@ interface Exports {
   glider_close(db: number): void
   glider_query(db: number, q: number): number
   glider_query_json(db: number, q: number): number
+  glider_query_params_json(db: number, q: number, params: number): number
   glider_schema_json(db: number): number
   glider_expand_json(db: number, id: bigint, limit: number): number
   glider_nodes_json(db: number, label: number, q: number, from: bigint, limit: number): number
@@ -489,6 +492,21 @@ export class GliderModule {
   }
 }
 
+/** A query parameter: what JSON can carry, lists included. */
+export type Param = null | boolean | number | string | Param[]
+
+export interface ExtensionInfo {
+  readonly name: string
+  readonly available: string | null
+  readonly installed: string | null
+  readonly summary: string
+}
+
+function extName(name: string): string {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new TypeError(`not an extension name: ${JSON.stringify(name)}`)
+  return name
+}
+
 /** One graph. Not shared between workers — wasm memory is per-instance. */
 export class GliderDb {
   #handle: number
@@ -505,12 +523,22 @@ export class GliderDb {
     return this.#handle
   }
 
-  /** Run a query and return the typed result, including the graph payload. */
-  query(cypher: string): QueryResult {
+  /**
+   * Run a query and return the typed result, including the graph payload.
+   * `params` fill `$name` placeholders as literals, so a value can never
+   * change the statement.
+   */
+  query(cypher: string, params?: Record<string, Param>): QueryResult {
     const db = this.#alive()
     const t0 = monoMs()
     const json = this.mod.instrument('query', cypher, () => {
-      const j = this.mod.withCString(cypher, (p) => this.mod.take(this.mod.raw.glider_query_json(db, p)))
+      const j = this.mod.withCString(cypher, (p) =>
+        params === undefined
+          ? this.mod.take(this.mod.raw.glider_query_json(db, p))
+          : this.mod.withCString(JSON.stringify(params), (pp) =>
+              this.mod.take(this.mod.raw.glider_query_params_json(db, p, pp)),
+            ),
+      )
       if (j === null) throw new GliderError(this.mod.lastError() ?? 'query failed', cypher)
       return j
     })
@@ -523,8 +551,35 @@ export class GliderDb {
    * Run a statement for its effect and return how many entities it touched.
    * Sugar over `query` for writes, where the rows are empty anyway.
    */
-  run(cypher: string): number {
-    return this.query(cypher).touched
+  run(cypher: string, params?: Record<string, Param>): number {
+    return this.query(cypher, params).touched
+  }
+
+  /** Extensions this build has, and the version this graph installed (or null). */
+  extensions(): ExtensionInfo[] {
+    return this.query('SHOW EXTENSIONS').rows.map(([name, available, installed, summary]) => ({
+      name: name as string,
+      available: available as string | null,
+      installed: installed as string | null,
+      summary: summary as string,
+    }))
+  }
+
+  /** `CREATE EXTENSION IF NOT EXISTS name`. */
+  createExtension(name: string): void {
+    this.query(`CREATE EXTENSION IF NOT EXISTS ${extName(name)}`)
+  }
+
+  /** `DROP EXTENSION IF EXISTS name`: uninstall, deleting what it stored. */
+  dropExtension(name: string): void {
+    this.query(`DROP EXTENSION IF EXISTS ${extName(name)}`)
+  }
+
+  #context?: GliderContext
+
+  /** The `context` extension: token-budgeted retrieval for language models. */
+  get context(): GliderContext {
+    return (this.#context ??= new GliderContext(this))
   }
 
   /** Every node and relationship the query produced, ready to draw. */
@@ -646,3 +701,5 @@ export class GliderDb {
 }
 
 export type { Cell, GliderNode, GliderRel }
+export { GliderContext } from './context.js'
+export type { ContextText, NodeRef, PathsOptions, RetrieveOptions, RetrievedRow, SearchHit } from './context.js'
