@@ -37,3 +37,7 @@ path = "src/bin/scale-gen.rs"
 [[bin]]
 name = "pagebench"
 path = "src/bin/pagebench.rs"
+
+[[bin]]
+name = "ctxbench"
+path = "src/bin/ctxbench.rs"

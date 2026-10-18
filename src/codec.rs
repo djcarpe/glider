@@ -41,6 +41,11 @@ pub fn put_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(s.as_bytes());
 }
 
+pub fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+    put_varint(out, b.len() as u64);
+    out.extend_from_slice(b);
+}
+
 pub fn put_value(out: &mut Vec<u8>, v: &Value) {
     match v {
         Value::Null => put_u8(out, 0),
@@ -170,6 +175,25 @@ impl<'a> Reader<'a> {
             return Err("unexpected end of record".into());
         }
         self.pos += n;
+        Ok(())
+    }
+
+    pub fn bytes(&mut self) -> Result<Vec<u8>, String> {
+        let len = self.varint()? as usize;
+        if self.remaining() < len {
+            return Err("unexpected end of bytes".into());
+        }
+        let b = self.buf[self.pos..self.pos + len].to_vec();
+        self.pos += len;
+        Ok(b)
+    }
+
+    pub fn skip_bytes(&mut self) -> Result<(), String> {
+        let len = self.varint()? as usize;
+        if self.remaining() < len {
+            return Err("unexpected end of bytes".into());
+        }
+        self.pos += len;
         Ok(())
     }
 

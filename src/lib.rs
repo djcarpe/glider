@@ -20,6 +20,7 @@
 pub mod algo;
 pub mod api;
 pub mod codec;
+pub mod ext;
 pub mod ffi;
 pub mod graph;
 pub mod legacy;

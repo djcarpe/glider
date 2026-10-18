@@ -1064,6 +1064,9 @@ impl Graph {
                 self.next_node = 1;
                 self.next_edge = 1;
             }
+            // Extensions arrived with paged storage; a legacy image has
+            // nowhere to keep them, and `migrate` re-runs CREATE EXTENSION.
+            Op::ExtensionAdd { .. } | Op::ExtensionDel { .. } | Op::ExtWrite { .. } => {}
         }
     }
 

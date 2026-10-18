@@ -214,6 +214,9 @@ fn lex_with(src: &str, params: &[(String, Value)]) -> Result<Vec<Tok>> {
 struct Parser {
     toks: Vec<Tok>,
     pos: usize,
+    /// Extension functions (`ns.name(...)`) the statement calls, checked
+    /// against the database before it runs.
+    ext_funcs: Vec<String>,
 }
 
 impl Parser {
@@ -416,6 +419,15 @@ enum Stmt {
     Commit,
     Rollback,
     Help,
+    Extension(ExtAction),
+}
+
+#[derive(Clone, Debug)]
+enum ExtAction {
+    Create { name: String, if_not_exists: bool },
+    Drop { name: String, if_exists: bool },
+    Update { name: String },
+    Show,
 }
 
 impl Stmt {
@@ -435,6 +447,10 @@ impl Stmt {
             Stmt::Commit => "COMMIT",
             Stmt::Rollback => "ROLLBACK",
             Stmt::Help => "HELP",
+            Stmt::Extension(ExtAction::Create { .. }) => "CREATE EXTENSION",
+            Stmt::Extension(ExtAction::Drop { .. }) => "DROP EXTENSION",
+            Stmt::Extension(ExtAction::Update { .. }) => "ALTER EXTENSION",
+            Stmt::Extension(ExtAction::Show) => "SHOW EXTENSIONS",
         }
     }
 }
@@ -444,11 +460,16 @@ fn parse(src: &str) -> Result<Stmt> {
 }
 
 fn parse_with(src: &str, params: &[(String, Value)]) -> Result<Stmt> {
+    parse_checked(src, params).map(|(s, _)| s)
+}
+
+/// The statement, and the extension functions it calls.
+fn parse_checked(src: &str, params: &[(String, Value)]) -> Result<(Stmt, Vec<String>)> {
     let toks = lex_with(src, params)?;
     if toks.is_empty() {
         return Err(Error::Msg("empty statement".into()));
     }
-    let mut p = Parser { toks, pos: 0 };
+    let mut p = Parser { toks, pos: 0, ext_funcs: Vec::new() };
     let stmt = parse_stmt(&mut p, src)?;
     // Whatever the grammar didn't consume is a mistake, not something to drop:
     // `RETURN x LIMIT 10, count(n)` used to run as `RETURN x`, ignoring the rest.
@@ -458,7 +479,7 @@ fn parse_with(src: &str, params: &[(String, Value)]) -> Result<Stmt> {
             describe_tok(p.peek())
         )));
     }
-    Ok(stmt)
+    Ok((stmt, p.ext_funcs))
 }
 
 fn describe_tok(t: Option<&Tok>) -> String {
@@ -499,6 +520,17 @@ fn parse_stmt(p: &mut Parser, src: &str) -> Result<Stmt> {
         });
     }
     if p.eat_kw("CREATE") {
+        if p.eat_kw("EXTENSION") {
+            let if_not_exists = if p.eat_kw("IF") {
+                p.expect_kw("NOT")?;
+                p.expect_kw("EXISTS")?;
+                true
+            } else {
+                false
+            };
+            let name = p.ident()?;
+            return Ok(Stmt::Extension(ExtAction::Create { name, if_not_exists }));
+        }
         if p.is_kw("INDEX") {
             p.pos += 1;
             let (label, key) = parse_index_target(&mut p)?;
@@ -511,7 +543,11 @@ fn parse_stmt(p: &mut Parser, src: &str) -> Result<Stmt> {
         return Ok(Stmt::Create(parse_pattern_list(&mut p)?));
     }
     if p.eat_kw("CALL") {
-        let name = p.ident()?;
+        let mut name = p.ident()?;
+        // `CALL context.retrieve(...)`: a procedure of an extension.
+        if p.eat_sym(".") {
+            name = format!("{}.{}", name.to_lowercase(), p.ident()?.to_lowercase());
+        }
         let mut args = Vec::new();
         if p.eat_sym("(") {
             while !p.eat_sym(")") {
@@ -535,6 +571,16 @@ fn parse_stmt(p: &mut Parser, src: &str) -> Result<Stmt> {
         });
     }
     if p.eat_kw("DROP") {
+        if p.eat_kw("EXTENSION") {
+            let if_exists = if p.eat_kw("IF") {
+                p.expect_kw("EXISTS")?;
+                true
+            } else {
+                false
+            };
+            let name = p.ident()?;
+            return Ok(Stmt::Extension(ExtAction::Drop { name, if_exists }));
+        }
         p.expect_kw("INDEX")?;
         let (label, key) = parse_index_target(&mut p)?;
         return Ok(Stmt::Index {
@@ -542,6 +588,16 @@ fn parse_stmt(p: &mut Parser, src: &str) -> Result<Stmt> {
             key,
             drop: true,
         });
+    }
+    if p.eat_kw("ALTER") {
+        p.expect_kw("EXTENSION")?;
+        let name = p.ident()?;
+        p.expect_kw("UPDATE")?;
+        return Ok(Stmt::Extension(ExtAction::Update { name }));
+    }
+    if p.eat_kw("SHOW") {
+        p.expect_kw("EXTENSIONS")?;
+        return Ok(Stmt::Extension(ExtAction::Show));
     }
     if p.eat_kw("STATS") {
         return Ok(Stmt::Stats);
@@ -1051,6 +1107,23 @@ fn parse_primary(p: &mut Parser) -> Result<Expr> {
             }
             if p.eat_sym(".") {
                 let key = p.ident()?;
+                // `ns.fn(...)`: a function from an extension. A property
+                // can't be called, so this reads unambiguously.
+                if p.eat_sym("(") {
+                    let qualified = format!("{}.{}", lower, key.to_lowercase());
+                    let mut args = Vec::new();
+                    if !p.eat_sym(")") {
+                        loop {
+                            args.push(parse_expr(p)?);
+                            if !p.eat_sym(",") {
+                                break;
+                            }
+                        }
+                        p.expect_sym(")")?;
+                    }
+                    p.ext_funcs.push(qualified.clone());
+                    return Ok(Expr::Func(qualified, args));
+                }
                 return Ok(Expr::Prop(name, key));
             }
             Ok(Expr::Var(name))
@@ -1229,13 +1302,16 @@ pub fn execute_with(g: &mut Graph, src: &str, params: &[(String, Value)]) -> Res
     let watch = telemetry::Stopwatch::start();
     let before = g.pager_stats();
     let mut report = telemetry::OpReport { op: "INVALID", ..Default::default() };
-    let result = match parse_with(src, params) {
-        Ok(stmt) => {
+    let result = match parse_checked(src, params) {
+        Ok((stmt, ext_funcs)) => {
             report.op = stmt.op();
             if let Stmt::Call { name, .. } = &stmt {
                 report.procedure = Some(name.clone());
             }
-            execute_stmt(g, stmt)
+            match crate::ext::check_functions(g, &ext_funcs) {
+                Ok(()) => execute_stmt(g, stmt),
+                Err(e) => Err(e),
+            }
         }
         Err(e) => Err(e),
     };
@@ -1325,7 +1401,14 @@ fn run(g: &mut Graph, stmt: Stmt) -> Result<QueryResult> {
             result.touched = n + e;
             Ok(result)
         }
+        Stmt::Call { name, args } if name.contains('.') => crate::ext::call(g, &name, &args),
         Stmt::Call { name, args } => call_algorithm(g, &name, &args),
+        Stmt::Extension(action) => match action {
+            ExtAction::Create { name, if_not_exists } => crate::ext::create(g, &name, if_not_exists),
+            ExtAction::Drop { name, if_exists } => crate::ext::drop(g, &name, if_exists),
+            ExtAction::Update { name } => crate::ext::update(g, &name),
+            ExtAction::Show => Ok(crate::ext::show(g)),
+        },
         Stmt::Index { label, key, drop } => {
             if drop {
                 g.drop_index(&label, &key)?;
@@ -1489,6 +1572,14 @@ algorithms (CALL name(arg: value, ...))
 
 common args:  dir: "out" | "in" | "both"   type: "KNOWS"   weight: "cost"
               top: 10 (rows returned)      write: "score" (store result on nodes)
+
+extensions
+  SHOW EXTENSIONS                  CREATE EXTENSION [IF NOT EXISTS] context
+  CALL context.help()              DROP EXTENSION [IF EXISTS] context
+  CALL context.index()             CALL context.search(query: "ada lovelace")
+  CALL context.retrieve(query: "ada lovelace", budget: 800)
+  CALL context.paths(from: "n1", to: "n9")     CALL context.schema()
+  MATCH (p:Person) RETURN context.card(p)      docs/EXTENSIONS.md has the rest
 "#;
 
 /// Show the plan instead of running it: which pattern element anchors the
@@ -3065,6 +3156,17 @@ fn eval_func(g: &Graph, name: &str, args: &[Expr], binds: &Binds) -> Value {
             .map(|a| eval(g, a, binds))
             .unwrap_or(Value::Null)
     };
+
+    if name.contains('.') {
+        let args: Vec<crate::ext::Arg> = (0..args.len())
+            .map(|i| match arg_bind(i) {
+                Some(Bind::Node(id)) => crate::ext::Arg::Node(id),
+                Some(Bind::Edge(id)) => crate::ext::Arg::Edge(id),
+                None => crate::ext::Arg::Value(val(i)),
+            })
+            .collect();
+        return crate::ext::eval(g, name, &args);
+    }
 
     match name {
         "id" => match arg_bind(0) {
