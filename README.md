@@ -160,6 +160,33 @@ and falls back to a label scan, then a full scan. Indexes are maintained through
 property updates, label changes and deletes, and are recorded in the log so they
 survive reopen.
 
+## Extensions
+
+Databases opt into extra capability, as PostgreSQL databases opt into
+`timescaledb` or `vector`: `CREATE EXTENSION`, `DROP EXTENSION`,
+`SHOW EXTENSIONS`, then `CALL <ext>.<procedure>(...)` and `<ext>.<function>(...)`
+in queries. Installation is logged, transactional and replicated;
+extensions get their own transactional keyspace and can follow writes to
+keep derived state, such as an index, current. Embedders add their own
+with `glider::ext::register`.
+
+The built-in **`context`** extension serves knowledge graphs to language
+models: full-text search for entry points, a relevance-ranked, connected
+subgraph that fits a token budget (personalised PageRank by local push, hub
+damping, omissions reported), path explanations and a schema card, in a
+compact text form at a third or less of the tokens of JSON.
+
+```
+» CREATE EXTENSION context
+» CALL context.index()
+» CALL context.retrieve(query: "Ada Lovelace", budget: 1500)
+» CALL context.paths(from: "n1", to: "n9")
+» CALL context.schema()
+```
+
+See [`docs/EXTENSIONS.md`](docs/EXTENSIONS.md) and the measurements in
+[`bench/CONTEXT.md`](bench/CONTEXT.md).
+
 ## Browser console
 
 `glider <db> browser` opens a React console in the shape Neo4j Browser
@@ -420,13 +447,14 @@ src/            the library and both binaries
 src/storage/    pages, B+trees, write-ahead log, external sort
 src/legacy/     the previous engine: test oracle, and `migrate`
 src/stream/     glider-stream: S3/HTTP replication of pre-paged files
+src/ext/        extensions: the registry, and the built-in `context`
 tests/          integration tests
 bench/          benchmark harness (workspace member; ./bench/run.sh)
 include/        glider.h, the C ABI header
 ts/             TypeScript/wasm bindings
 ui/             browser console (React + Vite)
 scripts/        cross-compilation helpers
-docs/           design notes: MOBILE, REPLICATION, STREAM, REVIEW, TODO
+docs/           design notes: EXTENSIONS, MOBILE, REPLICATION, STREAM, REVIEW, TODO
 ```
 
 ## Licence

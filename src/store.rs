@@ -52,6 +52,9 @@ const K_INDEX_ADD: u8 = 10;
 const K_INDEX_DEL: u8 = 11;
 const K_COUNTERS: u8 = 12;
 const K_CLEAR: u8 = 13;
+const K_EXT_ADD: u8 = 14;
+const K_EXT_DEL: u8 = 15;
+const K_EXT_WRITE: u8 = 16;
 const K_TX_END: u8 = 255;
 
 /// A single mutation. The log is a sequence of these; replaying them in order
@@ -115,6 +118,22 @@ pub enum Op {
         next_edge: u64,
     },
     Clear,
+    /// `CREATE EXTENSION`: the database now uses this extension, at this
+    /// version. Re-adding updates the version.
+    ExtensionAdd {
+        name: String,
+        version: String,
+    },
+    ExtensionDel {
+        name: String,
+    },
+    /// Writes to extensions' own keyspace (full keys, the extension's name
+    /// first): deletes, then puts. One record per logical change, so an
+    /// index update for a node is all-or-nothing.
+    ExtWrite {
+        puts: Vec<(Vec<u8>, Vec<u8>)>,
+        dels: Vec<Vec<u8>>,
+    },
 }
 
 impl Op {
@@ -134,6 +153,9 @@ impl Op {
             Op::IndexDel { .. } => K_INDEX_DEL,
             Op::Counters { .. } => K_COUNTERS,
             Op::Clear => K_CLEAR,
+            Op::ExtensionAdd { .. } => K_EXT_ADD,
+            Op::ExtensionDel { .. } => K_EXT_DEL,
+            Op::ExtWrite { .. } => K_EXT_WRITE,
         }
     }
 
@@ -187,6 +209,22 @@ impl Op {
                 put_varint(out, *next_edge);
             }
             Op::Clear => {}
+            Op::ExtensionAdd { name, version } => {
+                put_str(out, name);
+                put_str(out, version);
+            }
+            Op::ExtensionDel { name } => put_str(out, name),
+            Op::ExtWrite { puts, dels } => {
+                put_varint(out, puts.len() as u64);
+                for (k, v) in puts {
+                    put_bytes(out, k);
+                    put_bytes(out, v);
+                }
+                put_varint(out, dels.len() as u64);
+                for k in dels {
+                    put_bytes(out, k);
+                }
+            }
         }
     }
 
@@ -257,6 +295,24 @@ impl Op {
                 next_edge: r.varint()?,
             },
             K_CLEAR => Op::Clear,
+            K_EXT_ADD => Op::ExtensionAdd {
+                name: r.string()?,
+                version: r.string()?,
+            },
+            K_EXT_DEL => Op::ExtensionDel { name: r.string()? },
+            K_EXT_WRITE => {
+                let n = r.varint()? as usize;
+                let mut puts = Vec::with_capacity(n.min(4096));
+                for _ in 0..n {
+                    puts.push((r.bytes()?, r.bytes()?));
+                }
+                let n = r.varint()? as usize;
+                let mut dels = Vec::with_capacity(n.min(4096));
+                for _ in 0..n {
+                    dels.push(r.bytes()?);
+                }
+                Op::ExtWrite { puts, dels }
+            }
             other => return Err(format!("unknown record kind {}", other)),
         };
         Ok(op)
@@ -321,9 +377,28 @@ impl Op {
                 r.varint()?;
                 r.skip_str()
             }
-            K_INDEX_ADD | K_INDEX_DEL => {
+            K_INDEX_ADD | K_INDEX_DEL | K_EXT_ADD => {
                 r.skip_str()?;
                 r.skip_str()
+            }
+            K_EXT_DEL => r.skip_str(),
+            K_EXT_WRITE => {
+                let n = r.varint()?;
+                if n as usize > r.remaining() {
+                    return Err("put count exceeds record".into());
+                }
+                for _ in 0..n {
+                    r.skip_bytes()?;
+                    r.skip_bytes()?;
+                }
+                let n = r.varint()?;
+                if n as usize > r.remaining() + 1 {
+                    return Err("delete count exceeds record".into());
+                }
+                for _ in 0..n {
+                    r.skip_bytes()?;
+                }
+                Ok(())
             }
             K_COUNTERS => {
                 r.varint()?;

@@ -12,12 +12,14 @@
 //!          'I' label key     -> index id, distinct values, entries
 //!          'L' label         -> nodes with the label
 //!          'T' type          -> edges of the type
+//!          'X' name          -> installed extension's version
 //! nodes    id                -> labels, properties
 //! edges    id                -> from, to, type, properties
 //! adj      node dir type edge -> other end          (dir 0 out, 1 in)
 //! labels   label node        -> ()
 //! types    type edge         -> ()
 //! props    index value node  -> truncated?          (order-preserving value)
+//! ext      name 0 key        -> value               (each extension's own keyspace)
 //! ```
 //!
 //! Every mutation is an [`Op`]: logged to the write-ahead log, then applied
@@ -51,6 +53,8 @@ const ADJ: Tree = Tree { slot: 3, id: 4 };
 const LABELS: Tree = Tree { slot: 4, id: 5 };
 const TYPES: Tree = Tree { slot: 5, id: 6 };
 const PROPS: Tree = Tree { slot: 6, id: 7 };
+/// Extensions' keyspace. Files from before it have an empty root here.
+const EXT: Tree = Tree { slot: 7, id: 8 };
 
 const M_NEXT_NODE: usize = 0;
 const M_NEXT_EDGE: usize = 1;
@@ -280,6 +284,13 @@ fn pair_key(a: u32, b: u64) -> [u8; 12] {
 fn cat_key(tag: u8, a: u32) -> [u8; 5] {
     let mut k = [tag, 0, 0, 0, 0];
     k[1..].copy_from_slice(&a.to_be_bytes());
+    k
+}
+
+fn ext_key(name: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(1 + name.len());
+    k.push(b'X');
+    k.extend_from_slice(name.as_bytes());
     k
 }
 
@@ -778,12 +789,31 @@ fn apply(p: &Pager, sch: &mut Schema<'_>, op: &Op) -> SResult<()> {
             p.set_meta(M_NEXT_NODE, p.meta(M_NEXT_NODE).max(*next_node));
             p.set_meta(M_NEXT_EDGE, p.meta(M_NEXT_EDGE).max(*next_edge));
         }
+        Op::ExtensionAdd { name, version } => {
+            CATALOG.put(p, &ext_key(name), version.as_bytes())?;
+        }
+        Op::ExtensionDel { name } => {
+            CATALOG.delete(p, &ext_key(name))?;
+            let mut prefix = name.as_bytes().to_vec();
+            prefix.push(0);
+            delete_prefix(p, EXT, &prefix)?;
+        }
+        Op::ExtWrite { puts, dels } => {
+            for k in dels {
+                EXT.delete(p, k)?;
+            }
+            for (k, v) in puts {
+                EXT.put(p, k, v)?;
+            }
+        }
+        // Like index definitions, installed extensions survive a CLEAR.
         Op::Clear => {
             for t in [NODES, EDGES, ADJ, LABELS, TYPES, PROPS] {
                 t.clear(p)?;
             }
             delete_prefix(p, CATALOG, &[b'L'])?;
             delete_prefix(p, CATALOG, &[b'T'])?;
+            clear_ext_data(p)?;
             let defs: Vec<_> = sch.indexes.iter().map(|(lk, d)| (*lk, d.id)).collect();
             for ((l, k), id) in defs {
                 put_index_stats(p, l, k, id, 0, 0)?;
@@ -796,6 +826,35 @@ fn apply(p: &Pager, sch: &mut Schema<'_>, op: &Op) -> SResult<()> {
         }
     }
     Ok(())
+}
+
+/// Under CLEAR, extensions lose what they derived from the data and keep
+/// their configuration: keys whose part after the name starts with `!`.
+fn clear_ext_data(p: &Pager) -> SResult<()> {
+    let mut after: Vec<u8> = Vec::new();
+    loop {
+        let mut batch = Vec::new();
+        let mut last = None;
+        {
+            let mut c = EXT.seek(p, &after)?;
+            while let Some((k, _)) = c.next()? {
+                if batch.len() == BATCH {
+                    break;
+                }
+                last = Some(k.to_vec());
+                let config = k.iter().position(|&b| b == 0).is_some_and(|i| k.get(i + 1) == Some(&b'!'));
+                if !config {
+                    batch.push(k.to_vec());
+                }
+            }
+        }
+        let Some(mut l) = last else { return Ok(()) };
+        for k in batch {
+            EXT.delete(p, &k)?;
+        }
+        l.push(0);
+        after = l;
+    }
 }
 
 /// Delete every key with `prefix`, a batch at a time.
@@ -907,6 +966,9 @@ pub struct Graph {
     last_edge: std::sync::Mutex<Option<std::sync::Arc<EdgeRef>>>,
     /// Identifies this graph to the telemetry exporter's registry.
     tel_id: u64,
+    /// Installed extensions that maintain state on node writes; computed
+    /// on first write, forgotten whenever installs or config may change.
+    hooks: Option<Vec<std::sync::Arc<dyn crate::ext::Extension>>>,
 }
 
 impl Drop for Graph {
@@ -940,6 +1002,7 @@ impl Graph {
             last_node: std::sync::Mutex::new(None),
             last_edge: std::sync::Mutex::new(None),
             tel_id: crate::telemetry::next_db_id(),
+            hooks: None,
         })
     }
 
@@ -1769,6 +1832,7 @@ impl Graph {
     /// Abandon everything since the last commit.
     pub fn rollback(&mut self) -> Result<()> {
         self.forget_reads();
+        self.hooks = None;
         self.db.rollback()?;
         (self.strings, self.indexes) = load_schema(self.pager())?;
         self.uncommitted = 0;
@@ -1777,6 +1841,7 @@ impl Graph {
 
     fn rollback_quietly(&mut self) {
         self.forget_reads();
+        self.hooks = None;
         let _ = self.db.rollback();
         if let Ok(s) = load_schema(self.pager()) {
             (self.strings, self.indexes) = s;
@@ -2031,7 +2096,7 @@ impl Graph {
 
     pub fn add_node(&mut self, labels: &[String], props: Vec<(String, Value)>) -> Result<u64> {
         let id = self.pager().meta(M_NEXT_NODE);
-        self.exec(Op::NodeAdd {
+        self.exec_node(id, Op::NodeAdd {
             id,
             labels: labels.to_vec(),
             props,
@@ -2061,7 +2126,7 @@ impl Graph {
         if !self.node_exists(id) {
             return Ok(false);
         }
-        self.exec(Op::NodeDel { id })?;
+        self.exec_node(id, Op::NodeDel { id })?;
         Ok(true)
     }
 
@@ -2077,7 +2142,7 @@ impl Graph {
         if !self.node_exists(id) {
             return Err(Error::Msg(format!("no node {}", id)));
         }
-        self.exec(Op::NodeSet {
+        self.exec_node(id, Op::NodeSet {
             id,
             key: key.to_string(),
             value,
@@ -2085,7 +2150,7 @@ impl Graph {
     }
 
     pub fn unset_node_prop(&mut self, id: u64, key: &str) -> Result<()> {
-        self.exec(Op::NodeUnset {
+        self.exec_node(id, Op::NodeUnset {
             id,
             key: key.to_string(),
         })
@@ -2113,14 +2178,14 @@ impl Graph {
         if !self.node_exists(id) {
             return Err(Error::Msg(format!("no node {}", id)));
         }
-        self.exec(Op::LabelAdd {
+        self.exec_node(id, Op::LabelAdd {
             id,
             label: label.to_string(),
         })
     }
 
     pub fn remove_label(&mut self, id: u64, label: &str) -> Result<()> {
-        self.exec(Op::LabelDel {
+        self.exec_node(id, Op::LabelDel {
             id,
             label: label.to_string(),
         })
@@ -2138,6 +2203,152 @@ impl Graph {
             label: label.to_string(),
             key: key.to_string(),
         })
+    }
+
+    /// Record that this database uses an extension (`CREATE EXTENSION`).
+    /// Logged like any write, so it survives recovery and replicates.
+    pub fn add_extension(&mut self, name: &str, version: &str) -> Result<()> {
+        self.hooks = None;
+        self.exec(Op::ExtensionAdd {
+            name: name.to_string(),
+            version: version.to_string(),
+        })
+    }
+
+    /// Uninstall, deleting everything the extension kept in its keyspace.
+    pub fn drop_extension(&mut self, name: &str) -> Result<()> {
+        self.hooks = None;
+        self.exec(Op::ExtensionDel { name: name.to_string() })
+    }
+
+    fn ext_full_key(ns: &str, key: &[u8]) -> Vec<u8> {
+        let mut k = Vec::with_capacity(ns.len() + 1 + key.len());
+        k.extend_from_slice(ns.as_bytes());
+        k.push(0);
+        k.extend_from_slice(key);
+        k
+    }
+
+    /// One value from extension `ns`'s keyspace. Sees the open transaction.
+    pub fn ext_get(&self, ns: &str, key: &[u8]) -> Option<Vec<u8>> {
+        self.note(EXT.get(self.pager(), &Self::ext_full_key(ns, key)))
+    }
+
+    /// Keys of extension `ns` starting with `prefix`, in order, until `f`
+    /// returns false. Keys are passed without the namespace.
+    pub fn ext_scan(&self, ns: &str, prefix: &[u8], f: &mut dyn FnMut(&[u8], &[u8]) -> bool) {
+        let full = Self::ext_full_key(ns, prefix);
+        let skip = ns.len() + 1;
+        self.note((|| -> SResult<()> {
+            let p = self.pager();
+            let mut c = EXT.seek(p, &full)?;
+            while let Some((k, v)) = c.next()? {
+                if !k.starts_with(&full) {
+                    break;
+                }
+                let v = v.load(p)?;
+                if !f(&k[skip..], &v) {
+                    break;
+                }
+            }
+            Ok(())
+        })())
+    }
+
+    /// Write to extension `ns`'s keyspace: deletes, then puts, as one
+    /// logged record, so it commits, rolls back, recovers and replicates
+    /// with the transaction it is part of. Keys starting with `!` are
+    /// configuration and survive CLEAR; everything else counts as derived
+    /// from the data and is wiped with it.
+    pub fn ext_write(&mut self, ns: &str, puts: Vec<(Vec<u8>, Vec<u8>)>, dels: Vec<Vec<u8>>) -> Result<()> {
+        if puts.is_empty() && dels.is_empty() {
+            return Ok(());
+        }
+        let config = puts.iter().map(|(k, _)| k).chain(dels.iter()).any(|k| k.first() == Some(&b'!'));
+        if config {
+            self.hooks = None;
+        }
+        self.exec(Op::ExtWrite {
+            puts: puts.into_iter().map(|(k, v)| (Self::ext_full_key(ns, &k), v)).collect(),
+            dels: dels.into_iter().map(|k| Self::ext_full_key(ns, &k)).collect(),
+        })
+    }
+
+    fn write_hooks(&mut self) -> Vec<std::sync::Arc<dyn crate::ext::Extension>> {
+        if self.hooks.is_none() {
+            let mut hooks = Vec::new();
+            for (name, _) in self.extensions() {
+                if let Some(e) = crate::ext::find(&name) {
+                    if e.wants_writes(self) {
+                        hooks.push(e);
+                    }
+                }
+            }
+            self.hooks = Some(hooks);
+        }
+        self.hooks.clone().unwrap_or_default()
+    }
+
+    fn node_image(&self, id: u64) -> Option<crate::ext::NodeImage> {
+        self.node(id)?;
+        Some(crate::ext::NodeImage { labels: self.node_labels(id), props: self.node_props(id) })
+    }
+
+    /// A node write, and the extension hooks that follow it, as one unit:
+    /// with autocommit on they commit together, and a failing hook takes
+    /// the write back with it.
+    fn exec_node(&mut self, id: u64, op: Op) -> Result<()> {
+        let hooks = self.write_hooks();
+        if hooks.is_empty() {
+            return self.exec(op);
+        }
+        let before = self.node_image(id);
+        let auto = self.autocommit;
+        self.autocommit = false;
+        let r = (|| -> Result<()> {
+            self.exec(op)?;
+            let after = self.node_image(id);
+            for h in &hooks {
+                h.on_node_write(self, id, before.as_ref(), after.as_ref())?;
+            }
+            Ok(())
+        })();
+        self.autocommit = auto;
+        match r {
+            Ok(()) => self.maybe_commit(),
+            Err(e) => {
+                if auto {
+                    self.rollback_quietly();
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// The installed version of an extension, if this database has it.
+    pub fn extension_version(&self, name: &str) -> Option<String> {
+        self.note((|| -> SResult<Option<String>> {
+            Ok(CATALOG.get(self.pager(), &ext_key(name))?.map(|v| String::from_utf8_lossy(&v).into_owned()))
+        })())
+    }
+
+    /// Every installed extension as (name, version), by name.
+    pub fn extensions(&self) -> Vec<(String, String)> {
+        self.note((|| -> SResult<Vec<(String, String)>> {
+            let mut out = Vec::new();
+            let mut c = CATALOG.seek(self.pager(), b"X")?;
+            while let Some((k, v)) = c.next()? {
+                if k[0] != b'X' {
+                    break;
+                }
+                let v = v.load(self.pager())?;
+                out.push((
+                    String::from_utf8_lossy(&k[1..]).into_owned(),
+                    String::from_utf8_lossy(&v).into_owned(),
+                ));
+            }
+            Ok(out)
+        })())
     }
 
     pub fn clear(&mut self) -> Result<()> {
@@ -2299,7 +2510,7 @@ impl Graph {
     /// chains. Returns the number of entries seen.
     pub fn verify_trees(&self) -> Result<u64> {
         let mut n = 0;
-        for t in [CATALOG, NODES, EDGES, ADJ, LABELS, TYPES, PROPS] {
+        for t in [CATALOG, NODES, EDGES, ADJ, LABELS, TYPES, PROPS, EXT] {
             n += t.check(self.pager())?.entries;
         }
         Ok(n)
