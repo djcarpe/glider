@@ -251,8 +251,8 @@ impl Replicator {
     ) -> io::Result<Synced> {
         if crate::replica::is_paged(&self.db) {
             return Err(io::Error::other(format!(
-                "{} uses paged storage, which glider-stream does not replicate yet; \
-                 use `glider {} wal tail --to <dir> --exec '<upload command>'` instead",
+                "{} uses paged storage: replicate it with stream::paged::PagedReplicator \
+                 (glider-stream does this itself), or `glider {} wal tail --to <dir> --exec ...`",
                 self.db.display(),
                 self.db.display()
             )));

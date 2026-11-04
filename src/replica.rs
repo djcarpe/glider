@@ -53,6 +53,11 @@ pub fn is_paged(db: &Path) -> bool {
     pager::read_superblock(db).is_ok()
 }
 
+/// A paged database's generation, spelled as replica directories name it.
+pub fn generation_hex(db: &Path) -> io::Result<String> {
+    pager::read_superblock(db).map(|sb| hex(&sb.generation)).map_err(sio)
+}
+
 /// One base snapshot in a replica.
 #[derive(Clone, Debug)]
 pub struct Base {
@@ -344,6 +349,13 @@ fn whole_transactions(path: &Path) -> io::Result<bool> {
 /// Follow a paged database: take a base, then ship committed log as it
 /// appears, taking a new base whenever the log needed has gone.
 pub fn tail(db_path: &Path, dir: &Path, opts: &TailOptions) -> io::Result<()> {
+    tail_with(db_path, dir, opts, &|_| false)
+}
+
+/// [`tail`], plus `new_base`: asked once per pass with the newest base of the
+/// generation, it takes a new base now when it answers true (glider-stream's
+/// snapshot interval, so a restore never replays more than that much log).
+pub fn tail_with(db_path: &Path, dir: &Path, opts: &TailOptions, new_base: &dyn Fn(&Base) -> bool) -> io::Result<()> {
     let mut t = Tailer {
         db: db_path,
         dir,
@@ -373,6 +385,14 @@ pub fn tail(db_path: &Path, dir: &Path, opts: &TailOptions) -> io::Result<()> {
             match bases(dir, &gen)?.last() {
                 Some(b) => t.shipped = reach(&wal::segments(dir, &gen)?, b.lsn),
                 None => need_base = true,
+            }
+        }
+        if !need_base {
+            if let Some(b) = bases(dir, &gen)?.last() {
+                if new_base(b) {
+                    t.note(&format!("{gen} taking a new base (the newest, at log {}, is due for renewal)", b.lsn));
+                    need_base = true;
+                }
             }
         }
         if !need_base {
