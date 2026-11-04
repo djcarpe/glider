@@ -67,9 +67,21 @@ commit.
 
 ## Shipping to S3, MinIO, or anything else
 
-Glider does not speak S3: an HTTP client, TLS and SigV4 would be its first
-dependencies. The tailer writes to a directory and runs a command for each
-base and log segment:
+The `glider` binary does not speak S3, so it never grows a network stack.
+Two ways to get a replica into object storage:
+
+- **`glider-stream`** (the replication daemon, zero dependencies: SigV4 and
+  HTTP written against the spec) replicates paged databases to S3, a
+  directory or an `exec:` command, with retention, snapshot intervals,
+  metrics and restore — see [STREAM.md](STREAM.md#paged-databases):
+
+  ```sh
+  glider-stream replicate app.gldb s3://graphs/app -endpoint http://minio.internal:9000
+  glider-stream restore -o recovered.gldb s3://graphs/app -endpoint http://minio.internal:9000
+  ```
+
+- **`wal tail --exec`**: the tailer writes to a directory and runs a command
+  for each base and log segment:
 
 ```sh
 glider app.gldb wal tail --to /var/spool/glider \
@@ -90,9 +102,8 @@ tailer rather than silently dropping something.
 
 Lag is `--interval` in the worst case.
 
-`glider-stream`, the daemon with built-in S3 and HTTP backends, replicates
-databases from before paged storage; for paged databases use `wal tail
---exec`.
+`glider-stream` lays a paged replica out the same way, with the shipping time
+in each segment's name (`<offset>-<unix>.seg`); `glider wal` reads both.
 
 ## Restoring
 
@@ -129,8 +140,9 @@ glider app.gldb wal status --to /var/spool/glider
 # lag         0 bytes
 ```
 
-To restore from object storage, pull the generation down and restore
-locally; keep the directory layout, since offsets live in the names.
+To restore from object storage, `glider-stream restore` does it in one step;
+or pull the generation down and restore locally, keeping the directory
+layout, since offsets live in the names.
 
 ## Databases from before paged storage
 

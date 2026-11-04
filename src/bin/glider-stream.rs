@@ -11,12 +11,13 @@
 //! ```
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use glider::stream::config::{self, Config, DbConfig, ReplicaConfig};
+use glider::stream::paged::{self, PagedReplicator};
 use glider::stream::replicator::{self, Metrics, Replicator};
 
 const USAGE: &str = r#"glider-stream — continuous replication for glider databases
@@ -39,6 +40,11 @@ replica urls:
   s3://bucket/prefix          S3-compatible; needs -endpoint for plaintext, or the
                               aws CLI on PATH for TLS
 
+paged databases (every database glider writes today) are replicated as base
+snapshots plus the write-ahead log: the paged tailer ships into a local spool
+(<db>-stream/ unless -spool or the config says) and each base and segment it
+completes is uploaded. Files from before paged storage replicate as before.
+
 options:
   -config PATH        config file (default /etc/glider-stream.yml)
   -no-expand-env      do not substitute $VARS in the config
@@ -52,6 +58,7 @@ options:
   -endpoint URL       S3 endpoint, e.g. http://minio.internal:9000
   -region NAME        S3 region (default us-east-1)
   -addr HOST:PORT     serve Prometheus metrics while replicating
+  -spool DIR          paged databases: where to ship before upload
   -v                  verbose
 
 credentials come from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY, or the config.
@@ -90,6 +97,7 @@ fn positionals(args: &[String]) -> Vec<String> {
         "-endpoint",
         "-region",
         "-addr",
+        "-spool",
     ];
     let mut out = Vec::new();
     let mut i = 1;
@@ -116,8 +124,44 @@ fn replica_from_args(url: &str, args: &[String]) -> ReplicaConfig {
         region: flag(args, "-region").unwrap_or_else(|| "us-east-1".into()),
         min_bytes: 0,
         sync_interval: Duration::from_secs(1),
+        spool: flag(args, "-spool"),
         ..Default::default()
     }
+}
+
+fn is_paged(db: &str) -> bool {
+    glider::replica::is_paged(Path::new(db))
+}
+
+fn paged_replicator(db: &str, rc: &ReplicaConfig) -> io::Result<PagedReplicator> {
+    let spool = rc
+        .spool
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| paged::default_spool(Path::new(db), &rc.url));
+    let backend = config::open_backend(rc)?;
+    let mut r = PagedReplicator::new(Path::new(db), spool, backend, rc.clone());
+    r.verbose = true;
+    Ok(r)
+}
+
+fn print_paged_sync(db: &str, s: &paged::SyncReport) {
+    println!(
+        "{db}: generation {} — {} base(s) and {} segment(s) uploaded, {} bytes{}",
+        if s.generation.is_empty() {
+            "?"
+        } else {
+            &s.generation
+        },
+        s.bases_uploaded,
+        s.segments_uploaded,
+        s.bytes,
+        if s.deleted > 0 {
+            format!(", {} object(s) expired", s.deleted)
+        } else {
+            String::new()
+        }
+    );
 }
 
 fn load_config(args: &[String]) -> io::Result<Config> {
@@ -163,6 +207,15 @@ fn run(args: &[String]) -> io::Result<()> {
             let cfg = load_config(args)?;
             for db in &cfg.dbs {
                 for rc in &db.replicas {
+                    if is_paged(&db.path) {
+                        let r = paged_replicator(&db.path, rc)?;
+                        let s = r.sync(
+                            has(args, "-force-snapshot"),
+                            has(args, "-enforce-retention"),
+                        )?;
+                        print_paged_sync(&db.path, &s);
+                        continue;
+                    }
                     let backend = config::open_backend(rc)?;
                     let mut r = Replicator::new(Path::new(&db.path), backend, rc.clone());
                     r.verbose = true;
@@ -197,6 +250,29 @@ fn run(args: &[String]) -> io::Result<()> {
             };
 
             let backend = config::open_backend(&replica_from_args(&url, args))?;
+            if paged::is_paged_replica(backend.as_ref())? {
+                let report = paged::restore(
+                    backend.as_ref(),
+                    flag(args, "-generation").as_deref(),
+                    as_of,
+                    Path::new(&out),
+                )?;
+                // Open it: that replays the log. A restore that does not open is not a restore.
+                let g = glider::Graph::open(Path::new(&out), glider::Sync::Normal)
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                g.verify_trees()
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                println!(
+                    "restored generation {} from the base at log {} ({}) and {} log segment(s), through log {}",
+                    report.generation,
+                    report.base.lsn,
+                    glider::wal::fmt_unix(report.base.ts),
+                    report.segments,
+                    report.through
+                );
+                println!("{} nodes, {} edges", g.node_count(), g.edge_count());
+                return Ok(());
+            }
             let report = match replicator::restore(
                 backend.as_ref(),
                 flag(args, "-generation").as_deref(),
@@ -250,6 +326,35 @@ fn run(args: &[String]) -> io::Result<()> {
                 .cloned()
                 .ok_or_else(|| io::Error::other("needs a replica url"))?;
             let backend = config::open_backend(&replica_from_args(&url, args))?;
+            if paged::is_paged_replica(backend.as_ref())? {
+                for gen in paged::generations(backend.as_ref())? {
+                    let l = paged::listing(backend.as_ref(), &gen)?;
+                    match args[0].as_str() {
+                        "generations" => println!("{}", paged::describe(&l)),
+                        "segments" => {
+                            for s in &l.segments {
+                                println!(
+                                    "{gen}  offset {:>12}  {:>10} bytes  {}",
+                                    s.seg.offset,
+                                    s.seg.len,
+                                    glider::wal::fmt_unix(s.seg.ts)
+                                );
+                            }
+                        }
+                        _ => {
+                            for b in &l.bases {
+                                println!(
+                                    "{gen}  base at log {:>12}  {:>10} bytes  {}",
+                                    b.lsn,
+                                    b.bytes,
+                                    glider::wal::fmt_unix(b.ts)
+                                );
+                            }
+                        }
+                    }
+                }
+                return Ok(());
+            }
             let gens = replicator::generations(backend.as_ref())?;
             if gens.is_empty() {
                 println!("no generations in {url}");
@@ -303,6 +408,23 @@ fn run(args: &[String]) -> io::Result<()> {
         "status" => {
             let cfg = load_config(args)?;
             for db in &cfg.dbs {
+                if is_paged(&db.path) {
+                    for rc in &db.replicas {
+                        let r = paged_replicator(&db.path, rc)?;
+                        let gen = glider::replica::generation_hex(Path::new(&db.path))
+                            .unwrap_or_else(|_| "unreadable".into());
+                        let l = paged::listing(r.backend.as_ref(), &gen)?;
+                        println!(
+                            "{}\n  generation {gen}\n  newest base {}\n  replicated log to {} ({})\n  lag        {} bytes",
+                            db.path,
+                            l.bases.last().map(|b| format!("at log {} ({})", b.lsn, glider::wal::fmt_unix(b.ts))).unwrap_or_else(|| "none".into()),
+                            l.complete_to(),
+                            rc.url,
+                            r.lag(&gen).unwrap_or(0)
+                        );
+                    }
+                    continue;
+                }
                 let local = glider::store::scan_committed_end(Path::new(&db.path), 0).unwrap_or(0);
                 let gen = glider::store::read_header(Path::new(&db.path))
                     .map(|h| h.generation_hex())
@@ -345,6 +467,24 @@ fn replicate(cfg: Config, args: &[String], verbose: bool) -> io::Result<()> {
 
     for db in cfg.dbs {
         for rc in db.replicas {
+            if is_paged(&db.path) {
+                let r = paged_replicator(&db.path, &rc)?;
+                if once {
+                    match r.sync(force_snapshot, enforce_retention) {
+                        Ok(s) => print_paged_sync(&db.path, &s),
+                        Err(e) => eprintln!("error: {}: {e}", db.path),
+                    }
+                    continue;
+                }
+                exported.push((db.path.clone(), rc.url.clone(), r.metrics.clone()));
+                let stop = stop.clone();
+                handles.push(std::thread::spawn(move || {
+                    if let Err(e) = r.run(stop) {
+                        eprintln!("replicator stopped: {e}");
+                    }
+                }));
+                continue;
+            }
             let backend = config::open_backend(&rc)?;
             let mut r = Replicator::new(Path::new(&db.path), backend, rc.clone());
             r.verbose = true;

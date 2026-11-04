@@ -334,6 +334,9 @@ pub struct ReplicaConfig {
     pub exec_get: Option<String>,
     pub exec_list: Option<String>,
     pub exec_delete: Option<String>,
+    /// Paged databases: where the tailer ships before upload. Default: beside
+    /// the database (`<db>-stream/<hash of url>`).
+    pub spool: Option<String>,
 }
 
 impl Default for ReplicaConfig {
@@ -353,6 +356,7 @@ impl Default for ReplicaConfig {
             exec_get: None,
             exec_list: None,
             exec_delete: None,
+            spool: None,
         }
     }
 }
@@ -444,6 +448,7 @@ pub fn from_node(root: &Node) -> io::Result<Config> {
             rc.exec_get = r.str("exec-get");
             rc.exec_list = r.str("exec-list");
             rc.exec_delete = r.str("exec-delete");
+            rc.spool = r.str("spool").filter(|s| !s.is_empty());
             replicas.push(rc);
         }
 

@@ -1,11 +1,10 @@
 # glider-stream
 
-> **Paged databases:** `glider-stream` replicates database files from before
-> paged storage (an append-only log with a snapshot image). For a paged
-> database it stops with an error pointing at `glider <db> wal tail --exec`,
-> which ships base snapshots and the write-ahead log to any destination a
-> command can reach — see [REPLICATION.md](REPLICATION.md). Built-in S3 and
-> HTTP backends for paged replicas are future work (PAGED-6 in TODO.md).
+> **Paged databases** (everything `glider` writes today) replicate as base
+> snapshots plus the write-ahead log — the layout of `glider <db> wal tail`
+> ([REPLICATION.md](REPLICATION.md)) — uploaded to S3, a directory, or an
+> `exec:` command. Files from before paged storage replicate as below. The
+> section [Paged databases](#paged-databases) has the details.
 
 Continuous replication for glider databases, built to Litestream's shape: a
 daemon that watches database files and streams committed bytes to object
@@ -186,3 +185,49 @@ One writer per file. No leader election, no lock file, no fencing. Two
 processes writing one glider database corrupt it, and replication does not
 change that — it only means you will have a good copy of the moment before
 you did it.
+
+## Paged databases
+
+`glider-stream` notices a paged database and replicates it the way `glider
+<db> wal tail` does — a base taken under a checkpoint hold while the writer
+carries on, then whole transactions of log as they commit — and uploads what
+the tailer completes. Same commands, same config; nothing to switch on.
+
+```text
+<generation>/base/<lsn:016x>/db                 pages of one checkpoint
+<generation>/base/<lsn:016x>/data/<n:08>.seg    its segment files, if any
+<generation>/base/<lsn:016x>/base.json          uploaded last: the base is whole
+<generation>/segments/<offset:016x>-<unix>.seg  log from <offset>, whole transactions
+```
+
+- **The spool.** The tailer ships into a local directory first:
+  `<db>-stream/<hash of the replica url>/` unless `-spool DIR` or `spool:` in
+  the replica's config says otherwise. After every pass the spool is
+  reconciled with the backend: whatever is complete and not yet uploaded goes
+  up. A failed upload stays pending for the next pass, so a flaky network
+  delays replication but never drops a segment. An uploaded base keeps only
+  its `base.json` in the spool, and log wholly below the newest base is
+  dropped, so the spool stays about the size of the unshipped log.
+- **Snapshots** are bases. `snapshot.interval` takes a new one when the
+  newest is that old (so a restore never replays more than that much log);
+  `-force-snapshot` takes one now. A base also comes whenever the log the
+  replica needs has been checkpointed away.
+- **Retention** deletes bases older than `retention` (never the newest),
+  then the log wholly below the oldest base kept, and whole generations idle
+  longer than `retention` (never the current one). A base loses its
+  `base.json` first, so a restore never picks one half deleted.
+- **Restore** (`glider-stream restore -o out.gldb [-timestamp T] URL`)
+  downloads the newest base at or before `T` and the log shipped after it,
+  up to `T` and stopping at a gap, into the layout `glider wal restore`
+  reads, runs that restore, opens the result (which replays the log) and
+  checks every tree. `generations`, `segments` (log) and `snapshots` (bases)
+  list a paged replica; `status` shows the newest base, how far the log is
+  replicated, and the lag.
+- **Size.** Objects are single PUTs, read whole on restore: fine for the
+  small and mid-sized databases this is for; for bases past a few GB use
+  `wal tail --exec` with a tool that does multipart uploads.
+
+A writer that may sit idle for long periods should call
+`Graph::poll_replication()` now and then (`glider serve` does it every
+second), or a base waits for its next commit.
+

@@ -182,10 +182,16 @@ These produce wrong results or lost data. Nothing else should go first.
   Dijkstra's priority queue is in memory (O(frontier)); betweenness and
   closeness are O(n·m) by nature — use `samples:`.
 
-- [ ] **PAGED-6 · Incremental bases and glider-stream** · M
+- [x] **PAGED-6a · glider-stream for paged databases** · M
+  `glider-stream` replicates paged databases to S3, a directory or `exec:`
+  (the tailer into a spool, reconciled with the backend after every pass),
+  with snapshot intervals, retention, listing, status and point-in-time
+  restore (`src/stream/paged.rs`, `tests/paged_stream.rs`, `tests/test_s3.py`).
+
+- [ ] **PAGED-6 · Incremental bases** · M
   A new replica base copies every page; ship only pages changed since the
-  previous base. `glider-stream` (built-in S3/HTTP) still replicates only
-  pre-paged files; paged ones use `wal tail --exec`.
+  previous base. Also: multipart uploads and streamed (not whole-object)
+  reads for bases of many GB.
 
 - [ ] **PAGED-7 · Concurrent readers** · L
   Copy-on-write already gives every checkpoint a consistent snapshot; a
