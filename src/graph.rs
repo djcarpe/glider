@@ -380,7 +380,7 @@ struct Schema<'a> {
 fn load_schema(p: &Pager) -> SResult<(Interner, Indexes)> {
     {
         let mut list = Vec::new();
-        let mut c = CATALOG.seek(p, &[b'S'])?;
+        let mut c = CATALOG.seek(p, b"S")?;
         while let Some((k, v)) = c.next()? {
             if k[0] != b'S' {
                 break;
@@ -390,10 +390,13 @@ fn load_schema(p: &Pager) -> SResult<(Interner, Indexes)> {
                 return Err(SError::Corrupt(format!("string table has a gap at {id}")));
             }
             let s = v.load(p)?;
-            list.push(String::from_utf8(s.into_owned()).map_err(|_| SError::Corrupt("string is not utf-8".into()))?);
+            list.push(
+                String::from_utf8(s.into_owned())
+                    .map_err(|_| SError::Corrupt("string is not utf-8".into()))?,
+            );
         }
         let mut indexes = HashMap::new();
-        let mut c = CATALOG.seek(p, &[b'I'])?;
+        let mut c = CATALOG.seek(p, b"I")?;
         while let Some((k, v)) = c.next()? {
             if k[0] != b'I' {
                 break;
@@ -401,7 +404,12 @@ fn load_schema(p: &Pager) -> SResult<(Interner, Indexes)> {
             let l = keys::get_u32(k, 1);
             let key = keys::get_u32(k, 5);
             let v = v.load(p)?;
-            indexes.insert((l, key), IndexDef { id: u32::from_le_bytes(v[0..4].try_into().unwrap()) });
+            indexes.insert(
+                (l, key),
+                IndexDef {
+                    id: u32::from_le_bytes(v[0..4].try_into().unwrap()),
+                },
+            );
         }
         Ok((Interner::from_list(list), indexes))
     }
@@ -493,7 +501,14 @@ fn idx_remove(p: &Pager, lk: (u32, u32), index: u32, v: &Value, node: u64) -> SR
     // `v` itself rather than re-reading this node.
     let gone = !value_indexed(p, index, lk.1, v, node)?;
     if let Some((id, d, e)) = index_stats(p, lk.0, lk.1)? {
-        put_index_stats(p, lk.0, lk.1, id, d.saturating_sub(gone as u64), e.saturating_sub(1))?;
+        put_index_stats(
+            p,
+            lk.0,
+            lk.1,
+            id,
+            d.saturating_sub(gone as u64),
+            e.saturating_sub(1),
+        )?;
     }
     Ok(())
 }
@@ -811,8 +826,8 @@ fn apply(p: &Pager, sch: &mut Schema<'_>, op: &Op) -> SResult<()> {
             for t in [NODES, EDGES, ADJ, LABELS, TYPES, PROPS] {
                 t.clear(p)?;
             }
-            delete_prefix(p, CATALOG, &[b'L'])?;
-            delete_prefix(p, CATALOG, &[b'T'])?;
+            delete_prefix(p, CATALOG, b"L")?;
+            delete_prefix(p, CATALOG, b"T")?;
             clear_ext_data(p)?;
             let defs: Vec<_> = sch.indexes.iter().map(|(lk, d)| (*lk, d.id)).collect();
             for ((l, k), id) in defs {
@@ -842,7 +857,10 @@ fn clear_ext_data(p: &Pager) -> SResult<()> {
                     break;
                 }
                 last = Some(k.to_vec());
-                let config = k.iter().position(|&b| b == 0).is_some_and(|i| k.get(i + 1) == Some(&b'!'));
+                let config = k
+                    .iter()
+                    .position(|&b| b == 0)
+                    .is_some_and(|i| k.get(i + 1) == Some(&b'!'));
                 if !config {
                     batch.push(k.to_vec());
                 }
@@ -1015,7 +1033,8 @@ impl Graph {
     /// that, writes fail with [`Error::Full`] and are rolled back; the graph
     /// stays usable.
     pub fn memory_with_limit(max_memory: u64) -> Graph {
-        Graph::init(Db::memory(crate::storage::page::DEFAULT_PAGE, max_memory)).expect("empty memory graph")
+        Graph::init(Db::memory(crate::storage::page::DEFAULT_PAGE, max_memory))
+            .expect("empty memory graph")
     }
 
     /// A memory graph with a chosen page size: for tests that want splits
@@ -1163,7 +1182,10 @@ impl Graph {
                 }
             }
             let (next_node, next_edge) = crate::legacy::image::ImageSource::next_ids(old);
-            self.exec(Op::Counters { next_node, next_edge })?;
+            self.exec(Op::Counters {
+                next_node,
+                next_edge,
+            })?;
             self.commit()
         })();
         self.autocommit = auto;
@@ -1211,7 +1233,10 @@ impl Graph {
 
     /// The first storage error a read hit, if any (cleared when read).
     pub fn integrity_error(&self) -> Option<String> {
-        self.read_error.lock().unwrap_or_else(|x| x.into_inner()).take()
+        self.read_error
+            .lock()
+            .unwrap_or_else(|x| x.into_inner())
+            .take()
     }
 
     // -------------------------------------------------------------- reads
@@ -1229,7 +1254,10 @@ impl Graph {
             return Some(n.clone());
         }
         let n = self
-            .note(node_record(self.pager(), id).map(|r| r.map(|(labels, props)| NodeRef { id, labels, props })))
+            .note(
+                node_record(self.pager(), id)
+                    .map(|r| r.map(|(labels, props)| NodeRef { id, labels, props })),
+            )
             .map(std::sync::Arc::new);
         last.clone_from(&n);
         n
@@ -1240,7 +1268,13 @@ impl Graph {
     /// id order (a scan instead of a lookup per node) and leaving it in the
     /// read cache for whatever the caller does next. Returns how many ids
     /// were visited and the last one, or None when `f` stopped.
-    pub fn scan_nodes(&self, label: Option<u32>, from: u64, limit: usize, f: &mut dyn FnMut(u64) -> bool) -> Option<(usize, u64)> {
+    pub fn scan_nodes(
+        &self,
+        label: Option<u32>,
+        from: u64,
+        limit: usize,
+        f: &mut dyn FnMut(u64) -> bool,
+    ) -> Option<(usize, u64)> {
         self.note((|| -> SResult<Option<(usize, u64)>> {
             let p = self.pager();
             let mut nodes = NODES.seek(p, &node_key(from))?;
@@ -1258,7 +1292,9 @@ impl Graph {
                 }
                 let want = match members.as_mut() {
                     Some(c) => match c.next()? {
-                        Some((k, _)) if k[..4] == label.unwrap().to_be_bytes() => keys::get_u64(k, 4),
+                        Some((k, _)) if k[..4] == label.unwrap().to_be_bytes() => {
+                            keys::get_u64(k, 4)
+                        }
                         _ => return Ok(Some((seen, last))),
                     },
                     None => match at {
@@ -1314,7 +1350,13 @@ impl Graph {
         }
         let e = self
             .note(edge_record(self.pager(), id).map(|r| {
-                r.map(|(from, to, etype, props)| EdgeRef { id, from, to, etype, props })
+                r.map(|(from, to, etype, props)| EdgeRef {
+                    id,
+                    from,
+                    to,
+                    etype,
+                    props,
+                })
             }))
             .map(std::sync::Arc::new);
         last.clone_from(&e);
@@ -1356,7 +1398,13 @@ impl Graph {
                     continue;
                 }
                 let (from, to, etype, props) = decode_edge(&rec.1)?;
-                let e = std::sync::Arc::new(EdgeRef { id: want, from, to, etype, props });
+                let e = std::sync::Arc::new(EdgeRef {
+                    id: want,
+                    from,
+                    to,
+                    etype,
+                    props,
+                });
                 *self.last_edge.lock().unwrap_or_else(|x| x.into_inner()) = Some(e.clone());
                 if !f(&e) {
                     return Ok(());
@@ -1443,7 +1491,13 @@ impl Graph {
 
     /// `for_each_adj`, stopping as soon as `f` returns false. Returns false
     /// if it was stopped.
-    pub fn for_each_adj_while(&self, id: u64, dir: Dir, etype: Option<u32>, mut f: impl FnMut(Adj) -> bool) -> bool {
+    pub fn for_each_adj_while(
+        &self,
+        id: u64,
+        dir: Dir,
+        etype: Option<u32>,
+        mut f: impl FnMut(Adj) -> bool,
+    ) -> bool {
         let sides: &[u8] = match dir {
             Dir::Out => &[OUT],
             Dir::In => &[IN],
@@ -1578,7 +1632,8 @@ impl Graph {
         };
         for d in sides {
             let r = (|| -> SResult<()> {
-                let (prefix, n) = adj_prefix(id, if matches!(d, Dir::Out) { OUT } else { IN }, None);
+                let (prefix, n) =
+                    adj_prefix(id, if matches!(d, Dir::Out) { OUT } else { IN }, None);
                 let prefix = &prefix[..n];
                 let mut c = ADJ.seek(self.pager(), prefix)?;
                 while let Some((k, v)) = c.next()? {
@@ -1661,7 +1716,10 @@ impl Graph {
         let l = self.strings.lookup(label)?;
         let k = self.strings.lookup(key)?;
         let def = *self.indexes.get(&(l, k))?;
-        Some(self.note(self.index_scan(def.id, k, value, COUNT_CAP)).len())
+        Some(
+            self.note(self.index_scan(def.id, k, value, COUNT_CAP))
+                .len(),
+        )
     }
 
     pub fn has_index(&self, label: &str, key: &str) -> bool {
@@ -1714,7 +1772,9 @@ impl Graph {
     }
 
     pub fn has_label(&self, id: u64, label: u32) -> bool {
-        self.node_shared(id).map(|n| n.has_label(label)).unwrap_or(false)
+        self.node_shared(id)
+            .map(|n| n.has_label(label))
+            .unwrap_or(false)
     }
 
     pub fn node_props(&self, id: u64) -> Vec<(String, Value)> {
@@ -1749,7 +1809,10 @@ impl Graph {
     /// such as autocomplete, and stays cheap on a graph of any size.
     pub fn sample_keys(&self, per: usize) -> (KeySample, KeySample) {
         let names = |ids: BTreeSet<u32>| -> Vec<String> {
-            let mut v: Vec<String> = ids.into_iter().map(|k| self.strings.name(k).to_string()).collect();
+            let mut v: Vec<String> = ids
+                .into_iter()
+                .map(|k| self.strings.name(k).to_string())
+                .collect();
             v.sort();
             v
         };
@@ -1862,16 +1925,13 @@ impl Graph {
     fn exec(&mut self, op: Op) -> Result<()> {
         self.forget_reads();
         let rec = op_record(&op);
-        let r = self
-            .db
-            .log(&rec)
-            .and_then(|_| {
-                let mut sch = Schema {
-                    strings: &mut self.strings,
-                    indexes: &mut self.indexes,
-                };
-                apply(self.db.pager(), &mut sch, &op)
-            });
+        let r = self.db.log(&rec).and_then(|_| {
+            let mut sch = Schema {
+                strings: &mut self.strings,
+                indexes: &mut self.indexes,
+            };
+            apply(self.db.pager(), &mut sch, &op)
+        });
         if let Err(e) = r {
             self.rollback_quietly();
             let e: Error = e.into();
@@ -1911,7 +1971,10 @@ impl Graph {
     ) -> Result<Graph> {
         use crate::storage::btree::Builder;
         use crate::storage::extsort::Sorter;
-        if std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false) {
+        if std::fs::metadata(path)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false)
+        {
             return Err(Error::Msg(format!("{} already exists", path.display())));
         }
         let mut g = Graph::open_opts(path, opts)?;
@@ -1993,8 +2056,12 @@ impl Graph {
                 }
                 let r = (|| -> Result<()> {
                     b.push(&node_key(id), &encode_edge(from, to, t, props))?;
-                    adj_s.push(&adj_key(from, OUT, t, id), &adj_val(to)).map_err(io)?;
-                    adj_s.push(&adj_key(to, IN, t, id), &adj_val(from)).map_err(io)?;
+                    adj_s
+                        .push(&adj_key(from, OUT, t, id), &adj_val(to))
+                        .map_err(io)?;
+                    adj_s
+                        .push(&adj_key(to, IN, t, id), &adj_val(from))
+                        .map_err(io)?;
                     types_s.push(&pair_key(t, id), &[]).map_err(io)?;
                     *type_counts.entry(t).or_default() += 1;
                     m += 1;
@@ -2048,7 +2115,11 @@ impl Graph {
                     };
                     let st = &mut stats[index as usize];
                     st.1 += 1;
-                    if last.as_ref().map(|(i, v)| *i != index || *v != ident).unwrap_or(true) {
+                    if last
+                        .as_ref()
+                        .map(|(i, v)| *i != index || *v != ident)
+                        .unwrap_or(true)
+                    {
                         st.0 += 1;
                     }
                     last = Some((index, ident));
@@ -2096,15 +2167,24 @@ impl Graph {
 
     pub fn add_node(&mut self, labels: &[String], props: Vec<(String, Value)>) -> Result<u64> {
         let id = self.pager().meta(M_NEXT_NODE);
-        self.exec_node(id, Op::NodeAdd {
+        self.exec_node(
             id,
-            labels: labels.to_vec(),
-            props,
-        })?;
+            Op::NodeAdd {
+                id,
+                labels: labels.to_vec(),
+                props,
+            },
+        )?;
         Ok(id)
     }
 
-    pub fn add_edge(&mut self, from: u64, to: u64, etype: &str, props: Vec<(String, Value)>) -> Result<u64> {
+    pub fn add_edge(
+        &mut self,
+        from: u64,
+        to: u64,
+        etype: &str,
+        props: Vec<(String, Value)>,
+    ) -> Result<u64> {
         if !self.node_exists(from) {
             return Err(Error::Msg(format!("no node {}", from)));
         }
@@ -2142,18 +2222,24 @@ impl Graph {
         if !self.node_exists(id) {
             return Err(Error::Msg(format!("no node {}", id)));
         }
-        self.exec_node(id, Op::NodeSet {
+        self.exec_node(
             id,
-            key: key.to_string(),
-            value,
-        })
+            Op::NodeSet {
+                id,
+                key: key.to_string(),
+                value,
+            },
+        )
     }
 
     pub fn unset_node_prop(&mut self, id: u64, key: &str) -> Result<()> {
-        self.exec_node(id, Op::NodeUnset {
+        self.exec_node(
             id,
-            key: key.to_string(),
-        })
+            Op::NodeUnset {
+                id,
+                key: key.to_string(),
+            },
+        )
     }
 
     pub fn set_edge_prop(&mut self, id: u64, key: &str, value: Value) -> Result<()> {
@@ -2178,17 +2264,23 @@ impl Graph {
         if !self.node_exists(id) {
             return Err(Error::Msg(format!("no node {}", id)));
         }
-        self.exec_node(id, Op::LabelAdd {
+        self.exec_node(
             id,
-            label: label.to_string(),
-        })
+            Op::LabelAdd {
+                id,
+                label: label.to_string(),
+            },
+        )
     }
 
     pub fn remove_label(&mut self, id: u64, label: &str) -> Result<()> {
-        self.exec_node(id, Op::LabelDel {
+        self.exec_node(
             id,
-            label: label.to_string(),
-        })
+            Op::LabelDel {
+                id,
+                label: label.to_string(),
+            },
+        )
     }
 
     pub fn create_index(&mut self, label: &str, key: &str) -> Result<()> {
@@ -2218,7 +2310,9 @@ impl Graph {
     /// Uninstall, deleting everything the extension kept in its keyspace.
     pub fn drop_extension(&mut self, name: &str) -> Result<()> {
         self.hooks = None;
-        self.exec(Op::ExtensionDel { name: name.to_string() })
+        self.exec(Op::ExtensionDel {
+            name: name.to_string(),
+        })
     }
 
     fn ext_full_key(ns: &str, key: &[u8]) -> Vec<u8> {
@@ -2260,17 +2354,32 @@ impl Graph {
     /// with the transaction it is part of. Keys starting with `!` are
     /// configuration and survive CLEAR; everything else counts as derived
     /// from the data and is wiped with it.
-    pub fn ext_write(&mut self, ns: &str, puts: Vec<(Vec<u8>, Vec<u8>)>, dels: Vec<Vec<u8>>) -> Result<()> {
+    pub fn ext_write(
+        &mut self,
+        ns: &str,
+        puts: Vec<(Vec<u8>, Vec<u8>)>,
+        dels: Vec<Vec<u8>>,
+    ) -> Result<()> {
         if puts.is_empty() && dels.is_empty() {
             return Ok(());
         }
-        let config = puts.iter().map(|(k, _)| k).chain(dels.iter()).any(|k| k.first() == Some(&b'!'));
+        let config = puts
+            .iter()
+            .map(|(k, _)| k)
+            .chain(dels.iter())
+            .any(|k| k.first() == Some(&b'!'));
         if config {
             self.hooks = None;
         }
         self.exec(Op::ExtWrite {
-            puts: puts.into_iter().map(|(k, v)| (Self::ext_full_key(ns, &k), v)).collect(),
-            dels: dels.into_iter().map(|k| Self::ext_full_key(ns, &k)).collect(),
+            puts: puts
+                .into_iter()
+                .map(|(k, v)| (Self::ext_full_key(ns, &k), v))
+                .collect(),
+            dels: dels
+                .into_iter()
+                .map(|k| Self::ext_full_key(ns, &k))
+                .collect(),
         })
     }
 
@@ -2291,7 +2400,10 @@ impl Graph {
 
     fn node_image(&self, id: u64) -> Option<crate::ext::NodeImage> {
         self.node(id)?;
-        Some(crate::ext::NodeImage { labels: self.node_labels(id), props: self.node_props(id) })
+        Some(crate::ext::NodeImage {
+            labels: self.node_labels(id),
+            props: self.node_props(id),
+        })
     }
 
     /// A node write, and the extension hooks that follow it, as one unit:
@@ -2328,7 +2440,9 @@ impl Graph {
     /// The installed version of an extension, if this database has it.
     pub fn extension_version(&self, name: &str) -> Option<String> {
         self.note((|| -> SResult<Option<String>> {
-            Ok(CATALOG.get(self.pager(), &ext_key(name))?.map(|v| String::from_utf8_lossy(&v).into_owned()))
+            Ok(CATALOG
+                .get(self.pager(), &ext_key(name))?
+                .map(|v| String::from_utf8_lossy(&v).into_owned()))
         })())
     }
 
@@ -2491,13 +2605,21 @@ impl Graph {
     /// The graph as algorithms see it. In memory (a [`Csr`]) when it fits
     /// the algorithm budget (see [`crate::ooc::with_budget`]), else read
     /// from the pages as it goes. `tier` forces one or the other.
-    pub fn projection(&self, dir: Dir, etype: Option<u32>, weight: Option<&str>, tier: Tier) -> Projection<'_> {
+    pub fn projection(
+        &self,
+        dir: Dir,
+        etype: Option<u32>,
+        weight: Option<&str>,
+        tier: Tier,
+    ) -> Projection<'_> {
         let est = self.csr_bytes(dir);
         let mem = match tier {
             Tier::Mem => true,
             Tier::Ooc => false,
             // Leave at least as much again for per-node state.
-            Tier::Auto => crate::ooc::budget_left().map(|b| est.saturating_mul(2) <= b).unwrap_or(true),
+            Tier::Auto => crate::ooc::budget_left()
+                .map(|b| est.saturating_mul(2) <= b)
+                .unwrap_or(true),
         };
         if mem {
             crate::ooc::take(est);
@@ -2531,7 +2653,10 @@ impl Graph {
             edges: self.edge_count() as u64,
             bytes: self.file_len(),
             // u64::MAX is "no limit" (wasm, where physical memory is unknown).
-            memory_limit: p.memory_usage().map(|(_, max)| max).filter(|m| *m != u64::MAX),
+            memory_limit: p
+                .memory_usage()
+                .map(|(_, max)| max)
+                .filter(|m| *m != u64::MAX),
             page_size: p.page_size() as u64,
             resident_pages: ps.resident_pages,
             allocated_pages: ps.allocated_pages,
@@ -2659,7 +2784,9 @@ impl Projection<'_> {
     /// be written to while results stream out).
     pub fn into_ids(mut self) -> crate::ooc::StateVec<u64> {
         let rc = match &mut self {
-            Projection::Mem(c, _) => return crate::ooc::StateVec::from_vec(std::mem::take(&mut c.ids)),
+            Projection::Mem(c, _) => {
+                return crate::ooc::StateVec::from_vec(std::mem::take(&mut c.ids))
+            }
             Projection::Paged(p) => p.ids.clone(),
         };
         drop(self);
@@ -2806,9 +2933,12 @@ impl<'g> PagedView<'g> {
     fn each(&self, v: usize, f: &mut dyn FnMut(usize, f64, u64)) {
         let id = self.ids.borrow_mut().get(v);
         let mut list: Vec<(u64, u64)> = Vec::new();
-        self.g.for_each_adj(id, self.dir, self.etype, |a| list.push((a.other, a.edge)));
+        self.g
+            .for_each_adj(id, self.dir, self.etype, |a| list.push((a.other, a.edge)));
         for (other, edge) in list {
-            let Some(t) = self.index_of(other) else { continue };
+            let Some(t) = self.index_of(other) else {
+                continue;
+            };
             let w = match self.wkey {
                 Some(k) => self
                     .g

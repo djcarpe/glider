@@ -16,10 +16,10 @@ use std::path::PathBuf;
 
 use glider::graph::{Dir, Graph, OpenOptions};
 use glider::legacy::graph::Graph as Legacy;
+use glider::query;
 use glider::store::Sync;
 use glider::types::Error;
 use glider::value::Value;
-use glider::query;
 
 fn temp(name: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
@@ -77,7 +77,11 @@ fn value(r: &mut Rng) -> Value {
         6 => Value::Text(["", "ada", "bob", "ünï", "a\"b"][r.below(5) as usize].into()),
         7 => Value::List(vec![Value::Int(1), Value::Text("x".into())]),
         // Long text: overflows a 1 KiB page, and truncates in an index key.
-        8 => Value::Text(format!("{}-{}", "x".repeat(400 + r.below(2000) as usize), r.below(3))),
+        8 => Value::Text(format!(
+            "{}-{}",
+            "x".repeat(400 + r.below(2000) as usize),
+            r.below(3)
+        )),
         _ => Value::List(vec![Value::List(vec![Value::Null]), Value::Float(-1.5)]),
     }
 }
@@ -115,10 +119,19 @@ fn gen(r: &mut Rng, nodes: &[u64], edges: &[u64]) -> Option<Act> {
     let key = KEYS[r.below(KEYS.len() as u64) as usize];
     Some(match r.below(100) {
         0..=24 => {
-            let labels = LABELS.iter().filter(|_| r.chance(45)).map(|s| s.to_string()).collect();
+            let labels = LABELS
+                .iter()
+                .filter(|_| r.chance(45))
+                .map(|s| s.to_string())
+                .collect();
             Act::AddNode(labels, props(r))
         }
-        25..=44 => Act::AddEdge(r.pick(nodes)?, r.pick(nodes)?, TYPES[r.below(2) as usize], props(r)),
+        25..=44 => Act::AddEdge(
+            r.pick(nodes)?,
+            r.pick(nodes)?,
+            TYPES[r.below(2) as usize],
+            props(r),
+        ),
         45..=50 => Act::DelNode(r.pick(nodes)?),
         51..=56 => Act::DelEdge(r.pick(edges)?),
         57..=68 => Act::SetNode(r.pick(nodes)?, key, value(r)),
@@ -191,14 +204,21 @@ macro_rules! impl_g {
                         put(format!("deg {n} {dir:?}"), dbg(g.degree(n, dir)));
                     }
                     if let Some(t) = g.strings.lookup("X") {
-                        let mut adj: Vec<_> = g.neighbors(n, Dir::Both, Some(t)).iter().map(|a| a.edge).collect();
+                        let mut adj: Vec<_> = g
+                            .neighbors(n, Dir::Both, Some(t))
+                            .iter()
+                            .map(|a| a.edge)
+                            .collect();
                         adj.sort();
                         put(format!("adj {n} X"), dbg(adj));
                     }
                 }
                 for &e in &edges {
                     let r = g.edge(e).unwrap();
-                    put(format!("edge {e}"), dbg((r.from, r.to, g.edge_type_name(e))));
+                    put(
+                        format!("edge {e}"),
+                        dbg((r.from, r.to, g.edge_type_name(e))),
+                    );
                     put(format!("eprops {e}"), sorted(g.edge_props(e)));
                     for k in KEYS {
                         put(format!("eprop {e}.{k}"), dbg(g.edge_prop(e, k)));
@@ -233,7 +253,10 @@ macro_rules! impl_g {
                     put(format!("type {t}"), dbg(g.edges_with_type(t)));
                 }
                 let s = g.stats();
-                put("stats".into(), dbg((s.nodes, s.edges, &s.labels, &s.edge_types, &s.indexes)));
+                put(
+                    "stats".into(),
+                    dbg((s.nodes, s.edges, &s.labels, &s.edge_types, &s.indexes)),
+                );
                 let (sample, _) = g.sample_keys(usize::MAX);
                 put("sample_keys".into(), dbg(sample));
                 let csr = g.csr(Dir::Out, None, Some("w"));
@@ -287,8 +310,12 @@ fn queries_same(a: &mut Graph, b: &mut Graph, ctx: &str) {
         "CALL pagerank(iterations: 5, top: 5)",
         "CALL wcc(top: 3)",
     ] {
-        let x = query::execute(a, q).map(|r| dbg(&r.rows)).map_err(|e| e.to_string());
-        let y = query::execute(b, q).map(|r| dbg(&r.rows)).map_err(|e| e.to_string());
+        let x = query::execute(a, q)
+            .map(|r| dbg(&r.rows))
+            .map_err(|e| e.to_string());
+        let y = query::execute(b, q)
+            .map(|r| dbg(&r.rows))
+            .map_err(|e| e.to_string());
         assert_eq!(x, y, "{ctx}: {q}");
     }
 }

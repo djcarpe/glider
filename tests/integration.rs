@@ -210,7 +210,10 @@ fn compaction_preserves_state_and_reuses_space() {
     }
     g.compact().unwrap();
     let after = g.file_len();
-    assert!(after <= before, "freed pages must be reused: {before} -> {after}");
+    assert!(
+        after <= before,
+        "freed pages must be reused: {before} -> {after}"
+    );
     assert_eq!(g.node_count(), 10);
     drop(g);
 
@@ -502,6 +505,59 @@ fn mst_picks_the_cheap_edges() {
 }
 
 #[test]
+fn levels_and_reduction_of_a_dag() {
+    // 1 -> 2 -> 4, 1 -> 3 -> 4, 4 -> 5, the shortcuts 1 -> 4 and 2 -> 5, a
+    // parallel 1 -> 2, and 6 on its own.
+    let mut g = Graph::memory();
+    for _ in 0..6 {
+        g.add_node(&["Call".into()], vec![]).unwrap();
+    }
+    let mut edge = |f, t| g.add_edge(f, t, "AFTER", vec![]).unwrap();
+    for (f, t) in [(1, 2), (2, 4), (1, 3), (3, 4), (4, 5)] {
+        edge(f, t);
+    }
+    let shortcut = edge(1, 4);
+    let skip = edge(2, 5);
+    let parallel = edge(1, 2);
+
+    let r = q(&mut g, r#"CALL levels(write: "level")"#);
+    let got: Vec<(i64, i64)> = r
+        .rows
+        .iter()
+        .map(|row| (row[0].as_i64().unwrap(), row[2].as_i64().unwrap()))
+        .collect();
+    assert_eq!(got, [(1, 0), (6, 0), (2, 1), (3, 1), (4, 2), (5, 3)]);
+    assert_eq!(r.message.as_deref(), Some("4 levels"));
+    assert_eq!(g.node_prop(5, "level").unwrap().as_i64(), Some(3));
+
+    let r = q(&mut g, "CALL reduce()");
+    let mut redundant: Vec<u64> = r
+        .rows
+        .iter()
+        .map(|row| row[0].as_i64().unwrap() as u64)
+        .collect();
+    redundant.sort_unstable();
+    assert_eq!(redundant, [shortcut, skip, parallel]);
+
+    // Dropping them changes no level.
+    for eid in redundant {
+        g.delete_edge(eid).unwrap();
+    }
+    assert!(q(&mut g, "CALL reduce()").rows.is_empty());
+    let r = q(&mut g, "CALL levels()");
+    assert_eq!(r.rows.last().unwrap()[2].as_i64(), Some(3));
+
+    g.add_edge(5, 1, "AFTER", vec![]).unwrap();
+    for call in ["CALL levels()", "CALL reduce()"] {
+        let err = query::execute(&mut g, call)
+            .err()
+            .expect("a cycle is an error")
+            .to_string();
+        assert!(err.contains("cycle"), "{call}: {err}");
+    }
+}
+
+#[test]
 fn write_back_stores_scores_as_properties() {
     let mut g = Graph::memory();
     q(&mut g, r#"CREATE (:P {name:"a"})-[:R]->(:P {name:"b"})"#);
@@ -545,7 +601,7 @@ fn negative_literals_stay_integers() {
 
 #[test]
 fn value_ordering_is_total_and_sane() {
-    let vals = vec![
+    let vals = [
         Value::Null,
         Value::Bool(false),
         Value::Int(-5),
@@ -857,7 +913,10 @@ fn rollback_discards_the_open_transaction() {
         assert_eq!(r.rows.len(), 1);
         assert_eq!(r.rows[0][1], Value::Int(1));
         assert!(!g.has_index("Gone", "n"), "schema changes roll back too");
-        assert_eq!(q(&mut g, "MATCH (k:Keep {n: 1}) RETURN count(k)").rows[0][0], Value::Int(1));
+        assert_eq!(
+            q(&mut g, "MATCH (k:Keep {n: 1}) RETURN count(k)").rows[0][0],
+            Value::Int(1)
+        );
         q(&mut g, "CREATE (:After)");
     }
     let mut g = Graph::open(&path, Sync::Normal).unwrap();
@@ -869,23 +928,59 @@ fn rollback_discards_the_open_transaction() {
 fn parameters_are_values_never_syntax() {
     let mut g = Graph::memory();
     let p = |pairs: &[(&str, Value)]| -> Vec<(String, Value)> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
     };
     let evil = Value::from("x\"}) DETACH DELETE n //");
-    query::execute_with(&mut g, "CREATE (:P {name: $n, tags: $t, age: $a})",
-        &p(&[("n", evil.clone()), ("t", Value::List(vec![Value::Int(1), Value::Null, Value::from("a")])), ("a", Value::Int(-4))])).unwrap();
-    query::execute_with(&mut g, "CREATE (:P {name: $n, age: $a})", &p(&[("n", Value::from("Bob")), ("a", Value::Float(2.5))])).unwrap();
+    query::execute_with(
+        &mut g,
+        "CREATE (:P {name: $n, tags: $t, age: $a})",
+        &p(&[
+            ("n", evil.clone()),
+            (
+                "t",
+                Value::List(vec![Value::Int(1), Value::Null, Value::from("a")]),
+            ),
+            ("a", Value::Int(-4)),
+        ]),
+    )
+    .unwrap();
+    query::execute_with(
+        &mut g,
+        "CREATE (:P {name: $n, age: $a})",
+        &p(&[("n", Value::from("Bob")), ("a", Value::Float(2.5))]),
+    )
+    .unwrap();
     q(&mut g, "INDEX ON :P(name)");
-    let r = query::execute_with(&mut g, "MATCH (x:P {name: $n}) RETURN x.name, x.tags, x.age", &p(&[("n", evil.clone())])).unwrap();
+    let r = query::execute_with(
+        &mut g,
+        "MATCH (x:P {name: $n}) RETURN x.name, x.tags, x.age",
+        &p(&[("n", evil.clone())]),
+    )
+    .unwrap();
     assert_eq!(r.rows.len(), 1);
     assert_eq!(r.rows[0][0], evil);
     assert_eq!(r.rows[0][2], Value::Int(-4));
-    let r = query::execute_with(&mut g, "MATCH (x:P) WHERE x.age > $min AND x.name IN $names RETURN x.name",
-        &p(&[("min", Value::Int(0)), ("names", Value::List(vec![Value::from("Bob")]))])).unwrap();
+    let r = query::execute_with(
+        &mut g,
+        "MATCH (x:P) WHERE x.age > $min AND x.name IN $names RETURN x.name",
+        &p(&[
+            ("min", Value::Int(0)),
+            ("names", Value::List(vec![Value::from("Bob")])),
+        ]),
+    )
+    .unwrap();
     assert_eq!(r.rows, vec![vec![Value::from("Bob")]]);
-    let e = query::execute_with(&mut g, "MATCH (x:P {name: $nope}) RETURN x", &[]).err().unwrap();
+    let e = query::execute_with(&mut g, "MATCH (x:P {name: $nope}) RETURN x", &[])
+        .err()
+        .unwrap();
     assert!(e.to_string().contains("missing parameter $nope"));
-    assert_eq!(q(&mut g, "MATCH (x:P) RETURN count(x)").rows[0][0], Value::Int(2));
+    assert_eq!(
+        q(&mut g, "MATCH (x:P) RETURN count(x)").rows[0][0],
+        Value::Int(2)
+    );
 }
 
 /// The local traversals (default) and the whole-graph ones (`tier:`) must
@@ -908,10 +1003,15 @@ fn local_traversals_match_whole_graph_algorithms() {
     for _ in 0..900 {
         let (a, b) = (rnd(300), rnd(300));
         let t = ["A", "B", "C"][rnd(3) as usize];
-        q(&mut g, &format!("MATCH (a:N {{i: {a}}}), (b:N {{i: {b}}}) CREATE (a)-[:{t}]->(b)"));
+        q(
+            &mut g,
+            &format!("MATCH (a:N {{i: {a}}}), (b:N {{i: {b}}}) CREATE (a)-[:{t}]->(b)"),
+        );
     }
     q(&mut g, "COMMIT");
-    let id_of = |g: &mut Graph, i: u64| match q(g, &format!("MATCH (n:N {{i: {i}}}) RETURN id(n)")).rows[0][0] {
+    let id_of = |g: &mut Graph, i: u64| match q(g, &format!("MATCH (n:N {{i: {i}}}) RETURN id(n)"))
+        .rows[0][0]
+    {
         Value::Int(v) => v,
         _ => unreachable!(),
     };
@@ -928,7 +1028,11 @@ fn local_traversals_match_whole_graph_algorithms() {
                     }
                 }
                 let base = format!("CALL subgraph(from: {from}, dir: \"{dir}\"{ty}, depth: 3");
-                assert_eq!(q(&mut g, &format!("{base})")).rows, q(&mut g, &format!("{base}, tier: \"mem\")")).rows, "{base}");
+                assert_eq!(
+                    q(&mut g, &format!("{base})")).rows,
+                    q(&mut g, &format!("{base}, tier: \"mem\")")).rows,
+                    "{base}"
+                );
 
                 let to = id_of(&mut g, (start * 37 + k as u64 * 11 + 5) % 300);
                 let base = format!("CALL shortestpath(from: {from}, to: {to}, dir: \"{dir}\"{ty}");
@@ -938,11 +1042,29 @@ fn local_traversals_match_whole_graph_algorithms() {
                 assert_eq!(local.rows.len(), whole.rows.len(), "{base}");
                 // A real path: every step follows an edge of the right type
                 // in the right direction.
-                let ids: Vec<u64> = local.rows.iter().map(|r| match r[1] { Value::Int(v) => v as u64, _ => 0 }).collect();
-                let d = match dir { "out" => Dir::Out, "in" => Dir::In, _ => Dir::Both };
-                let t = if ty.is_empty() { None } else { g.strings.lookup("A") };
+                let ids: Vec<u64> = local
+                    .rows
+                    .iter()
+                    .map(|r| match r[1] {
+                        Value::Int(v) => v as u64,
+                        _ => 0,
+                    })
+                    .collect();
+                let d = match dir {
+                    "out" => Dir::Out,
+                    "in" => Dir::In,
+                    _ => Dir::Both,
+                };
+                let t = if ty.is_empty() {
+                    None
+                } else {
+                    g.strings.lookup("A")
+                };
                 for w in ids.windows(2) {
-                    assert!(g.neighbors(w[0], d, t).iter().any(|a| a.other == w[1]), "{base}: {w:?} is not an edge");
+                    assert!(
+                        g.neighbors(w[0], d, t).iter().any(|a| a.other == w[1]),
+                        "{base}: {w:?} is not an edge"
+                    );
                 }
             }
         }
@@ -966,13 +1088,22 @@ fn edge_anchors_and_counter_counts_match_the_general_plans() {
     q(&mut g, "INDEX ON :N(k)");
     for i in 0..400 {
         let label = if i % 3 == 0 { ":N:M" } else { ":N" };
-        q(&mut g, &format!("CREATE (n{label} {{i: {i}, k: {}}})", i % 7));
+        q(
+            &mut g,
+            &format!("CREATE (n{label} {{i: {i}, k: {}}})", i % 7),
+        );
     }
     for _ in 0..1200 {
         let (a, b) = (rnd(400), if rnd(10) == 0 { u64::MAX } else { rnd(400) });
         let b = if b == u64::MAX { a } else { b }; // some self-loops
         let t = ["A", "A", "A", "B", "R"][rnd(5) as usize];
-        q(&mut g, &format!("MATCH (a:N {{i: {a}}}), (b:N {{i: {b}}}) CREATE (a)-[:{t} {{w: {}}}]->(b)", rnd(4)));
+        q(
+            &mut g,
+            &format!(
+                "MATCH (a:N {{i: {a}}}), (b:N {{i: {b}}}) CREATE (a)-[:{t} {{w: {}}}]->(b)",
+                rnd(4)
+            ),
+        );
     }
     q(&mut g, "COMMIT");
 
@@ -988,7 +1119,11 @@ fn edge_anchors_and_counter_counts_match_the_general_plans() {
     ];
     let plans = |g: &mut Graph| reads.iter().map(|s| q(g, s).rows).collect::<Vec<_>>();
     let explain = q(&mut g, &format!("EXPLAIN {}", reads[0]));
-    assert!(format!("{:?}", explain.rows).contains("edges :R"), "the rare type should anchor: {:?}", explain.rows);
+    assert!(
+        format!("{:?}", explain.rows).contains("edges :R"),
+        "the rare type should anchor: {:?}",
+        explain.rows
+    );
     glider::query::EDGE_ANCHORS.store(false, Ordering::Relaxed);
     let by_nodes = plans(&mut g);
     glider::query::EDGE_ANCHORS.store(true, Ordering::Relaxed);
@@ -1015,7 +1150,11 @@ fn edge_anchors_and_counter_counts_match_the_general_plans() {
     ] {
         let fast = q(&mut g, s);
         let slow = q(&mut g, &s.replace(" RETURN", " WHERE true RETURN"));
-        assert_eq!((fast.columns.clone(), fast.rows.clone()), (slow.columns, slow.rows), "{s}");
+        assert_eq!(
+            (fast.columns.clone(), fast.rows.clone()),
+            (slow.columns, slow.rows),
+            "{s}"
+        );
     }
 }
 
@@ -1025,19 +1164,49 @@ fn edge_anchors_and_counter_counts_match_the_general_plans() {
 fn a_match_never_reuses_a_relationship() {
     let mut g = Graph::memory();
     q(&mut g, "CREATE (a:P {n: 1})-[:K]->(b:P {n: 2})");
-    q(&mut g, "MATCH (a:P {n: 1}), (b:P {n: 2}) CREATE (b)-[:K]->(a)");
+    q(
+        &mut g,
+        "MATCH (a:P {n: 1}), (b:P {n: 2}) CREATE (b)-[:K]->(a)",
+    );
     let n = |g: &mut Graph, s: &str| match q(g, s).rows.first().map(|r| r[0].clone()) {
         Some(Value::Int(v)) => v,
         _ => 0,
     };
     // a->b, b->a, then a->b again would reuse the first edge.
-    assert_eq!(n(&mut g, "MATCH (x:P {n: 1})-[:K]->()-[:K]->()-[:K]->(y) RETURN count(y)"), 0);
-    assert_eq!(n(&mut g, "MATCH (x:P {n: 1})-[:K]->()-[:K]->(y) RETURN count(y)"), 1);
+    assert_eq!(
+        n(
+            &mut g,
+            "MATCH (x:P {n: 1})-[:K]->()-[:K]->()-[:K]->(y) RETURN count(y)"
+        ),
+        0
+    );
+    assert_eq!(
+        n(
+            &mut g,
+            "MATCH (x:P {n: 1})-[:K]->()-[:K]->(y) RETURN count(y)"
+        ),
+        1
+    );
     // With a second a->b edge, both orders of the two parallel edges match.
-    q(&mut g, "MATCH (a:P {n: 1}), (b:P {n: 2}) CREATE (a)-[:K]->(b)");
-    assert_eq!(n(&mut g, "MATCH (x:P {n: 1})-[:K]->()-[:K]->()-[:K]->(y) RETURN count(y)"), 2);
+    q(
+        &mut g,
+        "MATCH (a:P {n: 1}), (b:P {n: 2}) CREATE (a)-[:K]->(b)",
+    );
+    assert_eq!(
+        n(
+            &mut g,
+            "MATCH (x:P {n: 1})-[:K]->()-[:K]->()-[:K]->(y) RETURN count(y)"
+        ),
+        2
+    );
     // An edge anchor counts as used too.
-    assert_eq!(n(&mut g, "MATCH (x)-[:K]->()-[:K]->()-[:K]->(y) WHERE x.n = 1 RETURN count(y)"), 2);
+    assert_eq!(
+        n(
+            &mut g,
+            "MATCH (x)-[:K]->()-[:K]->()-[:K]->(y) WHERE x.n = 1 RETURN count(y)"
+        ),
+        2
+    );
 }
 
 #[test]
@@ -1045,12 +1214,27 @@ fn subscripts_group_and_limit_and_trailing_tokens_are_errors() {
     let path = temp("subscripts");
     let mut g = Graph::open(&path, Sync::Always).unwrap();
     for i in 0..30 {
-        let label = if i % 3 == 0 { "Order" } else if i % 3 == 1 { "Customer" } else { "Venue" };
-        q(&mut g, &format!("CREATE (n:{} {{i: {}, tags: [\"a\", \"b\", \"c\"]}})", label, i));
+        let label = if i % 3 == 0 {
+            "Order"
+        } else if i % 3 == 1 {
+            "Customer"
+        } else {
+            "Venue"
+        };
+        q(
+            &mut g,
+            &format!(
+                "CREATE (n:{} {{i: {}, tags: [\"a\", \"b\", \"c\"]}})",
+                label, i
+            ),
+        );
     }
 
     // a subscript no longer ends the RETURN: grouping, ORDER BY and LIMIT all apply
-    let r = q(&mut g, "MATCH (n) RETURN labels(n)[0] AS label, count(n) AS nodes ORDER BY nodes DESC LIMIT 2");
+    let r = q(
+        &mut g,
+        "MATCH (n) RETURN labels(n)[0] AS label, count(n) AS nodes ORDER BY nodes DESC LIMIT 2",
+    );
     assert_eq!(r.columns, vec!["label".to_string(), "nodes".to_string()]);
     assert_eq!(r.rows.len(), 2);
     assert_eq!(r.rows[0][1], Value::Int(10));
@@ -1059,14 +1243,23 @@ fn subscripts_group_and_limit_and_trailing_tokens_are_errors() {
     let r = q(&mut g, "MATCH (n:Order) RETURN n.tags[0], n.tags[-1], n.tags[1..], n.tags[..2], [10, 20, 30][1] LIMIT 1");
     assert_eq!(r.rows[0][0], Value::Text("a".into()));
     assert_eq!(r.rows[0][1], Value::Text("c".into()));
-    assert_eq!(r.rows[0][2], Value::List(vec![Value::Text("b".into()), Value::Text("c".into())]));
-    assert_eq!(r.rows[0][3], Value::List(vec![Value::Text("a".into()), Value::Text("b".into())]));
+    assert_eq!(
+        r.rows[0][2],
+        Value::List(vec![Value::Text("b".into()), Value::Text("c".into())])
+    );
+    assert_eq!(
+        r.rows[0][3],
+        Value::List(vec![Value::Text("a".into()), Value::Text("b".into())])
+    );
     assert_eq!(r.rows[0][4], Value::Int(20));
     let r = q(&mut g, "MATCH (n:Order) RETURN n.tags[9] LIMIT 1");
     assert_eq!(r.rows[0][0], Value::Null);
 
     // leftovers after the statement are an error, not silently dropped
-    let err = match query::execute(&mut g, "MATCH (n) RETURN labels(n)[0] AS label LIMIT 10, count(n) AS nodes") {
+    let err = match query::execute(
+        &mut g,
+        "MATCH (n) RETURN labels(n)[0] AS label LIMIT 10, count(n) AS nodes",
+    ) {
         Ok(_) => panic!("a statement with leftovers ran"),
         Err(e) => e,
     };

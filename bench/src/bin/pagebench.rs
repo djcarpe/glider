@@ -97,13 +97,21 @@ struct Args(Vec<String>);
 
 impl Args {
     fn get(&self, name: &str) -> Option<&str> {
-        self.0.iter().position(|a| a == name).and_then(|i| self.0.get(i + 1)).map(|s| s.as_str())
+        self.0
+            .iter()
+            .position(|a| a == name)
+            .and_then(|i| self.0.get(i + 1))
+            .map(|s| s.as_str())
     }
     fn num(&self, name: &str, default: u64) -> u64 {
-        self.get(name).and_then(|v| v.parse().ok()).unwrap_or(default)
+        self.get(name)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
     }
     fn f(&self, name: &str, default: f64) -> f64 {
-        self.get(name).and_then(|v| v.parse().ok()).unwrap_or(default)
+        self.get(name)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
     }
 }
 
@@ -253,7 +261,12 @@ fn lookups(a: &Args) -> SResult<()> {
                 check_value(key, &v).map_err(SError::Corrupt)?;
             }
             (1, None) => {}
-            (_, g) => return Err(SError::Corrupt(format!("key {key}: wrong presence {}", g.is_some()))),
+            (_, g) => {
+                return Err(SError::Corrupt(format!(
+                    "key {key}: wrong presence {}",
+                    g.is_some()
+                )))
+            }
         }
     }
     let secs = t0.elapsed().as_secs_f64();
@@ -438,7 +451,9 @@ fn crashloop(a: &Args) -> SResult<()> {
         if counter > 0 && seen_last == 0 {
             // Every key of the last transaction could have been deleted by
             // its own deletes, but not plausibly all 40.
-            return Err(SError::Corrupt(format!("round {round}: transaction {counter} missing entirely")));
+            return Err(SError::Corrupt(format!(
+                "round {round}: transaction {counter} missing entirely"
+            )));
         }
         eprintln!(
             "  round {round}: killed after {} ms, acked {acked}, recovered {counter}, replayed {} txns in {:.3} s, {} entries",
@@ -491,14 +506,21 @@ fn memfill(a: &Args) -> SResult<()> {
     let p = db.pager();
     let st = T.check(p)?;
     if st.entries != committed {
-        return Err(SError::Corrupt(format!("{} entries after rollback, expected {committed}", st.entries)));
+        return Err(SError::Corrupt(format!(
+            "{} entries after rollback, expected {committed}",
+            st.entries
+        )));
     }
     for i in 0..committed / 2 {
         T.delete(p, &i.to_be_bytes())?;
     }
     db.commit()?;
     for i in 0..1000u64 {
-        T.put(db.pager(), &(committed + i).to_be_bytes(), &value(committed + i, 0))?;
+        T.put(
+            db.pager(),
+            &(committed + i).to_be_bytes(),
+            &value(committed + i, 0),
+        )?;
     }
     db.commit()?;
     let (used, limit) = db.pager().memory_usage().unwrap();

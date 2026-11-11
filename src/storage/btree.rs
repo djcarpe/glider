@@ -214,7 +214,9 @@ fn try_insert(p: &mut [u8], pos: usize, cell: &[u8]) -> bool {
     let n = page::nslots(p);
     if free_space(p) < cell.len() + 2 {
         let mut cs = cells(p);
-        if !cells_fit(p.len(), base(p), &cs) || base(p) + cs.iter().map(|c| c.len() + 2).sum::<usize>() + cell.len() + 2 > p.len() {
+        if !cells_fit(p.len(), base(p), &cs)
+            || base(p) + cs.iter().map(|c| c.len() + 2).sum::<usize>() + cell.len() + 2 > p.len()
+        {
             return false;
         }
         cs.insert(pos, cell.to_vec());
@@ -335,7 +337,8 @@ fn make_cell(p: &Pager, tree: u32, key: &[u8], value: &[u8]) -> SResult<Vec<u8>>
             max_key(ps)
         ));
     }
-    let inline = 1 + varint_len(key.len() as u64) + varint_len(value.len() as u64) + key.len() + value.len();
+    let inline =
+        1 + varint_len(key.len() as u64) + varint_len(value.len() as u64) + key.len() + value.len();
     if inline <= max_cell(ps) {
         return Ok(leaf_cell_bytes(key, value, false));
     }
@@ -377,7 +380,12 @@ impl Tree {
                         Err(_) => Ok(None),
                     };
                 }
-                k => return corrupt(format!("page {pno}: unexpected kind {k} in tree {}", self.id)),
+                k => {
+                    return corrupt(format!(
+                        "page {pno}: unexpected kind {k} in tree {}",
+                        self.id
+                    ))
+                }
             }
         }
     }
@@ -522,7 +530,10 @@ impl Tree {
                     }
                 }
             }
-            k => corrupt(format!("page {pno}: unexpected kind {k} in tree {}", self.id)),
+            k => corrupt(format!(
+                "page {pno}: unexpected kind {k} in tree {}",
+                self.id
+            )),
         }
     }
 
@@ -609,7 +620,10 @@ impl Tree {
                     }
                 }
             }
-            k => corrupt(format!("page {pno}: unexpected kind {k} in tree {}", self.id)),
+            k => corrupt(format!(
+                "page {pno}: unexpected kind {k} in tree {}",
+                self.id
+            )),
         }
     }
 
@@ -710,7 +724,10 @@ fn check_rec(
 ) -> SResult<()> {
     let pg = p.get(pno)?;
     if page::tree(&pg) != id {
-        return corrupt(format!("page {pno} belongs to tree {}, not {id}", page::tree(&pg)));
+        return corrupt(format!(
+            "page {pno} belongs to tree {}, not {id}",
+            page::tree(&pg)
+        ));
     }
     let n = page::nslots(&pg);
     for i in 0..n {
@@ -929,7 +946,9 @@ impl<'p> Builder<'p> {
         let cap = self.capacity(level);
         let full = {
             let l = &self.levels[level];
-            !l.cells.is_empty() && l.bytes + cell.len() + 2 > cap && (level > 0 || l.cells.len() >= 2)
+            !l.cells.is_empty()
+                && l.bytes + cell.len() + 2 > cap
+                && (level > 0 || l.cells.len() >= 2)
                 || (level > 0 && l.leftmost != 0 && l.bytes + cell.len() + 2 > cap)
         };
         if full {
@@ -1129,8 +1148,14 @@ mod tests {
         assert_eq!(sb.entries, 5000);
         // Appends split at the right edge, so incremental growth packs
         // leaves nearly as tightly as the bulk build.
-        assert!(sg.leaves as f64 <= sb.leaves as f64 * 1.15, "{sg:?} vs {sb:?}");
-        assert!(built.get(&p, &(4998 * 3u64).to_be_bytes()).unwrap().is_some());
+        assert!(
+            sg.leaves as f64 <= sb.leaves as f64 * 1.15,
+            "{sg:?} vs {sb:?}"
+        );
+        assert!(built
+            .get(&p, &(4998 * 3u64).to_be_bytes())
+            .unwrap()
+            .is_some());
         assert!(built.get(&p, &1u64.to_be_bytes()).unwrap().is_none());
     }
 
@@ -1157,7 +1182,8 @@ mod tests {
     fn a_hold_keeps_a_checkpoint_readable_from_a_slow_copy() {
         use crate::storage::pager::Config;
         for held in [true, false] {
-            let dir = std::env::temp_dir().join(format!("glider-hold-{}-{held}", std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("glider-hold-{}-{held}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             let path = dir.join("db");
@@ -1171,20 +1197,21 @@ mod tests {
             let t = Tree { slot: 0, id: 1 };
             let mut r = Rng(9);
             let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
-            let churn = |p: &Pager, r: &mut Rng, model: &mut BTreeMap<Vec<u8>, Vec<u8>>, n: usize| {
-                for _ in 0..n {
-                    let k = (r.next() % 2000).to_be_bytes().to_vec();
-                    if r.next() % 4 == 0 {
-                        t.delete(p, &k).unwrap();
-                        model.remove(&k);
-                    } else {
-                        let v = val(r);
-                        t.put(p, &k, &v).unwrap();
-                        model.insert(k, v);
+            let churn =
+                |p: &Pager, r: &mut Rng, model: &mut BTreeMap<Vec<u8>, Vec<u8>>, n: usize| {
+                    for _ in 0..n {
+                        let k = (r.next() % 2000).to_be_bytes().to_vec();
+                        if r.next() % 4 == 0 {
+                            t.delete(p, &k).unwrap();
+                            model.remove(&k);
+                        } else {
+                            let v = val(r);
+                            t.put(p, &k, &v).unwrap();
+                            model.insert(k, v);
+                        }
                     }
-                }
-                p.commit();
-            };
+                    p.commit();
+                };
             churn(&p, &mut r, &mut model, 3000);
             p.checkpoint(0).unwrap();
             if held {
@@ -1199,7 +1226,11 @@ mod tests {
             let slot = if epoch(sb(0)) >= epoch(sb(1)) { 0 } else { 1 };
             let saved = sb(slot).to_vec();
             if held {
-                assert_eq!(page::get_u64(&saved, 96), 77, "the superblock names the hold");
+                assert_eq!(
+                    page::get_u64(&saved, 96),
+                    77,
+                    "the superblock names the hold"
+                );
             }
             for _ in 0..20 {
                 churn(&p, &mut r, &mut model, 300);
@@ -1237,7 +1268,10 @@ mod tests {
                 let again = Pager::open(&path, 512 * 16).unwrap();
                 assert_eq!(contents(&again, t), model.into_iter().collect::<Vec<_>>());
             } else {
-                assert!(read.map(|x| x != snap).unwrap_or(true), "without a hold the copy is torn");
+                assert!(
+                    read.map(|x| x != snap).unwrap_or(true),
+                    "without a hold the copy is torn"
+                );
             }
             let _ = std::fs::remove_dir_all(&dir);
         }

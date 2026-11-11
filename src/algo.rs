@@ -343,7 +343,12 @@ pub struct PageRank {
     pub delta: f64,
 }
 
-pub fn pagerank<A: Adjacency + ?Sized>(a: &A, damping: f64, max_iter: u32, tolerance: f64) -> PageRank {
+pub fn pagerank<A: Adjacency + ?Sized>(
+    a: &A,
+    damping: f64,
+    max_iter: u32,
+    tolerance: f64,
+) -> PageRank {
     let n = a.len();
     if n == 0 {
         return PageRank {
@@ -710,7 +715,9 @@ impl NbrCache {
             lists: std::collections::HashMap::new(),
             order: std::collections::BTreeMap::new(),
             bytes: 0,
-            limit: crate::ooc::budget_left().map(|b| (b / 4) as usize).unwrap_or(usize::MAX),
+            limit: crate::ooc::budget_left()
+                .map(|b| (b / 4) as usize)
+                .unwrap_or(usize::MAX),
             tick: 0,
         }
     }
@@ -726,7 +733,9 @@ impl NbrCache {
         let list = std::rc::Rc::new(simple_nbrs(a, v));
         let size = list.len() * 8 + 64;
         while self.bytes + size > self.limit {
-            let Some((_, old)) = self.order.pop_first() else { break };
+            let Some((_, old)) = self.order.pop_first() else {
+                break;
+            };
             if let Some((l, _)) = self.lists.remove(&old) {
                 self.bytes -= l.len() * 8 + 64;
             }
@@ -895,6 +904,99 @@ pub fn topological_sort<A: Adjacency + ?Sized>(a: &A) -> Option<StateVec<u64>> {
     }
 }
 
+/// Topological levels: each position's level is the length of the longest
+/// path reaching it, so a node sits one level below its deepest
+/// predecessor and the nodes of one level do not depend on each other.
+/// Returns the levels and how many there are; `None` when the graph has a
+/// cycle.
+pub fn topological_levels<A: Adjacency + ?Sized>(a: &A) -> Option<(StateVec<u64>, u64)> {
+    let n = a.len();
+    let mut indeg = StateVec::new(n, 0u64);
+    for v in 0..n {
+        a.each(v, &mut |t, _, _| {
+            let x = indeg.get(t);
+            indeg.set(t, x + 1);
+        });
+    }
+    let mut q: SpillQueue<u64> = SpillQueue::new();
+    for v in 0..n {
+        if indeg.get(v) == 0 {
+            q.push_back(v as u64);
+        }
+    }
+    let mut level = StateVec::new(n, 0u64);
+    let mut seen = 0usize;
+    let mut count = 0u64;
+    while let Some(v) = q.pop_front() {
+        seen += 1;
+        // Final: every predecessor was popped before v's in-degree hit zero.
+        let lv = level.get(v as usize);
+        count = count.max(lv + 1);
+        a.each(v as usize, &mut |t, _, _| {
+            if level.get(t) < lv + 1 {
+                level.set(t, lv + 1);
+            }
+            let x = indeg.get(t) - 1;
+            indeg.set(t, x);
+            if x == 0 {
+                q.push_back(t as u64);
+            }
+        });
+    }
+    if seen == n {
+        Some((level, count))
+    } else {
+        None
+    }
+}
+
+/// Transitive reduction of a DAG: the ids of the edges a longer path
+/// already implies (and of every parallel edge after the first), so that
+/// dropping them leaves the same reachability with the fewest edges.
+/// `None` when the graph has a cycle. One walk of each node's descendants:
+/// O(V·(V+E)) time, O(V) state.
+pub fn transitive_reduction<A: Adjacency + ?Sized>(a: &A) -> Option<Vec<u64>> {
+    topological_sort(a)?;
+    let n = a.len();
+    const UNSEEN: u64 = u64::MAX;
+    // seen[w] == u: w is reachable from u in two or more hops.
+    let mut seen = StateVec::new(n, UNSEEN);
+    // first[w] == u: an edge u->w was already kept.
+    let mut first = StateVec::new(n, UNSEEN);
+    let mut redundant = Vec::new();
+    let mut stack: SpillStack<u64> = SpillStack::new();
+    for u in 0..n {
+        if a.degree(u) < 2 {
+            continue;
+        }
+        let mark = u as u64;
+        a.each(u, &mut |c, _, _| {
+            a.each(c, &mut |t, _, _| {
+                if seen.get(t) != mark {
+                    seen.set(t, mark);
+                    stack.push(t as u64);
+                }
+            });
+        });
+        while let Some(v) = stack.pop() {
+            a.each(v as usize, &mut |t, _, _| {
+                if seen.get(t) != mark {
+                    seen.set(t, mark);
+                    stack.push(t as u64);
+                }
+            });
+        }
+        a.each(u, &mut |w, _, eid| {
+            if seen.get(w) == mark || first.get(w) == mark {
+                redundant.push(eid);
+            } else {
+                first.set(w, mark);
+            }
+        });
+    }
+    Some(redundant)
+}
+
 pub fn find_cycle<A: Adjacency + ?Sized>(a: &A) -> Option<Vec<usize>> {
     let n = a.len();
     // 0 = unvisited, 1 = on stack, 2 = done
@@ -1010,7 +1112,11 @@ pub fn minimum_spanning_forest<A: Adjacency + ?Sized>(a: &A) -> (Vec<u64>, f64) 
             if v < t {
                 // Key: weight in total order, then arrival (a stable sort).
                 let bits = w.to_bits();
-                let k = if bits >> 63 == 1 { !bits } else { bits ^ (1 << 63) };
+                let k = if bits >> 63 == 1 {
+                    !bits
+                } else {
+                    bits ^ (1 << 63)
+                };
                 let mut key = Vec::with_capacity(16);
                 key.extend_from_slice(&k.to_be_bytes());
                 key.extend_from_slice(&seq.to_be_bytes());

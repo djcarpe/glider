@@ -21,11 +21,13 @@ pub fn detect(path: &Path) -> Option<&'static str> {
         return Some("format v1 (legacy)");
     }
     if &head[0..8] == b"GLIDER\x00\x01" {
-        return Some(match u32::from_le_bytes([head[8], head[9], head[10], head[11]]) {
-            1 => "format v1 (legacy)",
-            2 => "format v2 (legacy log)",
-            _ => "format v3 (legacy snapshot image)",
-        });
+        return Some(
+            match u32::from_le_bytes([head[8], head[9], head[10], head[11]]) {
+                1 => "format v1 (legacy)",
+                2 => "format v2 (legacy log)",
+                _ => "format v3 (legacy snapshot image)",
+            },
+        );
     }
     None
 }

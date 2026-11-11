@@ -100,7 +100,6 @@ impl Interner {
     }
 }
 
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Adj {
     pub edge: u64,
@@ -108,11 +107,9 @@ pub struct Adj {
     pub etype: u32,
 }
 
-
 pub fn get_prop(props: &[(u32, Value)], key: u32) -> Option<&Value> {
     props.iter().find(|(k, _)| *k == key).map(|(_, v)| v)
 }
-
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dir {
@@ -198,7 +195,6 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Property keys per label or relationship type, from `Graph::sample_keys`.
 pub type KeySample = Vec<(String, Vec<String>)>;
-
 
 /// Compressed sparse row view of the graph, with dense indices 0..n.
 pub struct Csr {

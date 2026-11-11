@@ -1731,16 +1731,17 @@ impl ImageSource for Graph {
         Ok(())
     }
 
-    fn edges(
-        &self,
-        f: &mut dyn FnMut(u64, u64, u64, u32, &[(u32, Value)]),
-    ) -> std::io::Result<()> {
+    fn edges(&self, f: &mut dyn FnMut(u64, u64, u64, u32, &[(u32, Value)])) -> std::io::Result<()> {
         let mut scratch = ChunkScratch::default();
         for id in self.edge_ids() {
             if let Some(e) = self.edges.get(&id) {
                 f(id, e.from, e.to, e.etype, &e.props);
             } else if let Some(s) = self.base_live_edge(id) {
-                let (from, to, t) = (self.base.edge_from(s), self.base.edge_to(s), self.base.edge_type(s));
+                let (from, to, t) = (
+                    self.base.edge_from(s),
+                    self.base.edge_to(s),
+                    self.base.edge_type(s),
+                );
                 match self.edge_props.get(&id) {
                     Some(p) => f(id, from, to, t, p),
                     None => {
@@ -1753,4 +1754,3 @@ impl ImageSource for Graph {
         Ok(())
     }
 }
-

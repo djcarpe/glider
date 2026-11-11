@@ -55,7 +55,9 @@ pub fn is_paged(db: &Path) -> bool {
 
 /// A paged database's generation, spelled as replica directories name it.
 pub fn generation_hex(db: &Path) -> io::Result<String> {
-    pager::read_superblock(db).map(|sb| hex(&sb.generation)).map_err(sio)
+    pager::read_superblock(db)
+        .map(|sb| hex(&sb.generation))
+        .map_err(sio)
 }
 
 /// One base snapshot in a replica.
@@ -92,12 +94,20 @@ pub fn bases(dir: &Path, gen: &str) -> io::Result<Vec<Base>> {
         let Ok(text) = fs::read_to_string(e.path().join("base.json")) else {
             continue;
         };
-        let (Some(lsn), Some(epoch), Some(ts), Some(bytes)) =
-            (field(&text, "lsn"), field(&text, "epoch"), field(&text, "ts"), field(&text, "bytes"))
-        else {
+        let (Some(lsn), Some(epoch), Some(ts), Some(bytes)) = (
+            field(&text, "lsn"),
+            field(&text, "epoch"),
+            field(&text, "ts"),
+            field(&text, "bytes"),
+        ) else {
             continue;
         };
-        out.push(Base { lsn, epoch, ts, bytes });
+        out.push(Base {
+            lsn,
+            epoch,
+            ts,
+            bytes,
+        });
     }
     out.sort_by_key(|b| (b.lsn, b.epoch));
     Ok(out)
@@ -183,7 +193,9 @@ impl Tailer<'_> {
                 .unwrap_or(false);
             if !intact {
                 if let Ok(b) = &result {
-                    let _ = fs::remove_dir_all(base_root(self.dir, &self.gen).join(format!("{:016x}", b.lsn)));
+                    let _ = fs::remove_dir_all(
+                        base_root(self.dir, &self.gen).join(format!("{:016x}", b.lsn)),
+                    );
                 }
                 result = Err(other(
                     "the writer released its hold during the base copy (was the replicator stalled?)",
@@ -257,6 +269,8 @@ impl Tailer<'_> {
             sb.wal_lsn, sb.epoch, ts, bytes, ps, sb.high_water, sb.seg_pages
         )?;
         meta.sync_all()?;
+        // Windows refuses to rename a directory that holds an open file.
+        drop(meta);
         let fin = root.join(&name);
         let _ = fs::remove_dir_all(&fin);
         fs::rename(&tmp, &fin)?;
@@ -339,7 +353,9 @@ fn whole_transactions(path: &Path) -> io::Result<bool> {
         let mut c = crate::codec::Crc32::new();
         c.update(&head);
         c.update(&body[..len]);
-        if c.finish() != u32::from_le_bytes([body[len], body[len + 1], body[len + 2], body[len + 3]]) {
+        if c.finish()
+            != u32::from_le_bytes([body[len], body[len + 1], body[len + 2], body[len + 3]])
+        {
             return Ok(false);
         }
         last = head[0];
@@ -355,7 +371,12 @@ pub fn tail(db_path: &Path, dir: &Path, opts: &TailOptions) -> io::Result<()> {
 /// [`tail`], plus `new_base`: asked once per pass with the newest base of the
 /// generation, it takes a new base now when it answers true (glider-stream's
 /// snapshot interval, so a restore never replays more than that much log).
-pub fn tail_with(db_path: &Path, dir: &Path, opts: &TailOptions, new_base: &dyn Fn(&Base) -> bool) -> io::Result<()> {
+pub fn tail_with(
+    db_path: &Path,
+    dir: &Path,
+    opts: &TailOptions,
+    new_base: &dyn Fn(&Base) -> bool,
+) -> io::Result<()> {
     let mut t = Tailer {
         db: db_path,
         dir,
@@ -390,7 +411,10 @@ pub fn tail_with(db_path: &Path, dir: &Path, opts: &TailOptions, new_base: &dyn 
         if !need_base {
             if let Some(b) = bases(dir, &gen)?.last() {
                 if new_base(b) {
-                    t.note(&format!("{gen} taking a new base (the newest, at log {}, is due for renewal)", b.lsn));
+                    t.note(&format!(
+                        "{gen} taking a new base (the newest, at log {}, is due for renewal)",
+                        b.lsn
+                    ));
                     need_base = true;
                 }
             }
@@ -404,7 +428,9 @@ pub fn tail_with(db_path: &Path, dir: &Path, opts: &TailOptions, new_base: &dyn 
                 Committed::To(end) => {
                     let pending = end.saturating_sub(t.shipped);
                     let waited = last_ship.elapsed();
-                    if pending > 0 && (pending >= opts.min_bytes || waited >= opts.max_delay || opts.once) {
+                    if pending > 0
+                        && (pending >= opts.min_bytes || waited >= opts.max_delay || opts.once)
+                    {
                         if let Some(seg) = t.ship(end)? {
                             t.note(&format!(
                                 "{gen} +{} bytes of log at {} ({})",
@@ -413,7 +439,15 @@ pub fn tail_with(db_path: &Path, dir: &Path, opts: &TailOptions, new_base: &dyn 
                                 wal::fmt_unix(seg.ts)
                             ));
                             if let Some(cmd) = &opts.exec {
-                                run_hook(cmd, dir, &gen, "segments", &format!("{:016x}.seg", seg.offset), seg.offset, seg.len)?;
+                                run_hook(
+                                    cmd,
+                                    dir,
+                                    &gen,
+                                    "segments",
+                                    &format!("{:016x}.seg", seg.offset),
+                                    seg.offset,
+                                    seg.len,
+                                )?;
                             }
                             last_ship = Instant::now();
                         }
@@ -429,7 +463,15 @@ pub fn tail_with(db_path: &Path, dir: &Path, opts: &TailOptions, new_base: &dyn 
                 base.lsn, base.epoch, base.bytes
             ));
             if let Some(cmd) = &opts.exec {
-                run_hook(cmd, dir, &gen, "base", &format!("{:016x}", base.lsn), base.lsn, base.bytes)?;
+                run_hook(
+                    cmd,
+                    dir,
+                    &gen,
+                    "base",
+                    &format!("{:016x}", base.lsn),
+                    base.lsn,
+                    base.bytes,
+                )?;
             }
             continue;
         }
@@ -441,7 +483,15 @@ pub fn tail_with(db_path: &Path, dir: &Path, opts: &TailOptions, new_base: &dyn 
     }
 }
 
-fn run_hook(cmd: &str, dir: &Path, gen: &str, kind: &str, name: &str, offset: u64, len: u64) -> io::Result<()> {
+fn run_hook(
+    cmd: &str,
+    dir: &Path,
+    gen: &str,
+    kind: &str,
+    name: &str,
+    offset: u64,
+    len: u64,
+) -> io::Result<()> {
     let path = dir.join(gen).join(kind).join(name);
     let filled = cmd
         .replace("{path}", &path.to_string_lossy())
@@ -451,12 +501,20 @@ fn run_hook(cmd: &str, dir: &Path, gen: &str, kind: &str, name: &str, offset: u6
         .replace("{offset}", &offset.to_string())
         .replace("{len}", &len.to_string());
     let status = if cfg!(windows) {
-        std::process::Command::new("cmd").arg("/C").arg(&filled).status()
+        std::process::Command::new("cmd")
+            .arg("/C")
+            .arg(&filled)
+            .status()
     } else {
-        std::process::Command::new("sh").arg("-c").arg(&filled).status()
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&filled)
+            .status()
     }?;
     if !status.success() {
-        return Err(other(format!("replication hook failed ({status}): {filled}")));
+        return Err(other(format!(
+            "replication hook failed ({status}): {filled}"
+        )));
     }
     Ok(())
 }
@@ -498,7 +556,10 @@ pub fn verify(dir: &Path) -> io::Result<Vec<Status>> {
         let segs = wal::segments(dir, &gen)?;
         let from = b.last().map(|x| x.lsn).unwrap_or(0);
         let complete_to = reach(&segs, from);
-        let gap_at = segs.iter().any(|s| s.offset > complete_to).then_some(complete_to);
+        let gap_at = segs
+            .iter()
+            .any(|s| s.offset > complete_to)
+            .then_some(complete_to);
         out.push(Status {
             generation: gen,
             segments: segs.len(),
@@ -529,12 +590,20 @@ pub struct RestoreReport {
 /// Rebuild a database at `out` from the newest base (at or before `as_of`)
 /// and the log shipped after it (up to `as_of`). Open the result to finish:
 /// opening replays that log.
-pub fn restore(dir: &Path, generation: Option<&str>, as_of: Option<u64>, out: &Path) -> io::Result<RestoreReport> {
+pub fn restore(
+    dir: &Path,
+    generation: Option<&str>,
+    as_of: Option<u64>,
+    out: &Path,
+) -> io::Result<RestoreReport> {
     let gen = match generation {
         Some(g) => g.to_string(),
-        None => generations(dir)?
-            .pop()
-            .ok_or_else(|| other(format!("no replicated paged databases in {}", dir.display())))?,
+        None => generations(dir)?.pop().ok_or_else(|| {
+            other(format!(
+                "no replicated paged databases in {}",
+                dir.display()
+            ))
+        })?,
     };
     let all = bases(dir, &gen)?;
     let base = all
@@ -542,7 +611,11 @@ pub fn restore(dir: &Path, generation: Option<&str>, as_of: Option<u64>, out: &P
         .rev()
         .find(|b| as_of.map(|t| b.ts <= t).unwrap_or(true))
         .cloned()
-        .ok_or_else(|| other(format!("generation {gen} has no base at or before that time")))?;
+        .ok_or_else(|| {
+            other(format!(
+                "generation {gen} has no base at or before that time"
+            ))
+        })?;
     let src = base_root(dir, &gen).join(format!("{:016x}", base.lsn));
 
     // Pages.
@@ -552,7 +625,10 @@ pub fn restore(dir: &Path, generation: Option<&str>, as_of: Option<u64>, out: &P
     if let Ok(rd) = fs::read_dir(src.join("data")) {
         for e in rd.flatten() {
             let name = e.file_name();
-            let dst = pager::segment_path(out, 1).parent().unwrap_or(out).join(&name);
+            let dst = pager::segment_path(out, 1)
+                .parent()
+                .unwrap_or(out)
+                .join(&name);
             fs::create_dir_all(dst.parent().unwrap())?;
             fs::copy(e.path(), dst)?;
         }
@@ -561,7 +637,10 @@ pub fn restore(dir: &Path, generation: Option<&str>, as_of: Option<u64>, out: &P
     // Log after the base, up to the first gap or the target time.
     let wal_dir = log::wal_dir(out);
     fs::create_dir_all(&wal_dir)?;
-    let mut w = io::BufWriter::with_capacity(1 << 20, File::create(wal_dir.join(format!("{:016x}.wal", base.lsn)))?);
+    let mut w = io::BufWriter::with_capacity(
+        1 << 20,
+        File::create(wal_dir.join(format!("{:016x}.wal", base.lsn)))?,
+    );
     let mut at = base.lsn;
     let mut used = 0usize;
     for s in wal::segments(dir, &gen)? {
@@ -574,7 +653,11 @@ pub fn restore(dir: &Path, generation: Option<&str>, as_of: Option<u64>, out: &P
         if as_of.map(|t| s.ts > t).unwrap_or(false) {
             break;
         }
-        let mut f = File::open(dir.join(&gen).join("segments").join(format!("{:016x}.seg", s.offset)))?;
+        let mut f = File::open(
+            dir.join(&gen)
+                .join("segments")
+                .join(format!("{:016x}.seg", s.offset)),
+        )?;
         let mut skip = at - s.offset;
         let mut buf = vec![0u8; 1 << 20];
         loop {

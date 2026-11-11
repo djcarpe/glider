@@ -341,7 +341,10 @@ fn a_corrupt_image_is_an_error_not_a_panic() {
         if let Ok(mut g) = Graph::open_opts(&path, no_auto(Sync::Normal)) {
             touch_everything(&g);
             assert!(g.integrity_error().is_some(), "flip at {at}: not recorded");
-            assert!(g.compact().is_err(), "flip at {at}: compacted a damaged image");
+            assert!(
+                g.compact().is_err(),
+                "flip at {at}: compacted a damaged image"
+            );
             assert!(g.stats().integrity_error.is_some());
         }
         let _ = fs::remove_file(store::lock_path(&path));
@@ -507,7 +510,10 @@ struct Tiny {
 
 impl glider::legacy::image::ImageSource for Tiny {
     fn strings(&self) -> Vec<String> {
-        ["P", "name", "R", "w"].iter().map(|s| s.to_string()).collect()
+        ["P", "name", "R", "w"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     }
     fn next_ids(&self) -> (u64, u64) {
         (100, 50)
@@ -516,16 +522,17 @@ impl glider::legacy::image::ImageSource for Tiny {
         vec![(0, 1)]
     }
     fn nodes(&self, f: &mut dyn FnMut(u64, &[u32], &[(u32, Value)])) -> std::io::Result<()> {
-        let ids: &[u64] = if self.bad == Some("order") { &[5, 3] } else { &[3, 5, 9] };
+        let ids: &[u64] = if self.bad == Some("order") {
+            &[5, 3]
+        } else {
+            &[3, 5, 9]
+        };
         for id in ids {
             f(*id, &[0], &[(1, Value::Text(format!("n{id}")))]);
         }
         Ok(())
     }
-    fn edges(
-        &self,
-        f: &mut dyn FnMut(u64, u64, u64, u32, &[(u32, Value)]),
-    ) -> std::io::Result<()> {
+    fn edges(&self, f: &mut dyn FnMut(u64, u64, u64, u32, &[(u32, Value)])) -> std::io::Result<()> {
         let to = if self.bad == Some("dangling") { 4 } else { 9 };
         let t = if self.bad == Some("string") { 17 } else { 2 };
         f(1, 3, 5, t, &[(3, Value::Float(0.5))]);
@@ -543,9 +550,20 @@ fn image_build_writes_a_database_from_a_stream() {
     assert_eq!((g.node_count(), g.edge_count()), (3, 3));
     assert_eq!(g.node_prop(5, "name"), Some(Value::from("n5")));
     assert_eq!(g.edge_prop(1, "w"), Some(Value::Float(0.5)));
-    assert_eq!(g.indexed_lookup("P", "name", &Value::from("n9")), Some(vec![9]));
-    let out: Vec<u64> = g.neighbors(9, Dir::Both, None).iter().map(|a| a.edge).collect();
-    assert_eq!(out, vec![8, 7, 8], "self-loop appears once each way, runs in edge order");
+    assert_eq!(
+        g.indexed_lookup("P", "name", &Value::from("n9")),
+        Some(vec![9])
+    );
+    let out: Vec<u64> = g
+        .neighbors(9, Dir::Both, None)
+        .iter()
+        .map(|a| a.edge)
+        .collect();
+    assert_eq!(
+        out,
+        vec![8, 7, 8],
+        "self-loop appears once each way, runs in edge order"
+    );
     // Ids carry on from the source's next ids.
     assert_eq!(g.add_node(&[], vec![]).unwrap(), 100);
     assert!(matches!(store::verify(&path).unwrap().image, Some(Ok(_))));
@@ -554,7 +572,10 @@ fn image_build_writes_a_database_from_a_stream() {
 
     for bad in ["order", "dangling", "string"] {
         let path = temp(&format!("build-{bad}"));
-        assert!(glider::legacy::image::build(&path, &Tiny { bad: Some(bad) }).is_err(), "{bad}");
+        assert!(
+            glider::legacy::image::build(&path, &Tiny { bad: Some(bad) }).is_err(),
+            "{bad}"
+        );
         assert!(!path.exists(), "{bad}: a failed build leaves no file");
     }
 }
@@ -585,7 +606,10 @@ fn preload_loads_everything_and_a_graph_copies_into_a_new_file() {
     let b = Graph::open(&copy, Sync::Normal).unwrap();
     assert_eq!(a.node_ids(), b.node_ids());
     assert_eq!(a.edge_ids(), b.edge_ids());
-    assert_eq!(b.indexed_lookup("Person", "name", &Value::from("p9")), Some(vec![10]));
+    assert_eq!(
+        b.indexed_lookup("Person", "name", &Value::from("p9")),
+        Some(vec![10])
+    );
     drop((a, b));
     let _ = fs::remove_file(&path);
     let _ = fs::remove_file(&copy);

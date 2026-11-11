@@ -129,7 +129,7 @@ pub fn tail(db: &Path, dir: &Path, opts: &TailOptions) -> io::Result<()> {
             generation = Some(gen.clone());
         }
 
-        let end = store::scan_committed_end(db, shipped.max(0))?;
+        let end = store::scan_committed_end(db, shipped)?;
         let pending = end.saturating_sub(shipped);
         let waited = last_ship.elapsed().unwrap_or_default();
 

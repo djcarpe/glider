@@ -52,6 +52,10 @@ unsafe_op_in_unsafe_fn = "warn"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+# Tuples and callbacks are spelled out where they are used.
+type_complexity = "allow"
+# Cursors have a fallible `next`, which `Iterator` cannot express.
+should_implement_trait = "allow"
 
 [profile.release]
 opt-level = 3

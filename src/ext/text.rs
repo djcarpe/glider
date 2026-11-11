@@ -71,7 +71,11 @@ pub fn config(g: &Graph) -> Option<Config> {
 
 /// A node's terms with weighted frequencies (names count double), and its
 /// length in words; `None` when the index does not cover the node.
-pub fn doc_terms(c: &Config, labels: &[String], props: &[(String, Value)]) -> Option<(HashMap<String, u32>, u32)> {
+pub fn doc_terms(
+    c: &Config,
+    labels: &[String],
+    props: &[(String, Value)],
+) -> Option<(HashMap<String, u32>, u32)> {
     if !c.labels.is_empty() && !labels.iter().any(|l| c.labels.contains(l)) {
         return None;
     }
@@ -162,7 +166,13 @@ fn stats_val(docs: u64, total: u64) -> Vec<u8> {
 /// A node's labels and properties, borrowed.
 pub type NodeView<'a> = (&'a [String], &'a [(String, Value)]);
 
-pub fn on_node_write(g: &mut Graph, c: &Config, id: u64, before: Option<NodeView<'_>>, after: Option<NodeView<'_>>) -> Result<()> {
+pub fn on_node_write(
+    g: &mut Graph,
+    c: &Config,
+    id: u64,
+    before: Option<NodeView<'_>>,
+    after: Option<NodeView<'_>>,
+) -> Result<()> {
     let old = before.and_then(|(l, p)| doc_terms(c, l, p));
     let new = after.and_then(|(l, p)| doc_terms(c, l, p));
     if old == new {
@@ -238,10 +248,18 @@ fn clear_data(g: &mut Graph) -> Result<()> {
 pub fn build(g: &mut Graph, c: &Config, flush_terms: usize) -> Result<Built> {
     clear_data(g)?;
     g.ext_write(NS, vec![(CONFIG.to_vec(), c.encode())], Vec::new())?;
-    let label_ids: Vec<u32> = c.labels.iter().filter_map(|l| g.strings.lookup(l)).collect();
+    let label_ids: Vec<u32> = c
+        .labels
+        .iter()
+        .filter_map(|l| g.strings.lookup(l))
+        .collect();
     if !c.labels.is_empty() && label_ids.is_empty() {
         g.ext_write(NS, vec![(b"s".to_vec(), stats_val(0, 0))], Vec::new())?;
-        return Ok(Built { docs: 0, terms: 0, postings: 0 });
+        return Ok(Built {
+            docs: 0,
+            terms: 0,
+            postings: 0,
+        });
     }
     let mut df: HashMap<String, u64> = HashMap::new();
     let (mut docs, mut total, mut postings) = (0u64, 0u64, 0u64);
@@ -259,7 +277,11 @@ pub fn build(g: &mut Graph, c: &Config, flush_terms: usize) -> Result<Built> {
     };
     // One pass per label (or one over all nodes); a node in two indexed
     // labels is indexed once.
-    let passes: Vec<Option<u32>> = if label_ids.is_empty() { vec![None] } else { label_ids.into_iter().map(Some).collect() };
+    let passes: Vec<Option<u32>> = if label_ids.is_empty() {
+        vec![None]
+    } else {
+        label_ids.into_iter().map(Some).collect()
+    };
     let multi = passes.len() > 1;
     for label in passes {
         let mut from = 0u64;
@@ -277,7 +299,9 @@ pub fn build(g: &mut Graph, c: &Config, flush_terms: usize) -> Result<Built> {
                 }
                 let labels = g.node_labels(*id);
                 let props = g.node_props(*id);
-                let Some((tf, len)) = doc_terms(c, &labels, &props) else { continue };
+                let Some((tf, len)) = doc_terms(c, &labels, &props) else {
+                    continue;
+                };
                 docs += 1;
                 total += len as u64;
                 for (t, f) in tf {
@@ -298,13 +322,21 @@ pub fn build(g: &mut Graph, c: &Config, flush_terms: usize) -> Result<Built> {
         }
     }
     flush_df(g, &mut df)?;
-    g.ext_write(NS, vec![(b"s".to_vec(), stats_val(docs, total))], Vec::new())?;
+    g.ext_write(
+        NS,
+        vec![(b"s".to_vec(), stats_val(docs, total))],
+        Vec::new(),
+    )?;
     let mut terms = 0u64;
     g.ext_scan(NS, b"f", &mut |_, _| {
         terms += 1;
         true
     });
-    Ok(Built { docs, terms, postings })
+    Ok(Built {
+        docs,
+        terms,
+        postings,
+    })
 }
 
 pub fn drop_index(g: &mut Graph) -> Result<()> {
@@ -314,7 +346,12 @@ pub fn drop_index(g: &mut Graph) -> Result<()> {
 
 /// BM25 through the index: (node, score) best first, the postings read,
 /// and how many documents matched any term.
-pub fn search(g: &Graph, q: &str, top: usize, label: Option<u32>) -> (Vec<(u64, f64)>, usize, usize) {
+pub fn search(
+    g: &Graph,
+    q: &str,
+    top: usize,
+    label: Option<u32>,
+) -> (Vec<(u64, f64)>, usize, usize) {
     let qt = query_terms(q);
     let (docs, total) = stats(g);
     let n = docs.max(1) as f64;
@@ -359,8 +396,16 @@ pub fn search(g: &Graph, q: &str, top: usize, label: Option<u32>) -> (Vec<(u64, 
         .into_iter()
         .filter(|(id, _, _)| label.map_or(true, |l| g.has_label(*id, l)))
         .map(|(id, _, tf)| {
-            let len = g.ext_get(NS, &len_key(id)).map(|b| varint(&b)).unwrap_or(avg as u64) as f64;
-            let mut s: f64 = tf.iter().map(|&(idf, f)| idf * f as f64 * (k1 + 1.0) / (f as f64 + k1 * (1.0 - b + b * len / avg))).sum();
+            let len = g
+                .ext_get(NS, &len_key(id))
+                .map(|b| varint(&b))
+                .unwrap_or(avg as u64) as f64;
+            let mut s: f64 = tf
+                .iter()
+                .map(|&(idf, f)| {
+                    idf * f as f64 * (k1 + 1.0) / (f as f64 + k1 * (1.0 - b + b * len / avg))
+                })
+                .sum();
             for key in ["name", "title"] {
                 if let Some(Value::Text(v)) = g.node_prop(id, key) {
                     if v.trim().to_lowercase() == phrase {

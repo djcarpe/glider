@@ -49,21 +49,32 @@ impl R {
 }
 
 const WORDS: &[&str] = &[
-    "alpha", "basalt", "cobalt", "delta", "ember", "fjord", "garnet", "harbor", "indigo", "juniper", "krypton", "lumen",
-    "meridian", "nebula", "onyx", "prism", "quartz", "rune", "sierra", "tundra",
+    "alpha", "basalt", "cobalt", "delta", "ember", "fjord", "garnet", "harbor", "indigo",
+    "juniper", "krypton", "lumen", "meridian", "nebula", "onyx", "prism", "quartz", "rune",
+    "sierra", "tundra",
 ];
 
 fn peak_rss_mb() -> f64 {
     std::fs::read_to_string("/proc/self/status")
         .ok()
-        .and_then(|s| s.lines().find(|l| l.starts_with("VmHWM:")).map(|l| l.to_string()))
-        .and_then(|l| l.split_whitespace().nth(1).and_then(|v| v.parse::<f64>().ok()))
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmHWM:"))
+                .map(|l| l.to_string())
+        })
+        .and_then(|l| {
+            l.split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse::<f64>().ok())
+        })
         .map(|kb| kb / 1024.0)
         .unwrap_or(0.0)
 }
 
 fn arg(args: &[String], key: &str) -> Option<String> {
-    args.iter().position(|a| a == key).and_then(|i| args.get(i + 1).cloned())
+    args.iter()
+        .position(|a| a == key)
+        .and_then(|i| args.get(i + 1).cloned())
 }
 
 fn text(r: &query::QueryResult) -> String {
@@ -99,14 +110,20 @@ const COMMUNITY: u64 = 50;
 const HUBS: u64 = 10;
 
 fn quality(args: &[String]) {
-    let n: u64 = arg(args, "--nodes").and_then(|v| v.parse().ok()).unwrap_or(200_000);
-    let seeds: usize = arg(args, "--seeds").and_then(|v| v.parse().ok()).unwrap_or(200);
+    let n: u64 = arg(args, "--nodes")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200_000);
+    let seeds: usize = arg(args, "--seeds")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200);
     let budgets: Vec<usize> = arg(args, "--budget")
         .map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect())
         .unwrap_or_else(|| vec![500, 1500, 4000]);
 
     // Extra retrieve arguments, for trying settings: --extra "alpha: 0.1"
-    let extra = arg(args, "--extra").map(|e| format!(", {e}")).unwrap_or_default();
+    let extra = arg(args, "--extra")
+        .map(|e| format!(", {e}"))
+        .unwrap_or_default();
     let t0 = Instant::now();
     let mut g = Graph::memory();
     g.autocommit = false;
@@ -114,7 +131,11 @@ fn quality(args: &[String]) {
     // Hubs are ids 1..=HUBS; entity i (0-based) is id HUBS + 1 + i, in
     // community i / COMMUNITY.
     for h in 0..HUBS {
-        g.add_node(&["Topic".into()], vec![("name".into(), Value::from(format!("Topic {h}")))]).unwrap();
+        g.add_node(
+            &["Topic".into()],
+            vec![("name".into(), Value::from(format!("Topic {h}")))],
+        )
+        .unwrap();
     }
     for i in 0..n {
         let w = WORDS[r.below(WORDS.len() as u64) as usize];
@@ -122,7 +143,10 @@ fn quality(args: &[String]) {
             &["Entity".into()],
             vec![
                 ("name".into(), Value::from(format!("{w} {i}"))),
-                ("note".into(), Value::from(format!("entity {i} of group {}", i / COMMUNITY))),
+                (
+                    "note".into(),
+                    Value::from(format!("entity {i} of group {}", i / COMMUNITY)),
+                ),
             ],
         )
         .unwrap();
@@ -149,9 +173,14 @@ fn quality(args: &[String]) {
     g.autocommit = true;
     query::execute(&mut g, "CREATE EXTENSION context").unwrap();
     let build_s = t0.elapsed().as_secs_f64();
-    eprintln!("built {} nodes, {} edges in {build_s:.1}s", g.node_count(), g.edge_count());
+    eprintln!(
+        "built {} nodes, {} edges in {build_s:.1}s",
+        g.node_count(),
+        g.edge_count()
+    );
 
-    let community_of = |node: u64| -> Option<u64> { (node > HUBS).then(|| (node - HUBS - 1) / COMMUNITY) };
+    let community_of =
+        |node: u64| -> Option<u64> { (node > HUBS).then(|| (node - HUBS - 1) / COMMUNITY) };
 
     for &budget in &budgets {
         #[derive(Default)]
@@ -177,11 +206,24 @@ fn quality(args: &[String]) {
             let truth = COMMUNITY.min(n - c * COMMUNITY) - 1;
             let score = |nodes: &[u64]| -> (f64, f64) {
                 let others: Vec<u64> = nodes.iter().copied().filter(|&x| x != seed).collect();
-                let hit = others.iter().filter(|&&x| community_of(x) == Some(c)).count() as f64;
-                (if others.is_empty() { 0.0 } else { hit / others.len() as f64 }, hit / truth as f64)
+                let hit = others
+                    .iter()
+                    .filter(|&&x| community_of(x) == Some(c))
+                    .count() as f64;
+                (
+                    if others.is_empty() {
+                        0.0
+                    } else {
+                        hit / others.len() as f64
+                    },
+                    hit / truth as f64,
+                )
             };
             let rows_nodes = |r: &query::QueryResult| -> Vec<u64> {
-                r.rows.iter().filter_map(|row| row.first().and_then(|v| v.as_i64()).map(|v| v as u64)).collect()
+                r.rows
+                    .iter()
+                    .filter_map(|row| row.first().and_then(|v| v.as_i64()).map(|v| v as u64))
+                    .collect()
             };
 
             // context.retrieve, two ways.
@@ -218,7 +260,11 @@ fn quality(args: &[String]) {
             let set: HashSet<u64> = bfs.iter().copied().collect();
             let mut out = String::new();
             for &v in &bfs {
-                let r = query::execute(&mut g, &format!("MATCH (n) WHERE id(n) = {v} RETURN context.card(n)")).unwrap();
+                let r = query::execute(
+                    &mut g,
+                    &format!("MATCH (n) WHERE id(n) = {v} RETURN context.card(n)"),
+                )
+                .unwrap();
                 out.push_str(&text(&r));
                 out.push('\n');
                 g.for_each_adj(v, Dir::Out, None, |a| {
@@ -241,7 +287,11 @@ fn quality(args: &[String]) {
                 let src = format!("MATCH {pat} WHERE id(s) = {seed} RETURN s, r, m");
                 let json = glider::api::query_json(&mut g, &src).unwrap();
                 let ms = t.elapsed().as_secs_f64() * 1e3;
-                let ids = query::execute(&mut g, &format!("MATCH {pat} WHERE id(s) = {seed} RETURN DISTINCT id(m)")).unwrap();
+                let ids = query::execute(
+                    &mut g,
+                    &format!("MATCH {pat} WHERE id(s) = {seed} RETURN DISTINCT id(m)"),
+                )
+                .unwrap();
                 let nodes = rows_nodes(&ids);
                 let (p, rc) = score(&nodes);
                 let a = &mut acc[k].1;
@@ -282,10 +332,17 @@ fn quality(args: &[String]) {
 
 fn scale(args: &[String]) {
     let db = PathBuf::from(arg(args, "--db").expect("--db PATH"));
-    let cache_mb: u64 = arg(args, "--cache-mb").and_then(|v| v.parse().ok()).unwrap_or(256);
-    let seeds: usize = arg(args, "--seeds").and_then(|v| v.parse().ok()).unwrap_or(50);
+    let cache_mb: u64 = arg(args, "--cache-mb")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256);
+    let seeds: usize = arg(args, "--seeds")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
     let label = arg(args, "--label").unwrap_or_else(|| "cold".into());
-    let opts = OpenOptions { cache_size: cache_mb << 20, ..OpenOptions::default() };
+    let opts = OpenOptions {
+        cache_size: cache_mb << 20,
+        ..OpenOptions::default()
+    };
     let t = Instant::now();
     let mut g = Graph::open_opts(&db, opts).expect("open");
     let open_ms = t.elapsed().as_secs_f64() * 1e3;
@@ -316,7 +373,12 @@ fn scale(args: &[String]) {
             pct(misses, 0.95)
         );
         println!("{line}");
-        eprintln!("  {op:<28} p50 {:>9.2} ms  p95 {:>9.2} ms  misses p50 {:>6.0}{extra}", pct(ms, 0.5), pct(ms, 0.95), pct(misses, 0.5));
+        eprintln!(
+            "  {op:<28} p50 {:>9.2} ms  p95 {:>9.2} ms  misses p50 {:>6.0}{extra}",
+            pct(ms, 0.5),
+            pct(ms, 0.95),
+            pct(misses, 0.5)
+        );
     };
     let run = |g: &mut Graph, src: &str| -> (f64, f64, query::QueryResult) {
         let before = g.pager_stats();
@@ -328,16 +390,26 @@ fn scale(args: &[String]) {
     };
 
     for budget in [500usize, 2000, 8000] {
-        let (mut ms, mut mi, mut tok, mut shown, mut reached) = (vec![], vec![], vec![], vec![], vec![]);
+        let (mut ms, mut mi, mut tok, mut shown, mut reached) =
+            (vec![], vec![], vec![], vec![], vec![]);
         for _ in 0..seeds {
             let s = pick(&g);
-            let (t, m, r) = run(&mut g, &format!("CALL context.retrieve(seeds: [{s}], budget: {budget})"));
+            let (t, m, r) = run(
+                &mut g,
+                &format!("CALL context.retrieve(seeds: [{s}], budget: {budget})"),
+            );
             ms.push(t);
             mi.push(m);
             tok.push(r.rows[0][3].as_i64().unwrap_or(0) as f64);
             shown.push(r.rows[0][1].as_i64().unwrap_or(0) as f64);
             let msg = r.message.unwrap_or_default();
-            reached.push(msg.split(" of ").nth(1).and_then(|x| x.split_whitespace().next()).and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0));
+            reached.push(
+                msg.split(" of ")
+                    .nth(1)
+                    .and_then(|x| x.split_whitespace().next())
+                    .and_then(|x| x.parse::<f64>().ok())
+                    .unwrap_or(0.0),
+            );
         }
         let extra = format!(
             ",\"budget\":{budget},\"tokens_p50\":{:.0},\"tokens_max\":{:.0},\"shown_p50\":{:.0},\"reached_p50\":{:.0},\"reached_max\":{:.0}",
@@ -347,7 +419,12 @@ fn scale(args: &[String]) {
             pct(&mut reached, 0.5),
             pct(&mut reached, 1.0)
         );
-        emit(&format!("retrieve budget {budget}"), &mut ms, &mut mi, extra);
+        emit(
+            &format!("retrieve budget {budget}"),
+            &mut ms,
+            &mut mi,
+            extra,
+        );
     }
 
     // The plain alternative at this size: one hop as JSON rows.
@@ -357,12 +434,20 @@ fn scale(args: &[String]) {
             let s = pick(&g);
             let before = g.pager_stats();
             let t = Instant::now();
-            let json = glider::api::query_json(&mut g, &format!("MATCH (s)-[r]-(m) WHERE id(s) = {s} RETURN s, r, m")).unwrap();
+            let json = glider::api::query_json(
+                &mut g,
+                &format!("MATCH (s)-[r]-(m) WHERE id(s) = {s} RETURN s, r, m"),
+            )
+            .unwrap();
             ms.push(t.elapsed().as_secs_f64() * 1e3);
             mi.push(g.pager_stats().misses.saturating_sub(before.misses) as f64);
             tok.push(tokens(&json) as f64);
         }
-        let extra = format!(",\"tokens_p50\":{:.0},\"tokens_max\":{:.0}", pct(&mut tok, 0.5), pct(&mut tok, 1.0));
+        let extra = format!(
+            ",\"tokens_p50\":{:.0},\"tokens_max\":{:.0}",
+            pct(&mut tok, 0.5),
+            pct(&mut tok, 1.0)
+        );
         emit("cypher 1-hop JSON", &mut ms, &mut mi, extra);
     }
 
@@ -370,13 +455,22 @@ fn scale(args: &[String]) {
         let (mut ms, mut mi, mut found, mut hops) = (vec![], vec![], 0usize, vec![]);
         for _ in 0..seeds.min(30) {
             let (a, b) = (pick(&g), pick(&g));
-            let (t, m, r) = run(&mut g, &format!("CALL context.paths(from: {a}, to: {b}, k: 3, depth: 8)"));
+            let (t, m, r) = run(
+                &mut g,
+                &format!("CALL context.paths(from: {a}, to: {b}, k: 3, depth: 8)"),
+            );
             ms.push(t);
             mi.push(m);
             let msg = r.message.unwrap_or_default();
             if msg != "no path" {
                 found += 1;
-                hops.push(msg.split(" of ").nth(1).and_then(|x| x.split_whitespace().next()).and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0));
+                hops.push(
+                    msg.split(" of ")
+                        .nth(1)
+                        .and_then(|x| x.split_whitespace().next())
+                        .and_then(|x| x.parse::<f64>().ok())
+                        .unwrap_or(0.0),
+                );
             }
         }
         let extra = format!(",\"found\":{found},\"hops_p50\":{:.0}", pct(&mut hops, 0.5));
@@ -386,15 +480,29 @@ fn scale(args: &[String]) {
     {
         let (t, m, r) = run(&mut g, "CALL context.schema()");
         let tok = r.rows[0][1].as_i64().unwrap_or(0);
-        emit("schema", &mut vec![t], &mut vec![m], format!(",\"tokens\":{tok}"));
+        emit(
+            "schema",
+            &mut vec![t],
+            &mut vec![m],
+            format!(",\"tokens\":{tok}"),
+        );
     }
 
     // Search without an index is a scan; bound it the way an agent would.
-    const QUERIES: &[&str] = &["copper lantern", "glacier kernel harbour", "quiet thunder", "marble atlas", "London engineer"];
+    const QUERIES: &[&str] = &[
+        "copper lantern",
+        "glacier kernel harbour",
+        "quiet thunder",
+        "marble atlas",
+        "London engineer",
+    ];
     {
         let (mut ms, mut mi) = (vec![], vec![]);
         for w in QUERIES {
-            let (t, m, _) = run(&mut g, &format!("CALL context.search(query: \"{w}\", scan: 100000, top: 5)"));
+            let (t, m, _) = run(
+                &mut g,
+                &format!("CALL context.search(query: \"{w}\", scan: 100000, top: 5)"),
+            );
             ms.push(t);
             mi.push(m);
         }
@@ -403,19 +511,39 @@ fn scale(args: &[String]) {
     // Then through the text index, built here if the database has none.
     let index_labels = arg(args, "--index-labels").unwrap_or_else(|| "Document,Product".into());
     if glider::ext::text::config(&g).is_none() {
-        let labels = index_labels.split(',').map(|l| format!("\"{l}\"")).collect::<Vec<_>>().join(", ");
+        let labels = index_labels
+            .split(',')
+            .map(|l| format!("\"{l}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
         let (t, m, r) = run(&mut g, &format!("CALL context.index(labels: [{labels}])"));
         let msg = r.message.unwrap_or_default().replace('"', "'");
-        emit("index build", &mut vec![t], &mut vec![m], format!(",\"labels\":\"{index_labels}\",\"result\":\"{msg}\""));
+        emit(
+            "index build",
+            &mut vec![t],
+            &mut vec![m],
+            format!(",\"labels\":\"{index_labels}\",\"result\":\"{msg}\""),
+        );
     }
     {
         let (mut ms, mut mi, mut read) = (vec![], vec![], vec![]);
         for _ in 0..3 {
             for w in QUERIES {
-                let (t, m, r) = run(&mut g, &format!("CALL context.search(query: \"{w}\", top: 5)"));
+                let (t, m, r) = run(
+                    &mut g,
+                    &format!("CALL context.search(query: \"{w}\", top: 5)"),
+                );
                 ms.push(t);
                 mi.push(m);
-                read.push(r.message.unwrap_or_default().split(", ").nth(1).and_then(|x| x.split_whitespace().next()).and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0));
+                read.push(
+                    r.message
+                        .unwrap_or_default()
+                        .split(", ")
+                        .nth(1)
+                        .and_then(|x| x.split_whitespace().next())
+                        .and_then(|x| x.parse::<f64>().ok())
+                        .unwrap_or(0.0),
+                );
             }
         }
         let extra = format!(",\"postings_p50\":{:.0}", pct(&mut read, 0.5));
@@ -423,7 +551,10 @@ fn scale(args: &[String]) {
         let (mut ms, mut mi) = (vec![], vec![]);
         // Words that occur in the indexed labels' text.
         for w in &QUERIES[..4] {
-            let (t, m, _) = run(&mut g, &format!("CALL context.retrieve(query: \"{w}\", budget: 2000)"));
+            let (t, m, _) = run(
+                &mut g,
+                &format!("CALL context.retrieve(query: \"{w}\", budget: 2000)"),
+            );
             ms.push(t);
             mi.push(m);
         }

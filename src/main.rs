@@ -120,7 +120,10 @@ fn run() -> Result<(), String> {
         return run_wal(&args, at);
     }
 
-    if args.len() >= 2 && (args[1] == "verify" || args[1] == "migrate") && !Path::new(&args[0]).exists() {
+    if args.len() >= 2
+        && (args[1] == "verify" || args[1] == "migrate")
+        && !Path::new(&args[0]).exists()
+    {
         return Err(format!("{}: no such database", args[0]));
     }
 
@@ -128,7 +131,10 @@ fn run() -> Result<(), String> {
         return migrate(&args[0]);
     }
 
-    if args.len() >= 2 && args[1] == "verify" && glider::legacy::detect(Path::new(&args[0])).is_none() {
+    if args.len() >= 2
+        && args[1] == "verify"
+        && glider::legacy::detect(Path::new(&args[0])).is_none()
+    {
         return verify_paged(&args[0]);
     }
 
@@ -373,7 +379,9 @@ fn parse_size(s: &str) -> Option<u64> {
 fn migrate(db: &str) -> Result<(), String> {
     let path = Path::new(db);
     let Some(kind) = glider::legacy::detect(path) else {
-        return Err(format!("{db} is not a legacy glider file; nothing to migrate"));
+        return Err(format!(
+            "{db} is not a legacy glider file; nothing to migrate"
+        ));
     };
     let t = std::time::Instant::now();
     eprintln!("reading {db} ({kind}) ...");
@@ -865,7 +873,8 @@ fn run_wal(args: &[String], at: usize) -> Result<(), String> {
                 opts.min_bytes = s.parse().map_err(|_| "--min-bytes takes a number")?;
             }
             if glider::replica::is_paged(Path::new(&db)) {
-                glider::replica::tail(Path::new(&db), Path::new(&dir), &opts).map_err(|e| e.to_string())
+                glider::replica::tail(Path::new(&db), Path::new(&dir), &opts)
+                    .map_err(|e| e.to_string())
             } else {
                 glider::wal::tail(Path::new(&db), Path::new(&dir), &opts).map_err(|e| e.to_string())
             }
@@ -884,8 +893,10 @@ fn run_wal(args: &[String], at: usize) -> Result<(), String> {
                     glider::storage::log::Committed::To(e) => e,
                     glider::storage::log::Committed::Gone => sb.wal_lsn,
                 };
-                let bases = glider::replica::bases(Path::new(&dir), &gen).map_err(|e| e.to_string())?;
-                let segs = glider::wal::segments(Path::new(&dir), &gen).map_err(|e| e.to_string())?;
+                let bases =
+                    glider::replica::bases(Path::new(&dir), &gen).map_err(|e| e.to_string())?;
+                let segs =
+                    glider::wal::segments(Path::new(&dir), &gen).map_err(|e| e.to_string())?;
                 let replicated = bases
                     .last()
                     .map(|b| glider::replica::reach(&segs, b.lsn))
@@ -902,7 +913,11 @@ fn run_wal(args: &[String], at: usize) -> Result<(), String> {
                     ),
                     None => println!("base        none yet"),
                 }
-                println!("replicated  log to {} in {} segments", replicated, segs.len());
+                println!(
+                    "replicated  log to {} in {} segments",
+                    replicated,
+                    segs.len()
+                );
                 println!("lag         {} bytes", local.saturating_sub(replicated));
                 if let Some(last) = segs.last() {
                     println!("last ship   {}", glider::wal::fmt_unix(last.ts));
@@ -1009,9 +1024,13 @@ fn run_wal(args: &[String], at: usize) -> Result<(), String> {
             let use_paged = match &generation {
                 Some(g) => paged.contains(g),
                 None => {
-                    let legacy = glider::wal::generations(Path::new(&dir)).map_err(|e| e.to_string())?;
+                    let legacy =
+                        glider::wal::generations(Path::new(&dir)).map_err(|e| e.to_string())?;
                     // The most recently active lineage decides.
-                    legacy.last().map(|g| paged.contains(g)).unwrap_or(!paged.is_empty())
+                    legacy
+                        .last()
+                        .map(|g| paged.contains(g))
+                        .unwrap_or(!paged.is_empty())
                 }
             };
             if use_paged {
@@ -1024,7 +1043,8 @@ fn run_wal(args: &[String], at: usize) -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
                 // Opening replays the log laid beside the base; a restore
                 // that does not open is not a restore.
-                let g = glider::Graph::open(Path::new(&out), Sync::Normal).map_err(|e| e.to_string())?;
+                let g = glider::Graph::open(Path::new(&out), Sync::Normal)
+                    .map_err(|e| e.to_string())?;
                 g.verify_trees().map_err(|e| e.to_string())?;
                 println!(
                     "restored generation {} from the base at log {} ({}) and {} log segments, through log {}",
@@ -1054,7 +1074,9 @@ fn run_wal(args: &[String], at: usize) -> Result<(), String> {
             );
             println!("{} nodes, {} edges", g.node_count(), g.edge_count());
             drop(g);
-            println!("(a database from before paged storage: convert it with `glider {out} migrate`)");
+            println!(
+                "(a database from before paged storage: convert it with `glider {out} migrate`)"
+            );
             Ok(())
         }
 

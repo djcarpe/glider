@@ -303,7 +303,8 @@ pub unsafe extern "C" fn glider_set_auto_compact(db: *mut GliderDb, bytes: u64) 
     unsafe {
         guard(-1, || {
             let db = as_db(db)?;
-            db.graph.set_checkpoint_bytes(if bytes == 0 { u64::MAX } else { bytes });
+            db.graph
+                .set_checkpoint_bytes(if bytes == 0 { u64::MAX } else { bytes });
             Ok(0)
         })
     }
@@ -428,7 +429,11 @@ pub unsafe extern "C" fn glider_query_json(db: *mut GliderDb, q: *const c_char) 
 /// `q` must be a NUL-terminated UTF-8 string, `params` one or null. Free
 /// the result with `glider_free`.
 #[no_mangle]
-pub unsafe extern "C" fn glider_query_params_json(db: *mut GliderDb, q: *const c_char, params: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn glider_query_params_json(
+    db: *mut GliderDb,
+    q: *const c_char,
+    params: *const c_char,
+) -> *mut c_char {
     unsafe {
         guard(std::ptr::null_mut(), || {
             let db = as_db(db)?;
@@ -553,7 +558,9 @@ pub unsafe extern "C" fn glider_edges_json(
 /// rows, touched, page traffic, and the duration histogram.
 #[no_mangle]
 pub extern "C" fn glider_telemetry_json() -> *mut c_char {
-    guard(std::ptr::null_mut(), || out_string(crate::telemetry::snapshot().to_json()))
+    guard(std::ptr::null_mut(), || {
+        out_string(crate::telemetry::snapshot().to_json())
+    })
 }
 
 /// The calling thread's most recent statement as JSON — operation, rows,
@@ -588,7 +595,10 @@ pub unsafe extern "C" fn glider_db_metrics_json(db: *mut GliderDb) -> *mut c_cha
 }
 
 /// `(name, metrics)` for each non-NULL handle in `dbs[..n]`.
-unsafe fn db_list(dbs: *const *mut GliderDb, n: usize) -> Vec<(String, crate::telemetry::DbMetrics)> {
+unsafe fn db_list(
+    dbs: *const *mut GliderDb,
+    n: usize,
+) -> Vec<(String, crate::telemetry::DbMetrics)> {
     unsafe {
         if dbs.is_null() {
             return Vec::new();
@@ -626,10 +636,15 @@ pub unsafe extern "C" fn glider_metrics_otlp(
             let now = if now_unix_ms > 0.0 {
                 (now_unix_ms * 1e6) as u64
             } else {
-                crate::telemetry::now_unix_ns().ok_or("no clock on this target: pass now_unix_ms")?
+                crate::telemetry::now_unix_ns()
+                    .ok_or("no clock on this target: pass now_unix_ms")?
             };
             let res = crate::telemetry::default_resource(service);
-            out_string(crate::telemetry::otlp_metrics_json(&res, now, &db_list(dbs, n)))
+            out_string(crate::telemetry::otlp_metrics_json(
+                &res,
+                now,
+                &db_list(dbs, n),
+            ))
         })
     }
 }
@@ -640,8 +655,15 @@ pub unsafe extern "C" fn glider_metrics_otlp(
 /// # Safety
 /// As `glider_metrics_otlp`.
 #[no_mangle]
-pub unsafe extern "C" fn glider_metrics_prometheus(dbs: *const *mut GliderDb, n: usize) -> *mut c_char {
-    unsafe { guard(std::ptr::null_mut(), || out_string(crate::telemetry::prometheus(&db_list(dbs, n)))) }
+pub unsafe extern "C" fn glider_metrics_prometheus(
+    dbs: *const *mut GliderDb,
+    n: usize,
+) -> *mut c_char {
+    unsafe {
+        guard(std::ptr::null_mut(), || {
+            out_string(crate::telemetry::prometheus(&db_list(dbs, n)))
+        })
+    }
 }
 
 /// Add a duration the host measured to the statement-duration histogram.
@@ -693,7 +715,9 @@ pub unsafe extern "C" fn glider_trace_context(traceparent: *const c_char) -> c_i
         guard(-1, || {
             let ctx = match as_opt_str(traceparent, "traceparent")? {
                 None => None,
-                Some(s) => Some(crate::telemetry::TraceContext::parse(s).ok_or("not a valid traceparent")?),
+                Some(s) => Some(
+                    crate::telemetry::TraceContext::parse(s).ok_or("not a valid traceparent")?,
+                ),
             };
             crate::telemetry::set_context(ctx);
             Ok(0)

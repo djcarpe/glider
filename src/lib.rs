@@ -39,9 +39,7 @@ pub mod utils;
 pub mod value;
 pub mod wal;
 
-pub use graph::{
-    Csr, Dir, EdgeRef, Error, Graph, NodeRef, OpenOptions, Result, Stats,
-};
+pub use graph::{Csr, Dir, EdgeRef, Error, Graph, NodeRef, OpenOptions, Result, Stats};
 pub use query::{execute, export_jsonl, export_jsonl_to, import_jsonl, QueryResult};
 pub use store::Sync;
 pub use value::Value;
