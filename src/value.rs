@@ -14,6 +14,24 @@ pub enum Value {
 }
 
 impl Value {
+    /// Conservative retained heap cost, including spare capacity and headers.
+    pub fn memory_bytes(&self) -> u64 {
+        let extra = match self {
+            Value::Text(s) => s.capacity() as u64,
+            Value::List(v) => {
+                v.capacity() as u64 * std::mem::size_of::<Value>() as u64
+                    + v.iter()
+                        .map(|v| {
+                            v.memory_bytes()
+                                .saturating_sub(std::mem::size_of::<Value>() as u64)
+                        })
+                        .sum::<u64>()
+            }
+            _ => 0,
+        };
+        std::mem::size_of::<Value>() as u64 + extra
+    }
+
     pub fn type_name(&self) -> &'static str {
         match self {
             Value::Null => "null",

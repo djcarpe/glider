@@ -352,6 +352,32 @@ impl Expr {
         }
     }
 
+    /// Variables the expression reads.
+    fn vars(&self, out: &mut Vec<String>) {
+        match self {
+            Expr::Var(v) | Expr::Prop(v, _) => out.push(v.clone()),
+            Expr::Lit(_) => {}
+            Expr::Not(a) | Expr::IsNull(a, _) => a.vars(out),
+            Expr::And(a, b)
+            | Expr::Or(a, b)
+            | Expr::Cmp(_, a, b)
+            | Expr::Arith(_, a, b)
+            | Expr::Index(a, b) => {
+                a.vars(out);
+                b.vars(out);
+            }
+            Expr::In(a, xs) => {
+                a.vars(out);
+                xs.iter().for_each(|x| x.vars(out));
+            }
+            Expr::Func(_, xs) | Expr::List(xs) => xs.iter().for_each(|x| x.vars(out)),
+            Expr::Slice(a, b, c) => {
+                a.vars(out);
+                b.iter().chain(c.iter()).for_each(|x| x.vars(out));
+            }
+        }
+    }
+
     fn is_aggregate(&self) -> bool {
         match self {
             Expr::Func(name, _) => matches!(
@@ -1296,6 +1322,55 @@ pub fn edge_value(g: &Graph, id: u64) -> Value {
 
 // ------------------------------------------------------------------- execute
 
+/// Caps on one materialized response. Cursor caps apply to each batch.
+#[derive(Clone, Copy, Debug)]
+pub struct QueryLimits {
+    pub max_rows: usize,
+    pub max_bytes: u64,
+}
+impl Default for QueryLimits {
+    fn default() -> Self {
+        Self {
+            max_rows: 10_000,
+            max_bytes: 8 << 20,
+        }
+    }
+}
+thread_local! { static LIMITS: std::cell::Cell<Option<QueryLimits>> = const { std::cell::Cell::new(None) }; }
+struct LimitsGuard(Option<QueryLimits>);
+impl Drop for LimitsGuard {
+    fn drop(&mut self) {
+        LIMITS.with(|l| l.set(self.0));
+    }
+}
+
+pub fn row_bytes(row: &[Value]) -> u64 {
+    64 + row.iter().map(Value::memory_bytes).sum::<u64>() * 2
+}
+fn budget_error() -> Error {
+    Error::Full("query work_mem or result row/byte cap exceeded".into())
+}
+
+pub fn execute_capped(
+    g: &mut Graph,
+    src: &str,
+    params: &[(String, Value)],
+    limits: QueryLimits,
+) -> Result<QueryResult> {
+    if limits.max_rows == 0 || limits.max_bytes == 0 {
+        return Err(budget_error());
+    }
+    let _guard = LimitsGuard(LIMITS.with(|l| l.replace(Some(limits))));
+    let result = execute_with(g, src, params)?;
+    if result.rows.len() > limits.max_rows
+        || result.rows.iter().map(|r| row_bytes(r)).sum::<u64>()
+            > limits.max_bytes.min(g.query_memory())
+    {
+        return Err(budget_error());
+    }
+    Ok(result)
+}
+
 pub fn execute(g: &mut Graph, src: &str) -> Result<QueryResult> {
     execute_with(g, src, &[])
 }
@@ -1312,6 +1387,15 @@ pub fn execute(g: &mut Graph, src: &str) -> Result<QueryResult> {
 /// assert_eq!(r.rows[0][0], Value::from("Ada"));
 /// ```
 pub fn execute_with(g: &mut Graph, src: &str, params: &[(String, Value)]) -> Result<QueryResult> {
+    let input = src.len() as u64 * 32
+        + params
+            .iter()
+            .map(|(k, v)| k.len() as u64 + v.memory_bytes())
+            .sum::<u64>()
+            * 4;
+    if input > g.query_memory() {
+        return Err(budget_error());
+    }
     let watch = telemetry::Stopwatch::start();
     let before = g.pager_stats();
     let mut report = telemetry::OpReport {
@@ -1756,7 +1840,7 @@ fn exec_match(
             if let Some(r) = count_from_counters(g, patterns, filter, tail) {
                 return Ok(r);
             }
-            let mut proj = Projection::new(kind, *distinct, order, *skip, *limit);
+            let mut proj = Projection::new(kind, *distinct, order, *skip, *limit, g.query_memory());
             let mut err = None;
             match_all(
                 g,
@@ -2840,8 +2924,10 @@ impl Acc {
         }
     }
 
-    fn add(&mut self, g: &Graph, e: &Expr, binds: &Binds) {
-        let Expr::Func(_, args) = e else { return };
+    fn add(&mut self, g: &Graph, e: &Expr, binds: &Binds, memory: &mut Workspace) -> Result<()> {
+        let Expr::Func(_, args) = e else {
+            return Ok(());
+        };
         let arg = args.first();
         let star = matches!(arg, Some(Expr::Lit(Value::Text(s))) if s == "*");
         if let Acc::Count(n) = self {
@@ -2854,18 +2940,18 @@ impl Acc {
                 None => false,
             };
             *n += counts as i64;
-            return;
+            return Ok(());
         }
         let v = if star {
             Value::Int(1)
         } else {
             match arg {
                 Some(a) => eval(g, a, binds),
-                None => return,
+                None => return Ok(()),
             }
         };
         if matches!(v, Value::Null) {
-            return;
+            return Ok(());
         }
         match self {
             Acc::Sum(s) => {
@@ -2886,6 +2972,8 @@ impl Acc {
                     .map(|c| v.total_cmp(c) == std::cmp::Ordering::Less)
                     .unwrap_or(true)
                 {
+                    let old = m.as_ref().map(Value::memory_bytes).unwrap_or(0);
+                    memory.charge(v.memory_bytes().saturating_sub(old))?;
                     *m = Some(v);
                 }
             }
@@ -2894,12 +2982,18 @@ impl Acc {
                     .map(|c| v.total_cmp(c) != std::cmp::Ordering::Less)
                     .unwrap_or(true)
                 {
+                    let old = m.as_ref().map(Value::memory_bytes).unwrap_or(0);
+                    memory.charge(v.memory_bytes().saturating_sub(old))?;
                     *m = Some(v);
                 }
             }
-            Acc::Collect(l) => l.push(v),
+            Acc::Collect(l) => {
+                memory.charge(v.memory_bytes() * 2)?;
+                l.push(v);
+            }
             Acc::Count(_) | Acc::Other => {}
         }
+        Ok(())
     }
 
     fn value(self) -> Value {
@@ -2931,6 +3025,9 @@ struct Projection<'q> {
     limit: Option<usize>,
     items: Option<Vec<(Expr, String)>>,
     keys: Vec<(usize, bool)>,
+    /// Columns the caller sees; any after these are ORDER BY keys that were
+    /// not returned, evaluated per row for sorting and dropped at the end.
+    shown: usize,
     has_agg: bool,
     rows: Vec<Vec<Value>>,
     seen: FirstSeen,
@@ -2939,6 +3036,30 @@ struct Projection<'q> {
     group_keys: Vec<Vec<Value>>,
     /// Rows produced before SKIP/LIMIT (after DISTINCT).
     total: usize,
+    memory: Workspace,
+    caps: Option<QueryLimits>,
+}
+
+/// Every variable `e` reads is one of `known`.
+fn reads_only(e: &Expr, known: &[String]) -> bool {
+    let mut used = Vec::new();
+    e.vars(&mut used);
+    used.iter().all(|v| known.contains(v))
+}
+
+struct Workspace {
+    used: u64,
+    limit: u64,
+}
+impl Workspace {
+    fn charge(&mut self, bytes: u64) -> Result<()> {
+        let next = self.used.saturating_add(bytes);
+        if next > self.limit {
+            return Err(budget_error());
+        }
+        self.used = next;
+        Ok(())
+    }
 }
 
 impl<'q> Projection<'q> {
@@ -2948,6 +3069,7 @@ impl<'q> Projection<'q> {
         order: &'q [(Expr, bool)],
         skip: usize,
         limit: Option<usize>,
+        work_mem: u64,
     ) -> Projection<'q> {
         Projection {
             kind,
@@ -2957,6 +3079,7 @@ impl<'q> Projection<'q> {
             limit,
             items: None,
             keys: Vec::new(),
+            shown: 0,
             has_agg: false,
             rows: Vec::new(),
             seen: FirstSeen::default(),
@@ -2964,6 +3087,11 @@ impl<'q> Projection<'q> {
             group_index: FirstSeen::default(),
             group_keys: Vec::new(),
             total: 0,
+            memory: Workspace {
+                used: 0,
+                limit: work_mem,
+            },
+            caps: LIMITS.with(|l| l.get()),
         }
     }
 
@@ -2983,19 +3111,44 @@ impl<'q> Projection<'q> {
                 })
                 .unwrap_or_default(),
         };
-        let columns: Vec<String> = items.iter().map(|(_, a)| a.clone()).collect();
-        self.keys = self
-            .order
-            .iter()
-            .map(|(e, desc)| {
-                let alias = e.alias();
-                let idx = columns.iter().position(|c| *c == alias).ok_or_else(|| {
-                    Error::Msg(format!("ORDER BY {} is not a returned column", alias))
-                })?;
-                Ok((idx, *desc))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.has_agg = items.iter().any(|(e, _)| e.is_aggregate());
+        let mut items = items;
+        let has_agg = items.iter().any(|(e, _)| e.is_aggregate());
+        self.shown = items.len();
+        // What a hidden sort key may read: the match's variables, or with no
+        // row to look at, those the returned columns read.
+        let mut known = Vec::new();
+        match first {
+            Some(b) => known.extend(b.iter().map(|(k, _)| k.to_string())),
+            None => items.iter().for_each(|(e, _)| e.vars(&mut known)),
+        }
+        let mut keys = Vec::with_capacity(self.order.len());
+        for (e, desc) in self.order {
+            let alias = e.alias();
+            let idx = match items.iter().position(|(_, c)| *c == alias) {
+                Some(idx) => idx,
+                // `RETURN s ORDER BY s.seq`, `RETURN t.key ORDER BY t.stage`:
+                // an expression over the match's variables sorts on a hidden
+                // column. Not under aggregation or DISTINCT, where it would
+                // change the groups or duplicates.
+                None if !has_agg
+                    && !self.distinct
+                    && !e.is_aggregate()
+                    && reads_only(e, &known) =>
+                {
+                    items.push((e.clone(), alias));
+                    items.len() - 1
+                }
+                None => {
+                    return Err(Error::Msg(format!(
+                        "ORDER BY {} is not a returned column",
+                        alias
+                    )))
+                }
+            };
+            keys.push((idx, *desc));
+        }
+        self.keys = keys;
+        self.has_agg = has_agg;
         self.items = Some(items);
         Ok(())
     }
@@ -3022,8 +3175,13 @@ impl<'q> Projection<'q> {
                 .map(|(e, _)| eval(g, e, &binds))
                 .collect();
             let idx = self.groups.len();
+            self.memory
+                .charge(row_bytes(&key) * 4 + items.len() as u64 * 128)?;
             let gi = match self.group_index.find_or_add(&self.group_keys, &key, idx) {
-                Some(i) => i,
+                Some(i) => {
+                    self.memory.used -= row_bytes(&key) * 4 + items.len() as u64 * 128;
+                    i
+                }
                 None => {
                     let accs = items
                         .iter()
@@ -3040,15 +3198,27 @@ impl<'q> Projection<'q> {
                 .filter(|(e, _)| e.is_aggregate())
                 .map(|(e, _)| e);
             for (acc, e) in self.groups[gi].1.iter_mut().zip(aggs) {
-                acc.add(g, e, &binds);
+                acc.add(g, e, &binds, &mut self.memory)?;
             }
             return Ok(true);
         }
         let row: Vec<Value> = items.iter().map(|(e, _)| eval(g, e, &binds)).collect();
+        let charge = row_bytes(&row) * if self.distinct { 4 } else { 1 };
+        self.memory.charge(charge)?;
         if self.distinct {
             let idx = self.rows.len();
             if self.seen.find_or_add(&self.rows, &row, idx).is_some() {
+                self.memory.used -= charge;
                 return Ok(true);
+            }
+        }
+        if self.keys.is_empty() {
+            if let Some(caps) = self.caps {
+                if self.rows.len().saturating_sub(self.skip) >= caps.max_rows
+                    || self.memory.used > caps.max_bytes
+                {
+                    return Err(budget_error());
+                }
             }
         }
         self.total += 1;
@@ -3061,12 +3231,13 @@ impl<'q> Projection<'q> {
             // No order: the first rows are the answer.
             return Ok(self.rows.len() < want);
         }
-        if !self.distinct && self.rows.len() >= want.saturating_mul(2).max(want + 1024) {
+        if !self.distinct && self.rows.len() >= want.saturating_mul(2).max(want.saturating_add(1)) {
             // Keep only the best `want`; a stable sort keeps ties in arrival
             // order, as sorting everything at the end would.
             let keys = self.keys.clone();
             self.rows.sort_by(|a, b| Self::cmp_rows(&keys, a, b));
             self.rows.truncate(want);
+            self.memory.used = self.rows.iter().map(|r| row_bytes(r)).sum();
         }
         Ok(true)
     }
@@ -3074,7 +3245,11 @@ impl<'q> Projection<'q> {
     fn finish(mut self) -> Result<QueryResult> {
         self.resolve(None)?;
         let items = self.items.take().expect("resolved");
-        let columns: Vec<String> = items.iter().map(|(_, a)| a.clone()).collect();
+        let columns: Vec<String> = items
+            .iter()
+            .take(self.shown)
+            .map(|(_, a)| a.clone())
+            .collect();
         let mut out_rows: Vec<Vec<Value>> = if self.has_agg {
             let rows: Vec<Vec<Value>> = std::mem::take(&mut self.groups)
                 .into_iter()
@@ -3115,9 +3290,15 @@ impl<'q> Projection<'q> {
             let keys = self.keys.clone();
             out_rows.sort_by(|a, b| Self::cmp_rows(&keys, a, b));
         }
-        let mut final_rows: Vec<Vec<Value>> = out_rows.into_iter().skip(self.skip).collect();
+        let mut final_rows = out_rows;
+        final_rows.drain(..self.skip.min(final_rows.len()));
         if let Some(l) = self.limit {
             final_rows.truncate(l);
+        }
+        if items.len() > self.shown {
+            for r in final_rows.iter_mut() {
+                r.truncate(self.shown);
+            }
         }
         Ok(QueryResult {
             columns,
@@ -3996,7 +4177,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
 /// How many nodes a local walk may remember before it gives way to the
 /// whole-graph algorithm, from the algorithm memory budget.
 fn walk_cap(g: &Graph) -> usize {
-    (g.algorithm_memory() / crate::traverse::BYTES_PER_NODE).max(1 << 16) as usize
+    (g.query_memory() / crate::traverse::BYTES_PER_NODE).max(1 << 16) as usize
 }
 
 /// BFS or DFS over the adjacency, keeping state only for what it visits.
@@ -4167,9 +4348,9 @@ pub fn export_jsonl_to(g: &Graph, w: &mut impl std::io::Write) -> std::io::Resul
         let Some(&last) = ids.last() else { break };
         for id in ids {
             write_node_line(g, id, &mut out);
+            w.write_all(out.as_bytes())?;
+            out.clear();
         }
-        w.write_all(out.as_bytes())?;
-        out.clear();
         from = last + 1;
     }
     from = 0;
@@ -4178,9 +4359,9 @@ pub fn export_jsonl_to(g: &Graph, w: &mut impl std::io::Write) -> std::io::Resul
         let Some(&last) = ids.last() else { break };
         for id in ids {
             write_edge_line(g, id, &mut out);
+            w.write_all(out.as_bytes())?;
+            out.clear();
         }
-        w.write_all(out.as_bytes())?;
-        out.clear();
         from = last + 1;
     }
     w.flush()
@@ -4226,3 +4407,6 @@ fn write_edge_line(g: &Graph, id: u64, out: &mut String) {
     }
     out.push_str("}}\n");
 }
+
+mod bounded;
+pub use bounded::{execute_batch, import_jsonl_from, Cursor};

@@ -125,6 +125,9 @@ impl Default for OpenOptions {
 /// Default working memory for algorithms on a file-backed graph.
 pub const DEFAULT_WORK_MEM: u64 = 256 << 20;
 
+/// The smallest query workspace ([`Graph::query_memory`]), whatever `work_mem` says.
+pub const MIN_QUERY_MEM: u64 = 64 << 10;
+
 fn sync_mode(s: Sync) -> SyncMode {
     match s {
         Sync::Always => SyncMode::Always,
@@ -1087,7 +1090,7 @@ impl Graph {
             checkpoint_bytes: opts.checkpoint_bytes,
             force: opts.force,
             wal_segment: opts.wal_segment,
-            ..DbConfig::default()
+            replay_buffer: opts.work_mem.min(64 << 20) as usize,
         };
         let mut sch: Option<(Interner, Indexes)> = None;
         let (db, _) = Db::open(path, &cfg, &mut |p, rec| replay(p, &mut sch, rec))?;
@@ -2557,10 +2560,11 @@ impl Graph {
     }
 
     /// Memory an algorithm may hold right now before it spills: `work_mem`
-    /// for a file, the headroom under `max_memory` for `:memory:`.
+    /// for a file; for `:memory:`, the headroom under `max_memory`, never
+    /// more than `work_mem`.
     pub fn algorithm_memory(&self) -> u64 {
         match self.pager().memory_usage() {
-            Some((used, max)) => max.saturating_sub(used),
+            Some((used, max)) => max.saturating_sub(used).min(self.work_mem),
             None => self.work_mem,
         }
     }
@@ -2573,6 +2577,15 @@ impl Graph {
             return Ok(());
         }
         Ok(self.db.poll_pin(false)?)
+    }
+
+    /// The workspace one query may hold for its result rows, sort buffer,
+    /// DISTINCT/grouping state and collected lists; past it the query fails
+    /// instead of growing. It is `work_mem`, but never below
+    /// [`MIN_QUERY_MEM`], so `work_mem: 0` (spill every algorithm array)
+    /// still answers small queries. Independent of `:memory:` page headroom.
+    pub fn query_memory(&self) -> u64 {
+        self.work_mem.max(MIN_QUERY_MEM)
     }
 
     pub fn set_work_mem(&mut self, bytes: u64) {

@@ -39,7 +39,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 use super::page::{self, Page};
 use super::{corrupt, SError, SResult};
@@ -125,7 +125,7 @@ pub struct Stats {
 
 pub struct Pager {
     ps: usize,
-    inner: Mutex<Inner>,
+    inner: Arc<Mutex<Inner>>,
 }
 
 struct Inner {
@@ -190,6 +190,8 @@ struct Cache {
     frames: Vec<Frame>,
     map: HashMap<u64, usize, IdBuild>,
     hand: usize,
+    pool: Option<Arc<crate::budget::Pool>>,
+    charge: u64,
 }
 
 struct Frame {
@@ -238,7 +240,7 @@ impl Pager {
         };
         Pager {
             ps: page_size,
-            inner: Mutex::new(inner),
+            inner: Arc::new(Mutex::new(inner)),
         }
     }
 
@@ -261,7 +263,7 @@ impl Pager {
         let ps = cfg.page_size;
         let p = Pager {
             ps,
-            inner: Mutex::new(Inner {
+            inner: Arc::new(Mutex::new(Inner {
                 ps,
                 store: Store::File(FileStore {
                     base: path.to_path_buf(),
@@ -289,7 +291,7 @@ impl Pager {
                 wal_lsn: 0,
                 sb_slot: 0,
                 stats: Stats::default(),
-            }),
+            })),
         };
         // Two superblocks so the first checkpoint has somewhere to go.
         {
@@ -298,6 +300,7 @@ impl Pager {
             g.write_superblock(1)?;
             g.sync_all()?;
         }
+        register_cache(&p);
         Ok(p)
     }
 
@@ -359,7 +362,7 @@ impl Pager {
         }
         let p = Pager {
             ps,
-            inner: Mutex::new(Inner {
+            inner: Arc::new(Mutex::new(Inner {
                 ps,
                 store: Store::File(FileStore {
                     base: path.to_path_buf(),
@@ -387,7 +390,7 @@ impl Pager {
                 wal_lsn,
                 sb_slot,
                 stats: Stats::default(),
-            }),
+            })),
         };
         // Load the free list.
         {
@@ -425,6 +428,7 @@ impl Pager {
                 next = page::get_u64(&pg, 32);
             }
         }
+        register_cache(&p);
         Ok(p)
     }
 
@@ -534,7 +538,7 @@ impl Pager {
         };
         Ok(Pager {
             ps,
-            inner: Mutex::new(inner),
+            inner: Arc::new(Mutex::new(inner)),
         })
     }
 
@@ -708,9 +712,7 @@ impl Pager {
         let mut g = self.lock();
         g.flush_dirty()?;
         if let Store::File(f) = &mut g.store {
-            f.cache.frames.clear();
-            f.cache.map.clear();
-            f.cache.hand = 0;
+            f.cache.clear();
         }
         Ok(())
     }
@@ -939,7 +941,7 @@ impl Inner {
             fr.usage = 3;
             return Ok(());
         }
-        if f.cache.frames.len() < f.cache.cap {
+        if f.cache.frames.len() < f.cache.cap && f.cache.reserve_frame() {
             f.cache.frames.push(Frame {
                 pno,
                 data,
@@ -968,17 +970,9 @@ impl Inner {
             break;
         }
         let Some(v) = victim else {
-            // Every frame is pinned: grow rather than fail.
-            f.cache.frames.push(Frame {
-                pno,
-                data,
-                dirty,
-                usage: 1,
-            });
-            let i = f.cache.frames.len() - 1;
-            f.cache.map.insert(pno, i);
-            self.stats.overflow_frames += 1;
-            return Ok(());
+            return Err(SError::Full(
+                "page cache budget exhausted (all frames pinned or other databases busy)".into(),
+            ));
         };
         let old_pno = f.cache.frames[v].pno;
         if f.cache.frames[v].dirty {
@@ -1221,6 +1215,7 @@ impl Inner {
                 let last = f.cache.frames.len() - 1;
                 f.cache.frames.swap(i, last);
                 f.cache.frames.pop();
+                f.cache.release_frame();
                 if i < f.cache.frames.len() {
                     let moved = f.cache.frames[i].pno;
                     f.cache.map.insert(moved, i);
@@ -1298,8 +1293,94 @@ impl Cache {
             frames: Vec::new(),
             map: HashMap::default(),
             hand: 0,
+            pool: crate::budget::process().map(|b| b.cache.clone()),
+            // Payload plus conservative Arc/Vec/hash-table bookkeeping.
+            charge: ps as u64 + 512,
         }
     }
+
+    fn reserve_frame(&self) -> bool {
+        let Some(pool) = &self.pool else { return true };
+        if pool.reserve(self.charge) {
+            return true;
+        }
+        reclaim_caches(pool, self.charge);
+        pool.reserve(self.charge)
+    }
+    fn release_frame(&self) {
+        if let Some(pool) = &self.pool {
+            pool.release(self.charge);
+        }
+    }
+    fn clear(&mut self) {
+        if let Some(pool) = &self.pool {
+            pool.release(self.frames.len() as u64 * self.charge);
+        }
+        self.frames = Vec::new();
+        self.map = HashMap::default();
+        self.hand = 0;
+    }
+}
+
+impl Drop for Cache {
+    fn drop(&mut self) {
+        if let Some(pool) = &self.pool {
+            pool.release(self.frames.len() as u64 * self.charge);
+        }
+    }
+}
+
+static CACHES: OnceLock<Mutex<Vec<Weak<Mutex<Inner>>>>> = OnceLock::new();
+
+fn register_cache(pager: &Pager) {
+    if crate::budget::process().is_some() {
+        let mut caches = CACHES
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        caches.retain(|c| c.strong_count() > 0);
+        caches.push(Arc::downgrade(&pager.inner));
+    }
+}
+
+// Never wait for another pager while holding one: concurrent opens and queries
+// may reclaim each other's idle frames without a lock-order cycle.
+fn reclaim_caches(pool: &crate::budget::Pool, needed: u64) {
+    let Some(registry) = CACHES.get() else { return };
+    let caches = registry.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for cache in caches {
+        if pool.used().saturating_add(needed) <= pool.limit() {
+            break;
+        }
+        let Some(inner) = cache.upgrade() else {
+            continue;
+        };
+        let Ok(mut inner) = inner.try_lock() else {
+            continue;
+        };
+        let evictable = match &inner.store {
+            Store::File(f) => f
+                .cache
+                .frames
+                .iter()
+                .all(|f| Arc::strong_count(&f.data) == 1),
+            _ => false,
+        };
+        if evictable && inner.flush_dirty().is_ok() {
+            if let Store::File(f) = &mut inner.store {
+                f.cache.clear();
+            }
+        }
+    }
+}
+
+/// Governor hook. Busy/pinned frames are reclaimed on the next admission;
+/// the returned usage makes a pending shrink observable.
+pub fn resize_shared_cache(bytes: u64) -> Option<u64> {
+    let budget = crate::budget::process()?;
+    budget.cache.resize(bytes.min(budget.config.cache));
+    reclaim_caches(&budget.cache, 0);
+    Some(budget.cache.used())
 }
 
 // ---------------------------------------------------------------------- tests
