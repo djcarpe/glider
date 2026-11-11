@@ -498,8 +498,6 @@ fn describe_tok(t: Option<&Tok>) -> String {
 }
 
 fn parse_stmt(p: &mut Parser, src: &str) -> Result<Stmt> {
-    let mut p = p;
-
     if p.eat_kw("EXPLAIN") {
         let rest: String = src
             .trim_start()
@@ -510,13 +508,13 @@ fn parse_stmt(p: &mut Parser, src: &str) -> Result<Stmt> {
     }
 
     if p.eat_kw("MATCH") {
-        let patterns = parse_pattern_list(&mut p)?;
+        let patterns = parse_pattern_list(p)?;
         let filter = if p.eat_kw("WHERE") {
-            Some(parse_expr(&mut p)?)
+            Some(parse_expr(p)?)
         } else {
             None
         };
-        let tail = parse_tail(&mut p)?;
+        let tail = parse_tail(p)?;
         return Ok(Stmt::Match {
             patterns,
             filter,
@@ -540,14 +538,14 @@ fn parse_stmt(p: &mut Parser, src: &str) -> Result<Stmt> {
         }
         if p.is_kw("INDEX") {
             p.pos += 1;
-            let (label, key) = parse_index_target(&mut p)?;
+            let (label, key) = parse_index_target(p)?;
             return Ok(Stmt::Index {
                 label,
                 key,
                 drop: false,
             });
         }
-        return Ok(Stmt::Create(parse_pattern_list(&mut p)?));
+        return Ok(Stmt::Create(parse_pattern_list(p)?));
     }
     if p.eat_kw("CALL") {
         let mut name = p.ident()?;
@@ -560,7 +558,7 @@ fn parse_stmt(p: &mut Parser, src: &str) -> Result<Stmt> {
             while !p.eat_sym(")") {
                 let key = p.ident()?;
                 p.expect_sym(":")?;
-                let v = parse_expr(&mut p)?;
+                let v = parse_expr(p)?;
                 args.push((key.to_lowercase(), const_value(&v)?));
                 if !p.eat_sym(",") && !p.is_sym(")") {
                     return Err(Error::Msg("expected ',' or ')' in CALL arguments".into()));
@@ -570,7 +568,7 @@ fn parse_stmt(p: &mut Parser, src: &str) -> Result<Stmt> {
         return Ok(Stmt::Call { name, args });
     }
     if p.eat_kw("INDEX") {
-        let (label, key) = parse_index_target(&mut p)?;
+        let (label, key) = parse_index_target(p)?;
         return Ok(Stmt::Index {
             label,
             key,
@@ -589,7 +587,7 @@ fn parse_stmt(p: &mut Parser, src: &str) -> Result<Stmt> {
             return Ok(Stmt::Extension(ExtAction::Drop { name, if_exists }));
         }
         p.expect_kw("INDEX")?;
-        let (label, key) = parse_index_target(&mut p)?;
+        let (label, key) = parse_index_target(p)?;
         return Ok(Stmt::Index {
             label,
             key,
@@ -1847,7 +1845,7 @@ fn count_from_counters(
                 && a.var.is_some()
                 && a.var != b.var
                 && a.var != r.var
-                && counted.is_none_or(|c| Some(c) != a.var.as_deref()) =>
+                && counted.map_or(true, |c| Some(c) != a.var.as_deref()) =>
         {
             // count over one typed hop from anchored nodes: the adjacency
             // range count of each anchor, no rows built.
@@ -2370,12 +2368,12 @@ fn match_from_edges(
         }
         // As written, then (undirected) the other way round: the same rows
         // a walk from either end would produce.
-        let ends: &[(u64, u64)] = match rel.dir {
-            Dir::Out => &[(e.from, e.to)],
-            Dir::In => &[(e.to, e.from)],
-            Dir::Both => &[(e.from, e.to), (e.to, e.from)],
+        let (ends, n) = match rel.dir {
+            Dir::Out => ([(e.from, e.to); 2], 1),
+            Dir::In => ([(e.to, e.from); 2], 1),
+            Dir::Both => ([(e.from, e.to), (e.to, e.from)], 2),
         };
-        for &(a, b_) in ends {
+        for &(a, b_) in &ends[..n] {
             if !node_matches(g, lp, a, &binds) || !node_matches(g, rp, b_, &binds) {
                 continue;
             }

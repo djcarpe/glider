@@ -601,7 +601,7 @@ fn negative_literals_stay_integers() {
 
 #[test]
 fn value_ordering_is_total_and_sane() {
-    let vals = vec![
+    let vals = [
         Value::Null,
         Value::Bool(false),
         Value::Int(-5),

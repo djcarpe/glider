@@ -38,7 +38,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use glider::legacy::image::{self, ImageSource};
@@ -836,8 +836,8 @@ fn owned(props: Props) -> Vec<(String, Value)> {
 
 /// The same graph loaded into the paged engine through its own write path,
 /// in large transactions.
-fn write_paged(g: &Gen, out: &PathBuf, cache_mb: u64) -> io::Result<(u64, u64, u64)> {
-    let err = |e: glider::types::Error| io::Error::new(io::ErrorKind::Other, e.to_string());
+fn write_paged(g: &Gen, out: &Path, cache_mb: u64) -> io::Result<(u64, u64, u64)> {
+    let err = |e: glider::types::Error| io::Error::other(e.to_string());
     let mut db = glider::graph::Graph::open_opts(
         out,
         glider::graph::OpenOptions {
@@ -907,7 +907,7 @@ fn write_paged(g: &Gen, out: &PathBuf, cache_mb: u64) -> io::Result<(u64, u64, u
 
 /// The same graph bulk-loaded into the paged engine: external sorts and
 /// bottom-up tree builds, no per-edge B+tree inserts.
-fn bulk_paged(g: &Gen, out: &PathBuf, cache_mb: u64, work_mb: u64) -> io::Result<(u64, u64, u64)> {
+fn bulk_paged(g: &Gen, out: &Path, cache_mb: u64, work_mb: u64) -> io::Result<(u64, u64, u64)> {
     let strings = g.string_table();
     let ids = strings
         .iter()
@@ -930,7 +930,7 @@ fn bulk_paged(g: &Gen, out: &PathBuf, cache_mb: u64, work_mb: u64) -> io::Result
         },
         (work_mb << 20) as usize,
     )
-    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    .map_err(|e| io::Error::other(e.to_string()))?;
     Ok((
         db.node_count() as u64,
         db.edge_count() as u64,
@@ -939,7 +939,7 @@ fn bulk_paged(g: &Gen, out: &PathBuf, cache_mb: u64, work_mb: u64) -> io::Result
 }
 
 /// The same graph as a log: index definitions, every node, every edge.
-fn write_log(g: &Gen, out: &PathBuf, v2: bool) -> io::Result<(u64, u64, u64)> {
+fn write_log(g: &Gen, out: &Path, v2: bool) -> io::Result<(u64, u64, u64)> {
     let mut w = if v2 {
         LogWriter::create_v2(out)?
     } else {
@@ -994,7 +994,7 @@ fn write_log(g: &Gen, out: &PathBuf, v2: bool) -> io::Result<(u64, u64, u64)> {
     Ok((nodes, edges, bytes))
 }
 
-fn build_image(g: &Gen, out: &PathBuf) -> io::Result<u64> {
+fn build_image(g: &Gen, out: &Path) -> io::Result<u64> {
     let strings = g.string_table();
     let ids = strings
         .iter()

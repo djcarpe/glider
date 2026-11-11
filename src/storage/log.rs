@@ -294,8 +294,7 @@ impl Wal {
         }
         let start = list_segments(&self.dir)?
             .into_iter()
-            .filter(|s| *s <= self.committed)
-            .next_back()
+            .rfind(|s| *s <= self.committed)
             .unwrap_or(self.committed);
         self.lsn = self.committed;
         self.pending_records = 0;

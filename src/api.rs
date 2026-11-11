@@ -468,7 +468,7 @@ const SCAN_BUDGET: usize = 200_000;
 
 /// Walk ids from `from` upwards through `fetch` (which returns up to n ids
 /// >= a cursor, ascending), keeping those `keep` accepts, until `limit` are
-/// found. Returns them and the cursor to continue from, if any.
+/// > found. Returns them and the cursor to continue from, if any.
 fn page<F: Fn(u64) -> bool>(
     fetch: &dyn Fn(u64, usize) -> Vec<u64>,
     from: u64,

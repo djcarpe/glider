@@ -380,7 +380,7 @@ struct Schema<'a> {
 fn load_schema(p: &Pager) -> SResult<(Interner, Indexes)> {
     {
         let mut list = Vec::new();
-        let mut c = CATALOG.seek(p, &[b'S'])?;
+        let mut c = CATALOG.seek(p, b"S")?;
         while let Some((k, v)) = c.next()? {
             if k[0] != b'S' {
                 break;
@@ -396,7 +396,7 @@ fn load_schema(p: &Pager) -> SResult<(Interner, Indexes)> {
             );
         }
         let mut indexes = HashMap::new();
-        let mut c = CATALOG.seek(p, &[b'I'])?;
+        let mut c = CATALOG.seek(p, b"I")?;
         while let Some((k, v)) = c.next()? {
             if k[0] != b'I' {
                 break;
@@ -826,8 +826,8 @@ fn apply(p: &Pager, sch: &mut Schema<'_>, op: &Op) -> SResult<()> {
             for t in [NODES, EDGES, ADJ, LABELS, TYPES, PROPS] {
                 t.clear(p)?;
             }
-            delete_prefix(p, CATALOG, &[b'L'])?;
-            delete_prefix(p, CATALOG, &[b'T'])?;
+            delete_prefix(p, CATALOG, b"L")?;
+            delete_prefix(p, CATALOG, b"T")?;
             clear_ext_data(p)?;
             let defs: Vec<_> = sch.indexes.iter().map(|(lk, d)| (*lk, d.id)).collect();
             for ((l, k), id) in defs {

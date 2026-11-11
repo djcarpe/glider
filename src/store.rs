@@ -250,10 +250,7 @@ impl Op {
                 from: r.varint()?,
                 to: r.varint()?,
                 etype: r.string()?,
-                props: {
-                    let p = read_props(&mut r)?;
-                    p
-                },
+                props: read_props(&mut r)?,
             },
             K_EDGE_DEL => Op::EdgeDel { id: r.varint()? },
             K_NODE_SET => Op::NodeSet {
@@ -563,6 +560,7 @@ impl Store {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path)?;
 
         let len = file.metadata()?.len();
@@ -1211,9 +1209,9 @@ impl Lock {
         loop {
             match OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(mut f) => {
-                    let _ = write!(
+                    let _ = writeln!(
                         f,
-                        "{{\"pid\":{},\"since\":{}}}\n",
+                        "{{\"pid\":{},\"since\":{}}}",
                         std::process::id(),
                         std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
