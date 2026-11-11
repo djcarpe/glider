@@ -257,6 +257,8 @@ impl Tailer<'_> {
             sb.wal_lsn, sb.epoch, ts, bytes, ps, sb.high_water, sb.seg_pages
         )?;
         meta.sync_all()?;
+        // Windows refuses to rename a directory that holds an open file.
+        drop(meta);
         let fin = root.join(&name);
         let _ = fs::remove_dir_all(&fin);
         fs::rename(&tmp, &fin)?;
