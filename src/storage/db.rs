@@ -337,6 +337,67 @@ impl Db {
         Ok(())
     }
 
+    /// The log position just past the last committed transaction.
+    pub fn committed_lsn(&self) -> u64 {
+        self.wal.as_ref().map(|w| w.committed_lsn()).unwrap_or(0)
+    }
+
+    /// Follow another database's log: append `bytes` — whole committed
+    /// transactions it shipped, starting at exactly this database's commit
+    /// point — to this log verbatim, then apply each record through `apply`
+    /// and commit at each commit marker, as recovery would. The two logs end
+    /// up byte-identical at the same positions, so this database's position
+    /// in its primary's log is simply [`Db::committed_lsn`], and a crash
+    /// part-way is recovered by the ordinary replay.
+    ///
+    /// The bytes are logged before they are applied: if applying fails, the
+    /// transaction is in the log but not the pages, and this `Db` must be
+    /// dropped and reopened (which replays it, and fails the same way if the
+    /// log itself is bad).
+    pub fn apply_shipped(
+        &mut self,
+        bytes: &[u8],
+        apply: &mut dyn FnMut(&Pager, &[u8]) -> SResult<()>,
+    ) -> SResult<u64> {
+        let Some(w) = &mut self.wal else {
+            return Err(SError::Io(std::io::Error::other("a :memory: database cannot follow a log")));
+        };
+        if self.pager.in_txn() {
+            return Err(SError::Io(std::io::Error::other(
+                "cannot apply a shipped log inside a transaction",
+            )));
+        }
+        w.append_shipped(bytes)?;
+        let pager = &self.pager;
+        let mut err: Option<SError> = None;
+        super::log::for_each_record(bytes, &mut |r| {
+            if err.is_none() {
+                let res = match r {
+                    Some(payload) => apply(pager, payload),
+                    None => {
+                        pager.commit();
+                        Ok(())
+                    }
+                };
+                if let Err(e) = res {
+                    err = Some(e);
+                }
+            }
+            Ok(())
+        })?;
+        if let Some(e) = err {
+            self.pager.rollback();
+            return Err(e);
+        }
+        if let Some(w) = &self.wal {
+            if w.bytes_since(self.ckpt_lsn) >= self.checkpoint_bytes {
+                self.checkpoint()?;
+            }
+        }
+        self.poll_pin(false)?;
+        Ok(self.committed_lsn())
+    }
+
     /// Force the log to disk, whatever the sync mode.
     pub fn flush(&mut self) -> SResult<()> {
         if let Some(w) = &mut self.wal {

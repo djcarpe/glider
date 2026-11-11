@@ -45,6 +45,14 @@ These produce wrong results or lost data. Nothing else should go first.
   unknown means alive and the human decides. Tests:
   `a_second_writer_is_refused_rather_than_corrupting`,
   `a_lock_left_by_a_dead_process_is_reclaimed`.
+  **2026-11-08:** the lock also records the holder's process start time
+  (`/proc/<pid>/stat`). In a container every server is pid 1, so after a
+  crash or SIGTERM the stale lock named a pid that was alive again — the
+  k3s demo crash-looped on it, and ragentic had worked around the same
+  thing. A reused pid never has the same start time. Test:
+  `a_lock_from_an_earlier_process_with_our_pid_is_reclaimed`. Still open:
+  glider does not handle SIGTERM (std has no signal API), so a stopped
+  container always leaves its lock; the WAL makes that safe for the data.
 
 ---
 
@@ -168,15 +176,43 @@ These produce wrong results or lost data. Nothing else should go first.
   commits (group commit) and add sequential readahead to scans.
 
 - [ ] **PAGED-3 · Query working memory for sorts, DISTINCT and grouping** · M
-  Write statements spool their matches to disk, algorithms spill, and
-  `ORDER BY … LIMIT` keeps only the top k, but `ORDER BY` without a limit,
-  `DISTINCT` and `GROUP BY` hold their output in memory — as a
-  `QueryResult` must, since it returns every row. A streaming result API
-  (cursor over the executor) is what makes spilling those worthwhile.
+  **Grouping done** (LAKE-0 below): groups spill to the external sorter
+  past half of `work_mem` and partial states merge back, so an aggregate
+  over millions of groups costs the budget, not the groups. Still open:
+  `ORDER BY` without a limit and `DISTINCT` hold their output in memory —
+  as a `QueryResult` must, since it returns every row. A streaming result
+  API (cursor over the executor) is what makes spilling those worthwhile.
 
 - [ ] **PAGED-4 · Free list is held in memory** · M
   Free page numbers are a `Vec<u64>`, 8 bytes per free page. Fine until a
   mass delete frees billions of pages; an extent tree would bound it.
+
+- [x] **PAGED-8 · Algorithms use more than `work_mem` out of core** · M
+  **Fixed (mostly heap fragmentation, not live data).** Same image, same
+  1 Gi container, probes and scrapes: with every allocation over 8 KiB
+  mmapped the sequence peaked at 425 MB, so glider's live memory was close
+  to bounded and glibc was holding freed holes. Every cache miss allocated
+  a 16 KiB page and every eviction freed one; every spill-block miss did
+  the same with 64 KiB. Now the pager recycles evicted page buffers
+  (`spare`, also used by allocation and copy-on-write, and eviction seals
+  in place instead of copying), spill blocks reuse the evicted block's
+  buffer, and a spilled array's block cache is charged to `work_mem`.
+  Measured after: RSS between algorithms 262–294 MB (was ratcheting to
+  623), peak 430 MB (was 632 locally, 838 in k3s) = cache + work_mem +
+  ~50 MB. History of the finding below.
+  Measured on k3s (2026-11-08): `wcc` on the 5 GiB graph with
+  `--cache-size 256M --work-mem 128M` took the server's RSS from 263 MB to
+  a 595 MB peak (`memory.stat`: anon 481 MB). The budget covers the
+  `StateVec` arrays; the spill block caches, frontier queues, visited sets
+  and the sorter's buffers are outside it. Worse on the 1 GiB graph in a
+  1 Gi pod: wcc 530 MB, pagerank 560 MB, **kcore 838 MB** RSS, then an
+  OOM kill during scc — all anonymous memory (`memory.stat` anon 841 MB),
+  not page cache. RSS also never comes back down afterwards (824 MB after
+  the write phase), so the allocator keeps what the algorithms took. Count them against the budget,
+  or document the real envelope (~cache + 2–3 × work_mem). Also: a
+  statement a client abandons keeps running and holding the graph mutex
+  (`wcc` past a 30-minute client timeout), so the server needs a way to
+  cancel or time out a statement.
 
 - [ ] **PAGED-5 · Dijkstra's heap, betweenness and closeness at scale** · M
   Dijkstra's priority queue is in memory (O(frontier)); betweenness and
@@ -197,6 +233,36 @@ These produce wrong results or lost data. Nothing else should go first.
   Copy-on-write already gives every checkpoint a consistent snapshot; a
   reader could hold an epoch while the writer continues (as LMDB does),
   using the same hold mechanism replication uses.
+
+---
+
+## Lake
+
+Immutable glider files under a metadata log, on a directory or S3 — the
+design is `docs/LAKE.md`, which also carries the phase list.
+
+- [x] **LAKE-0 · Memory grew linearly with the graph while reading** · S
+  The suite's peak RSS was 0.63 / 1.28 / 2.58 / 4.06 / 8.61 GB at 0.5 / 1 /
+  5 / 10 / 25 GiB with a 1 GiB cache. **Found:** one query,
+  `MATCH (p:Person)<-[:KNOWS]-() RETURN id(p), count(*) … LIMIT 5`, groups
+  by person and `Projection` held every group in memory with its key
+  stored three times (`groups`, `group_keys`, and the `EqKey` in a
+  `BTreeMap`): ~300 bytes × 31M groups at 25 GiB, which is the whole of the
+  growth (and why it timed out there). Measured on the 1 GiB graph with a
+  64 MiB cache: an indexed count peaks at 11 MB, this query at 376 MB.
+  **Fixed:** one key copy with a byte-encoded index, memory accounted, and
+  groups spilled through `extsort::Sorter` past half of `work_mem`; equal
+  groups come out adjacent and their partial states merge. Same query now:
+  301 MB without spilling, 99 MB with `--work-mem 16M`, and faster. Test:
+  `grouping_spills_past_the_working_memory_and_answers_exactly`. Two
+  semantics notes: groups are equal when their keys are equal under
+  `total_cmp` (so `1` and `1.0` share a group, as before; NaNs now do too),
+  and spilled groups come out in key order rather than arrival order,
+  which only shows without an `ORDER BY`.
+
+- [ ] **LAKE-1 · Read-only open** · S  (subsumes DUR-3)
+- [ ] **LAKE-2 · `get_range` and `put_if_absent` on the backends** · S
+- [ ] **LAKE-3 … LAKE-10** — see `docs/LAKE.md`.
 
 ---
 

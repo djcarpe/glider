@@ -407,9 +407,12 @@ the dump in memory (it aborted on multi-GB graphs).
   would need about 22 GiB of RAM and 25 GiB about 54 GiB, which this machine
   could not provide alongside everything else. It is an in-memory database;
   this is the trade it makes, not a defect.
-- **glider's memory grows with data size while reading** (8.6 GB peak at
-  25 GiB with a 1 GiB page cache), so something in the read path is not
-  bounded. Under investigation.
+- **glider's memory grew with data size while reading** (8.6 GB peak at
+  25 GiB with a 1 GiB page cache). Found and fixed after this run: one
+  query (`degree: top 5 KNOWS in-degree`) groups by person, and grouping
+  held every group in memory. Groups now spill past the working memory
+  (`docs/TODO.md`, LAKE-0). The numbers in this document are from before
+  the fix.
 - **glider's out-of-core PageRank is slow.** Past 10 GiB the algorithm state
   no longer fits the default 256 MB `--work-mem` and PageRank runs from pages:
   356 s at 10 GiB, over the 30-minute limit at 25 GiB (SQLite: 7 min). A

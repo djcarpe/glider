@@ -1,0 +1,10 @@
+target
+bench/results
+bench/wasm
+ts
+*.jsonl
+*.dump
+*.pem
+*.gldb
+*.gldb-*
+.git

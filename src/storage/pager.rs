@@ -163,7 +163,17 @@ struct Inner {
     /// checkpoint writes the other one.
     sb_slot: u64,
     stats: Stats,
+    /// Page buffers given up by the cache, reused for the next page read or
+    /// made. Without them every cache miss allocates a page and every
+    /// eviction frees one, and that churn, interleaved with the rest of the
+    /// process's allocations, fragments the heap until the allocator holds
+    /// far more than the cache: 838 MB for a 256 MiB cache, measured.
+    spare: Vec<Page>,
 }
+
+/// Recycled page buffers kept at most: the cache hands one back for each
+/// page it takes, so a handful covers any burst.
+const SPARE_PAGES: usize = 16;
 
 enum Store {
     Mem(Mem),
@@ -235,6 +245,7 @@ impl Pager {
             wal_lsn: 0,
             sb_slot: 0,
             stats: Stats::default(),
+            spare: Vec::new(),
         };
         Pager {
             ps: page_size,
@@ -286,6 +297,7 @@ impl Pager {
                 wal_lsn: 0,
                 sb_slot: 0,
                 stats: Stats::default(),
+                spare: Vec::new(),
             }),
         };
         // Two superblocks so the first checkpoint has somewhere to go.
@@ -380,6 +392,7 @@ impl Pager {
                 wal_lsn,
                 sb_slot,
                 stats: Stats::default(),
+                spare: Vec::new(),
             }),
         };
         // Load the free list.
@@ -521,6 +534,7 @@ impl Pager {
             wal_lsn: 0,
             sb_slot: 0,
             stats: Stats::default(),
+            spare: Vec::new(),
         };
         Ok(Pager {
             ps,
@@ -569,9 +583,11 @@ impl Pager {
             return Ok(pno);
         }
         let new = g.alloc_pno()?;
-        let mut b = pg.to_vec();
-        page::rehome(&mut b, new, epoch);
-        g.install(new, b.into(), true)?;
+        let mut b = g.fresh_page();
+        let buf = Arc::get_mut(&mut b).expect("a fresh page is not shared");
+        buf.copy_from_slice(&pg);
+        page::rehome(buf, new, epoch);
+        g.install(new, b, true)?;
         g.txn_free.push((pno, page::epoch(&pg)));
         g.stats.copies += 1;
         Ok(new)
@@ -831,22 +847,36 @@ impl Inner {
                     return Ok(fr.data.clone());
                 }
                 self.stats.misses += 1;
-                let data: Page = self.read_page(pno)?.into();
+                let data: Page = self.read_page(pno)?;
                 self.install(pno, data.clone(), false)?;
                 Ok(data)
             }
         }
     }
 
+    /// A page buffer nobody else holds: a recycled one when there is one.
+    /// Its contents are whatever was there; callers overwrite all of it.
+    fn fresh_page(&mut self) -> Page {
+        self.spare.pop().unwrap_or_else(|| new_page(self.ps).into())
+    }
+
+    /// Take back a buffer the cache no longer needs, if nobody else holds it.
+    fn recycle(&mut self, p: Page) {
+        if self.spare.len() < SPARE_PAGES && Arc::strong_count(&p) == 1 && Arc::weak_count(&p) == 0 {
+            self.spare.push(p);
+        }
+    }
+
     /// Read a page from disk, checked. Does not touch the cache.
-    fn read_page(&mut self, pno: u64) -> SResult<Vec<u8>> {
+    fn read_page(&mut self, pno: u64) -> SResult<Page> {
         let ps = self.ps;
+        let mut b = self.fresh_page();
         let Store::File(f) = &mut self.store else {
             return corrupt("read_page on a memory store");
         };
         let (file, off) = f.locate(pno, ps, false)?;
-        let mut b = new_page(ps);
-        file.read_exact_at(&mut b, off)
+        let buf = Arc::get_mut(&mut b).expect("a fresh page is not shared");
+        file.read_exact_at(buf, off)
             .map_err(|e| SError::Corrupt(format!("page {pno}: {e}")))?;
         self.stats.reads += 1;
         match page::check(&b, pno) {
@@ -887,9 +917,11 @@ impl Inner {
 
     fn alloc(&mut self, kind: u8, tree: u32) -> SResult<u64> {
         let pno = self.alloc_pno()?;
-        let mut b = new_page(self.ps);
-        page::init(&mut b, kind, pno, self.epoch, tree);
-        self.install(pno, b.into(), true)?;
+        let mut b = self.fresh_page();
+        let buf = Arc::get_mut(&mut b).expect("a fresh page is not shared");
+        buf.fill(0);
+        page::init(buf, kind, pno, self.epoch, tree);
+        self.install(pno, b, true)?;
         Ok(pno)
     }
 
@@ -922,9 +954,10 @@ impl Inner {
         };
         if let Some(&i) = f.cache.map.get(&pno) {
             let fr = &mut f.cache.frames[i];
-            fr.data = data;
+            let old = std::mem::replace(&mut fr.data, data);
             fr.dirty |= dirty;
             fr.usage = 3;
+            self.recycle(old);
             return Ok(());
         }
         if f.cache.frames.len() < f.cache.cap {
@@ -968,23 +1001,28 @@ impl Inner {
             self.stats.overflow_frames += 1;
             return Ok(());
         };
-        let old_pno = f.cache.frames[v].pno;
-        if f.cache.frames[v].dirty {
-            let mut b = f.cache.frames[v].data.to_vec();
-            page::seal(&mut b);
-            let (file, off) = f.locate(old_pno, ps, true)?;
-            file.write_all_at(&b, off)?;
+        let mut old = std::mem::replace(
+            &mut f.cache.frames[v],
+            Frame {
+                pno,
+                data,
+                dirty,
+                usage: 1,
+            },
+        );
+        f.cache.map.remove(&old.pno);
+        f.cache.map.insert(pno, v);
+        if old.dirty {
+            // The CLOCK hand only picks frames nobody holds, so the bytes
+            // can be sealed where they are instead of copied.
+            let b = Arc::get_mut(&mut old.data).expect("an evicted frame is not shared");
+            page::seal(b);
+            let (file, off) = f.locate(old.pno, ps, true)?;
+            file.write_all_at(b, off)?;
             self.stats.writes += 1;
         }
-        f.cache.map.remove(&old_pno);
-        f.cache.frames[v] = Frame {
-            pno,
-            data,
-            dirty,
-            usage: 1,
-        };
-        f.cache.map.insert(pno, v);
         self.stats.evictions += 1;
+        self.recycle(old.data);
         Ok(())
     }
 
@@ -998,7 +1036,7 @@ impl Inner {
             Store::File(fs) => {
                 if !fs.cache.map.contains_key(&pno) {
                     // Load it (it may have been evicted after being written).
-                    let data: Page = self.read_page(pno)?.into();
+                    let data: Page = self.read_page(pno)?;
                     self.cache_insert(pno, data, false)?;
                 }
                 let Store::File(fs) = &mut self.store else {
@@ -1059,9 +1097,10 @@ impl Inner {
             .filter(|i| f.cache.frames[*i].dirty)
             .collect();
         dirty.sort_by_key(|i| f.cache.frames[*i].pno);
+        let mut b = new_page(ps);
         for i in dirty {
             let pno = f.cache.frames[i].pno;
-            let mut b = f.cache.frames[i].data.to_vec();
+            b.copy_from_slice(&f.cache.frames[i].data);
             page::seal(&mut b);
             let (file, off) = f.locate(pno, ps, true)?;
             file.write_all_at(&b, off)?;

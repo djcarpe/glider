@@ -1,0 +1,45 @@
+# Runs the benchmark query set against every served graph, first run cold
+# (the server was just started) then the median of three warm runs, with the
+# server's own page and memory counters from /metrics beside each query.
+# Results: the job's log (a table) and /data/results/*.json on the volume.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: glider-bench-__RUN__
+  namespace: glider-demo
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels: {app: glider-bench}
+    spec:
+      restartPolicy: Never
+      nodeSelector: {kubernetes.io/hostname: __NODE__}
+      containers:
+        - name: bench
+          image: __IMAGE__
+          imagePullPolicy: Always
+          command: ["python3", "/opt/glider/bench.py"]
+          args:
+            - --target
+            - 1g=http://glider-1g.glider-demo.svc.cluster.local:7878
+            - --target
+            - 5g=http://glider-5g.glider-demo.svc.cluster.local:7878
+            - --gen-log
+            - 1g=/data/gen-1g.log
+            - --gen-log
+            - 5g=/data/gen-5g.log
+            - --out
+            - /data/results/bench-__RUN__.json
+            - --limit
+            - 768Mi
+            - --api
+            __EXTRA__
+          resources:
+            requests: {cpu: 200m, memory: 128Mi}
+            limits: {cpu: "1", memory: 256Mi}
+          volumeMounts: [{name: data, mountPath: /data}]
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: glider-data}

@@ -1,0 +1,149 @@
+# Rendered by deploy.sh for each size: __SIZE__ (1g, 5g), __BYTES__ (1GiB,
+# 5GiB). The generator and the server share the demo volume and the node.
+---
+# Builds the graph once; a rerun exits at once if the file is already there.
+# Bulk load: external sorts and bottom-up B+tree builds, so the generator's
+# memory is its cache plus its working memory however large the graph.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: glider-gen-__SIZE__
+  namespace: glider-demo
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels: {app: glider-gen, size: "__SIZE__"}
+    spec:
+      restartPolicy: Never
+      nodeSelector: {kubernetes.io/hostname: __NODE__}
+      containers:
+        - name: gen
+          image: __IMAGE__
+          imagePullPolicy: Always
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              if [ -s /data/scale-__SIZE__.gldb ]; then echo "graph exists"; exit 0; fi
+              rm -rf /data/scale-__SIZE__.gldb*
+              scale-gen --size __BYTES__ --paged --out /data/scale-__SIZE__.gldb \
+                --cache-mb 256 --work-mb 256 2>&1 | tee /data/gen-__SIZE__.log
+              ls -la /data
+          resources:
+            requests: {cpu: "1", memory: 768Mi}
+            limits: {cpu: "3", memory: 1Gi}
+          volumeMounts: [{name: data, mountPath: /data}]
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: glider-data}
+---
+# The server: the whole graph behind a 256 MiB page cache and 128 MiB of
+# working memory, in a pod limited to 768 Mi. The limit is the same for both
+# sizes on purpose: the process's envelope is cache + work-mem + ~50 MB
+# (430 MB peak measured over all seven algorithms on the 1 GiB graph), and
+# does not depend on the graph's size.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: glider-__SIZE__
+  namespace: glider-demo
+  labels: {app: glider, size: "__SIZE__"}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: glider, size: "__SIZE__"}
+  template:
+    metadata:
+      labels: {app: glider, size: "__SIZE__"}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "7878"
+        prometheus.io/path: /metrics
+    spec:
+      nodeSelector: {kubernetes.io/hostname: __NODE__}
+      initContainers:
+        - name: wait-for-graph
+          image: __IMAGE__
+          imagePullPolicy: Always
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              until [ -s /data/scale-__SIZE__.gldb ] && [ -f /data/gen-__SIZE__.log ] \
+                && grep -q '"nodes"' /data/gen-__SIZE__.log; do
+                echo "waiting for /data/scale-__SIZE__.gldb"; sleep 10
+              done
+              # A server killed by SIGTERM leaves its lock behind, naming pid 1
+              # (every container's server is pid 1). The Recreate strategy
+              # guarantees the previous server is gone by the time this runs,
+              # so the lock is stale by construction.
+              if [ -f /data/scale-__SIZE__.gldb.lock ]; then
+                echo "removing lock left by the previous server: $(cat /data/scale-__SIZE__.gldb.lock)"
+                rm -f /data/scale-__SIZE__.gldb.lock
+              fi
+          volumeMounts: [{name: data, mountPath: /data}]
+      containers:
+        - name: glider
+          image: __IMAGE__
+          imagePullPolicy: Always
+          args:
+            - /data/scale-__SIZE__.gldb
+            - serve
+            - --addr
+            - 0.0.0.0:7878
+            - --cache-size
+            - 256M
+            - --work-mem
+            - 128M
+          ports: [{name: http, containerPort: 7878}]
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 30
+            timeoutSeconds: 10
+            # a whole-graph algorithm holds the lock for minutes
+            failureThreshold: 20
+          resources:
+            requests: {cpu: 500m, memory: 512Mi}
+            limits: {cpu: "2", memory: 768Mi}
+          volumeMounts: [{name: data, mountPath: /data}]
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: glider-data}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: glider-__SIZE__
+  namespace: glider-demo
+  labels: {app: glider, size: "__SIZE__"}
+spec:
+  selector: {app: glider, size: "__SIZE__"}
+  ports: [{name: http, port: 7878, targetPort: http}]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: glider-__SIZE__
+  namespace: glider-demo
+  annotations:
+    cert-manager.io/cluster-issuer: step-ca-issuer
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts: [glider-__SIZE__.home]
+      secretName: glider-__SIZE__-home-tls
+  rules:
+    - host: glider-__SIZE__.home
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: glider-__SIZE__
+                port: {name: http}

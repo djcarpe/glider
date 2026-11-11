@@ -299,9 +299,10 @@ by orders of magnitude on shortest paths, traversals and counts; SQLite stays
 faster on whole-label scans, aggregates and bulk writes.
 
 Opening takes milliseconds at any size and point queries cost a few page
-reads. Reads through the paged engine keep the page cache bounded, though
-peak memory still grows with the graph (8.6 GB while reading the 25 GiB
-graph with a 1 GiB cache), which is being tracked down.
+reads. Reads through the paged engine keep the page cache bounded; the one
+reader whose memory grew with the graph (aggregates with millions of
+groups: 8.6 GB at 25 GiB in that run) now spills groups past `--work-mem`
+(`docs/TODO.md`, LAKE-0).
 [`bench/SCALE.md`](bench/SCALE.md) has the earlier snapshot-image engine's
 numbers. A 100 GB B+tree (`pagebench`) was built in 15 minutes at 1.1 GB of
 RAM, answered cold point lookups in 0.5 ms (1.35 disk reads each), scanned at

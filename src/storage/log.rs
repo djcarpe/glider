@@ -239,6 +239,42 @@ impl Wal {
         Ok(())
     }
 
+    /// Append another log's bytes verbatim: whole committed transactions,
+    /// framed, starting at this log's commit point (a follower copying its
+    /// primary's log, so both have the same bytes at the same positions).
+    /// Synced as the sync mode says, like a commit.
+    pub fn append_shipped(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if self.pending_records != 0 {
+            return Err(io::Error::other("shipped log appended inside a transaction"));
+        }
+        if !is_whole_transactions(bytes) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "shipped log is not whole committed transactions",
+            ));
+        }
+        // One record at a time, so segments still roll at record boundaries.
+        let mut at = 0usize;
+        while at < bytes.len() {
+            let len = u32::from_le_bytes([bytes[at + 1], bytes[at + 2], bytes[at + 3], bytes[at + 4]]) as usize;
+            let end = at + 5 + len + 4;
+            self.write_bytes(&bytes[at..end])?;
+            at = end;
+        }
+        if let Some(w) = self.cur.as_mut() {
+            match self.sync {
+                SyncMode::Always => {
+                    w.flush()?;
+                    w.get_ref().sync_data()?;
+                }
+                SyncMode::Normal => w.flush()?,
+                SyncMode::Off => {}
+            }
+        }
+        self.committed = self.lsn;
+        Ok(())
+    }
+
     pub fn append(&mut self, payload: &[u8]) -> io::Result<()> {
         let mut buf = Vec::with_capacity(payload.len() + 9);
         frame(&mut buf, K_DATA, payload);
@@ -401,6 +437,20 @@ pub fn copy_range(db: &Path, from: u64, to: u64, out: &mut dyn Write) -> io::Res
             io::ErrorKind::UnexpectedEof,
             format!("log bytes {at}..{to} are missing"),
         ));
+    }
+    Ok(())
+}
+
+/// The records of `bytes` (already checked with [`is_whole_transactions`]):
+/// each data record's payload, and `None` at each commit marker.
+pub fn for_each_record(bytes: &[u8], f: &mut dyn FnMut(Option<&[u8]>) -> io::Result<()>) -> io::Result<()> {
+    let mut at = 0usize;
+    while at + 5 <= bytes.len() {
+        let kind = bytes[at];
+        let len = u32::from_le_bytes([bytes[at + 1], bytes[at + 2], bytes[at + 3], bytes[at + 4]]) as usize;
+        let payload = &bytes[at + 5..at + 5 + len];
+        f(if kind == K_TX_END { None } else { Some(payload) })?;
+        at += 5 + len + 4;
     }
     Ok(())
 }

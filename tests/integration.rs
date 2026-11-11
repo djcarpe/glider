@@ -678,6 +678,38 @@ fn a_lock_left_by_a_dead_process_is_reclaimed() {
     std::fs::remove_file(glider::store::lock_path(&path)).ok();
 }
 
+/// In a container every incarnation of the server is pid 1, so a lock left
+/// by a crashed holder names a pid that is alive again — ours. The start
+/// time recorded beside the pid tells the two apart.
+#[test]
+fn a_lock_from_an_earlier_process_with_our_pid_is_reclaimed() {
+    let path = temp("reusedpidlock");
+    {
+        let _g = Graph::open(&path, Sync::Normal).unwrap();
+    }
+    // Our own pid, started at a time that is not ours.
+    std::fs::write(
+        glider::store::lock_path(&path),
+        format!("{{\"pid\":{},\"start\":1,\"since\":0}}\n", std::process::id()),
+    )
+    .unwrap();
+    let opened = Graph::open(&path, Sync::Normal).is_ok();
+    if cfg!(target_os = "linux") {
+        assert!(opened, "a lock from a dead process that had our pid should not block an open");
+    } else {
+        assert!(!opened);
+    }
+    // Without a start time the same pid is taken to be alive: refuse.
+    std::fs::write(
+        glider::store::lock_path(&path),
+        format!("{{\"pid\":{},\"since\":0}}\n", std::process::id()),
+    )
+    .unwrap();
+    assert!(Graph::open(&path, Sync::Normal).is_err());
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(glider::store::lock_path(&path)).ok();
+}
+
 // ------------------------------------------------------------------ planning
 
 fn rows(g: &mut Graph, q: &str) -> Vec<Vec<glider::Value>> {
@@ -1075,4 +1107,67 @@ fn subscripts_group_and_limit_and_trailing_tokens_are_errors() {
     let r = q(&mut g, "MATCH (n) RETURN n LIMIT 10");
     assert_eq!(r.rows.len(), 10);
     let _ = std::fs::remove_file(&path);
+}
+
+/// Grouping past the working memory spills groups to disk and merges their
+/// partial states back; every aggregate must come out exactly as it does
+/// when everything fits, and ORDER BY ... LIMIT over spilled groups must
+/// pick the same top rows.
+#[test]
+fn grouping_spills_past_the_working_memory_and_answers_exactly() {
+    let path = temp("group-spill");
+    let mut g = Graph::open(&path, Sync::Off).unwrap();
+    // 2000 groups of 5 rows each, interleaved so every group is seen again
+    // after a spill.
+    for i in 0..10_000u64 {
+        g.add_node(
+            &["N".to_string()],
+            vec![
+                ("grp".to_string(), Value::Int((i % 2000) as i64)),
+                ("v".to_string(), Value::Int(i as i64)),
+                ("name".to_string(), Value::Text(format!("n{:05}", i))),
+            ],
+        )
+        .unwrap();
+    }
+    g.commit().unwrap();
+    let full = "MATCH (n:N) RETURN n.grp, count(*), sum(n.v), avg(n.v), min(n.name), max(n.v), collect(n.v) ORDER BY n.grp";
+    let topk = "MATCH (n:N) RETURN n.grp, sum(n.v) AS s ORDER BY s DESC, n.grp LIMIT 7";
+    let text = "MATCH (n:N) RETURN n.name, count(*) ORDER BY n.name LIMIT 3";
+
+    let normalize = |r: glider::QueryResult| -> Vec<Vec<Value>> {
+        r.rows
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|v| match v {
+                        // collect's order across spills is not defined.
+                        Value::List(mut l) => {
+                            l.sort_by(|a, b| a.total_cmp(b));
+                            Value::List(l)
+                        }
+                        v => v,
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+
+    let want_full = normalize(q(&mut g, full));
+    let want_topk = q(&mut g, topk).rows;
+    let want_text = q(&mut g, text).rows;
+    assert_eq!(want_full.len(), 2000);
+    assert_eq!(want_topk.len(), 7);
+
+    // 64 KiB of group budget: ~2000 groups do not fit, so the projection
+    // spills several times along the way.
+    g.set_work_mem(128 << 10);
+    let got_full = normalize(q(&mut g, full));
+    assert_eq!(got_full, want_full);
+    assert_eq!(q(&mut g, topk).rows, want_topk);
+    assert_eq!(q(&mut g, text).rows, want_text);
+    let _ = std::fs::remove_file(&path);
+    let mut tmp = path.clone().into_os_string();
+    tmp.push("-tmp");
+    let _ = std::fs::remove_dir_all(tmp);
 }

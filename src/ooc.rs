@@ -411,8 +411,10 @@ impl<T: Pod> SpillStack<T> {
 }
 
 const BLOCK: usize = 64 * 1024;
-/// Blocks a spilled array keeps cached.
+/// Blocks a spilled array keeps cached, when the budget allows.
 const CACHE_BLOCKS: usize = 256;
+/// Blocks a spilled array keeps however tight the budget.
+const MIN_CACHED: usize = 4;
 
 /// A fixed-length array of `T`, in memory or spilled to a file.
 pub struct StateVec<T: Pod> {
@@ -484,6 +486,10 @@ impl Disk {
         let tick = self.tick;
         let size = self.block;
         if !self.blocks.contains_key(&b) {
+            // The evicted block's buffer becomes the new block's: a freed
+            // and reallocated 64 KiB per miss fragments the heap (see the
+            // pager's spare pages).
+            let mut reuse: Option<Vec<u8>> = None;
             if self.blocks.len() >= self.cached {
                 let victim = *self.blocks.iter().min_by_key(|(_, v)| v.2).map(|(k, _)| k).unwrap();
                 let (data, dirty, _) = self.blocks.remove(&victim).unwrap();
@@ -492,15 +498,17 @@ impl Disk {
                     write_at(f, &data, victim * size as u64).expect("state spill write");
                     self.written.insert(victim);
                 }
+                reuse = Some(data);
             }
+            let mut d = reuse.unwrap_or_else(|| Vec::with_capacity(size));
+            d.clear();
             let data = if self.written.contains(&b) {
-                let mut d = vec![0u8; size];
+                d.resize(size, 0);
                 let f = self.file.as_ref().expect("spill file");
                 read_at(f, &mut d, b * size as u64).expect("state spill read");
                 d
             } else {
                 // Never written: every element holds the initial value.
-                let mut d = Vec::with_capacity(size);
                 while d.len() + self.init.len() <= size {
                     d.extend_from_slice(&self.init);
                 }
@@ -577,11 +585,21 @@ impl<T: Pod> StateVec<T> {
         }
         let mut one = vec![0u8; T::SIZE];
         init.put(&mut one);
+        let mut disk = Disk::create(one).expect("create algorithm spill file");
+        // The block cache is memory too: size it to what the budget has
+        // left (at least a few blocks, so an array always makes progress)
+        // and charge it, so many spilled arrays cannot each hold 16 MiB
+        // beyond the budget.
+        let left = budget_left().unwrap_or(u64::MAX);
+        let fit = (left / disk.block as u64).min(disk.cached as u64) as usize;
+        disk.cached = fit.max(MIN_CACHED.min(disk.cached));
+        let bytes = (disk.cached * disk.block) as u64;
+        take(bytes);
         StateVec {
             len,
             mem: None,
-            disk: Some(Disk::create(one).expect("create algorithm spill file")),
-            reserved: 0,
+            disk: Some(disk),
+            reserved: bytes,
         }
     }
 
@@ -716,8 +734,11 @@ mod tests {
     fn spilled_arrays_behave_like_vecs() {
         let dir = std::env::temp_dir().join(format!("glider-ooc-{}", std::process::id()));
         set_spill_shape(4096, 3);
-        with_budget(1024, dir.clone(), || {
+        // Room for the spilled array's block cache (3 × 4 KiB, charged to
+        // the budget) and the small array, not for the big array itself.
+        with_budget(3 * 4096 + 1024, dir.clone(), || {
             let mut a: StateVec<f64> = StateVec::new(100_000, 1.5);
+            assert_eq!(budget_left(), Some(3 * 4096 + 1024 - 3 * 4096), "the spill cache is charged");
             let mut b: StateVec<u32> = StateVec::new(10, 7);
             assert!(a.is_spilled());
             assert!(!b.is_spilled());

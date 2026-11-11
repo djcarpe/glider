@@ -1,0 +1,100 @@
+{
+  "title": "glider scale demo",
+  "uid": "glider-scale-demo",
+  "tags": ["glider"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": {"from": "now-1h", "to": "now"},
+  "templating": {
+    "list": [
+      {"name": "DS", "type": "datasource", "query": "prometheus", "label": "Prometheus", "current": {}, "hide": 0}
+    ]
+  },
+  "panels": [
+    {
+      "type": "timeseries", "title": "Resident memory of the server process, by graph",
+      "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${DS}"},
+      "fieldConfig": {"defaults": {"unit": "bytes", "min": 0, "custom": {"fillOpacity": 10}},
+        "overrides": [{"matcher": {"id": "byRegexp", "options": ".*peak.*"}, "properties": [{"id": "custom.lineStyle", "value": {"fill": "dash", "dash": [6, 4]}}]}]},
+      "targets": [
+        {"refId": "A", "expr": "glider_process_memory_bytes{namespace=\"glider-demo\"}", "legendFormat": "{{size}} rss"},
+        {"refId": "B", "expr": "glider_process_memory_peak_bytes{namespace=\"glider-demo\"}", "legendFormat": "{{size}} peak"}
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Container working set vs. the 768 Mi limit",
+      "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${DS}"},
+      "fieldConfig": {"defaults": {"unit": "bytes", "min": 0, "custom": {"fillOpacity": 10, "thresholdsStyle": {"mode": "line"}},
+        "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 805306368}]}}, "overrides": []},
+      "targets": [
+        {"refId": "A", "expr": "container_memory_working_set_bytes{namespace=\"glider-demo\", container=\"glider\"}", "legendFormat": "{{pod}}"}
+      ]
+    },
+    {
+      "type": "stat", "title": "Database size on disk",
+      "gridPos": {"x": 0, "y": 8, "w": 6, "h": 5},
+      "datasource": {"type": "prometheus", "uid": "${DS}"},
+      "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "textMode": "value_and_name"},
+      "targets": [{"refId": "A", "expr": "glider_db_size_bytes{namespace=\"glider-demo\"}", "legendFormat": "{{size}}"}]
+    },
+    {
+      "type": "stat", "title": "Nodes / relationships",
+      "gridPos": {"x": 6, "y": 8, "w": 6, "h": 5},
+      "datasource": {"type": "prometheus", "uid": "${DS}"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "textMode": "value_and_name"},
+      "targets": [
+        {"refId": "A", "expr": "glider_db_nodes{namespace=\"glider-demo\"}", "legendFormat": "{{size}} nodes"},
+        {"refId": "B", "expr": "glider_db_edges{namespace=\"glider-demo\"}", "legendFormat": "{{size}} rels"}
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Statement latency, p50 / p95 / p99",
+      "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${DS}"},
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0, "custom": {"scaleDistribution": {"type": "log", "log": 10}}}, "overrides": []},
+      "targets": [
+        {"refId": "A", "expr": "histogram_quantile(0.50, sum by (le, size) (rate(glider_query_duration_seconds_bucket{namespace=\"glider-demo\"}[2m])))", "legendFormat": "{{size}} p50"},
+        {"refId": "B", "expr": "histogram_quantile(0.95, sum by (le, size) (rate(glider_query_duration_seconds_bucket{namespace=\"glider-demo\"}[2m])))", "legendFormat": "{{size}} p95"},
+        {"refId": "C", "expr": "histogram_quantile(0.99, sum by (le, size) (rate(glider_query_duration_seconds_bucket{namespace=\"glider-demo\"}[2m])))", "legendFormat": "{{size}} p99"}
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Statements per second",
+      "gridPos": {"x": 0, "y": 13, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "${DS}"},
+      "fieldConfig": {"defaults": {"unit": "ops", "min": 0}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "sum by (size, db_operation_name) (rate(glider_queries_total{namespace=\"glider-demo\"}[1m]))", "legendFormat": "{{size}} {{db_operation_name}}"}]
+    },
+    {
+      "type": "timeseries", "title": "Page reads from disk and cache miss ratio",
+      "gridPos": {"x": 0, "y": 20, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${DS}"},
+      "fieldConfig": {"defaults": {"unit": "ops", "min": 0}, "overrides": [
+        {"matcher": {"id": "byRegexp", "options": ".*miss ratio"}, "properties": [{"id": "unit", "value": "percentunit"}, {"id": "custom.axisPlacement", "value": "right"}, {"id": "max", "value": 1}]}]},
+      "targets": [
+        {"refId": "A", "expr": "sum by (size) (rate(glider_db_io_reads_total{namespace=\"glider-demo\"}[1m]))", "legendFormat": "{{size}} page reads/s"},
+        {"refId": "B", "expr": "sum by (size) (rate(glider_db_cache_misses_total{namespace=\"glider-demo\"}[1m])) / clamp_min(sum by (size) (rate(glider_db_cache_hits_total{namespace=\"glider-demo\"}[1m]) + rate(glider_db_cache_misses_total{namespace=\"glider-demo\"}[1m])), 1)", "legendFormat": "{{size}} miss ratio"}
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Pages resident in the cache",
+      "gridPos": {"x": 12, "y": 16, "w": 12, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "${DS}"},
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "glider_db_cache_resident{namespace=\"glider-demo\"}", "legendFormat": "{{size}}"}]
+    },
+    {
+      "type": "timeseries", "title": "CPU of the server containers",
+      "gridPos": {"x": 12, "y": 22, "w": 12, "h": 6},
+      "datasource": {"type": "prometheus", "uid": "${DS}"},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{namespace=\"glider-demo\", container=\"glider\"}[1m]))", "legendFormat": "{{pod}}"}]
+    }
+  ]
+}

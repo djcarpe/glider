@@ -660,6 +660,23 @@ fn db_attr(name: &str) -> Vec<(String, Attr)> {
     vec![("glider.db".into(), name.into())]
 }
 
+/// (resident, peak resident) bytes of this process. Linux reads
+/// `/proc/self/status`; elsewhere there is no portable std answer.
+fn process_memory() -> Option<(u64, u64)> {
+    #[cfg(target_os = "linux")]
+    {
+        let s = std::fs::read_to_string("/proc/self/status").ok()?;
+        let kb = |key: &str| -> Option<u64> {
+            s.lines()
+                .find_map(|l| l.strip_prefix(key))
+                .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+        };
+        return Some((kb("VmRSS:")? * 1024, kb("VmHWM:")? * 1024));
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
 fn collect(s: &Snapshot, dbs: &[(String, DbMetrics)]) -> Vec<Metric> {
     let mut m = Vec::new();
     let one = |v: u64| vec![(Vec::new(), v)];
@@ -727,6 +744,25 @@ fn collect(s: &Snapshot, dbs: &[(String, DbMetrics)]) -> Vec<Metric> {
         kind: Kind::Counter,
         points: one(s.page_misses),
     });
+
+    // The process itself, where the platform says: what the bounded caches
+    // and working memory add up to in practice.
+    if let Some((rss, peak)) = process_memory() {
+        m.push(Metric {
+            name: "glider.process.memory",
+            unit: "By",
+            help: "Resident memory of the process.",
+            kind: Kind::Gauge,
+            points: one(rss),
+        });
+        m.push(Metric {
+            name: "glider.process.memory.peak",
+            unit: "By",
+            help: "Peak resident memory of the process.",
+            kind: Kind::Gauge,
+            points: one(peak),
+        });
+    }
 
     let per_db = |f: &dyn Fn(&DbMetrics) -> Option<u64>| -> Vec<(Vec<(String, Attr)>, u64)> {
         dbs.iter()

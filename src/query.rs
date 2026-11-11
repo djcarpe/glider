@@ -20,7 +20,9 @@ use std::collections::HashMap;
 
 use std::collections::BTreeMap;
 use crate::algo::{self, Adjacency};
+use crate::codec;
 use crate::graph::{Dir, Error, Graph, Projection as AlgoView, Result, Tier};
+use crate::storage::extsort::Sorter;
 use crate::ooc::StateVec;
 use crate::telemetry;
 use crate::value::{parse_json, write_json_string, Value};
@@ -2816,6 +2818,148 @@ impl Acc {
             Acc::Other => Value::Null,
         }
     }
+
+    /// Fold another partial state for the same group into this one (the
+    /// group was spilled and seen again).
+    fn merge(&mut self, other: Acc) {
+        match (self, other) {
+            (Acc::Count(a), Acc::Count(b)) => *a += b,
+            (Acc::Sum(a), Acc::Sum(b)) => *a += b,
+            (Acc::Avg(s, n), Acc::Avg(t, m)) => {
+                *s += t;
+                *n += m;
+            }
+            (Acc::Min(a), Acc::Min(b)) => {
+                if let Some(b) = b {
+                    if a.as_ref().map(|c| b.total_cmp(c) == std::cmp::Ordering::Less).unwrap_or(true) {
+                        *a = Some(b);
+                    }
+                }
+            }
+            (Acc::Max(a), Acc::Max(b)) => {
+                if let Some(b) = b {
+                    if a.as_ref().map(|c| b.total_cmp(c) != std::cmp::Ordering::Less).unwrap_or(true) {
+                        *a = Some(b);
+                    }
+                }
+            }
+            (Acc::Collect(a), Acc::Collect(b)) => a.extend(b),
+            _ => {}
+        }
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            Acc::Count(n) => {
+                codec::put_u8(out, 0);
+                codec::put_ivarint(out, *n);
+            }
+            Acc::Sum(s) => {
+                codec::put_u8(out, 1);
+                codec::put_f64(out, *s);
+            }
+            Acc::Avg(s, n) => {
+                codec::put_u8(out, 2);
+                codec::put_f64(out, *s);
+                codec::put_varint(out, *n);
+            }
+            Acc::Min(m) | Acc::Max(m) => {
+                codec::put_u8(out, if matches!(self, Acc::Min(_)) { 3 } else { 4 });
+                match m {
+                    Some(v) => {
+                        codec::put_u8(out, 1);
+                        codec::put_value(out, v);
+                    }
+                    None => codec::put_u8(out, 0),
+                }
+            }
+            Acc::Collect(l) => {
+                codec::put_u8(out, 5);
+                codec::put_value(out, &Value::List(l.clone()));
+            }
+            Acc::Other => codec::put_u8(out, 6),
+        }
+    }
+
+    fn decode(r: &mut codec::Reader<'_>) -> std::result::Result<Acc, String> {
+        Ok(match r.u8()? {
+            0 => Acc::Count(r.ivarint()?),
+            1 => Acc::Sum(r.f64()?),
+            2 => Acc::Avg(r.f64()?, r.varint()?),
+            t @ (3 | 4) => {
+                let m = if r.u8()? == 1 { Some(r.value()?) } else { None };
+                if t == 3 {
+                    Acc::Min(m)
+                } else {
+                    Acc::Max(m)
+                }
+            }
+            5 => match r.value()? {
+                Value::List(l) => Acc::Collect(l),
+                _ => return Err("collect state is not a list".into()),
+            },
+            6 => Acc::Other,
+            t => return Err(format!("unknown aggregate state {t}")),
+        })
+    }
+
+    /// Bytes this state holds beyond its own size (a collected list).
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Acc::Collect(l) => l.iter().map(approx_value_bytes).sum(),
+            Acc::Min(Some(v)) | Acc::Max(Some(v)) => approx_value_bytes(v),
+            _ => 0,
+        }
+    }
+}
+
+/// Roughly what a value occupies in memory, for the grouping budget.
+fn approx_value_bytes(v: &Value) -> usize {
+    32 + match v {
+        Value::Text(t) => t.len(),
+        Value::List(l) => l.iter().map(approx_value_bytes).sum(),
+        _ => 0,
+    }
+}
+
+/// A group key as bytes that sort and compare as `EqKey` does: the
+/// order-preserving encoding of each value, with -0.0 folded into 0.0. Equal
+/// groups are adjacent in a sort, which is what spilling relies on.
+fn group_key_bytes(key: &[Value]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(key.len() * 9);
+    for v in key {
+        crate::storage::keys::put_value(&mut out, &fold_zero(v));
+    }
+    out
+}
+
+fn encode_group(key: &[Value], accs: &[Acc], out: &mut Vec<u8>) {
+    codec::put_varint(out, key.len() as u64);
+    for v in key {
+        codec::put_value(out, v);
+    }
+    codec::put_varint(out, accs.len() as u64);
+    for a in accs {
+        a.encode(out);
+    }
+}
+
+fn decode_group(b: &[u8]) -> Result<(Vec<Value>, Vec<Acc>)> {
+    let mut r = codec::Reader::new(b);
+    let mut inner = || -> std::result::Result<(Vec<Value>, Vec<Acc>), String> {
+        let n = r.varint()? as usize;
+        let mut key = Vec::with_capacity(n.min(64));
+        for _ in 0..n {
+            key.push(r.value()?);
+        }
+        let n = r.varint()? as usize;
+        let mut accs = Vec::with_capacity(n.min(64));
+        for _ in 0..n {
+            accs.push(Acc::decode(&mut r)?);
+        }
+        Ok((key, accs))
+    };
+    inner().map_err(|e| Error::Msg(format!("spilled group is damaged: {e}")))
 }
 
 /// RETURN, fed one match at a time. Holds only what the output needs: the
@@ -2832,9 +2976,16 @@ struct Projection<'q> {
     has_agg: bool,
     rows: Vec<Vec<Value>>,
     seen: FirstSeen,
+    /// The groups in memory, in arrival order, and where each key is.
     groups: Vec<(Vec<Value>, Vec<Acc>)>,
-    group_index: FirstSeen,
-    group_keys: Vec<Vec<Value>>,
+    group_index: HashMap<Vec<u8>, usize>,
+    /// Roughly what `groups` and `group_index` occupy.
+    group_bytes: usize,
+    /// Groups spill past this; set from the graph on the first match.
+    group_budget: Option<usize>,
+    spill_dir: Option<std::path::PathBuf>,
+    /// Groups spilled so far, keyed to sort equal groups together.
+    spill: Option<Sorter>,
     /// Rows produced before SKIP/LIMIT (after DISTINCT).
     total: usize,
 }
@@ -2859,9 +3010,62 @@ impl<'q> Projection<'q> {
             rows: Vec::new(),
             seen: FirstSeen::default(),
             groups: Vec::new(),
-            group_index: FirstSeen::default(),
-            group_keys: Vec::new(),
+            group_index: HashMap::new(),
+            group_bytes: 0,
+            group_budget: None,
+            spill_dir: None,
+            spill: None,
             total: 0,
+        }
+    }
+
+    /// Move every group in memory into the spill sorter.
+    fn spill_groups(&mut self) -> Result<()> {
+        if self.groups.is_empty() {
+            return Ok(());
+        }
+        if self.spill.is_none() {
+            let dir = self.spill_dir.clone().unwrap_or_else(crate::ooc::system_temp_dir);
+            let budget = self.group_budget.unwrap_or(64 << 20);
+            self.spill = Some(Sorter::new(&dir, "groups", budget).map_err(Error::Io)?);
+        }
+        let s = self.spill.as_mut().expect("sorter");
+        let mut buf = Vec::new();
+        for (key, accs) in self.groups.drain(..) {
+            buf.clear();
+            encode_group(&key, &accs, &mut buf);
+            s.push(&group_key_bytes(&key), &buf).map_err(Error::Io)?;
+        }
+        self.group_index.clear();
+        self.group_bytes = 0;
+        Ok(())
+    }
+
+    /// One output row of an aggregate: key columns and aggregate columns in
+    /// the order the RETURN lists them.
+    fn group_row(items: &[(Expr, String)], key: Vec<Value>, accs: Vec<Acc>) -> Vec<Value> {
+        let mut key = key.into_iter();
+        let mut accs = accs.into_iter();
+        items
+            .iter()
+            .map(|(e, _)| {
+                if e.is_aggregate() {
+                    accs.next().map(Acc::value).unwrap_or(Value::Null)
+                } else {
+                    key.next().unwrap_or(Value::Null)
+                }
+            })
+            .collect()
+    }
+
+    /// Keep only the best `want` of `rows` when there are many more, so an
+    /// ORDER BY ... LIMIT never holds more than a bounded multiple of its
+    /// answer. A stable sort keeps ties in arrival order, as sorting
+    /// everything at the end would.
+    fn trim_top(rows: &mut Vec<Vec<Value>>, keys: &[(usize, bool)], want: usize) {
+        if rows.len() >= want.saturating_mul(2).max(want + 1024) {
+            rows.sort_by(|a, b| Self::cmp_rows(keys, a, b));
+            rows.truncate(want);
         }
     }
 
@@ -2910,28 +3114,45 @@ impl<'q> Projection<'q> {
         self.resolve(Some(&binds))?;
         let items = self.items.as_ref().expect("resolved");
         if self.has_agg {
+            if self.group_budget.is_none() {
+                // Half for the groups in memory, half for the sorter's buffer.
+                self.group_budget = Some((g.algorithm_memory() / 2).clamp(64 << 10, usize::MAX as u64) as usize);
+                self.spill_dir = Some(g.temp_dir());
+            }
             let key: Vec<Value> = items
                 .iter()
                 .filter(|(e, _)| !e.is_aggregate())
                 .map(|(e, _)| eval(g, e, &binds))
                 .collect();
-            let idx = self.groups.len();
-            let gi = match self.group_index.find_or_add(&self.group_keys, &key, idx) {
-                Some(i) => i,
+            let kb = group_key_bytes(&key);
+            let gi = match self.group_index.get(&kb) {
+                Some(&i) => i,
                 None => {
-                    let accs = items
+                    let accs: Vec<Acc> = items
                         .iter()
                         .filter(|(e, _)| e.is_aggregate())
                         .map(|(e, _)| Acc::new(e))
                         .collect();
-                    self.group_keys.push(key.clone());
+                    // Key bytes and the map entry, the key values, the
+                    // accumulators, and the Vec headers around them.
+                    self.group_bytes += kb.len()
+                        + key.iter().map(approx_value_bytes).sum::<usize>()
+                        + accs.len() * 40
+                        + 96;
+                    let idx = self.groups.len();
+                    self.group_index.insert(kb, idx);
                     self.groups.push((key, accs));
                     idx
                 }
             };
             let aggs = items.iter().filter(|(e, _)| e.is_aggregate()).map(|(e, _)| e);
             for (acc, e) in self.groups[gi].1.iter_mut().zip(aggs) {
+                let before = acc.heap_bytes();
                 acc.add(g, e, &binds);
+                self.group_bytes += acc.heap_bytes().saturating_sub(before);
+            }
+            if self.group_bytes > self.group_budget.unwrap_or(usize::MAX) {
+                self.spill_groups()?;
             }
             return Ok(true);
         }
@@ -2952,14 +3173,64 @@ impl<'q> Projection<'q> {
             // No order: the first rows are the answer.
             return Ok(self.rows.len() < want);
         }
-        if !self.distinct && self.rows.len() >= want.saturating_mul(2).max(want + 1024) {
-            // Keep only the best `want`; a stable sort keeps ties in arrival
-            // order, as sorting everything at the end would.
-            let keys = self.keys.clone();
-            self.rows.sort_by(|a, b| Self::cmp_rows(&keys, a, b));
-            self.rows.truncate(want);
+        if !self.distinct {
+            Self::trim_top(&mut self.rows, &self.keys, want);
         }
         Ok(true)
+    }
+
+    /// The aggregate's rows. With spilled groups, every group goes through
+    /// the sorter and partial states of one group (it was spilled, then
+    /// seen again) come out adjacent and are merged; an ORDER BY ... LIMIT
+    /// then keeps only its top rows, so memory stays bounded by the budget
+    /// rather than by the number of groups. Spilled rows come out in key
+    /// order rather than arrival order.
+    fn group_rows(&mut self, items: &[(Expr, String)]) -> Result<Vec<Vec<Value>>> {
+        if self.spill.is_none() {
+            self.total = self.groups.len();
+            return Ok(std::mem::take(&mut self.groups)
+                .into_iter()
+                .map(|(key, accs)| Self::group_row(items, key, accs))
+                .collect());
+        }
+        self.spill_groups()?;
+        let mut sorted = self.spill.take().expect("sorter").finish().map_err(Error::Io)?;
+        let want = if self.keys.is_empty() || self.distinct {
+            None
+        } else {
+            self.limit.map(|l| self.skip.saturating_add(l))
+        };
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        let mut groups = 0usize;
+        let mut emit = |rows: &mut Vec<Vec<Value>>, key: Vec<Value>, accs: Vec<Acc>| {
+            groups += 1;
+            rows.push(Self::group_row(items, key, accs));
+            if let Some(w) = want {
+                Self::trim_top(rows, &self.keys, w);
+            }
+        };
+        let mut cur: Option<(Vec<u8>, Vec<Value>, Vec<Acc>)> = None;
+        while let Some((k, v)) = sorted.next().map_err(Error::Io)? {
+            let (key, accs) = decode_group(&v)?;
+            match &mut cur {
+                Some((ck, _, caccs)) if *ck == k => {
+                    for (a, b) in caccs.iter_mut().zip(accs) {
+                        a.merge(b);
+                    }
+                }
+                _ => {
+                    if let Some((_, key, accs)) = cur.take() {
+                        emit(&mut rows, key, accs);
+                    }
+                    cur = Some((k, key, accs));
+                }
+            }
+        }
+        if let Some((_, key, accs)) = cur.take() {
+            emit(&mut rows, key, accs);
+        }
+        self.total = groups;
+        Ok(rows)
     }
 
     fn finish(mut self) -> Result<QueryResult> {
@@ -2967,23 +3238,7 @@ impl<'q> Projection<'q> {
         let items = self.items.take().expect("resolved");
         let columns: Vec<String> = items.iter().map(|(_, a)| a.clone()).collect();
         let mut out_rows: Vec<Vec<Value>> = if self.has_agg {
-            let rows: Vec<Vec<Value>> = std::mem::take(&mut self.groups)
-                .into_iter()
-                .map(|(key, accs)| {
-                    let mut key = key.into_iter();
-                    let mut accs = accs.into_iter();
-                    items
-                        .iter()
-                        .map(|(e, _)| {
-                            if e.is_aggregate() {
-                                accs.next().map(Acc::value).unwrap_or(Value::Null)
-                            } else {
-                                key.next().unwrap_or(Value::Null)
-                            }
-                        })
-                        .collect()
-                })
-                .collect();
+            let rows = self.group_rows(&items)?;
             let rows = if self.distinct {
                 let mut seen = FirstSeen::default();
                 let mut kept: Vec<Vec<Value>> = Vec::new();
@@ -2997,7 +3252,9 @@ impl<'q> Projection<'q> {
             } else {
                 rows
             };
-            self.total = rows.len();
+            if self.distinct {
+                self.total = rows.len();
+            }
             rows
         } else {
             std::mem::take(&mut self.rows)

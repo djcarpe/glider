@@ -969,6 +969,9 @@ pub struct Graph {
     /// Installed extensions that maintain state on node writes; computed
     /// on first write, forgotten whenever installs or config may change.
     hooks: Option<Vec<std::sync::Arc<dyn crate::ext::Extension>>>,
+    /// A replica: writes come only from the primary's log
+    /// ([`Graph::apply_shipped`]); every other write is refused.
+    read_only: Option<String>,
 }
 
 impl Drop for Graph {
@@ -1003,6 +1006,7 @@ impl Graph {
             last_edge: std::sync::Mutex::new(None),
             tel_id: crate::telemetry::next_db_id(),
             hooks: None,
+            read_only: None,
         })
     }
 
@@ -1860,6 +1864,9 @@ impl Graph {
     /// Log and apply one op. A failure rolls the whole open transaction
     /// back, so nothing is left half-done.
     fn exec(&mut self, op: Op) -> Result<()> {
+        if let Some(why) = &self.read_only {
+            return Err(Error::Msg(format!("this database is read-only: {why}")));
+        }
         self.forget_reads();
         let rec = op_record(&op);
         let r = self
@@ -2454,6 +2461,50 @@ impl Graph {
     /// Act on a replicator's pin now (keep unshipped log, start or end a
     /// hold for a base snapshot) instead of at the next commit. For a
     /// writer that may sit idle; does nothing inside a transaction.
+    /// Refuse every write from now on, saying `why` (a replica says whose
+    /// log it follows). `None` allows writes again.
+    pub fn set_read_only(&mut self, why: Option<String>) {
+        self.read_only = why;
+    }
+
+    pub fn read_only(&self) -> Option<&str> {
+        self.read_only.as_deref()
+    }
+
+    /// This database's position in its write-ahead log: just past the last
+    /// committed transaction. For a replica, its position in the primary's
+    /// log (see [`Graph::apply_shipped`]).
+    pub fn log_position(&self) -> u64 {
+        self.db.committed_lsn()
+    }
+
+    /// The generation (lineage) of this database, as replicas name it.
+    pub fn generation_hex(&self) -> String {
+        self.pager().generation().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Apply log another database shipped (whole committed transactions,
+    /// starting at exactly [`Graph::log_position`]): the bytes are appended
+    /// to this database's log unchanged and replayed into its pages, so a
+    /// replica's log is byte-identical to its primary's. Works on a
+    /// read-only graph; that is what it is for. Returns the new position.
+    ///
+    /// On an error the graph must be dropped and reopened: the log may hold
+    /// a transaction the pages do not.
+    pub fn apply_shipped(&mut self, bytes: &[u8]) -> Result<u64> {
+        if self.uncommitted > 0 {
+            return Err(Error::Msg("cannot apply a shipped log inside a transaction".into()));
+        }
+        self.forget_reads();
+        self.hooks = None;
+        let Graph { db, strings, indexes, .. } = self;
+        let at = db.apply_shipped(bytes, &mut |p, rec| {
+            let op = Op::decode_record(rec).map_err(SError::Corrupt)?;
+            apply(p, &mut Schema { strings, indexes }, &op)
+        })?;
+        Ok(at)
+    }
+
     pub fn poll_replication(&mut self) -> Result<()> {
         if self.uncommitted > 0 {
             return Ok(());

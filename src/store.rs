@@ -1207,9 +1207,16 @@ impl Lock {
         loop {
             match OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(mut f) => {
+                    // The holder's process start time goes in beside its pid:
+                    // in a container every incarnation of the server is pid 1,
+                    // so a pid alone cannot tell a crashed holder from a live
+                    // one, but a reused pid never has the same start time.
+                    let start = process_start(std::process::id())
+                        .map(|s| format!(",\"start\":{s}"))
+                        .unwrap_or_default();
                     let _ = write!(
                         f,
-                        "{{\"pid\":{},\"since\":{}}}\n",
+                        "{{\"pid\":{}{start},\"since\":{}}}\n",
                         std::process::id(),
                         std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -1222,15 +1229,27 @@ impl Lock {
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                     let holder = std::fs::read_to_string(&path).unwrap_or_default();
-                    let pid = holder
-                        .split("\"pid\":")
-                        .nth(1)
-                        .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
-                        .and_then(|s| s.parse::<u32>().ok());
+                    let field = |key: &str| {
+                        holder
+                            .split(&format!("\"{key}\":"))
+                            .nth(1)
+                            .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
+                            .and_then(|s| s.parse::<u64>().ok())
+                    };
+                    let pid = field("pid").map(|p| p as u32);
+                    let start = field("start");
 
-                    // If the platform can prove the holder is gone, take over
-                    // rather than making a human do it.
-                    let stale = force || pid.map(process_is_gone).unwrap_or(false);
+                    // If the platform can prove the holder is gone — no such
+                    // process, or a process by that pid that started at a
+                    // different time — take over rather than making a human
+                    // do it.
+                    let stale = force
+                        || pid
+                            .map(|p| {
+                                process_is_gone(p)
+                                    || matches!((start, process_start(p)), (Some(a), Some(b)) if a != b)
+                            })
+                            .unwrap_or(false);
                     if stale {
                         std::fs::remove_file(&path)?;
                         continue;
@@ -1269,6 +1288,24 @@ pub fn lock_path(db: &Path) -> PathBuf {
     let mut name = db.file_name().unwrap_or_default().to_os_string();
     name.push(".lock");
     db.with_file_name(name)
+}
+
+/// When the process started, in clock ticks since boot (Linux: field 22 of
+/// `/proc/<pid>/stat`, after the parenthesised command name, which may
+/// itself contain spaces). None where the platform does not say.
+fn process_start(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let after = &stat[stat.rfind(')')? + 1..];
+        // `after` begins at field 3 (state); starttime is field 22.
+        return after.split_whitespace().nth(19)?.parse().ok();
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 /// True only when we can *prove* the process is gone. Unknown means alive.

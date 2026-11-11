@@ -22,6 +22,7 @@ pub mod api;
 pub mod codec;
 pub mod ext;
 pub mod ffi;
+pub mod follow;
 pub mod graph;
 pub mod legacy;
 pub mod ooc;

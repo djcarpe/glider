@@ -1,0 +1,21 @@
+# glider scale demo: one node, one disk, two graphs (1 GiB and 5 GiB) served
+# from pods with the same 768 Mi memory limit. See k8s/demo/README.md.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: glider-demo
+---
+# One local-path volume on the demo node holds the generated graphs, the
+# generator logs and the benchmark results. RWO is per node, so every pod of
+# the demo mounts it; they are all pinned to the same node.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: glider-data
+  namespace: glider-demo
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 24Gi

@@ -131,7 +131,7 @@ impl Listing {
     }
 }
 
-fn parse_segment_key(gen: &str, key: &str, size: u64) -> Option<RemoteSegment> {
+pub(crate) fn parse_segment_key(gen: &str, key: &str, size: u64) -> Option<RemoteSegment> {
     let name = key
         .strip_prefix(&format!("{gen}/segments/"))?
         .strip_suffix(".seg")?;
