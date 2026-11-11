@@ -15,15 +15,15 @@
 //!   STATS / SCHEMA / COMPACT / CLEAR / HELP
 
 use std::collections::BTreeSet;
-use std::rc::Rc;
 use std::collections::HashMap;
+use std::rc::Rc;
 
-use std::collections::BTreeMap;
 use crate::algo::{self, Adjacency};
 use crate::graph::{Dir, Error, Graph, Projection as AlgoView, Result, Tier};
 use crate::ooc::StateVec;
 use crate::telemetry;
 use crate::value::{parse_json, write_json_string, Value};
+use std::collections::BTreeMap;
 
 // ------------------------------------------------------------------- tokens
 
@@ -469,7 +469,11 @@ fn parse_checked(src: &str, params: &[(String, Value)]) -> Result<(Stmt, Vec<Str
     if toks.is_empty() {
         return Err(Error::Msg("empty statement".into()));
     }
-    let mut p = Parser { toks, pos: 0, ext_funcs: Vec::new() };
+    let mut p = Parser {
+        toks,
+        pos: 0,
+        ext_funcs: Vec::new(),
+    };
     let stmt = parse_stmt(&mut p, src)?;
     // Whatever the grammar didn't consume is a mistake, not something to drop:
     // `RETURN x LIMIT 10, count(n)` used to run as `RETURN x`, ignoring the rest.
@@ -529,7 +533,10 @@ fn parse_stmt(p: &mut Parser, src: &str) -> Result<Stmt> {
                 false
             };
             let name = p.ident()?;
-            return Ok(Stmt::Extension(ExtAction::Create { name, if_not_exists }));
+            return Ok(Stmt::Extension(ExtAction::Create {
+                name,
+                if_not_exists,
+            }));
         }
         if p.is_kw("INDEX") {
             p.pos += 1;
@@ -1014,14 +1021,22 @@ fn parse_atom(p: &mut Parser) -> Result<Expr> {
     let mut e = parse_primary(p)?;
     while p.eat_sym("[") {
         if p.eat_sym("..") {
-            let end = if p.is_sym("]") { None } else { Some(Box::new(parse_expr(p)?)) };
+            let end = if p.is_sym("]") {
+                None
+            } else {
+                Some(Box::new(parse_expr(p)?))
+            };
             p.expect_sym("]")?;
             e = Expr::Slice(Box::new(e), None, end);
             continue;
         }
         let first = parse_expr(p)?;
         if p.eat_sym("..") {
-            let end = if p.is_sym("]") { None } else { Some(Box::new(parse_expr(p)?)) };
+            let end = if p.is_sym("]") {
+                None
+            } else {
+                Some(Box::new(parse_expr(p)?))
+            };
             p.expect_sym("]")?;
             e = Expr::Slice(Box::new(e), Some(Box::new(first)), end);
         } else {
@@ -1301,7 +1316,10 @@ pub fn execute(g: &mut Graph, src: &str) -> Result<QueryResult> {
 pub fn execute_with(g: &mut Graph, src: &str, params: &[(String, Value)]) -> Result<QueryResult> {
     let watch = telemetry::Stopwatch::start();
     let before = g.pager_stats();
-    let mut report = telemetry::OpReport { op: "INVALID", ..Default::default() };
+    let mut report = telemetry::OpReport {
+        op: "INVALID",
+        ..Default::default()
+    };
     let result = match parse_checked(src, params) {
         Ok((stmt, ext_funcs)) => {
             report.op = stmt.op();
@@ -1328,7 +1346,8 @@ pub fn execute_with(g: &mut Graph, src: &str, params: &[(String, Value)]) -> Res
         }
         Err(e) => report.error = Some(e.to_string()),
     }
-    let db = telemetry::wants_db_metrics().then(|| (g.telemetry_id(), g.telemetry_name(), g.telemetry()));
+    let db = telemetry::wants_db_metrics()
+        .then(|| (g.telemetry_id(), g.telemetry_name(), g.telemetry()));
     telemetry::finish(report, src, &watch, db);
     result
 }
@@ -1337,7 +1356,10 @@ fn execute_stmt(g: &mut Graph, stmt: Stmt) -> Result<QueryResult> {
     // STATS reports the damage itself; everything else must not return
     // results computed from an image that failed a checksum along the way.
     let reports_damage = matches!(stmt, Stmt::Stats);
-    let result = if matches!(stmt, Stmt::Begin | Stmt::Commit | Stmt::Rollback | Stmt::Compact | Stmt::Clear) {
+    let result = if matches!(
+        stmt,
+        Stmt::Begin | Stmt::Commit | Stmt::Rollback | Stmt::Compact | Stmt::Clear
+    ) {
         run(g, stmt)
     } else {
         atomically(g, |g| run(g, stmt))
@@ -1404,7 +1426,10 @@ fn run(g: &mut Graph, stmt: Stmt) -> Result<QueryResult> {
         Stmt::Call { name, args } if name.contains('.') => crate::ext::call(g, &name, &args),
         Stmt::Call { name, args } => call_algorithm(g, &name, &args),
         Stmt::Extension(action) => match action {
-            ExtAction::Create { name, if_not_exists } => crate::ext::create(g, &name, if_not_exists),
+            ExtAction::Create {
+                name,
+                if_not_exists,
+            } => crate::ext::create(g, &name, if_not_exists),
             ExtAction::Drop { name, if_exists } => crate::ext::drop(g, &name, if_exists),
             ExtAction::Update { name } => crate::ext::update(g, &name),
             ExtAction::Show => Ok(crate::ext::show(g)),
@@ -1463,7 +1488,10 @@ fn run(g: &mut Graph, stmt: Stmt) -> Result<QueryResult> {
                 ],
             ];
             if let Some((used, max)) = s.memory {
-                rows.push(vec![Value::Text("memory_bytes".into()), Value::Int(used as i64)]);
+                rows.push(vec![
+                    Value::Text("memory_bytes".into()),
+                    Value::Int(used as i64),
+                ]);
                 rows.push(vec![
                     Value::Text("max_memory".into()),
                     Value::Int(max.min(i64::MAX as u64) as i64),
@@ -1732,13 +1760,20 @@ fn exec_match(
             }
             let mut proj = Projection::new(kind, *distinct, order, *skip, *limit);
             let mut err = None;
-            match_all(g, patterns, 0, Vec::new(), filter, &mut |b| match proj.push(g, b) {
-                Ok(go) => Ok(go),
-                Err(e) => {
-                    err = Some(e);
-                    Ok(false)
-                }
-            })?;
+            match_all(
+                g,
+                patterns,
+                0,
+                Vec::new(),
+                filter,
+                &mut |b| match proj.push(g, b) {
+                    Ok(go) => Ok(go),
+                    Err(e) => {
+                        err = Some(e);
+                        Ok(false)
+                    }
+                },
+            )?;
             if let Some(e) = err {
                 return Err(e);
             }
@@ -1758,15 +1793,29 @@ fn exec_match(
 /// one label, one index bucket, or one edge type. Answered from counters
 /// instead of enumerating the matches. `None` when the query needs the
 /// general path.
-fn count_from_counters(g: &Graph, patterns: &[Chain], filter: Option<&Expr>, tail: &Tail) -> Option<QueryResult> {
-    let Tail::Return { kind: ReturnKind::Items(items), distinct: false, skip: 0, limit, .. } = tail else {
+fn count_from_counters(
+    g: &Graph,
+    patterns: &[Chain],
+    filter: Option<&Expr>,
+    tail: &Tail,
+) -> Option<QueryResult> {
+    let Tail::Return {
+        kind: ReturnKind::Items(items),
+        distinct: false,
+        skip: 0,
+        limit,
+        ..
+    } = tail
+    else {
         return None;
     };
     if filter.is_some() || patterns.len() != 1 || items.len() != 1 || *limit == Some(0) {
         return None;
     }
     let (expr, alias) = &items[0];
-    let Expr::Func(f, args) = expr else { return None };
+    let Expr::Func(f, args) = expr else {
+        return None;
+    };
     if !f.eq_ignore_ascii_case("count") || args.len() != 1 {
         return None;
     }
@@ -1789,8 +1838,16 @@ fn count_from_counters(g: &Graph, patterns: &[Chain], filter: Option<&Expr>, tai
                 _ => return None,
             }
         }
-        ([a, b], [r]) if !plain(a) && plain(b) && r.types.len() == 1 && r.props.is_empty() && r.hops.is_none()
-            && a.var.is_some() && a.var != b.var && a.var != r.var && counted.is_none_or(|c| Some(c) != a.var.as_deref()) =>
+        ([a, b], [r])
+            if !plain(a)
+                && plain(b)
+                && r.types.len() == 1
+                && r.props.is_empty()
+                && r.hops.is_none()
+                && a.var.is_some()
+                && a.var != b.var
+                && a.var != r.var
+                && counted.is_none_or(|c| Some(c) != a.var.as_deref()) =>
         {
             // count over one typed hop from anchored nodes: the adjacency
             // range count of each anchor, no rows built.
@@ -1824,7 +1881,12 @@ fn count_from_counters(g: &Graph, patterns: &[Chain], filter: Option<&Expr>, tai
             if counted.is_some_and(|c| !named.contains(&&c)) {
                 return None;
             }
-            if !plain(a) || !plain(b) || !r.props.is_empty() || r.hops.is_some() || r.dir == Dir::Both {
+            if !plain(a)
+                || !plain(b)
+                || !r.props.is_empty()
+                || r.hops.is_some()
+                || r.dir == Dir::Both
+            {
                 return None;
             }
             match r.types.as_slice() {
@@ -1836,7 +1898,11 @@ fn count_from_counters(g: &Graph, patterns: &[Chain], filter: Option<&Expr>, tai
         _ => return None,
     };
     // As the general path: no matches, no rows.
-    let rows = if n == 0 { vec![] } else { vec![vec![Value::Int(n as i64)]] };
+    let rows = if n == 0 {
+        vec![]
+    } else {
+        vec![vec![Value::Int(n as i64)]]
+    };
     Some(QueryResult::table(vec![alias.clone()], rows))
 }
 
@@ -1892,7 +1958,10 @@ impl Spool {
 }
 
 /// Ids in ascending order without duplicates, however many.
-fn sorted_ids(sorter: crate::storage::extsort::Sorter, mut f: impl FnMut(u64) -> Result<()>) -> Result<()> {
+fn sorted_ids(
+    sorter: crate::storage::extsort::Sorter,
+    mut f: impl FnMut(u64) -> Result<()>,
+) -> Result<()> {
     let io = |e: std::io::Error| Error::Msg(format!("sorting ids: {e}"));
     let mut it = sorter.finish().map_err(io)?;
     let mut last = None;
@@ -1906,7 +1975,12 @@ fn sorted_ids(sorter: crate::storage::extsort::Sorter, mut f: impl FnMut(u64) ->
     Ok(())
 }
 
-fn exec_write(g: &mut Graph, patterns: &[Chain], filter: Option<&Expr>, tail: &Tail) -> Result<QueryResult> {
+fn exec_write(
+    g: &mut Graph,
+    patterns: &[Chain],
+    filter: Option<&Expr>,
+    tail: &Tail,
+) -> Result<QueryResult> {
     let mut spool = Spool::new();
     match_all(g, patterns, 0, Vec::new(), filter, &mut |b| {
         spool.push(&b);
@@ -1985,7 +2059,8 @@ fn exec_write(g: &mut Graph, patterns: &[Chain], filter: Option<&Expr>, tail: &T
             use crate::storage::extsort::Sorter;
             let io = |e: std::io::Error| Error::Msg(format!("sorting ids: {e}"));
             let dir = crate::ooc::temp_dir();
-            let per = (crate::ooc::budget_left().unwrap_or(1 << 30) / 4).clamp(1 << 20, 256 << 20) as usize;
+            let per = (crate::ooc::budget_left().unwrap_or(1 << 30) / 4).clamp(1 << 20, 256 << 20)
+                as usize;
             let mut nodes = Sorter::new(&dir, "del-nodes", per).map_err(io)?;
             let mut edges = Sorter::new(&dir, "del-edges", per).map_err(io)?;
             for binds in rows.by_ref() {
@@ -2233,7 +2308,10 @@ fn match_chain_filtered(
     let pat = &chain.nodes[plan.anchor];
     // A label scan's candidates carry the label already: with nothing else
     // to check, they need no read. Otherwise read records by scanning.
-    let from_label_scan = matches!(anchor_source(g, pat, &binds, &pins), Source::Label | Source::All);
+    let from_label_scan = matches!(
+        anchor_source(g, pat, &binds, &pins),
+        Source::Label | Source::All
+    );
     let already = from_label_scan && pat.labels.len() <= 1 && pat.props.is_empty();
     let prime = from_label_scan && (pat.var.is_some() || filter.is_some() || !already);
 
@@ -2272,7 +2350,14 @@ fn bind(b: &mut Binds, var: &Option<Rc<str>>, value: Bind) -> bool {
 
 /// Match a chain anchored on the edges of one type, streamed in pages of
 /// edge ids.
-fn match_from_edges(g: &Graph, chain: &Chain, plan: &Plan, ri: usize, binds: Binds, out: &mut Sink<'_>) -> Result<bool> {
+fn match_from_edges(
+    g: &Graph,
+    chain: &Chain,
+    plan: &Plan,
+    ri: usize,
+    binds: Binds,
+    out: &mut Sink<'_>,
+) -> Result<bool> {
     let rel = &chain.rels[ri];
     let Some(t) = g.strings.lookup(&rel.types[0]) else {
         return Ok(true);
@@ -2366,7 +2451,11 @@ fn for_each_candidate(
             return f(id);
         }
         if let Some((_, id)) = pins.iter().find(|(name, _)| **name == **v) {
-            return if g.node(*id).is_some() { f(*id) } else { Ok(true) };
+            return if g.node(*id).is_some() {
+                f(*id)
+            } else {
+                Ok(true)
+            };
         }
     }
     for label in &pat.labels {
@@ -2473,7 +2562,11 @@ fn walk(
         seen.insert(current);
         for depth in 1..=max {
             let mut next = Vec::new();
-            let only = if type_ids.len() == 1 { Some(type_ids[0]) } else { None };
+            let only = if type_ids.len() == 1 {
+                Some(type_ids[0])
+            } else {
+                None
+            };
             for node in &frontier {
                 for adj in g.neighbors(*node, dir, only) {
                     if !type_ids.is_empty() && !type_ids.contains(&adj.etype) {
@@ -2517,7 +2610,11 @@ fn walk(
     }
 
     // One type: a range scan of just that type's adjacency.
-    let only = if type_ids.len() == 1 { Some(type_ids[0]) } else { None };
+    let only = if type_ids.len() == 1 {
+        Some(type_ids[0])
+    } else {
+        None
+    };
     for adj in g.neighbors(current, dir, only) {
         if !type_ids.is_empty() && !type_ids.contains(&adj.etype) {
             continue;
@@ -2787,12 +2884,18 @@ impl Acc {
             // First of equal minimums, last of equal maximums, as min_by and
             // max_by pick them.
             Acc::Min(m) => {
-                if m.as_ref().map(|c| v.total_cmp(c) == std::cmp::Ordering::Less).unwrap_or(true) {
+                if m.as_ref()
+                    .map(|c| v.total_cmp(c) == std::cmp::Ordering::Less)
+                    .unwrap_or(true)
+                {
                     *m = Some(v);
                 }
             }
             Acc::Max(m) => {
-                if m.as_ref().map(|c| v.total_cmp(c) != std::cmp::Ordering::Less).unwrap_or(true) {
+                if m.as_ref()
+                    .map(|c| v.total_cmp(c) != std::cmp::Ordering::Less)
+                    .unwrap_or(true)
+                {
                     *m = Some(v);
                 }
             }
@@ -2875,7 +2978,11 @@ impl<'q> Projection<'q> {
         let items: Vec<(Expr, String)> = match self.kind {
             ReturnKind::Items(items) => items.clone(),
             ReturnKind::All => first
-                .map(|b| b.iter().map(|(k, _)| (Expr::Var(k.to_string()), k.to_string())).collect())
+                .map(|b| {
+                    b.iter()
+                        .map(|(k, _)| (Expr::Var(k.to_string()), k.to_string()))
+                        .collect()
+                })
                 .unwrap_or_default(),
         };
         let columns: Vec<String> = items.iter().map(|(_, a)| a.clone()).collect();
@@ -2930,7 +3037,10 @@ impl<'q> Projection<'q> {
                     idx
                 }
             };
-            let aggs = items.iter().filter(|(e, _)| e.is_aggregate()).map(|(e, _)| e);
+            let aggs = items
+                .iter()
+                .filter(|(e, _)| e.is_aggregate())
+                .map(|(e, _)| e);
             for (acc, e) in self.groups[gi].1.iter_mut().zip(aggs) {
                 acc.add(g, e, &binds);
             }
@@ -3097,10 +3207,14 @@ fn eval(g: &Graph, e: &Expr, binds: &Binds) -> Value {
             let (v, i) = (eval(g, e, binds), eval(g, i, binds));
             let Value::Int(i) = i else { return Value::Null };
             match v {
-                Value::List(items) => position(i, items.len()).map(|k| items[k].clone()).unwrap_or(Value::Null),
+                Value::List(items) => position(i, items.len())
+                    .map(|k| items[k].clone())
+                    .unwrap_or(Value::Null),
                 Value::Text(t) => {
                     let chars: Vec<char> = t.chars().collect();
-                    position(i, chars.len()).map(|k| Value::Text(chars[k].to_string())).unwrap_or(Value::Null)
+                    position(i, chars.len())
+                        .map(|k| Value::Text(chars[k].to_string()))
+                        .unwrap_or(Value::Null)
                 }
                 _ => Value::Null,
             }
@@ -3110,7 +3224,9 @@ fn eval(g: &Graph, e: &Expr, binds: &Binds) -> Value {
             let bound = |x: &Option<Box<Expr>>, len: usize, default: usize| -> Option<usize> {
                 match x.as_ref().map(|x| eval(g, x, binds)) {
                     None => Some(default),
-                    Some(Value::Int(i)) if i < 0 => Some(len.saturating_sub(i.unsigned_abs() as usize)),
+                    Some(Value::Int(i)) if i < 0 => {
+                        Some(len.saturating_sub(i.unsigned_abs() as usize))
+                    }
                     Some(Value::Int(i)) => Some((i as usize).min(len)),
                     Some(_) => None,
                 }
@@ -3375,11 +3491,18 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
         None => None,
     };
     let tier = match a.str("tier") {
-        Some(t) => Tier::parse(&t).ok_or_else(|| Error::Msg(format!("bad tier '{t}': use mem, ooc or auto")))?,
+        Some(t) => Tier::parse(&t)
+            .ok_or_else(|| Error::Msg(format!("bad tier '{t}': use mem, ooc or auto")))?,
         None => Tier::Auto,
     };
     let weight = a.str("weight");
-    fn proj<'g>(g: &'g Graph, d: Dir, etype: Option<u32>, w: Option<&str>, tier: Tier) -> AlgoView<'g> {
+    fn proj<'g>(
+        g: &'g Graph,
+        d: Dir,
+        etype: Option<u32>,
+        w: Option<&str>,
+        tier: Tier,
+    ) -> AlgoView<'g> {
         g.projection(d, etype, w, tier)
     }
     macro_rules! proj {
@@ -3498,7 +3621,9 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                 if g.node(from).is_none() || g.node(to).is_none() {
                     return Err(Error::Msg("from/to must be existing node ids".into()));
                 }
-                if let Some(found) = crate::traverse::shortest_path(g, from, to, dir, etype, walk_cap(g)) {
+                if let Some(found) =
+                    crate::traverse::shortest_path(g, from, to, dir, etype, walk_cap(g))
+                {
                     return Ok(match found {
                         None => QueryResult::message("no path"),
                         Some(path) => {
@@ -3506,9 +3631,18 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                             let rows = path
                                 .into_iter()
                                 .enumerate()
-                                .map(|(i, id)| vec![Value::Int(i as i64), Value::Int(id as i64), label_of(g, id)])
+                                .map(|(i, id)| {
+                                    vec![
+                                        Value::Int(i as i64),
+                                        Value::Int(id as i64),
+                                        label_of(g, id),
+                                    ]
+                                })
                                 .collect();
-                            let mut r = QueryResult::table(vec!["step".into(), "id".into(), "node".into()], rows);
+                            let mut r = QueryResult::table(
+                                vec!["step".into(), "id".into(), "node".into()],
+                                rows,
+                            );
                             r.message = Some(format!("{hops} hops, cost {hops}"));
                             r
                         }
@@ -3570,7 +3704,8 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
             let write = a.str("write");
             let top = a.top();
             // Nearest first: lower distance, then lower id.
-            let better = |x: &(u64, f64), y: &(u64, f64)| x.1.total_cmp(&y.1).then_with(|| x.0.cmp(&y.0));
+            let better =
+                |x: &(u64, f64), y: &(u64, f64)| x.1.total_cmp(&y.1).then_with(|| x.0.cmp(&y.0));
             let mut keep: Vec<(u64, f64)> = Vec::new();
             for i in 0..ids.len() {
                 let d = dist.get(i);
@@ -3688,12 +3823,19 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                     if rows.len() >= top {
                         return false;
                     }
-                    rows.push(vec![Value::Int(v.node as i64), label_of(g, v.node), Value::Int(v.depth as i64)]);
+                    rows.push(vec![
+                        Value::Int(v.node as i64),
+                        label_of(g, v.node),
+                        Value::Int(v.depth as i64),
+                    ]);
                 }
                 true
             });
             if done.is_some() {
-                return Ok(QueryResult::table(vec!["id".into(), "node".into(), "depth".into()], rows));
+                return Ok(QueryResult::table(
+                    vec!["id".into(), "node".into(), "depth".into()],
+                    rows,
+                ));
             }
             let p = proj!(dir, weight.as_deref());
             let s = p
@@ -3862,7 +4004,14 @@ fn walk_cap(g: &Graph) -> usize {
 /// BFS or DFS over the adjacency, keeping state only for what it visits.
 /// `None` when the walk outgrew its budget and the caller should use the
 /// whole-graph version.
-fn local_walk(g: &Graph, name: &str, from: u64, dir: Dir, etype: Option<u32>, a: &Args) -> Result<Option<QueryResult>> {
+fn local_walk(
+    g: &Graph,
+    name: &str,
+    from: u64,
+    dir: Dir,
+    etype: Option<u32>,
+    a: &Args,
+) -> Result<Option<QueryResult>> {
     if g.node(from).is_none() {
         return Err(Error::Msg("from: must be an existing node id".into()));
     }
@@ -3874,7 +4023,11 @@ fn local_walk(g: &Graph, name: &str, from: u64, dir: Dir, etype: Option<u32>, a:
             visits.push(v);
             visits.len() < top
         };
-        let walk = if name == "bfs" { crate::traverse::bfs } else { crate::traverse::dfs };
+        let walk = if name == "bfs" {
+            crate::traverse::bfs
+        } else {
+            crate::traverse::dfs
+        };
         if walk(g, from, dir, etype, depth, walk_cap(g), &mut keep).is_none() {
             return Ok(None);
         }
@@ -3886,7 +4039,9 @@ fn local_walk(g: &Graph, name: &str, from: u64, dir: Dir, etype: Option<u32>, a:
                 Value::Int(v.node as i64),
                 label_of(g, v.node),
                 Value::Int(v.depth as i64),
-                v.parent.map(|q| Value::Int(q as i64)).unwrap_or(Value::Null),
+                v.parent
+                    .map(|q| Value::Int(q as i64))
+                    .unwrap_or(Value::Null),
             ]
         })
         .collect();

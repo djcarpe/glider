@@ -100,7 +100,10 @@ pub fn read_pin(db: &Path) -> Option<Pin> {
 pub fn write_pin(db: &Path, pin: Pin) -> std::io::Result<()> {
     let path = pin_path(db);
     let tmp = path.with_extension("pin-tmp");
-    std::fs::write(&tmp, format!("{} {} {}\n", pin.nonce, pin.hold as u8, pin.shipped))?;
+    std::fs::write(
+        &tmp,
+        format!("{} {} {}\n", pin.nonce, pin.hold as u8, pin.shipped),
+    )?;
     std::fs::rename(&tmp, &path)
 }
 
@@ -173,7 +176,9 @@ impl Db {
         apply: &mut dyn FnMut(&Pager, &[u8]) -> SResult<()>,
     ) -> SResult<(Db, OpenReport)> {
         let lock = Lock::acquire(path, cfg.force)?;
-        let exists = std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false);
+        let exists = std::fs::metadata(path)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false);
         let mut report = OpenReport::default();
         let pager = if exists {
             Pager::open(path, cfg.pager.cache_bytes)?
@@ -281,7 +286,12 @@ impl Db {
         let Some(path) = &self.path else {
             return Ok(());
         };
-        if !now && self.pin_checked.map(|t| t.elapsed() < Duration::from_secs(1)).unwrap_or(false) {
+        if !now
+            && self
+                .pin_checked
+                .map(|t| t.elapsed() < Duration::from_secs(1))
+                .unwrap_or(false)
+        {
             return Ok(());
         }
         self.pin_checked = Some(Instant::now());
@@ -357,7 +367,10 @@ impl Db {
 
     /// Log bytes a crash right now would replay.
     pub fn log_since_checkpoint(&self) -> u64 {
-        self.wal.as_ref().map(|w| w.bytes_since(self.ckpt_lsn)).unwrap_or(0)
+        self.wal
+            .as_ref()
+            .map(|w| w.bytes_since(self.ckpt_lsn))
+            .unwrap_or(0)
     }
 }
 
@@ -366,7 +379,11 @@ impl Drop for Db {
         // A clean close checkpoints, so the next open replays nothing. A
         // failure here loses nothing: the log still has it. Nothing to fold
         // in (a read-only session), nothing to write.
-        let idle = self.wal.as_ref().map(|w| w.committed_lsn() == self.ckpt_lsn).unwrap_or(true)
+        let idle = self
+            .wal
+            .as_ref()
+            .map(|w| w.committed_lsn() == self.ckpt_lsn)
+            .unwrap_or(true)
             && self.pager.hold() == self.hold_at_checkpoint;
         if self.wal.is_some() && !self.pager.in_txn() && !idle {
             let _ = self.checkpoint();

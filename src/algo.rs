@@ -343,7 +343,12 @@ pub struct PageRank {
     pub delta: f64,
 }
 
-pub fn pagerank<A: Adjacency + ?Sized>(a: &A, damping: f64, max_iter: u32, tolerance: f64) -> PageRank {
+pub fn pagerank<A: Adjacency + ?Sized>(
+    a: &A,
+    damping: f64,
+    max_iter: u32,
+    tolerance: f64,
+) -> PageRank {
     let n = a.len();
     if n == 0 {
         return PageRank {
@@ -710,7 +715,9 @@ impl NbrCache {
             lists: std::collections::HashMap::new(),
             order: std::collections::BTreeMap::new(),
             bytes: 0,
-            limit: crate::ooc::budget_left().map(|b| (b / 4) as usize).unwrap_or(usize::MAX),
+            limit: crate::ooc::budget_left()
+                .map(|b| (b / 4) as usize)
+                .unwrap_or(usize::MAX),
             tick: 0,
         }
     }
@@ -726,7 +733,9 @@ impl NbrCache {
         let list = std::rc::Rc::new(simple_nbrs(a, v));
         let size = list.len() * 8 + 64;
         while self.bytes + size > self.limit {
-            let Some((_, old)) = self.order.pop_first() else { break };
+            let Some((_, old)) = self.order.pop_first() else {
+                break;
+            };
             if let Some((l, _)) = self.lists.remove(&old) {
                 self.bytes -= l.len() * 8 + 64;
             }
@@ -1103,7 +1112,11 @@ pub fn minimum_spanning_forest<A: Adjacency + ?Sized>(a: &A) -> (Vec<u64>, f64) 
             if v < t {
                 // Key: weight in total order, then arrival (a stable sort).
                 let bits = w.to_bits();
-                let k = if bits >> 63 == 1 { !bits } else { bits ^ (1 << 63) };
+                let k = if bits >> 63 == 1 {
+                    !bits
+                } else {
+                    bits ^ (1 << 63)
+                };
                 let mut key = Vec::with_capacity(16);
                 key.extend_from_slice(&k.to_be_bytes());
                 key.extend_from_slice(&seq.to_be_bytes());

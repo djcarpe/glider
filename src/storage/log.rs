@@ -195,7 +195,10 @@ impl Wal {
                 let keep = rec.end - s;
                 if len > keep {
                     total_after += len - keep;
-                    fs::OpenOptions::new().write(true).open(&path)?.set_len(keep)?;
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .open(&path)?
+                        .set_len(keep)?;
                 }
             }
         }
@@ -414,12 +417,18 @@ pub fn is_whole_transactions(bytes: &[u8]) -> bool {
         if at + 5 > bytes.len() {
             return false;
         }
-        let len = u32::from_le_bytes([bytes[at + 1], bytes[at + 2], bytes[at + 3], bytes[at + 4]]) as usize;
+        let len = u32::from_le_bytes([bytes[at + 1], bytes[at + 2], bytes[at + 3], bytes[at + 4]])
+            as usize;
         let end = at + 5 + len + 4;
         if end > bytes.len() {
             return false;
         }
-        let stored = u32::from_le_bytes([bytes[end - 4], bytes[end - 3], bytes[end - 2], bytes[end - 1]]);
+        let stored = u32::from_le_bytes([
+            bytes[end - 4],
+            bytes[end - 3],
+            bytes[end - 2],
+            bytes[end - 1],
+        ]);
         if crc32(&bytes[at..at + 5 + len]) != stored {
             return false;
         }
@@ -501,7 +510,8 @@ impl SegReader {
             let mut c = crate::codec::Crc32::new();
             c.update(&head);
             c.update(&body[..len]);
-            let stored = u32::from_le_bytes([body[len], body[len + 1], body[len + 2], body[len + 3]]);
+            let stored =
+                u32::from_le_bytes([body[len], body[len + 1], body[len + 2], body[len + 3]]);
             if c.finish() != stored {
                 return Ok(None);
             }
@@ -538,20 +548,13 @@ mod tests {
     fn replay(db: &Path, from: u64, seg: u64, buf: usize) -> (Vec<Vec<u8>>, Recovery, Wal) {
         let mut got = Vec::new();
         let mut txn = Vec::new();
-        let (w, r) = Wal::open(
-            db,
-            from,
-            SyncMode::Normal,
-            seg,
-            buf,
-            &mut |e| {
-                match e {
-                    Replay::Record(p) => txn.push(p.to_vec()),
-                    Replay::Commit => got.append(&mut txn),
-                }
-                Ok(())
-            },
-        )
+        let (w, r) = Wal::open(db, from, SyncMode::Normal, seg, buf, &mut |e| {
+            match e {
+                Replay::Record(p) => txn.push(p.to_vec()),
+                Replay::Commit => got.append(&mut txn),
+            }
+            Ok(())
+        })
         .unwrap();
         (got, r, w)
     }

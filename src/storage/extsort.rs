@@ -49,7 +49,10 @@ fn get_varint(r: &mut impl Read) -> io::Result<Option<u64>> {
             return if shift == 0 {
                 Ok(None)
             } else {
-                Err(io::Error::new(io::ErrorKind::UnexpectedEof, "torn sort run"))
+                Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "torn sort run",
+                ))
             };
         }
         v |= ((b[0] & 0x7f) as u64) << shift;
@@ -116,7 +119,8 @@ impl Sorter {
 
     fn run_path(&mut self) -> PathBuf {
         self.next_run += 1;
-        self.dir.join(format!("{}-{:06}.run", self.name, self.next_run))
+        self.dir
+            .join(format!("{}-{:06}.run", self.name, self.next_run))
     }
 
     fn spill(&mut self) -> io::Result<()> {
@@ -223,7 +227,8 @@ impl RunReader {
         let Some(kl) = get_varint(&mut self.r)? else {
             return Ok(None);
         };
-        let vl = get_varint(&mut self.r)?.ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "torn sort run"))?;
+        let vl = get_varint(&mut self.r)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "torn sort run"))?;
         let mut k = vec![0u8; kl as usize];
         self.r.read_exact(&mut k)?;
         let mut v = vec![0u8; vl as usize];
@@ -285,7 +290,11 @@ impl Merge {
             return Ok(None);
         };
         if let Some((key, val)) = self.readers[top.run].next()? {
-            self.heap.push(HeapItem { key, val, run: top.run });
+            self.heap.push(HeapItem {
+                key,
+                val,
+                run: top.run,
+            });
         }
         Ok(Some((top.key, top.val)))
     }

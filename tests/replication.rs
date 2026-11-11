@@ -52,10 +52,21 @@ impl Writer {
         self.n += 1;
         let i = self.n;
         let a = g
-            .add_node(&["P".into()], vec![("i".into(), Value::Int(i as i64)), ("pad".into(), Value::Text("x".repeat((i % 50) as usize)))])
+            .add_node(
+                &["P".into()],
+                vec![
+                    ("i".into(), Value::Int(i as i64)),
+                    ("pad".into(), Value::Text("x".repeat((i % 50) as usize))),
+                ],
+            )
             .unwrap();
         if i > 3 {
-            let _ = g.add_edge(a, 1 + (i * 7919) % (a - 1), "K", vec![("w".into(), Value::Int(i as i64))]);
+            let _ = g.add_edge(
+                a,
+                1 + (i * 7919) % (a - 1),
+                "K",
+                vec![("w".into(), Value::Int(i as i64))],
+            );
         }
         if i % 5 == 0 {
             let victim = 1 + (i * 104729) % a;
@@ -82,7 +93,10 @@ fn tail_while_writing(g: &mut Graph, w: &mut Writer, db: &Path, dir: &Path) {
     while !done.load(Ordering::SeqCst) {
         w.step(g);
         std::thread::sleep(Duration::from_millis(2));
-        assert!(start.elapsed() < Duration::from_secs(60), "tailer never finished");
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "tailer never finished"
+        );
     }
     t.join().unwrap().unwrap();
 }
@@ -92,7 +106,11 @@ fn restore_and_compare(g: &Graph, dir: &Path, out: &Path) {
     glider::replica::restore(dir, None, None, out).unwrap();
     let r = Graph::open(out, glider::store::Sync::Normal).unwrap();
     r.verify_trees().unwrap();
-    assert_eq!(query::export_jsonl(&r), query::export_jsonl(g), "restored graph equals the source");
+    assert_eq!(
+        query::export_jsonl(&r),
+        query::export_jsonl(g),
+        "restored graph equals the source"
+    );
     assert_eq!(r.node_count(), g.node_count());
     assert_eq!(r.edge_count(), g.edge_count());
 }
@@ -117,7 +135,11 @@ fn base_and_log_restore_the_source_exactly() {
     // Later runs just ship the log, which the writer kept for us despite
     // many checkpoints.
     glider::replica::tail(&db, &dir, &once()).unwrap();
-    assert_eq!(glider::replica::bases(&dir, &gen(&db)).unwrap().len(), 1, "no new base needed");
+    assert_eq!(
+        glider::replica::bases(&dir, &gen(&db)).unwrap().len(),
+        1,
+        "no new base needed"
+    );
     restore_and_compare(&g, &dir, &out);
 
     for _ in 0..200 {
@@ -158,7 +180,11 @@ fn a_replica_that_fell_behind_takes_a_new_base() {
         w.step(&mut g);
     }
     tail_while_writing(&mut g, &mut w, &db, &dir);
-    assert_eq!(glider::replica::bases(&dir, &gen(&db)).unwrap().len(), 2, "a second base");
+    assert_eq!(
+        glider::replica::bases(&dir, &gen(&db)).unwrap().len(),
+        2,
+        "a second base"
+    );
     glider::replica::tail(&db, &dir, &once()).unwrap();
     restore_and_compare(&g, &dir, &out);
     drop(g);

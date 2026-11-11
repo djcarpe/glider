@@ -59,7 +59,9 @@ struct R(u64);
 
 impl R {
     fn new(seed: u64, id: u64, salt: u64) -> R {
-        R(mix(seed ^ mix(id.wrapping_mul(0x2545_F491_4F6C_DD1D) ^ salt)))
+        R(mix(
+            seed ^ mix(id.wrapping_mul(0x2545_F491_4F6C_DD1D) ^ salt)
+        ))
     }
     #[inline]
     fn next(&mut self) -> u64 {
@@ -90,28 +92,106 @@ impl R {
 }
 
 const WORDS: &[&str] = &[
-    "graph", "edge", "node", "river", "stone", "lantern", "harbour", "signal", "orbit",
-    "meadow", "copper", "velvet", "thunder", "quiet", "ember", "atlas", "cipher", "delta",
-    "fjord", "glacier", "horizon", "island", "jasmine", "kernel", "lattice", "marble",
-    "nectar", "oasis", "pixel", "quartz", "rhythm", "saffron", "tundra", "umbra", "vertex",
-    "willow", "xenon", "yonder", "zephyr", "naïve", "Zürich", "café", "Øresund", "São",
-    "über", "東京", "데이터", "Ελλάδα", "Москва", "मुंबई", "🚀", "🌍", "façade", "jalapeño",
+    "graph",
+    "edge",
+    "node",
+    "river",
+    "stone",
+    "lantern",
+    "harbour",
+    "signal",
+    "orbit",
+    "meadow",
+    "copper",
+    "velvet",
+    "thunder",
+    "quiet",
+    "ember",
+    "atlas",
+    "cipher",
+    "delta",
+    "fjord",
+    "glacier",
+    "horizon",
+    "island",
+    "jasmine",
+    "kernel",
+    "lattice",
+    "marble",
+    "nectar",
+    "oasis",
+    "pixel",
+    "quartz",
+    "rhythm",
+    "saffron",
+    "tundra",
+    "umbra",
+    "vertex",
+    "willow",
+    "xenon",
+    "yonder",
+    "zephyr",
+    "naïve",
+    "Zürich",
+    "café",
+    "Øresund",
+    "São",
+    "über",
+    "東京",
+    "데이터",
+    "Ελλάδα",
+    "Москва",
+    "मुंबई",
+    "🚀",
+    "🌍",
+    "façade",
+    "jalapeño",
 ];
 const COUNTRIES: &[&str] = &[
-    "GB", "US", "DE", "FR", "JP", "BR", "IN", "CN", "NG", "ZA", "MX", "CA", "AU", "ES", "IT",
-    "SE", "NO", "KR", "AR", "EG", "TR", "PL", "NL", "BE", "CH", "AT", "IE", "PT", "GR", "FI",
+    "GB", "US", "DE", "FR", "JP", "BR", "IN", "CN", "NG", "ZA", "MX", "CA", "AU", "ES", "IT", "SE",
+    "NO", "KR", "AR", "EG", "TR", "PL", "NL", "BE", "CH", "AT", "IE", "PT", "GR", "FI",
 ];
 const CITIES: &[&str] = &[
-    "London", "Paris", "Tokyo", "São Paulo", "Mumbai", "Lagos", "Zürich", "Toronto",
-    "Sydney", "Berlin", "Seoul", "Cairo", "Oslo", "Madrid", "Mexico City", "Montréal",
+    "London",
+    "Paris",
+    "Tokyo",
+    "São Paulo",
+    "Mumbai",
+    "Lagos",
+    "Zürich",
+    "Toronto",
+    "Sydney",
+    "Berlin",
+    "Seoul",
+    "Cairo",
+    "Oslo",
+    "Madrid",
+    "Mexico City",
+    "Montréal",
 ];
 const INDUSTRIES: &[&str] = &[
-    "software", "retail", "energy", "health", "logistics", "finance", "media", "farming",
+    "software",
+    "retail",
+    "energy",
+    "health",
+    "logistics",
+    "finance",
+    "media",
+    "farming",
 ];
-const STATUSES: &[&str] = &["placed", "paid", "shipped", "delivered", "returned", "cancelled"];
+const STATUSES: &[&str] = &[
+    "placed",
+    "paid",
+    "shipped",
+    "delivered",
+    "returned",
+    "cancelled",
+];
 const LANGS: &[&str] = &["en", "fr", "de", "ja", "pt", "hi", "ar", "日本語"];
 const EVENT_KINDS: &[&str] = &["click", "view", "purchase", "login", "error", "retry"];
-const ROLES: &[&str] = &["engineer", "manager", "analyst", "designer", "director", "intern"];
+const ROLES: &[&str] = &[
+    "engineer", "manager", "analyst", "designer", "director", "intern",
+];
 const CHANNELS: &[&str] = &["web", "app", "phone", "store"];
 
 fn text(r: &mut R, min_words: u64, max_words: u64) -> String {
@@ -170,18 +250,85 @@ const INDEXES: &[(&str, &str)] = &[
 /// Every label, type and key the generator can emit — what the string table
 /// must end up holding.
 const NODE_STRINGS: &[&str] = &[
-    "Person", "Employee", "VIP", "Company", "Product", "Discontinued", "Order", "Document",
-    "Draft", "Category", "Event", "name", "email", "age", "country", "city", "joined",
-    "score", "active", "tags", "bio", "nickname", "balance", "industry", "founded",
-    "revenue", "hq", "sku", "price", "stock", "attrs", "rating", "ref", "total", "status",
-    "placed", "items", "gift", "title", "body", "lang", "words", "embedding", "depth",
-    "seq", "kind", "ts", "payload",
+    "Person",
+    "Employee",
+    "VIP",
+    "Company",
+    "Product",
+    "Discontinued",
+    "Order",
+    "Document",
+    "Draft",
+    "Category",
+    "Event",
+    "name",
+    "email",
+    "age",
+    "country",
+    "city",
+    "joined",
+    "score",
+    "active",
+    "tags",
+    "bio",
+    "nickname",
+    "balance",
+    "industry",
+    "founded",
+    "revenue",
+    "hq",
+    "sku",
+    "price",
+    "stock",
+    "attrs",
+    "rating",
+    "ref",
+    "total",
+    "status",
+    "placed",
+    "items",
+    "gift",
+    "title",
+    "body",
+    "lang",
+    "words",
+    "embedding",
+    "depth",
+    "seq",
+    "kind",
+    "ts",
+    "payload",
 ];
 const EDGE_STRINGS: &[&str] = &[
-    "KNOWS", "since", "weight", "FOLLOWS", "WORKS_AT", "role", "REVIEWED", "rating", "text",
-    "SUBSIDIARY_OF", "stake", "IN_CATEGORY", "PARENT_OF", "SIMILAR", "score", "PLACED",
-    "channel", "CONTAINS", "qty", "price", "AUTHORED", "CITES", "MENTIONS", "offset", "NEXT",
-    "gap", "RETRY", "attempt", "TRIGGERED_BY",
+    "KNOWS",
+    "since",
+    "weight",
+    "FOLLOWS",
+    "WORKS_AT",
+    "role",
+    "REVIEWED",
+    "rating",
+    "text",
+    "SUBSIDIARY_OF",
+    "stake",
+    "IN_CATEGORY",
+    "PARENT_OF",
+    "SIMILAR",
+    "score",
+    "PLACED",
+    "channel",
+    "CONTAINS",
+    "qty",
+    "price",
+    "AUTHORED",
+    "CITES",
+    "MENTIONS",
+    "offset",
+    "NEXT",
+    "gap",
+    "RETRY",
+    "attempt",
+    "TRIGGERED_BY",
 ];
 
 struct Gen {
@@ -279,7 +426,10 @@ impl Gen {
                 if r.chance(0.01) {
                     labels.push("VIP");
                 }
-                put!("name", Value::Text(format!("{} {}", r.pick(WORDS), r.pick(WORDS))));
+                put!(
+                    "name",
+                    Value::Text(format!("{} {}", r.pick(WORDS), r.pick(WORDS)))
+                );
                 put!("email", Value::Text(format!("user{id:010}@example.org")));
                 put!("age", Value::Int(18 + r.below(70) as i64));
                 put!("country", Value::Text(r.pick(COUNTRIES).into()));
@@ -290,19 +440,36 @@ impl Gen {
                 let ntags = r.below(5);
                 put!(
                     "tags",
-                    Value::List((0..ntags).map(|_| Value::Text(r.pick(WORDS).into())).collect())
+                    Value::List(
+                        (0..ntags)
+                            .map(|_| Value::Text(r.pick(WORDS).into()))
+                            .collect()
+                    )
                 );
                 put!("bio", Value::Text(text(&mut r, 8, 60)));
                 if r.chance(0.5) {
-                    put!("nickname", if r.chance(0.2) { Value::Null } else { Value::Text(r.pick(WORDS).into()) });
+                    put!(
+                        "nickname",
+                        if r.chance(0.2) {
+                            Value::Null
+                        } else {
+                            Value::Text(r.pick(WORDS).into())
+                        }
+                    );
                 }
                 if r.chance(0.05) {
-                    put!("balance", Value::Int([i64::MIN, i64::MAX, -1, 0][r.below(4) as usize]));
+                    put!(
+                        "balance",
+                        Value::Int([i64::MIN, i64::MAX, -1, 0][r.below(4) as usize])
+                    );
                 }
             }
             Kind::Company => {
                 labels.push("Company");
-                put!("name", Value::Text(format!("{} {} Ltd", r.pick(WORDS), r.pick(WORDS))));
+                put!(
+                    "name",
+                    Value::Text(format!("{} {} Ltd", r.pick(WORDS), r.pick(WORDS)))
+                );
                 put!("industry", Value::Text(r.pick(INDUSTRIES).into()));
                 put!("founded", Value::Int(1850 + r.below(175) as i64));
                 put!("revenue", Value::Float(r.unit() * 1e9));
@@ -326,7 +493,14 @@ impl Gen {
                         Value::List(vec![Value::Float(r.unit()), Value::Null]),
                     ])
                 );
-                put!("rating", if r.chance(0.3) { Value::Null } else { Value::Float(1.0 + r.unit() * 4.0) });
+                put!(
+                    "rating",
+                    if r.chance(0.3) {
+                        Value::Null
+                    } else {
+                        Value::Float(1.0 + r.unit() * 4.0)
+                    }
+                );
             }
             Kind::Order => {
                 labels.push("Order");
@@ -347,7 +521,10 @@ impl Gen {
                 put!("lang", Value::Text(r.pick(LANGS).into()));
                 put!("score", Value::Float(r.unit()));
                 put!("words", Value::Int(r.below(5000) as i64));
-                put!("embedding", Value::List((0..8).map(|_| Value::Float(r.unit() * 2.0 - 1.0)).collect()));
+                put!(
+                    "embedding",
+                    Value::List((0..8).map(|_| Value::Float(r.unit() * 2.0 - 1.0)).collect())
+                );
             }
             Kind::Category => {
                 labels.push("Category");
@@ -414,7 +591,10 @@ impl Gen {
                 for _ in 0..deg {
                     let to = if r.chance(0.8) {
                         let span = (pe - base).min(1000);
-                        self.member(Kind::Person, ((base - ps) + r.below(span)) as f64 / (pe - ps) as f64)
+                        self.member(
+                            Kind::Person,
+                            ((base - ps) + r.below(span)) as f64 / (pe - ps) as f64,
+                        )
                     } else {
                         self.popular(Kind::Person, &mut r, 3.0)
                     };
@@ -422,7 +602,11 @@ impl Gen {
                 }
                 // FOLLOWS: reciprocal pairs (2k, 2k+1) where the pair agrees.
                 let partner = if id % 2 == 0 { id + 1 } else { id - 1 };
-                if partner >= ps && partner < pe && self.exists(partner) && mix(self.seed ^ (id / 2)) % 3 == 0 {
+                if partner >= ps
+                    && partner < pe
+                    && self.exists(partner)
+                    && mix(self.seed ^ (id / 2)) % 3 == 0
+                {
                     e!(id, partner, "FOLLOWS", []);
                 }
                 if r.chance(0.6) {
@@ -467,7 +651,11 @@ impl Gen {
                 let lines = 1 + r.below(8);
                 let first = self.uniform(Kind::Product, &mut r);
                 for _ in 0..lines {
-                    let p = if r.chance(0.25) { first } else { self.uniform(Kind::Product, &mut r) };
+                    let p = if r.chance(0.25) {
+                        first
+                    } else {
+                        self.uniform(Kind::Product, &mut r)
+                    };
                     e!(id, p, "CONTAINS", ["qty" => Value::Int(1 + r.below(5) as i64), "price" => Value::Float((r.below(50_000) as f64) / 100.0)]);
                 }
             }
@@ -478,7 +666,8 @@ impl Gen {
                 if id > s {
                     for _ in 0..r.pareto(1.0, 1.5, 200) {
                         // Older documents, skewed towards the oldest.
-                        let f = r.unit().powf(2.0) * ((id - s) as f64 / (self.range(Kind::Document).1 - s) as f64);
+                        let f = r.unit().powf(2.0)
+                            * ((id - s) as f64 / (self.range(Kind::Document).1 - s) as f64);
                         let to = self.member(Kind::Document, f);
                         if to < id {
                             e!(id, to, "CITES", []);
@@ -533,7 +722,8 @@ impl Gen {
         }
         let mut labels = Vec::new();
         let mut props = Vec::new();
-        let node_done = |seen: &HashMap<&str, u32>| NODE_STRINGS.iter().all(|s| seen.contains_key(s));
+        let node_done =
+            |seen: &HashMap<&str, u32>| NODE_STRINGS.iter().all(|s| seen.contains_key(s));
         for id in 1..=self.n {
             if node_done(&seen) {
                 break;
@@ -549,7 +739,8 @@ impl Gen {
                 intern(k, &mut seen);
             }
         }
-        let edge_done = |seen: &HashMap<&str, u32>| EDGE_STRINGS.iter().all(|s| seen.contains_key(s));
+        let edge_done =
+            |seen: &HashMap<&str, u32>| EDGE_STRINGS.iter().all(|s| seen.contains_key(s));
         let mut edges = Vec::new();
         for id in 1..=self.n {
             if edge_done(&seen) {
@@ -595,7 +786,10 @@ impl ImageSource for Source<'_> {
     }
 
     fn indexes(&self) -> Vec<(u32, u32)> {
-        INDEXES.iter().map(|(l, k)| (self.id(l), self.id(k))).collect()
+        INDEXES
+            .iter()
+            .map(|(l, k)| (self.id(l), self.id(k)))
+            .collect()
     }
 
     fn nodes(&self, f: &mut dyn FnMut(u64, &[u32], &[(u32, Value)])) -> io::Result<()> {
@@ -715,7 +909,11 @@ fn write_paged(g: &Gen, out: &PathBuf, cache_mb: u64) -> io::Result<(u64, u64, u
 /// bottom-up tree builds, no per-edge B+tree inserts.
 fn bulk_paged(g: &Gen, out: &PathBuf, cache_mb: u64, work_mb: u64) -> io::Result<(u64, u64, u64)> {
     let strings = g.string_table();
-    let ids = strings.iter().enumerate().map(|(i, s)| (s.clone(), i as u32)).collect();
+    let ids = strings
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.clone(), i as u32))
+        .collect();
     let src = Source {
         g,
         strings,
@@ -733,7 +931,11 @@ fn bulk_paged(g: &Gen, out: &PathBuf, cache_mb: u64, work_mb: u64) -> io::Result
         (work_mb << 20) as usize,
     )
     .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-    Ok((db.node_count() as u64, db.edge_count() as u64, db.file_len()))
+    Ok((
+        db.node_count() as u64,
+        db.edge_count() as u64,
+        db.file_len(),
+    ))
 }
 
 /// The same graph as a log: index definitions, every node, every edge.
@@ -823,7 +1025,10 @@ fn parse_size(s: &str) -> Option<u64> {
     .iter()
     .find_map(|(suf, m)| s.strip_suffix(suf).map(|n| (n, *m)))
     .unwrap_or((s, 1));
-    num.trim().parse::<f64>().ok().map(|n| (n * mult as f64) as u64)
+    num.trim()
+        .parse::<f64>()
+        .ok()
+        .map(|n| (n * mult as f64) as u64)
 }
 
 const USAGE: &str = "usage: scale-gen (--size <1GiB|...> | --nodes N) --out <file> [--log [--v2] | --paged | --paged-insert] [--cache-mb N] [--work-mb N] [--seed N]";

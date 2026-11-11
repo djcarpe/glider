@@ -118,28 +118,53 @@ impl Extension for Context {
         match procedure {
             "retrieve" => retrieve(g, a),
             "search" => {
-                let q = a.str("query").ok_or_else(|| Error::Msg("search needs query:".into()))?;
+                let q = a
+                    .str("query")
+                    .ok_or_else(|| Error::Msg("search needs query:".into()))?;
                 let hits = search(g, &q, &SearchOpts::from(g, a)?)?;
                 let rows = hits
                     .hits
                     .iter()
-                    .map(|&(id, s)| vec![Value::Int(id as i64), Value::Text(handle(id)), name_of(g, id), Value::Float(round(s))])
+                    .map(|&(id, s)| {
+                        vec![
+                            Value::Int(id as i64),
+                            Value::Text(handle(id)),
+                            name_of(g, id),
+                            Value::Float(round(s)),
+                        ]
+                    })
                     .collect();
-                let mut r = QueryResult::table(vec!["id".into(), "ref".into(), "node".into(), "score".into()], rows);
+                let mut r = QueryResult::table(
+                    vec!["id".into(), "ref".into(), "node".into(), "score".into()],
+                    rows,
+                );
                 r.message = Some(if hits.indexed {
-                    format!("{} matches, {} postings read from the text index", hits.matched, hits.scanned)
+                    format!(
+                        "{} matches, {} postings read from the text index",
+                        hits.matched, hits.scanned
+                    )
                 } else {
                     format!("{} matches in {} nodes scanned (CALL context.index() makes this an index lookup)", hits.matched, hits.scanned)
                 });
                 Ok(r)
             }
             "index" => {
-                let c = text::Config { labels: a.strs("labels").into_iter().chain(a.strs("label")).collect(), keys: a.strs("keys") };
+                let c = text::Config {
+                    labels: a
+                        .strs("labels")
+                        .into_iter()
+                        .chain(a.strs("label"))
+                        .collect(),
+                    keys: a.strs("keys"),
+                };
                 // No clock under wasm: the summary then leaves the time out.
                 let t = crate::telemetry::Stopwatch::start();
                 let flush = (g.algorithm_memory() / 128).max(1 << 14) as usize;
                 let b = text::build(g, &c, flush)?;
-                let took = t.elapsed_ns().map(|ns| format!(" in {:.1}s", ns as f64 / 1e9)).unwrap_or_default();
+                let took = t
+                    .elapsed_ns()
+                    .map(|ns| format!(" in {:.1}s", ns as f64 / 1e9))
+                    .unwrap_or_default();
                 let mut r = QueryResult::message(format!(
                     "indexed {} nodes: {} terms, {} postings{took}",
                     b.docs, b.terms, b.postings
@@ -161,8 +186,16 @@ impl Extension for Context {
         text::config(g).is_some()
     }
 
-    fn on_node_write(&self, g: &mut Graph, id: u64, before: Option<&NodeImage>, after: Option<&NodeImage>) -> Result<()> {
-        let Some(c) = text::config(g) else { return Ok(()) };
+    fn on_node_write(
+        &self,
+        g: &mut Graph,
+        id: u64,
+        before: Option<&NodeImage>,
+        after: Option<&NodeImage>,
+    ) -> Result<()> {
+        let Some(c) = text::config(g) else {
+            return Ok(());
+        };
         fn view(n: Option<&NodeImage>) -> Option<text::NodeView<'_>> {
             n.map(|n| (&n.labels[..], &n.props[..]))
         }
@@ -176,12 +209,17 @@ impl Extension for Context {
                     Some(Arg::Value(v)) => v.as_i64().map(|v| v.max(8) as usize),
                     _ => None,
                 };
-                let r = Render { max_chars: max.unwrap_or(DEFAULT_MAX_CHARS), ..Render::default() };
+                let r = Render {
+                    max_chars: max.unwrap_or(DEFAULT_MAX_CHARS),
+                    ..Render::default()
+                };
                 match args.first() {
                     Some(Arg::Node(id)) => Value::Text(r.card(g, *id)),
                     Some(Arg::Edge(id)) => Value::Text(r.edge_line(g, *id)),
                     Some(Arg::Value(v)) => match v.as_i64() {
-                        Some(id) if g.node(id as u64).is_some() => Value::Text(r.card(g, id as u64)),
+                        Some(id) if g.node(id as u64).is_some() => {
+                            Value::Text(r.card(g, id as u64))
+                        }
                         _ => Value::Null,
                     },
                     None => Value::Null,
@@ -192,7 +230,9 @@ impl Extension for Context {
                 Some(Arg::Value(Value::Text(s))) => Value::Int(tokens(s) as i64),
                 Some(Arg::Value(v)) => Value::Int(tokens(&v.to_string()) as i64),
                 Some(Arg::Node(id)) => Value::Int(tokens(&Render::default().card(g, *id)) as i64),
-                Some(Arg::Edge(id)) => Value::Int(tokens(&Render::default().edge_line(g, *id)) as i64),
+                Some(Arg::Edge(id)) => {
+                    Value::Int(tokens(&Render::default().edge_line(g, *id)) as i64)
+                }
             },
             _ => Value::Null,
         }
@@ -254,7 +294,12 @@ struct Render {
 
 impl Default for Render {
     fn default() -> Render {
-        Render { json: false, max_chars: DEFAULT_MAX_CHARS, props: Vec::new(), exclude: Vec::new() }
+        Render {
+            json: false,
+            max_chars: DEFAULT_MAX_CHARS,
+            props: Vec::new(),
+            exclude: Vec::new(),
+        }
     }
 }
 
@@ -271,7 +316,9 @@ pub(super) fn key_rank(k: &str) -> u8 {
 impl Render {
     fn from(a: &Args) -> Render {
         Render {
-            json: a.str("format").is_some_and(|f| f.eq_ignore_ascii_case("json")),
+            json: a
+                .str("format")
+                .is_some_and(|f| f.eq_ignore_ascii_case("json")),
             max_chars: a.usize("max_chars", DEFAULT_MAX_CHARS).max(8),
             props: a.strs("props"),
             exclude: a.strs("exclude"),
@@ -302,7 +349,11 @@ impl Render {
                 }
             }
             Value::List(items) => {
-                if items.len() >= VECTOR_MIN && items.iter().all(|x| matches!(x, Value::Int(_) | Value::Float(_))) {
+                if items.len() >= VECTOR_MIN
+                    && items
+                        .iter()
+                        .all(|x| matches!(x, Value::Int(_) | Value::Float(_)))
+                {
                     out.push_str(&format!("<vector {}>", items.len()));
                     return;
                 }
@@ -322,7 +373,10 @@ impl Render {
     }
 
     fn props(&self, props: &[(String, Value)], out: &mut String, sep: &str) {
-        let mut ps: Vec<&(String, Value)> = props.iter().filter(|(k, v)| self.keep(k) && *v != Value::Null).collect();
+        let mut ps: Vec<&(String, Value)> = props
+            .iter()
+            .filter(|(k, v)| self.keep(k) && *v != Value::Null)
+            .collect();
         ps.sort_by_key(|p| key_rank(&p.0));
         for (i, (k, v)) in ps.iter().take(MAX_PROPS).enumerate() {
             if i > 0 {
@@ -418,15 +472,18 @@ fn name_of(g: &Graph, id: u64) -> Value {
 
 fn text_result(text: String) -> QueryResult {
     let t = tokens(&text) as i64;
-    QueryResult::table(vec!["context".into(), "tokens".into()], vec![vec![Value::Text(text), Value::Int(t)]])
+    QueryResult::table(
+        vec!["context".into(), "tokens".into()],
+        vec![vec![Value::Text(text), Value::Int(t)]],
+    )
 }
 
 // ------------------------------------------------------------------ search
 
 const STOPWORDS: &[&str] = &[
-    "a", "an", "and", "are", "as", "at", "be", "by", "did", "do", "does", "for", "from", "has", "have", "how", "in",
-    "is", "it", "its", "of", "on", "or", "that", "the", "their", "this", "to", "was", "were", "what", "when", "where",
-    "which", "who", "whom", "why", "with",
+    "a", "an", "and", "are", "as", "at", "be", "by", "did", "do", "does", "for", "from", "has",
+    "have", "how", "in", "is", "it", "its", "of", "on", "or", "that", "the", "their", "this", "to",
+    "was", "were", "what", "when", "where", "which", "who", "whom", "why", "with",
 ];
 
 /// Lowercase word stems: alphanumeric runs, a plural `s` dropped.
@@ -434,7 +491,11 @@ pub(super) fn terms(s: &str, mut f: impl FnMut(&str)) {
     let mut w = String::new();
     let mut flush = |w: &mut String| {
         if !w.is_empty() {
-            let t = if w.len() > 3 && w.ends_with('s') && !w.ends_with("ss") { &w[..w.len() - 1] } else { &w[..] };
+            let t = if w.len() > 3 && w.ends_with('s') && !w.ends_with("ss") {
+                &w[..w.len() - 1]
+            } else {
+                &w[..]
+            };
             f(t);
             w.clear();
         }
@@ -478,8 +539,16 @@ struct SearchOpts {
 impl SearchOpts {
     fn from(g: &Graph, a: &Args) -> Result<SearchOpts> {
         let label_name = a.str("label");
-        let label = label_name.as_ref().map(|l| g.strings.lookup(l).unwrap_or(u32::MAX));
-        Ok(SearchOpts { label, label_name, keys: a.strs("keys"), top: a.usize("top", 10).max(1), scan: a.usize("scan", usize::MAX) })
+        let label = label_name
+            .as_ref()
+            .map(|l| g.strings.lookup(l).unwrap_or(u32::MAX));
+        Ok(SearchOpts {
+            label,
+            label_name,
+            keys: a.strs("keys"),
+            top: a.usize("top", 10).max(1),
+            scan: a.usize("scan", usize::MAX),
+        })
     }
 }
 
@@ -516,7 +585,10 @@ fn search(g: &Graph, q: &str, o: &SearchOpts) -> Result<Hits> {
     if let Some(l) = &o.label_name {
         for k in &o.keys {
             if g.has_index(l, k) {
-                exact.extend(g.indexed_lookup(l, k, &Value::Text(q.trim().to_string())).unwrap_or_default());
+                exact.extend(
+                    g.indexed_lookup(l, k, &Value::Text(q.trim().to_string()))
+                        .unwrap_or_default(),
+                );
             }
         }
     }
@@ -535,7 +607,12 @@ fn search(g: &Graph, q: &str, o: &SearchOpts) -> Result<Hits> {
     if o.scan == usize::MAX && o.keys.is_empty() && text::config(g).is_some() {
         let (mut scored, read, matched) = text::search(g, q, o.top, o.label);
         merge_exact(&mut scored, &exact);
-        return Ok(Hits { hits: scored, scanned: read, matched, indexed: true });
+        return Ok(Hits {
+            hits: scored,
+            scanned: read,
+            matched,
+            indexed: true,
+        });
     }
     let keep = (o.top * 8).max(256);
     let mut cands: Vec<Cand> = Vec::new();
@@ -544,7 +621,11 @@ fn search(g: &Graph, q: &str, o: &SearchOpts) -> Result<Hits> {
     let better = |a: &Cand, b: &Cand| {
         (b.phrase, b.covered)
             .cmp(&(a.phrase, a.covered))
-            .then_with(|| b.tf.iter().sum::<f32>().total_cmp(&a.tf.iter().sum::<f32>()))
+            .then_with(|| {
+                b.tf.iter()
+                    .sum::<f32>()
+                    .total_cmp(&a.tf.iter().sum::<f32>())
+            })
             .then_with(|| a.id.cmp(&b.id))
     };
     let mut from = 0u64;
@@ -556,13 +637,16 @@ fn search(g: &Graph, q: &str, o: &SearchOpts) -> Result<Hits> {
                 return false;
             }
             scanned += 1;
-            let Some(n) = g.node_shared(id) else { return true };
+            let Some(n) = g.node_shared(id) else {
+                return true;
+            };
             let mut tf = vec![0f32; qt.len()];
             let mut len = 0u32;
             let mut phrase_hit = false;
             for (k, v) in n.props().iter() {
                 let key = g.strings.name(*k);
-                if key.starts_with('_') || (!o.keys.is_empty() && !o.keys.iter().any(|x| x == key)) {
+                if key.starts_with('_') || (!o.keys.is_empty() && !o.keys.iter().any(|x| x == key))
+                {
                     continue;
                 }
                 // Names count double: a match there is about the node itself.
@@ -601,7 +685,13 @@ fn search(g: &Graph, q: &str, o: &SearchOpts) -> Result<Hits> {
                     df[i] += 1;
                 }
             }
-            cands.push(Cand { id, tf, len, phrase: phrase_hit, covered });
+            cands.push(Cand {
+                id,
+                tf,
+                len,
+                phrase: phrase_hit,
+                covered,
+            });
             if cands.len() >= keep * 2 {
                 cands.sort_by(better);
                 cands.truncate(keep);
@@ -634,7 +724,12 @@ fn search(g: &Graph, q: &str, o: &SearchOpts) -> Result<Hits> {
         })
         .collect();
     merge_exact(&mut scored, &exact);
-    Ok(Hits { hits: scored, scanned, matched, indexed: false })
+    Ok(Hits {
+        hits: scored,
+        scanned,
+        matched,
+        indexed: false,
+    })
 }
 
 // ------------------------------------------------------------------ retrieve
@@ -651,21 +746,32 @@ struct Walk {
 impl Walk {
     fn from(g: &Graph, a: &Args) -> Result<Walk> {
         let dir = match a.str("dir") {
-            Some(s) => Dir::parse(&s).ok_or_else(|| Error::Msg(format!("bad dir '{s}': use out, in or both")))?,
+            Some(s) => Dir::parse(&s)
+                .ok_or_else(|| Error::Msg(format!("bad dir '{s}': use out, in or both")))?,
             None => Dir::Both,
         };
         let ids = |names: Vec<String>| -> Option<Vec<u32>> {
             if names.is_empty() {
                 return None;
             }
-            Some(names.iter().map(|t| g.strings.lookup(t).unwrap_or(u32::MAX)).collect())
+            Some(
+                names
+                    .iter()
+                    .map(|t| g.strings.lookup(t).unwrap_or(u32::MAX))
+                    .collect(),
+            )
         };
         let types = ids(a.strs("types").into_iter().chain(a.strs("type")).collect());
         let etype = match &types {
             Some(t) if t.len() == 1 => Some(t[0]),
             _ => None,
         };
-        Ok(Walk { dir, etype, types: if etype.is_some() { None } else { types }, labels: ids(a.strs("labels")) })
+        Ok(Walk {
+            dir,
+            etype,
+            types: if etype.is_some() { None } else { types },
+            labels: ids(a.strs("labels")),
+        })
     }
 
     fn edge_ok(&self, t: u32) -> bool {
@@ -732,10 +838,20 @@ struct Mass {
 /// thousands of neighbours. Stops early, still a valid lower bound, past
 /// `cap` remembered nodes.
 fn ppr(g: &Graph, w: &Walk, seeds: &[(u64, f64)], o: &Push) -> (IdMap<Mass>, bool) {
-    let Push { alpha, eps, depth, max_fanout, cap } = *o;
+    let Push {
+        alpha,
+        eps,
+        depth,
+        max_fanout,
+        cap,
+    } = *o;
     let mut m: IdMap<Mass> = id_map();
     let mut q = VecDeque::new();
-    let total: f64 = seeds.iter().map(|s| s.1).sum::<f64>().max(f64::MIN_POSITIVE);
+    let total: f64 = seeds
+        .iter()
+        .map(|s| s.1)
+        .sum::<f64>()
+        .max(f64::MIN_POSITIVE);
     for &(s, wt) in seeds {
         let e = m.entry(s).or_default();
         e.r += wt / total;
@@ -779,7 +895,10 @@ fn ppr(g: &Graph, w: &Walk, seeds: &[(u64, f64)], o: &Push) -> (IdMap<Mass>, boo
                     continue;
                 }
             }
-            let e = m.entry(v).or_insert(Mass { hops: hops + 1, ..Mass::default() });
+            let e = m.entry(v).or_insert(Mass {
+                hops: hops + 1,
+                ..Mass::default()
+            });
             e.hops = e.hops.min(hops + 1);
             e.r += share;
             if e.r > eps && !e.queued {
@@ -801,7 +920,10 @@ impl PartialOrd for Cand2 {
 }
 impl Ord for Cand2 {
     fn cmp(&self, o: &Self) -> Ordering {
-        self.0.total_cmp(&o.0).then_with(|| o.1.cmp(&self.1)).then_with(|| o.2.cmp(&self.2))
+        self.0
+            .total_cmp(&o.0)
+            .then_with(|| o.1.cmp(&self.1))
+            .then_with(|| o.2.cmp(&self.2))
     }
 }
 
@@ -820,7 +942,15 @@ struct Picked {
 }
 
 impl Picked {
-    fn edge_cost(&self, r: &Render, g: &Graph, edge: u64, from: u64, to: u64, t: u32) -> (usize, bool) {
+    fn edge_cost(
+        &self,
+        r: &Render,
+        g: &Graph,
+        edge: u64,
+        from: u64,
+        to: u64,
+        t: u32,
+    ) -> (usize, bool) {
         if r.json {
             return (tokens(&r.edge_json(g, edge)) + 1, false);
         }
@@ -828,7 +958,16 @@ impl Picked {
         if props.is_empty() && self.groups.contains_key(&(from, t)) {
             return (tokens(&format!(", {}", handle(to))), true);
         }
-        (tokens(&format!("{} -{}{}-> {}", handle(from), g.strings.name(t), props, handle(to))) + 1, props.is_empty())
+        (
+            tokens(&format!(
+                "{} -{}{}-> {}",
+                handle(from),
+                g.strings.name(t),
+                props,
+                handle(to)
+            )) + 1,
+            props.is_empty(),
+        )
     }
 
     fn add_edge(&mut self, edge: u64, from: u64, t: u32, groupable: bool, cost: usize) {
@@ -850,11 +989,18 @@ fn retrieve(g: &mut Graph, a: &Args) -> Result<QueryResult> {
     let max_fanout = a.usize("max_fanout", 500).max(1);
     // Residual mass below which a node is not pushed. The budget only has
     // room for about budget/10 nodes, so finer than that is wasted work.
-    let eps = a.f64("epsilon", (0.2 / budget as f64).clamp(1e-5, 1e-3)).max(1e-9);
+    let eps = a
+        .f64("epsilon", (0.2 / budget as f64).clamp(1e-5, 1e-3))
+        .max(1e-9);
     let cap = (g.algorithm_memory() / 96).max(1 << 16) as usize;
-    let format = a.str("format").unwrap_or_else(|| "text".into()).to_lowercase();
+    let format = a
+        .str("format")
+        .unwrap_or_else(|| "text".into())
+        .to_lowercase();
     if !matches!(format.as_str(), "text" | "json" | "rows") {
-        return Err(Error::Msg(format!("bad format '{format}': use text, json or rows")));
+        return Err(Error::Msg(format!(
+            "bad format '{format}': use text, json or rows"
+        )));
     }
     let render = Render::from(a);
     let walk = Walk::from(g, a)?;
@@ -883,7 +1029,18 @@ fn retrieve(g: &mut Graph, a: &Args) -> Result<QueryResult> {
         }));
     }
 
-    let (mass, capped) = ppr(g, &walk, &seeds, &Push { alpha, eps, depth, max_fanout, cap });
+    let (mass, capped) = ppr(
+        g,
+        &walk,
+        &seeds,
+        &Push {
+            alpha,
+            eps,
+            depth,
+            max_fanout,
+            cap,
+        },
+    );
     // Rank by mass over degree^beta: with beta > 0 a node that is
     // reachable from the seeds mostly because it is adjacent to everything
     // ranks below one the seeds reach through several routes.
@@ -915,7 +1072,11 @@ fn retrieve(g: &mut Graph, a: &Args) -> Result<QueryResult> {
     let header_reserve = 24 + seeds.len() * 3;
     // Room kept back for saying what was left out (text form only).
     let full = budget;
-    let budget = if render.json { budget } else { budget - (budget / 12).max(8).min(budget / 2) };
+    let budget = if render.json {
+        budget
+    } else {
+        budget - (budget / 12).max(8).min(budget / 2)
+    };
     let mut pk = Picked {
         nodes: Vec::new(),
         in_set: id_set(),
@@ -930,49 +1091,59 @@ fn retrieve(g: &mut Graph, a: &Args) -> Result<QueryResult> {
     let mut cards: IdMap<String> = id_map();
     let mut costs: IdMap<usize> = id_map();
     let mut card = |g: &Graph, id: u64| -> (String, usize) {
-        let c = cards.entry(id).or_insert_with(|| render.card(g, id)).clone();
+        let c = cards
+            .entry(id)
+            .or_insert_with(|| render.card(g, id))
+            .clone();
         let t = if seen.contains(&id) {
             0
         } else {
-            *costs.entry(id).or_insert_with(|| if render.json { tokens(&render.node_json(g, id)) + 1 } else { tokens(&c) + 1 })
+            *costs.entry(id).or_insert_with(|| {
+                if render.json {
+                    tokens(&render.node_json(g, id)) + 1
+                } else {
+                    tokens(&c) + 1
+                }
+            })
         };
         (c, t)
     };
 
     // Add `v` and scan it: edges to nodes already picked are added while
     // they fit; the rest of its neighbours join the frontier.
-    let mut admit = |g: &Graph, pk: &mut Picked, frontier: &mut BinaryHeap<Cand2>, v: u64, card_cost: usize| {
-        pk.nodes.push(v);
-        pk.in_set.insert(v);
-        pk.used += card_cost;
-        walk.adj(g, v, Dir::Both, max_fanout, &mut adj);
-        let cut = adj.len() > max_fanout;
-        let mut by_type: Vec<(u32, usize)> = Vec::new();
-        for &(edge, other, t, outgoing) in &adj {
-            match by_type.iter_mut().find(|x| x.0 == t) {
-                Some(x) => x.1 += 1,
-                None => by_type.push((t, 1)),
-            }
-            if pk.in_set.contains(&other) {
-                let (from, to) = if outgoing { (v, other) } else { (other, v) };
-                let (c, groupable) = pk.edge_cost(&render, g, edge, from, to, t);
-                if pk.used + c <= budget {
-                    pk.add_edge(edge, from, t, groupable, c);
+    let mut admit =
+        |g: &Graph, pk: &mut Picked, frontier: &mut BinaryHeap<Cand2>, v: u64, card_cost: usize| {
+            pk.nodes.push(v);
+            pk.in_set.insert(v);
+            pk.used += card_cost;
+            walk.adj(g, v, Dir::Both, max_fanout, &mut adj);
+            let cut = adj.len() > max_fanout;
+            let mut by_type: Vec<(u32, usize)> = Vec::new();
+            for &(edge, other, t, outgoing) in &adj {
+                match by_type.iter_mut().find(|x| x.0 == t) {
+                    Some(x) => x.1 += 1,
+                    None => by_type.push((t, 1)),
                 }
-                continue;
+                if pk.in_set.contains(&other) {
+                    let (from, to) = if outgoing { (v, other) } else { (other, v) };
+                    let (c, groupable) = pk.edge_cost(&render, g, edge, from, to, t);
+                    if pk.used + c <= budget {
+                        pk.add_edge(edge, from, t, groupable, c);
+                    }
+                    continue;
+                }
+                let follows = match walk.dir {
+                    Dir::Both => true,
+                    Dir::Out => outgoing,
+                    Dir::In => !outgoing,
+                };
+                let s = score(other);
+                if follows && s > 0.0 {
+                    frontier.push(Cand2(s, other, edge));
+                }
             }
-            let follows = match walk.dir {
-                Dir::Both => true,
-                Dir::Out => outgoing,
-                Dir::In => !outgoing,
-            };
-            let s = score(other);
-            if follows && s > 0.0 {
-                frontier.push(Cand2(s, other, edge));
-            }
-        }
-        pk.degree.insert(v, (by_type, cut));
-    };
+            pk.degree.insert(v, (by_type, cut));
+        };
 
     for (i, &(s, _)) in seeds.iter().enumerate() {
         let (_, c) = card(g, s);
@@ -1021,7 +1192,9 @@ fn retrieve(g: &mut Graph, a: &Args) -> Result<QueryResult> {
     type Omitted = Vec<(u32, usize, bool)>;
     let mut more: Vec<(u64, Omitted)> = Vec::new();
     for &id in &order {
-        let Some((types, cut)) = pk.degree.get(&id) else { continue };
+        let Some((types, cut)) = pk.degree.get(&id) else {
+            continue;
+        };
         let mut m: Vec<(u32, usize, bool)> = types
             .iter()
             .filter_map(|&(t, n)| {
@@ -1041,7 +1214,11 @@ fn retrieve(g: &mut Graph, a: &Args) -> Result<QueryResult> {
         reached,
         pk.edges.len(),
         pk.used,
-        if capped { " (walk hit its memory cap)" } else { "" }
+        if capped {
+            " (walk hit its memory cap)"
+        } else {
+            ""
+        }
     );
 
     match format.as_str() {
@@ -1060,7 +1237,13 @@ fn retrieve(g: &mut Graph, a: &Args) -> Result<QueryResult> {
                 })
                 .collect();
             let mut r = QueryResult::table(
-                vec!["id".into(), "ref".into(), "score".into(), "hops".into(), "card".into()],
+                vec![
+                    "id".into(),
+                    "ref".into(),
+                    "score".into(),
+                    "hops".into(),
+                    "card".into(),
+                ],
                 rows,
             );
             r.message = Some(summary);
@@ -1091,7 +1274,12 @@ fn retrieve(g: &mut Graph, a: &Args) -> Result<QueryResult> {
                 for (id, m) in &more {
                     let mut part = format!(" {}", handle(*id));
                     for (t, n, cut) in m.iter().take(3) {
-                        part.push_str(&format!(" +{}{} {}", n, if *cut { "+" } else { "" }, g.strings.name(*t)));
+                        part.push_str(&format!(
+                            " +{}{} {}",
+                            n,
+                            if *cut { "+" } else { "" },
+                            g.strings.name(*t)
+                        ));
                     }
                     if !first {
                         part.insert(0, ';');
@@ -1109,7 +1297,11 @@ fn retrieve(g: &mut Graph, a: &Args) -> Result<QueryResult> {
                     out.push('\n');
                 }
             }
-            let shown_seeds: Vec<String> = seeds.iter().filter(|(s, _)| pk.in_set.contains(s)).map(|(s, _)| handle(*s)).collect();
+            let shown_seeds: Vec<String> = seeds
+                .iter()
+                .filter(|(s, _)| pk.in_set.contains(s))
+                .map(|(s, _)| handle(*s))
+                .collect();
             let mut text = format!(
                 "# context: {} nodes, {} edges; seeds {}\n",
                 pk.nodes.len(),
@@ -1119,7 +1311,12 @@ fn retrieve(g: &mut Graph, a: &Args) -> Result<QueryResult> {
             text.push_str(&out);
             let t = tokens(&text);
             let mut r = QueryResult::table(
-                vec!["context".into(), "nodes".into(), "edges".into(), "tokens".into()],
+                vec![
+                    "context".into(),
+                    "nodes".into(),
+                    "edges".into(),
+                    "tokens".into(),
+                ],
                 vec![vec![
                     Value::Text(text),
                     Value::Int(pk.nodes.len() as i64),
@@ -1142,7 +1339,13 @@ fn write_edges(g: &Graph, r: &Render, edges: &[u64], out: &mut String) {
         let Some(e) = g.edge(eid) else { continue };
         let props = r.edge_props(g, eid);
         if !props.is_empty() {
-            out.push_str(&format!("{} -{}{}-> {}\n", handle(e.from), g.strings.name(e.etype), props, handle(e.to)));
+            out.push_str(&format!(
+                "{} -{}{}-> {}\n",
+                handle(e.from),
+                g.strings.name(e.etype),
+                props,
+                handle(e.to)
+            ));
             continue;
         }
         match at.get(&(e.from, e.etype)) {
@@ -1155,7 +1358,12 @@ fn write_edges(g: &Graph, r: &Render, edges: &[u64], out: &mut String) {
     }
     for ((from, t), tos) in groups {
         let tos: Vec<String> = tos.into_iter().map(handle).collect();
-        out.push_str(&format!("{} -{}-> {}\n", handle(from), g.strings.name(t), tos.join(", ")));
+        out.push_str(&format!(
+            "{} -{}-> {}\n",
+            handle(from),
+            g.strings.name(t),
+            tos.join(", ")
+        ));
     }
 }
 
@@ -1163,7 +1371,10 @@ impl Render {
     fn props_json(&self, props: Vec<(String, Value)>, out: &mut String) {
         out.push('{');
         let mut first = true;
-        for (k, v) in props.iter().filter(|(k, v)| self.keep(k) && *v != Value::Null) {
+        for (k, v) in props
+            .iter()
+            .filter(|(k, v)| self.keep(k) && *v != Value::Null)
+        {
             if !first {
                 out.push(',');
             }
@@ -1204,7 +1415,9 @@ impl Render {
     }
 
     fn edge_json(&self, g: &Graph, eid: u64) -> String {
-        let Some(e) = g.edge(eid) else { return String::new() };
+        let Some(e) = g.edge(eid) else {
+            return String::new();
+        };
         let mut out = format!("{{\"id\":{eid},\"type\":");
         write_json_string(g.strings.name(e.etype), &mut out);
         out.push_str(&format!(",\"from\":{},\"to\":{},\"props\":", e.from, e.to));
@@ -1215,9 +1428,21 @@ impl Render {
 }
 
 fn to_json(g: &Graph, r: &Render, nodes: &[u64], edges: &[u64], seen: &IdSet) -> String {
-    let nodes: Vec<String> = nodes.iter().filter(|id| !seen.contains(id)).map(|&id| r.node_json(g, id)).collect();
-    let edges: Vec<String> = edges.iter().map(|&e| r.edge_json(g, e)).filter(|s| !s.is_empty()).collect();
-    format!("{{\"nodes\":[{}],\"edges\":[{}]}}", nodes.join(","), edges.join(","))
+    let nodes: Vec<String> = nodes
+        .iter()
+        .filter(|id| !seen.contains(id))
+        .map(|&id| r.node_json(g, id))
+        .collect();
+    let edges: Vec<String> = edges
+        .iter()
+        .map(|&e| r.edge_json(g, e))
+        .filter(|s| !s.is_empty())
+        .collect();
+    format!(
+        "{{\"nodes\":[{}],\"edges\":[{}]}}",
+        nodes.join(","),
+        edges.join(",")
+    )
 }
 
 // ------------------------------------------------------------------ paths
@@ -1228,8 +1453,14 @@ type Side = IdMap<(u32, Vec<(u64, u64)>)>;
 
 fn paths(g: &mut Graph, a: &Args) -> Result<QueryResult> {
     let g: &Graph = g;
-    let from = *a.ids("from")?.first().ok_or_else(|| Error::Msg("paths needs from:".into()))?;
-    let to = *a.ids("to")?.first().ok_or_else(|| Error::Msg("paths needs to:".into()))?;
+    let from = *a
+        .ids("from")?
+        .first()
+        .ok_or_else(|| Error::Msg("paths needs from:".into()))?;
+    let to = *a
+        .ids("to")?
+        .first()
+        .ok_or_else(|| Error::Msg("paths needs to:".into()))?;
     if g.node(from).is_none() || g.node(to).is_none() {
         return Err(Error::Msg("from: and to: must be existing nodes".into()));
     }
@@ -1257,8 +1488,11 @@ fn paths(g: &mut Graph, a: &Args) -> Result<QueryResult> {
     let mut adj = Vec::new();
     while meet.is_empty() && !ff.is_empty() && !bf.is_empty() && fd + bd < max_depth {
         let forward = ff.len() <= bf.len();
-        let (frontier, seen, other, d, depth) =
-            if forward { (&mut ff, &mut fwd, &bwd, walk.dir, &mut fd) } else { (&mut bf, &mut bwd, &fwd, back, &mut bd) };
+        let (frontier, seen, other, d, depth) = if forward {
+            (&mut ff, &mut fwd, &bwd, walk.dir, &mut fd)
+        } else {
+            (&mut bf, &mut bwd, &fwd, back, &mut bd)
+        };
         let mut next = Vec::new();
         for &u in frontier.iter() {
             walk.adj(g, u, d, usize::MAX - 1, &mut adj);
@@ -1285,11 +1519,19 @@ fn paths(g: &mut Graph, a: &Args) -> Result<QueryResult> {
             }
         }
         *depth += 1;
-        meet = next.iter().copied().filter(|v| other.contains_key(v)).collect();
+        meet = next
+            .iter()
+            .copied()
+            .filter(|v| other.contains_key(v))
+            .collect();
         *frontier = next;
     }
     if meet.is_empty() {
-        let mut r = text_result(format!("# no path from {} to {} within {max_depth} hops\n", handle(from), handle(to)));
+        let mut r = text_result(format!(
+            "# no path from {} to {} within {max_depth} hops\n",
+            handle(from),
+            handle(to)
+        ));
         r.message = Some("no path".into());
         return Ok(r);
     }
@@ -1297,10 +1539,20 @@ fn paths(g: &mut Graph, a: &Args) -> Result<QueryResult> {
     // Specific routes first: a path through low-degree nodes says more
     // than one through a hub everything touches.
     let mut deg: IdMap<usize> = id_map();
-    let mut degree = |id: u64| *deg.entry(id).or_insert_with(|| g.degree_of(id, Dir::Both, None));
+    let mut degree = |id: u64| {
+        *deg.entry(id)
+            .or_insert_with(|| g.degree_of(id, Dir::Both, None))
+    };
     meet.sort_by_key(|&m| (degree(m), m));
 
-    fn walk_back(side: &Side, at: u64, k: usize, deg: &mut dyn FnMut(u64) -> usize, cur: &mut Vec<(u64, u64)>, out: &mut Vec<Vec<(u64, u64)>>) {
+    fn walk_back(
+        side: &Side,
+        at: u64,
+        k: usize,
+        deg: &mut dyn FnMut(u64) -> usize,
+        cur: &mut Vec<(u64, u64)>,
+        out: &mut Vec<Vec<(u64, u64)>>,
+    ) {
         if out.len() >= k {
             return;
         }
@@ -1372,7 +1624,11 @@ fn paths(g: &mut Graph, a: &Args) -> Result<QueryResult> {
         handle(from),
         handle(to),
         found.len(),
-        if found.len() >= k { " (more may exist)" } else { "" }
+        if found.len() >= k {
+            " (more may exist)"
+        } else {
+            ""
+        }
     );
     text.push_str(&lines);
     // The nodes on the paths, while the budget allows, in path order.
@@ -1393,7 +1649,9 @@ fn paths(g: &mut Graph, a: &Args) -> Result<QueryResult> {
             text.push('\n');
         }
     }
-    if a.str("format").is_some_and(|f| f.eq_ignore_ascii_case("rows")) {
+    if a.str("format")
+        .is_some_and(|f| f.eq_ignore_ascii_case("rows"))
+    {
         let rows = found
             .iter()
             .enumerate()
@@ -1406,7 +1664,10 @@ fn paths(g: &mut Graph, a: &Args) -> Result<QueryResult> {
                 ]
             })
             .collect();
-        return Ok(QueryResult::table(vec!["path".into(), "nodes".into(), "edges".into(), "hops".into()], rows));
+        return Ok(QueryResult::table(
+            vec!["path".into(), "nodes".into(), "edges".into(), "hops".into()],
+            rows,
+        ));
     }
     let mut r = text_result(text);
     r.message = Some(format!("{} paths of {hops} hops", found.len()));
@@ -1427,7 +1688,11 @@ fn type_name(v: &Value) -> String {
         Value::Float(_) => "float".into(),
         Value::Text(_) => "text".into(),
         Value::List(items) => {
-            if items.len() >= VECTOR_MIN && items.iter().all(|x| matches!(x, Value::Int(_) | Value::Float(_))) {
+            if items.len() >= VECTOR_MIN
+                && items
+                    .iter()
+                    .all(|x| matches!(x, Value::Int(_) | Value::Float(_)))
+            {
                 format!("vector[{}]", items.len())
             } else {
                 match items.first() {
@@ -1469,13 +1734,24 @@ fn key_summary(samples: &[Vec<(String, Value)>]) -> String {
             }
         }
     }
-    keys.sort_by(|a, b| key_rank(&a.0).cmp(&key_rank(&b.0)).then(b.3.cmp(&a.3)).then(a.0.cmp(&b.0)));
+    keys.sort_by(|a, b| {
+        key_rank(&a.0)
+            .cmp(&key_rank(&b.0))
+            .then(b.3.cmp(&a.3))
+            .then(a.0.cmp(&b.0))
+    });
     let n = samples.len();
     keys.iter()
         .map(|(k, types, vals, count)| {
             let mut s = format!("{k}:{}", types.join("|"));
             // Enum-like: few distinct short values over a fair sample.
-            if types.len() == 1 && types[0] == "text" && !vals.is_empty() && vals.len() <= 5 && *count >= 8 && *count >= vals.len() * 3 {
+            if types.len() == 1
+                && types[0] == "text"
+                && !vals.is_empty()
+                && vals.len() <= 5
+                && *count >= 8
+                && *count >= vals.len() * 3
+            {
                 let quoted: Vec<String> = vals.iter().map(|v| format!("{v:?}")).collect();
                 s.push_str(&format!(" in {{{}}}", quoted.join(",")));
             }
@@ -1491,11 +1767,16 @@ fn key_summary(samples: &[Vec<(String, Value)>]) -> String {
 fn schema(g: &Graph, sample: usize) -> String {
     let st = g.stats();
     let sample = sample.clamp(1, 10_000);
-    let mut out = format!("# schema: {} nodes, {} edges (types from a sample of {sample} per label; ? = optional)\n", st.nodes, st.edges);
+    let mut out = format!(
+        "# schema: {} nodes, {} edges (types from a sample of {sample} per label; ? = optional)\n",
+        st.nodes, st.edges
+    );
     let mut labels = st.labels.clone();
     labels.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     for (l, n) in &labels {
-        let Some(lid) = g.strings.lookup(l) else { continue };
+        let Some(lid) = g.strings.lookup(l) else {
+            continue;
+        };
         let ids = g.label_members_from(lid, 0, sample);
         let samples: Vec<Vec<(String, Value)>> = ids.iter().map(|&id| g.node_props(id)).collect();
         let keys = key_summary(&samples);
@@ -1510,11 +1791,19 @@ fn schema(g: &Graph, sample: usize) -> String {
     let mut types = st.edge_types.clone();
     types.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     for (t, n) in &types {
-        let Some(tid) = g.strings.lookup(t) else { continue };
+        let Some(tid) = g.strings.lookup(t) else {
+            continue;
+        };
         let ids = g.type_members_from(tid, 0, sample);
         let mut patterns: Vec<((String, String), usize)> = Vec::new();
         let mut samples = Vec::new();
-        let first_label = |id: u64| g.node_labels(id).into_iter().next().map(|l| format!(":{l}")).unwrap_or_default();
+        let first_label = |id: u64| {
+            g.node_labels(id)
+                .into_iter()
+                .next()
+                .map(|l| format!(":{l}"))
+                .unwrap_or_default()
+        };
         for &eid in &ids {
             let Some(e) = g.edge(eid) else { continue };
             let key = (first_label(e.from), first_label(e.to));
@@ -1526,22 +1815,41 @@ fn schema(g: &Graph, sample: usize) -> String {
         }
         patterns.sort_by_key(|p| std::cmp::Reverse(p.1));
         let keys = key_summary(&samples);
-        let props = if keys.is_empty() { String::new() } else { format!(" {{{keys}}}") };
+        let props = if keys.is_empty() {
+            String::new()
+        } else {
+            format!(" {{{keys}}}")
+        };
         let total = ids.len().max(1);
         for ((fl, tl), c) in patterns.iter().take(4) {
-            let est = if ids.len() < sample { *c } else { (*c as f64 / total as f64 * *n as f64).round() as usize };
+            let est = if ids.len() < sample {
+                *c
+            } else {
+                (*c as f64 / total as f64 * *n as f64).round() as usize
+            };
             let approx = if ids.len() < sample { "" } else { "~" };
             out.push_str(&format!("({fl})-[:{t}{props}]->({tl}) {approx}{est}\n"));
         }
         if patterns.len() > 4 {
-            out.push_str(&format!("(…)-[:{t}]->(…) +{} more patterns\n", patterns.len() - 4));
+            out.push_str(&format!(
+                "(…)-[:{t}]->(…) +{} more patterns\n",
+                patterns.len() - 4
+            ));
         }
     }
     if !st.indexes.is_empty() {
-        let idx: Vec<String> = st.indexes.iter().map(|(l, k, _)| format!(":{l}({k})")).collect();
+        let idx: Vec<String> = st
+            .indexes
+            .iter()
+            .map(|(l, k, _)| format!(":{l}({k})"))
+            .collect();
         out.push_str(&format!("# indexes: {}\n", idx.join(" ")));
     }
-    let exts: Vec<String> = g.extensions().into_iter().map(|(n, v)| format!("{n} {v}")).collect();
+    let exts: Vec<String> = g
+        .extensions()
+        .into_iter()
+        .map(|(n, v)| format!("{n} {v}"))
+        .collect();
     out.push_str(&format!("# extensions: {}\n", exts.join(", ")));
     out
 }
@@ -1576,7 +1884,10 @@ mod tests {
 
     #[test]
     fn query_terms_drop_stopwords_and_plurals() {
-        assert_eq!(query_terms("Who wrote the papers on graphs?"), vec!["wrote", "paper", "graph"]);
+        assert_eq!(
+            query_terms("Who wrote the papers on graphs?"),
+            vec!["wrote", "paper", "graph"]
+        );
         assert_eq!(query_terms("the"), vec!["the"]);
     }
 }

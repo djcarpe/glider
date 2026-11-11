@@ -225,14 +225,20 @@ pub fn query_json(g: &mut Graph, src: &str) -> Result<String, String> {
 /// Nested objects become their JSON text, as properties do.
 pub fn params_from_json(json: &str) -> Result<Vec<(String, Value)>, String> {
     match crate::value::parse_json(json)? {
-        crate::value::Json::Object(fields) => Ok(fields.into_iter().map(|(k, v)| (k, v.to_value())).collect()),
+        crate::value::Json::Object(fields) => {
+            Ok(fields.into_iter().map(|(k, v)| (k, v.to_value())).collect())
+        }
         crate::value::Json::Null => Ok(Vec::new()),
         _ => Err("parameters must be a JSON object".into()),
     }
 }
 
 /// `query_json` with `$name` parameters, substituted as literals.
-pub fn query_json_with(g: &mut Graph, src: &str, params: &[(String, Value)]) -> Result<String, String> {
+pub fn query_json_with(
+    g: &mut Graph,
+    src: &str,
+    params: &[(String, Value)],
+) -> Result<String, String> {
     let started = timer();
     let r: QueryResult = query::execute_with(g, src, params).map_err(|e| e.to_string())?;
     let ms = elapsed_ms(started);
@@ -510,7 +516,10 @@ pub fn nodes_json(
     let label = label.filter(|l| !l.is_empty());
     let (fetch, total): (Box<dyn Fn(u64, usize) -> Vec<u64>>, usize) = match label {
         Some(l) => match g.strings.lookup(l) {
-            Some(lid) => (Box::new(move |c, n| g.label_members_from(lid, c, n)), g.label_count(l)),
+            Some(lid) => (
+                Box::new(move |c, n| g.label_members_from(lid, c, n)),
+                g.label_count(l),
+            ),
             None => (Box::new(|_, _| Vec::new()), 0),
         },
         None => (Box::new(|c, n| g.nodes_from(c, n)), g.node_count()),
@@ -547,7 +556,10 @@ pub fn edges_json(
     let etype = etype.filter(|t| !t.is_empty());
     let (fetch, total): (Box<dyn Fn(u64, usize) -> Vec<u64>>, usize) = match etype {
         Some(t) => match g.strings.lookup(t) {
-            Some(tid) => (Box::new(move |c, n| g.type_members_from(tid, c, n)), g.type_count(t)),
+            Some(tid) => (
+                Box::new(move |c, n| g.type_members_from(tid, c, n)),
+                g.type_count(t),
+            ),
             None => (Box::new(|_, _| Vec::new()), 0),
         },
         None => (Box::new(|c, n| g.edges_from(c, n)), g.edge_count()),

@@ -57,8 +57,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::codec::{self, Crc32, Reader};
-use crate::types::VKey;
 use crate::pread::PosFile;
+use crate::types::VKey;
 use crate::value::Value;
 
 pub const IMAGE_MAGIC: &[u8; 8] = b"GLIMG\x00\x00\x01";
@@ -189,7 +189,9 @@ enum Check {
     /// Strictly ascending (ids).
     Ascending,
     /// Offsets: start at 0, never decrease, end at `total`.
-    Offsets { total: u64 },
+    Offsets {
+        total: u64,
+    },
     /// Every value below the bound (slots, string ids).
     Below(u64),
 }
@@ -216,7 +218,13 @@ impl Validator {
         match self.check {
             Check::None => {}
             Check::Ascending => self.ok &= self.seen == 0 || v > self.prev,
-            Check::Offsets { .. } => self.ok &= if self.seen == 0 { v == 0 } else { v >= self.prev },
+            Check::Offsets { .. } => {
+                self.ok &= if self.seen == 0 {
+                    v == 0
+                } else {
+                    v >= self.prev
+                }
+            }
             Check::Below(b) => self.ok &= v < b,
         }
         self.prev = v;
@@ -444,7 +452,8 @@ impl IndexBody {
             r.pos += len;
             Ok(s)
         };
-        let words = |b: &[u8]| -> Vec<u32> { b.chunks_exact(4).map(<u32 as Word>::read_le).collect() };
+        let words =
+            |b: &[u8]| -> Vec<u32> { b.chunks_exact(4).map(<u32 as Word>::read_le).collect() };
         let key_off: Vec<u64> = words(take(4 * (nkeys + 1))?)
             .into_iter()
             .map(u64::from)
@@ -669,7 +678,16 @@ impl Base {
                 self.$c.cell.get_or_init(|| self.load(&self.$c, src));
             )*};
         }
-        force!(node_label_off, node_labels, out_off, out_nbr, out_edge, in_off, in_nbr, in_edge);
+        force!(
+            node_label_off,
+            node_labels,
+            out_off,
+            out_nbr,
+            out_edge,
+            in_off,
+            in_nbr,
+            in_edge
+        );
         force!(edge_from, edge_to, edge_type, label_nodes);
         force!(node_ids, node_prop_off, edge_ids, edge_prop_off);
         for i in 0..self.indexes.len() {
@@ -732,11 +750,17 @@ impl Base {
     }
     #[inline]
     pub fn node_id(&self, s: u32) -> u64 {
-        self.col(&self.node_ids).get(s as usize).copied().unwrap_or(0)
+        self.col(&self.node_ids)
+            .get(s as usize)
+            .copied()
+            .unwrap_or(0)
     }
     #[inline]
     pub fn edge_id(&self, s: u32) -> u64 {
-        self.col(&self.edge_ids).get(s as usize).copied().unwrap_or(0)
+        self.col(&self.edge_ids)
+            .get(s as usize)
+            .copied()
+            .unwrap_or(0)
     }
     pub fn node_ids(&self) -> &[u64] {
         self.col(&self.node_ids)
@@ -768,7 +792,10 @@ impl Base {
     }
     #[inline]
     pub fn edge_type(&self, s: u32) -> u32 {
-        self.col(&self.edge_type).get(s as usize).copied().unwrap_or(0)
+        self.col(&self.edge_type)
+            .get(s as usize)
+            .copied()
+            .unwrap_or(0)
     }
     pub fn edge_types(&self) -> &[u32] {
         self.col(&self.edge_type)
@@ -1031,12 +1058,20 @@ impl Base {
         self.decode(codec::find_prop(&run, key))
     }
 
-    pub(crate) fn node_props_scratch(&self, s: u32, scratch: &mut ChunkScratch) -> Vec<(u32, Value)> {
+    pub(crate) fn node_props_scratch(
+        &self,
+        s: u32,
+        scratch: &mut ChunkScratch,
+    ) -> Vec<(u32, Value)> {
         let run = self.run_scratch(0, s, scratch);
         self.decode(codec::read_prop_ids(&run))
     }
 
-    pub(crate) fn edge_props_scratch(&self, s: u32, scratch: &mut ChunkScratch) -> Vec<(u32, Value)> {
+    pub(crate) fn edge_props_scratch(
+        &self,
+        s: u32,
+        scratch: &mut ChunkScratch,
+    ) -> Vec<(u32, Value)> {
         let run = self.run_scratch(1, s, scratch);
         self.decode(codec::read_prop_ids(&run))
     }
@@ -1103,7 +1138,14 @@ pub fn verify_file(path: &Path, at: u64, len: u64) -> io::Result<ImageReport> {
     }
     stream!(node_ids, node_label_off, node_labels, node_prop_off);
     stream!(out_off, out_nbr, out_edge, in_off, in_nbr, in_edge);
-    stream!(edge_ids, edge_from, edge_to, edge_type, edge_prop_off, label_nodes);
+    stream!(
+        edge_ids,
+        edge_from,
+        edge_to,
+        edge_type,
+        edge_prop_off,
+        label_nodes
+    );
     for i in 0..base.indexes.len() {
         base.index_body(i, Some(&file));
     }
@@ -1174,7 +1216,11 @@ fn open(
             len: <u64 as Word>::read_le(&e[16..24]),
             crc: <u32 as Word>::read_le(&e[24..28]),
         };
-        if s.off.checked_add(s.len).map(|end| end > len).unwrap_or(true) {
+        if s.off
+            .checked_add(s.len)
+            .map(|end| end > len)
+            .unwrap_or(true)
+        {
             return Err(bad(format!("image section {kind} out of range")));
         }
         sections.insert(kind, s);
@@ -1229,7 +1275,13 @@ fn open(
 
     // The label offsets are small and are what label counts come from, so
     // they are read now.
-    let label_off_col = col32(S_LABEL_OFF, ns + 1, Check::Offsets { total: n_label_nodes })?;
+    let label_off_col = col32(
+        S_LABEL_OFF,
+        ns + 1,
+        Check::Offsets {
+            total: n_label_nodes,
+        },
+    )?;
     let label_off = label_off_col.read(src, at, true).map_err(bad)?;
 
     let props = |kind: u32, crc_kind: u32| -> io::Result<Props> {
@@ -1252,7 +1304,13 @@ fn open(
         node_slot: OnceLock::new(),
         node_label_off: col32(S_NODE_LABEL_OFF, nu + 1, Check::Offsets { total: n_labels })?,
         node_labels: col32(S_NODE_LABELS, n_labels, Check::Below(ns))?,
-        node_prop_off: col64(S_NODE_PROP_OFF, nu + 1, Check::Offsets { total: node_props_len })?,
+        node_prop_off: col64(
+            S_NODE_PROP_OFF,
+            nu + 1,
+            Check::Offsets {
+                total: node_props_len,
+            },
+        )?,
         out_off: col32(S_OUT_OFF, nu + 1, Check::Offsets { total: mu })?,
         out_nbr: col32(S_OUT_NBR, mu, Check::Below(nu))?,
         out_edge: col32(S_OUT_EDGE, mu, Check::Below(mu))?,
@@ -1264,7 +1322,13 @@ fn open(
         edge_from: col32(S_EDGE_FROM, mu, Check::Below(nu))?,
         edge_to: col32(S_EDGE_TO, mu, Check::Below(nu))?,
         edge_type: col32(S_EDGE_TYPE, mu, Check::Below(ns))?,
-        edge_prop_off: col64(S_EDGE_PROP_OFF, mu + 1, Check::Offsets { total: edge_props_len })?,
+        edge_prop_off: col64(
+            S_EDGE_PROP_OFF,
+            mu + 1,
+            Check::Offsets {
+                total: edge_props_len,
+            },
+        )?,
         label_off,
         label_nodes: col32(S_LABEL_NODES, n_label_nodes, Check::Below(nu))?,
         type_counts: OnceLock::new(),
@@ -1560,7 +1624,9 @@ pub fn write<W: Write + Seek>(src: &dyn ImageSource, w: &mut W) -> io::Result<u6
         if (id as usize) < ns {
             Ok(())
         } else {
-            Err(bad(format!("{what} refers to string {id}, which does not exist")))
+            Err(bad(format!(
+                "{what} refers to string {id}, which does not exist"
+            )))
         }
     };
 

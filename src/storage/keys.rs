@@ -52,7 +52,11 @@ pub fn put_value(out: &mut Vec<u8>, v: &Value) {
             let f = v.as_f64().unwrap_or(f64::NAN);
             let bits = f.to_bits();
             // f64::total_cmp's order, as unsigned bytes.
-            let k = if bits >> 63 == 1 { !bits } else { bits ^ (1 << 63) };
+            let k = if bits >> 63 == 1 {
+                !bits
+            } else {
+                bits ^ (1 << 63)
+            };
             out.extend_from_slice(&k.to_be_bytes());
         }
         Value::Text(t) => {
@@ -133,7 +137,10 @@ mod tests {
                 0 => Value::Int((x >> 8) as i64 % 1000 - 500),
                 1 => Value::Float(((x >> 11) as f64 / (1u64 << 53) as f64) * 200.0 - 100.0),
                 2 => Value::Text(format!("{:x}", x % 4096)),
-                _ => Value::List(vec![Value::Int((x % 5) as i64), Value::Text(format!("{}", x % 3))]),
+                _ => Value::List(vec![
+                    Value::Int((x % 5) as i64),
+                    Value::Text(format!("{}", x % 3)),
+                ]),
             });
         }
         v

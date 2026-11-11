@@ -265,8 +265,12 @@ impl<'a> Digraph<'a> {
 
     /// Topological order, or `None` if the graph has a cycle.
     pub fn topsort(&self) -> Option<Vec<u64>> {
-        algo::topological_sort(&self.out)
-            .map(|mut idx| idx.to_vec().into_iter().map(|i| self.out.ids[i as usize]).collect())
+        algo::topological_sort(&self.out).map(|mut idx| {
+            idx.to_vec()
+                .into_iter()
+                .map(|i| self.out.ids[i as usize])
+                .collect()
+        })
     }
 
     pub fn is_acyclic(&self) -> bool {

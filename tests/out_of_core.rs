@@ -56,8 +56,16 @@ fn build(g: &mut Graph, seed: u64, n: u64, m: u64) {
         g.add_node(&["N".into()], props).unwrap();
     }
     for _ in 0..m {
-        let from = if r.below(4) == 0 { 1 + r.below(3) } else { 1 + r.below(n) };
-        let to = if r.below(10) == 0 { from } else { 1 + r.below(n) };
+        let from = if r.below(4) == 0 {
+            1 + r.below(3)
+        } else {
+            1 + r.below(n)
+        };
+        let to = if r.below(10) == 0 {
+            from
+        } else {
+            1 + r.below(n)
+        };
         let t = if r.below(3) == 0 { "B" } else { "A" };
         let props = if r.below(5) == 0 {
             vec![]
@@ -124,7 +132,11 @@ fn run(g: &mut Graph, call: &str, tier: &str) -> String {
 }
 
 fn show(r: &QueryResult) -> String {
-    let msg = r.message.clone().unwrap_or_default().replace(" (out of core)", "");
+    let msg = r
+        .message
+        .clone()
+        .unwrap_or_default()
+        .replace(" (out of core)", "");
     format!("{:?} {:?} {}", r.columns, r.rows, msg)
 }
 
@@ -147,7 +159,11 @@ fn first_two(g: &Graph) -> (u64, u64) {
 #[test]
 fn file_backed_out_of_core_matches_in_memory() {
     // Unoptimised builds are ~10x slower: a smaller graph still covers it.
-    let (n, m) = if cfg!(debug_assertions) { (250, 900) } else { (700, 2400) };
+    let (n, m) = if cfg!(debug_assertions) {
+        (250, 900)
+    } else {
+        (700, 2400)
+    };
     for seed in [7u64, 12345] {
         let path = temp(&format!("file{seed}"));
         let mut g = Graph::open_opts(
@@ -171,12 +187,17 @@ fn file_backed_out_of_core_matches_in_memory() {
             assert_eq!(mem, ooc, "seed {seed}: {call}");
             // And auto picks the paged tier here, with the same answer.
             let auto = run(&mut g, &call, "auto");
-            assert!(same(&call, &mem, &auto), "seed {seed}: {call} (auto)\n  mem: {mem}\n auto: {auto}");
+            assert!(
+                same(&call, &mem, &auto),
+                "seed {seed}: {call} (auto)\n  mem: {mem}\n auto: {auto}"
+            );
         }
         // Spill files are gone.
         let mut tmp = path.as_os_str().to_os_string();
         tmp.push("-tmp");
-        let left = std::fs::read_dir(PathBuf::from(tmp)).map(|d| d.count()).unwrap_or(0);
+        let left = std::fs::read_dir(PathBuf::from(tmp))
+            .map(|d| d.count())
+            .unwrap_or(0);
         assert_eq!(left, 0, "spill files cleaned up");
         drop(g);
         cleanup(&path);
@@ -197,7 +218,10 @@ fn memory_graph_near_its_limit_spills_instead_of_failing() {
     for call in calls(a, b) {
         let want = run(&mut reference, &call, "mem");
         let got = run(&mut g, &call, "auto");
-        assert!(same(&call, &want, &got), "{call}\n want: {want}\n  got: {got}");
+        assert!(
+            same(&call, &want, &got),
+            "{call}\n want: {want}\n  got: {got}"
+        );
     }
 }
 
@@ -215,10 +239,18 @@ fn write_back_streams_to_every_node() {
     )
     .unwrap();
     build(&mut g, 5, 1500, 4000);
-    query::execute(&mut g, "CALL pagerank(iterations: 10, write: \"pr\", top: 3, tier: \"ooc\")").unwrap();
+    query::execute(
+        &mut g,
+        "CALL pagerank(iterations: 10, write: \"pr\", top: 3, tier: \"ooc\")",
+    )
+    .unwrap();
     let mut m = Graph::memory();
     build(&mut m, 5, 1500, 4000);
-    query::execute(&mut m, "CALL pagerank(iterations: 10, write: \"pr\", tier: \"mem\")").unwrap();
+    query::execute(
+        &mut m,
+        "CALL pagerank(iterations: 10, write: \"pr\", tier: \"mem\")",
+    )
+    .unwrap();
     for id in m.node_ids() {
         assert_eq!(g.node_prop(id, "pr"), m.node_prop(id, "pr"), "node {id}");
     }
@@ -253,8 +285,12 @@ fn write_queries_spool_their_matches_to_disk() {
         "MATCH (a)-[:B]->(b) DETACH DELETE b",
     ];
     for w in writes {
-        let x = query::execute(&mut g, w).map(|r| show(&r)).unwrap_or_else(|e| format!("error: {e}"));
-        let y = query::execute(&mut m, w).map(|r| show(&r)).unwrap_or_else(|e| format!("error: {e}"));
+        let x = query::execute(&mut g, w)
+            .map(|r| show(&r))
+            .unwrap_or_else(|e| format!("error: {e}"));
+        let y = query::execute(&mut m, w)
+            .map(|r| show(&r))
+            .unwrap_or_else(|e| format!("error: {e}"));
         assert_eq!(x, y, "{w}");
         for q in [
             "MATCH (n) RETURN count(n)",
@@ -269,7 +305,9 @@ fn write_queries_spool_their_matches_to_disk() {
     }
     let mut tmp = path.as_os_str().to_os_string();
     tmp.push("-tmp");
-    let left = std::fs::read_dir(PathBuf::from(tmp)).map(|d| d.count()).unwrap_or(0);
+    let left = std::fs::read_dir(PathBuf::from(tmp))
+        .map(|d| d.count())
+        .unwrap_or(0);
     assert_eq!(left, 0, "spool files cleaned up");
     drop(g);
     cleanup(&path);

@@ -141,11 +141,20 @@ fn traced(
     let route = path.split('?').next().unwrap_or("/").to_string();
     let watch = telemetry::Stopwatch::start();
     let (trace_id, span_id, parent_id) = Span::ids(parent);
-    let prev = telemetry::set_context(Some(TraceContext { trace_id, span_id, sampled: true }));
+    let prev = telemetry::set_context(Some(TraceContext {
+        trace_id,
+        span_id,
+        sampled: true,
+    }));
     let out = f();
     telemetry::set_context(prev);
     let start = watch.started_unix_ns().unwrap_or(0);
-    let code: i64 = out.0.split(' ').next().and_then(|c| c.parse().ok()).unwrap_or(0);
+    let code: i64 = out
+        .0
+        .split(' ')
+        .next()
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
     exp.span(Span {
         trace_id,
         span_id,
@@ -157,7 +166,10 @@ fn traced(
         attrs: vec![
             ("http.request.method".into(), method.into()),
             ("http.route".into(), route.into()),
-            ("url.path".into(), path.split('?').next().unwrap_or("/").into()),
+            (
+                "url.path".into(),
+                path.split('?').next().unwrap_or("/").into(),
+            ),
             ("http.response.status_code".into(), Attr::Int(code)),
         ],
         // Per the HTTP conventions, only 5xx marks a server span as failed.

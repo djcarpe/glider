@@ -44,7 +44,11 @@ pub fn bfs(
     let mut seen = id_set();
     let mut q = VecDeque::new();
     seen.insert(from);
-    q.push_back(Visit { node: from, depth: 0, parent: None });
+    q.push_back(Visit {
+        node: from,
+        depth: 0,
+        parent: None,
+    });
     while let Some(v) = q.pop_front() {
         if !f(v) {
             return Some(());
@@ -59,7 +63,11 @@ pub fn bfs(
                     over = true;
                     return false;
                 }
-                q.push_back(Visit { node: a.other, depth: v.depth + 1, parent: Some(v.node) });
+                q.push_back(Visit {
+                    node: a.other,
+                    depth: v.depth + 1,
+                    parent: Some(v.node),
+                });
             }
             true
         });
@@ -81,7 +89,11 @@ pub fn dfs(
     f: &mut dyn FnMut(Visit) -> bool,
 ) -> Option<()> {
     let mut seen = id_set();
-    let mut stack = vec![Visit { node: from, depth: 0, parent: None }];
+    let mut stack = vec![Visit {
+        node: from,
+        depth: 0,
+        parent: None,
+    }];
     let mut next = Vec::new();
     while let Some(v) = stack.pop() {
         if !seen.insert(v.node) {
@@ -99,7 +111,11 @@ pub fn dfs(
         next.clear();
         g.for_each_adj(v.node, dir, etype, |a| {
             if !seen.contains(&a.other) {
-                next.push(Visit { node: a.other, depth: v.depth + 1, parent: Some(v.node) });
+                next.push(Visit {
+                    node: a.other,
+                    depth: v.depth + 1,
+                    parent: Some(v.node),
+                });
             }
         });
         stack.extend(next.drain(..).rev());
@@ -111,7 +127,14 @@ pub fn dfs(
 /// both ends included, or `Some(None)` when there is none. Searches from
 /// both ends, always widening the smaller frontier, so it touches roughly
 /// the square root of what a one-sided search would. `None` past `cap`.
-pub fn shortest_path(g: &Graph, from: u64, to: u64, dir: Dir, etype: Option<u32>, cap: usize) -> Option<Option<Vec<u64>>> {
+pub fn shortest_path(
+    g: &Graph,
+    from: u64,
+    to: u64,
+    dir: Dir,
+    etype: Option<u32>,
+    cap: usize,
+) -> Option<Option<Vec<u64>>> {
     if from == to {
         return Some(Some(vec![from]));
     }

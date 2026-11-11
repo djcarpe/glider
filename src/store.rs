@@ -740,7 +740,11 @@ pub(crate) fn write_image_file(
     path: &Path,
     write: impl FnOnce(&mut BufWriter<File>) -> io::Result<()>,
 ) -> io::Result<u64> {
-    let f = OpenOptions::new().read(true).write(true).create_new(true).open(path)?;
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)?;
     let h = match write_image_into(f, &new_generation(), write) {
         Ok(h) => h,
         Err(e) => {

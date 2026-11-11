@@ -169,7 +169,11 @@ impl<A: Pod, B: Pod, C: Pod> Pod for (A, B, C) {
         self.2.put(&mut b[A::SIZE + B::SIZE..]);
     }
     fn get(b: &[u8]) -> Self {
-        (A::get(b), B::get(&b[A::SIZE..]), C::get(&b[A::SIZE + B::SIZE..]))
+        (
+            A::get(b),
+            B::get(&b[A::SIZE..]),
+            C::get(&b[A::SIZE + B::SIZE..]),
+        )
     }
 }
 
@@ -212,7 +216,12 @@ impl SpillFile {
 
     fn read<T: Pod>(&self, at: u64, n: usize, out: &mut Vec<T>) {
         let mut buf = vec![0u8; n * T::SIZE];
-        read_at(self.file.as_ref().expect("spill file"), &mut buf, at * T::SIZE as u64).expect("spill read");
+        read_at(
+            self.file.as_ref().expect("spill file"),
+            &mut buf,
+            at * T::SIZE as u64,
+        )
+        .expect("spill read");
         for i in 0..n {
             out.push(T::get(&buf[i * T::SIZE..]));
         }
@@ -485,7 +494,12 @@ impl Disk {
         let size = self.block;
         if !self.blocks.contains_key(&b) {
             if self.blocks.len() >= self.cached {
-                let victim = *self.blocks.iter().min_by_key(|(_, v)| v.2).map(|(k, _)| k).unwrap();
+                let victim = *self
+                    .blocks
+                    .iter()
+                    .min_by_key(|(_, v)| v.2)
+                    .map(|(k, _)| k)
+                    .unwrap();
                 let (data, dirty, _) = self.blocks.remove(&victim).unwrap();
                 if dirty {
                     let f = self.file().expect("create algorithm spill file");
@@ -537,7 +551,10 @@ fn read_at(f: &File, buf: &mut [u8], off: u64) -> io::Result<()> {
     #[cfg(not(any(unix, windows)))]
     {
         let _ = (f, buf, off);
-        Err(io::Error::new(io::ErrorKind::Unsupported, "no positional io"))
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no positional io",
+        ))
     }
 }
 
@@ -559,7 +576,10 @@ fn write_at(f: &File, buf: &[u8], off: u64) -> io::Result<()> {
     #[cfg(not(any(unix, windows)))]
     {
         let _ = (f, buf, off);
-        Err(io::Error::new(io::ErrorKind::Unsupported, "no positional io"))
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no positional io",
+        ))
     }
 }
 
@@ -708,7 +728,11 @@ mod tests {
             }
             assert_eq!(s.pop(), None);
         });
-        assert_eq!(std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0), 0, "spill files removed");
+        assert_eq!(
+            std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0),
+            0,
+            "spill files removed"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -740,7 +764,11 @@ mod tests {
             b.set(3, 9);
             assert_eq!(b.to_vec(), vec![7, 7, 7, 9, 7, 7, 7, 7, 7, 7]);
         });
-        assert_eq!(std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0), 0, "spill files removed");
+        assert_eq!(
+            std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0),
+            0,
+            "spill files removed"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

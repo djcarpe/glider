@@ -889,7 +889,10 @@ pub fn otlp_metrics_json(res: &Resource, now_unix_ns: u64, dbs: &[(String, DbMet
             out.push_str("{\"attributes\":");
             attrs_json(attrs, &mut out);
             // OTLP's asInt is a signed 64-bit integer.
-            out.push_str(&format!(",{times},\"asInt\":\"{}\"}}", (*v).min(i64::MAX as u64)));
+            out.push_str(&format!(
+                ",{times},\"asInt\":\"{}\"}}",
+                (*v).min(i64::MAX as u64)
+            ));
         }
         out.push_str("]}}");
     }

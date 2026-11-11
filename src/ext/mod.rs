@@ -90,7 +90,13 @@ pub trait Extension: Send + Sync {
     /// are logged like any other, so recovery and replicas replay them
     /// without running the hook again. Bulk loads do not call it; an
     /// extension rebuilds from a scan instead.
-    fn on_node_write(&self, _g: &mut Graph, _id: u64, _before: Option<&NodeImage>, _after: Option<&NodeImage>) -> Result<()> {
+    fn on_node_write(
+        &self,
+        _g: &mut Graph,
+        _id: u64,
+        _before: Option<&NodeImage>,
+        _after: Option<&NodeImage>,
+    ) -> Result<()> {
         Ok(())
     }
     /// Run once by `CREATE EXTENSION`, in the same transaction that records
@@ -134,7 +140,11 @@ pub fn find(name: &str) -> Option<Arc<dyn Extension>> {
 }
 
 fn names() -> String {
-    available().iter().map(|e| e.name().to_string()).collect::<Vec<_>>().join(", ")
+    available()
+        .iter()
+        .map(|e| e.name().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The extension a qualified name belongs to, checked to be installed in
@@ -144,7 +154,10 @@ pub fn resolve(g: &Graph, qualified: &str) -> Result<(Arc<dyn Extension>, String
         .split_once('.')
         .ok_or_else(|| Error::Msg(format!("'{qualified}' is not an extension member")))?;
     let ext = find(ns).ok_or_else(|| {
-        Error::Msg(format!("no extension named '{ns}' (available: {})", names()))
+        Error::Msg(format!(
+            "no extension named '{ns}' (available: {})",
+            names()
+        ))
     })?;
     if g.extension_version(ext.name()).is_none() {
         return Err(Error::Msg(format!(
@@ -199,7 +212,10 @@ pub fn eval(g: &Graph, qualified: &str, args: &[Arg]) -> Value {
 
 fn help(ext: &dyn Extension) -> QueryResult {
     let mut rows = Vec::new();
-    for (kind, list) in [("procedure", ext.procedures()), ("function", ext.functions())] {
+    for (kind, list) in [
+        ("procedure", ext.procedures()),
+        ("function", ext.functions()),
+    ] {
         for s in list {
             rows.push(vec![
                 Value::Text(kind.into()),
@@ -208,8 +224,16 @@ fn help(ext: &dyn Extension) -> QueryResult {
             ]);
         }
     }
-    let mut r = QueryResult::table(vec!["kind".into(), "signature".into(), "description".into()], rows);
-    r.message = Some(format!("{} {}: {}", ext.name(), ext.version(), ext.summary()));
+    let mut r = QueryResult::table(
+        vec!["kind".into(), "signature".into(), "description".into()],
+        rows,
+    );
+    r.message = Some(format!(
+        "{} {}: {}",
+        ext.name(),
+        ext.version(),
+        ext.summary()
+    ));
     r
 }
 
@@ -218,7 +242,10 @@ pub fn show(g: &Graph) -> QueryResult {
     let installed = g.extensions();
     let mut rows = Vec::new();
     for e in available() {
-        let v = installed.iter().find(|(n, _)| n == e.name()).map(|(_, v)| v.clone());
+        let v = installed
+            .iter()
+            .find(|(n, _)| n == e.name())
+            .map(|(_, v)| v.clone());
         rows.push(vec![
             Value::Text(e.name().into()),
             Value::Text(e.version().into()),
@@ -239,20 +266,34 @@ pub fn show(g: &Graph) -> QueryResult {
         }
     }
     QueryResult::table(
-        vec!["name".into(), "available".into(), "installed".into(), "summary".into()],
+        vec![
+            "name".into(),
+            "available".into(),
+            "installed".into(),
+            "summary".into(),
+        ],
         rows,
     )
 }
 
 pub fn create(g: &mut Graph, name: &str, if_not_exists: bool) -> Result<QueryResult> {
     let ext = find(name).ok_or_else(|| {
-        Error::Msg(format!("no extension named '{name}' (available: {})", names()))
+        Error::Msg(format!(
+            "no extension named '{name}' (available: {})",
+            names()
+        ))
     })?;
     if let Some(v) = g.extension_version(ext.name()) {
         if if_not_exists {
-            return Ok(QueryResult::message(format!("extension {} {v} is already installed", ext.name())));
+            return Ok(QueryResult::message(format!(
+                "extension {} {v} is already installed",
+                ext.name()
+            )));
         }
-        return Err(Error::Msg(format!("extension {} is already installed (version {v})", ext.name())));
+        return Err(Error::Msg(format!(
+            "extension {} is already installed (version {v})",
+            ext.name()
+        )));
     }
     ext.install(g)?;
     g.add_extension(ext.name(), ext.version())?;
@@ -271,7 +312,9 @@ pub fn drop(g: &mut Graph, name: &str, if_exists: bool) -> Result<QueryResult> {
     let name = name.to_ascii_lowercase();
     if g.extension_version(&name).is_none() {
         if if_exists {
-            return Ok(QueryResult::message(format!("extension {name} is not installed")));
+            return Ok(QueryResult::message(format!(
+                "extension {name} is not installed"
+            )));
         }
         return Err(Error::Msg(format!("extension {name} is not installed")));
     }
@@ -287,14 +330,24 @@ pub fn drop(g: &mut Graph, name: &str, if_exists: bool) -> Result<QueryResult> {
 pub fn update(g: &mut Graph, name: &str) -> Result<QueryResult> {
     let ext = find(name).ok_or_else(|| Error::Msg(format!("no extension named '{name}'")))?;
     let Some(from) = g.extension_version(ext.name()) else {
-        return Err(Error::Msg(format!("extension {} is not installed", ext.name())));
+        return Err(Error::Msg(format!(
+            "extension {} is not installed",
+            ext.name()
+        )));
     };
     if from == ext.version() {
-        return Ok(QueryResult::message(format!("extension {} is already at {from}", ext.name())));
+        return Ok(QueryResult::message(format!(
+            "extension {} is already at {from}",
+            ext.name()
+        )));
     }
     ext.upgrade(g, &from)?;
     g.add_extension(ext.name(), ext.version())?;
-    Ok(QueryResult::message(format!("updated {} from {from} to {}", ext.name(), ext.version())))
+    Ok(QueryResult::message(format!(
+        "updated {} from {from} to {}",
+        ext.name(),
+        ext.version()
+    )))
 }
 
 // ------------------------------------------------------------------ arguments
@@ -312,7 +365,10 @@ impl Args {
         self.get(key).and_then(|v| v.as_f64()).unwrap_or(default)
     }
     pub fn usize(&self, key: &str, default: usize) -> usize {
-        self.get(key).and_then(|v| v.as_i64()).map(|v| v.max(0) as usize).unwrap_or(default)
+        self.get(key)
+            .and_then(|v| v.as_i64())
+            .map(|v| v.max(0) as usize)
+            .unwrap_or(default)
     }
     pub fn str(&self, key: &str) -> Option<String> {
         match self.get(key)? {
@@ -348,7 +404,9 @@ impl Args {
         let bad = |v: &Value| Error::Msg(format!("{key}: expected node ids, got {v}"));
         match self.get(key) {
             None | Some(Value::Null) => Ok(Vec::new()),
-            Some(Value::List(items)) => items.iter().map(|v| one(v).ok_or_else(|| bad(v))).collect(),
+            Some(Value::List(items)) => {
+                items.iter().map(|v| one(v).ok_or_else(|| bad(v))).collect()
+            }
             Some(v) => Ok(vec![one(v).ok_or_else(|| bad(v))?]),
         }
     }

@@ -248,7 +248,10 @@ impl Pager {
         if !page::valid_page_size(cfg.page_size) {
             return Err(SError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("page size {} is not a power of two in 512..=32768", cfg.page_size),
+                format!(
+                    "page size {} is not a power of two in 512..=32768",
+                    cfg.page_size
+                ),
             )));
         }
         let f = PosFile::open_rw(path)?;
@@ -305,8 +308,9 @@ impl Pager {
         // The page size is in the superblock; read with the largest page
         // size and trim, since a superblock is at the front of its page.
         let mut probe = vec![0u8; page::MIN_PAGE];
-        f.read_exact_at(&mut probe, 0)
-            .map_err(|_| SError::Corrupt("file is too short to be a paged glider database".into()))?;
+        f.read_exact_at(&mut probe, 0).map_err(|_| {
+            SError::Corrupt("file is too short to be a paged glider database".into())
+        })?;
         if &probe[32..40] != MAGIC {
             return corrupt("not a paged glider database (bad magic)");
         }
@@ -322,7 +326,10 @@ impl Pager {
             if page::check(&b, slot).unwrap_or(false)
                 && page::kind(&b) == page::KIND_SUPER
                 && &b[32..40] == MAGIC
-                && best.as_ref().map(|(_, x)| sb_epoch(&b) > sb_epoch(x)).unwrap_or(true)
+                && best
+                    .as_ref()
+                    .map(|(_, x)| sb_epoch(&b) > sb_epoch(x))
+                    .unwrap_or(true)
             {
                 best = Some((slot, b));
             }
@@ -447,7 +454,9 @@ impl Pager {
         };
         let hw = page::get_u64(sb, 80);
         if hw > page::get_u64(sb, 104) || (hw as usize) * ps > bytes.len() {
-            return corrupt("the database spans segment files or is truncated; open it from its path");
+            return corrupt(
+                "the database spans segment files or is truncated; open it from its path",
+            );
         }
         let mut roots = [0u64; ROOTS];
         let mut meta = [0u64; METAS];
@@ -477,7 +486,8 @@ impl Pager {
             }
             next = page::get_u64(pg, 32);
         }
-        let skip: std::collections::HashSet<u64> = free.iter().chain(chain.iter()).copied().collect();
+        let skip: std::collections::HashSet<u64> =
+            free.iter().chain(chain.iter()).copied().collect();
         let mut pages: Vec<Option<Page>> = vec![None; hw as usize];
         let mut used = 0u64;
         for pno in 2..hw {
@@ -669,9 +679,8 @@ impl Pager {
     pub fn stats(&self) -> Stats {
         let g = self.lock();
         let mut s = g.stats;
-        s.allocated_pages = g
-            .hw
-            .saturating_sub(2 + (g.free.len() + g.pending.len() + g.held.len()) as u64);
+        s.allocated_pages =
+            g.hw.saturating_sub(2 + (g.free.len() + g.pending.len() + g.held.len()) as u64);
         s.resident_pages = match &g.store {
             Store::Mem(m) => m.used / g.ps as u64,
             Store::File(f) => f.cache.frames.len() as u64,
@@ -778,7 +787,10 @@ pub fn read_superblock(path: &Path) -> SResult<SuperInfo> {
         if page::check(&b, slot).unwrap_or(false)
             && page::kind(&b) == page::KIND_SUPER
             && &b[32..40] == MAGIC
-            && best.as_ref().map(|(_, x)| sb_epoch(&b) > sb_epoch(x)).unwrap_or(true)
+            && best
+                .as_ref()
+                .map(|(_, x)| sb_epoch(&b) > sb_epoch(x))
+                .unwrap_or(true)
         {
             best = Some((slot, b));
         }
@@ -1151,7 +1163,12 @@ impl Inner {
         // already free (not pending, not old chain).
         let reusable_now: std::collections::HashSet<u64> = {
             let mut s: std::collections::HashSet<u64> = list.iter().copied().collect();
-            for p in self.pending.iter().chain(self.chain.iter()).chain(self.held.iter()) {
+            for p in self
+                .pending
+                .iter()
+                .chain(self.chain.iter())
+                .chain(self.held.iter())
+            {
                 s.remove(p);
             }
             s
