@@ -91,6 +91,8 @@ const PROCEDURES = [
   ['neighbors', ['from', 'dir', 'type'], 'direct neighbours of a node', 'neighbors(from: ${1})'],
   ['subgraph', ['from', 'depth', 'dir', 'type'], 'everything within depth hops, drawn', 'subgraph(from: ${1}, depth: 2)'],
   ['toposort', ['type', 'top'], 'topological order (DAGs only)', 'toposort(top: ${50})'],
+  ['levels', ['type', 'top', 'write'], 'topological levels: what can run together (DAGs only)', 'levels(top: ${50})'],
+  ['reduce', ['type', 'top'], 'edges a longer path already implies (DAGs only)', 'reduce()$0'],
   ['cycle', ['type'], 'find a cycle, if there is one', 'cycle()$0'],
   ['mst', ['type', 'weight'], 'minimum spanning tree', 'mst(weight: "${cost}")'],
 ]

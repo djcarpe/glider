@@ -1568,6 +1568,7 @@ algorithms (CALL name(arg: value, ...))
   sssp(from, dir, type, weight, top)               bfs(from, depth, dir, type, top)
   dfs(from, depth, dir, type, top)                 neighbors(from, dir, type)
   toposort(type, top)                              cycle(type)
+  levels(type, top, write)                         reduce(type, top)
   mst(type, weight)                                subgraph(from, depth, dir, type)
 
 common args:  dir: "out" | "in" | "both"   type: "KNOWS"   weight: "cost"
@@ -3730,6 +3731,76 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                     ))
                 }
             }
+        }
+        "levels" | "layers" => {
+            let p = proj!(dir, weight.as_deref());
+            let Some((mut level, count)) = algo::topological_levels(&p) else {
+                return Err(Error::Msg(
+                    "graph has a cycle: no topological levels".into(),
+                ));
+            };
+            let mut ids = p.into_ids();
+            let write = a.str("write");
+            let top = a.top();
+            // Shallowest first, then lower id: the order the levels run in.
+            let mut keep: Vec<(u64, u64)> = Vec::new();
+            for i in 0..ids.len() {
+                let (id, lv) = (ids.get(i), level.get(i));
+                if let Some(prop) = &write {
+                    g.set_node_prop(id, prop, Value::Int(lv as i64))?;
+                }
+                if top == 0 {
+                    continue;
+                }
+                keep.push((lv, id));
+                if top != usize::MAX && keep.len() >= top.saturating_mul(2).max(1024) {
+                    keep.sort_unstable();
+                    keep.truncate(top);
+                }
+            }
+            keep.sort_unstable();
+            keep.truncate(top);
+            let rows = keep
+                .into_iter()
+                .map(|(lv, id)| {
+                    vec![
+                        Value::Int(id as i64),
+                        label_of(g, id),
+                        Value::Int(lv as i64),
+                    ]
+                })
+                .collect();
+            let mut r = QueryResult::table(vec!["id".into(), "node".into(), "level".into()], rows);
+            r.message = Some(format!("{} levels", count));
+            Ok(r)
+        }
+        "reduce" | "reduction" => {
+            let p = proj!(dir, weight.as_deref());
+            let Some(edges) = algo::transitive_reduction(&p) else {
+                return Err(Error::Msg(
+                    "graph has a cycle: no transitive reduction".into(),
+                ));
+            };
+            drop(p);
+            let rows: Vec<Vec<Value>> = edges
+                .iter()
+                .take(a.top())
+                .map(|eid| {
+                    let e = g.edge(*eid);
+                    vec![
+                        Value::Int(*eid as i64),
+                        Value::Int(e.as_ref().map(|e| e.from as i64).unwrap_or(0)),
+                        Value::Int(e.as_ref().map(|e| e.to as i64).unwrap_or(0)),
+                        Value::Text(g.edge_type_name(*eid).unwrap_or("").to_string()),
+                    ]
+                })
+                .collect();
+            let mut r = QueryResult::table(
+                vec!["edge".into(), "from".into(), "to".into(), "type".into()],
+                rows,
+            );
+            r.message = Some(format!("{} edges are implied by longer paths", edges.len()));
+            Ok(r)
         }
         "cycle" | "cycles" => {
             let p = proj!(dir, weight.as_deref());

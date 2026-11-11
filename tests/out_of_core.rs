@@ -90,6 +90,8 @@ fn calls(first: u64, second: u64) -> Vec<String> {
         "scc()",
         "labelprop()",
         "toposort()",
+        "levels()",
+        "reduce()",
         "cycle()",
         "mst(weight: \"w\")",
         "mst()",

@@ -502,6 +502,59 @@ fn mst_picks_the_cheap_edges() {
 }
 
 #[test]
+fn levels_and_reduction_of_a_dag() {
+    // 1 -> 2 -> 4, 1 -> 3 -> 4, 4 -> 5, the shortcuts 1 -> 4 and 2 -> 5, a
+    // parallel 1 -> 2, and 6 on its own.
+    let mut g = Graph::memory();
+    for _ in 0..6 {
+        g.add_node(&["Call".into()], vec![]).unwrap();
+    }
+    let mut edge = |f, t| g.add_edge(f, t, "AFTER", vec![]).unwrap();
+    for (f, t) in [(1, 2), (2, 4), (1, 3), (3, 4), (4, 5)] {
+        edge(f, t);
+    }
+    let shortcut = edge(1, 4);
+    let skip = edge(2, 5);
+    let parallel = edge(1, 2);
+
+    let r = q(&mut g, r#"CALL levels(write: "level")"#);
+    let got: Vec<(i64, i64)> = r
+        .rows
+        .iter()
+        .map(|row| (row[0].as_i64().unwrap(), row[2].as_i64().unwrap()))
+        .collect();
+    assert_eq!(got, [(1, 0), (6, 0), (2, 1), (3, 1), (4, 2), (5, 3)]);
+    assert_eq!(r.message.as_deref(), Some("4 levels"));
+    assert_eq!(g.node_prop(5, "level").unwrap().as_i64(), Some(3));
+
+    let r = q(&mut g, "CALL reduce()");
+    let mut redundant: Vec<u64> = r
+        .rows
+        .iter()
+        .map(|row| row[0].as_i64().unwrap() as u64)
+        .collect();
+    redundant.sort_unstable();
+    assert_eq!(redundant, [shortcut, skip, parallel]);
+
+    // Dropping them changes no level.
+    for eid in redundant {
+        g.delete_edge(eid).unwrap();
+    }
+    assert!(q(&mut g, "CALL reduce()").rows.is_empty());
+    let r = q(&mut g, "CALL levels()");
+    assert_eq!(r.rows.last().unwrap()[2].as_i64(), Some(3));
+
+    g.add_edge(5, 1, "AFTER", vec![]).unwrap();
+    for call in ["CALL levels()", "CALL reduce()"] {
+        let err = query::execute(&mut g, call)
+            .err()
+            .expect("a cycle is an error")
+            .to_string();
+        assert!(err.contains("cycle"), "{call}: {err}");
+    }
+}
+
+#[test]
 fn write_back_stores_scores_as_properties() {
     let mut g = Graph::memory();
     q(&mut g, r#"CREATE (:P {name:"a"})-[:R]->(:P {name:"b"})"#);

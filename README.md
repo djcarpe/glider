@@ -262,6 +262,8 @@ Details and the full API: `ts/README.md`.
 | `shortestpath`, `sssp` | BFS when unweighted, Dijkstra when given `weight:` |
 | `bfs`, `dfs`, `subgraph`, `neighbors` | traversal with depth limits |
 | `toposort`, `cycle` | topological order, cycle witness |
+| `levels` | topological levels of a DAG: the nodes of one level do not depend on each other |
+| `reduce` | transitive reduction of a DAG: the edges a longer path already implies |
 | `mst` | Kruskal minimum spanning forest |
 
 Common arguments: `dir: "out"|"in"|"both"`, `type: "KNOWS"` to restrict to one
