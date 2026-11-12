@@ -19,6 +19,7 @@
 
 pub mod algo;
 pub mod api;
+pub mod budget;
 pub mod codec;
 pub mod ext;
 pub mod ffi;

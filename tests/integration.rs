@@ -269,6 +269,37 @@ fn query_create_match_and_aggregate() {
     assert_eq!(r.rows[0][0].to_string(), "Bob");
     assert_eq!(r.rows[1][0].to_string(), "Ada");
 
+    // A property of a returned node sorts without being returned.
+    let r = q(
+        &mut g,
+        r#"MATCH (p:Person) WHERE p.age > 30 RETURN p ORDER BY p.name DESC LIMIT 1"#,
+    );
+    assert_eq!(r.columns, vec!["p".to_string()]);
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.rows[0].len(), 1);
+    assert!(query::execute(&mut g, "MATCH (p:Person) RETURN DISTINCT p ORDER BY p.name").is_err());
+
+    // ORDER BY a property that is not returned: sorted on, then dropped
+    let r = q(
+        &mut g,
+        r#"MATCH (p:Person) RETURN p.name ORDER BY p.age DESC LIMIT 2"#,
+    );
+    assert_eq!(r.columns, vec!["p.name".to_string()]);
+    assert_eq!(
+        r.rows,
+        vec![vec![Value::from("Bob")], vec![Value::from("Ada")]]
+    );
+    let r = q(&mut g, r#"MATCH (p:Person) RETURN p ORDER BY p.age"#);
+    assert_eq!(r.rows.len(), 3);
+    assert!(r.rows.iter().all(|row| row.len() == 1));
+    assert!(r.rows[0][0].to_string().contains("Cy"));
+    assert!(query::execute(
+        &mut g,
+        r#"MATCH (p:Person) RETURN DISTINCT p.name ORDER BY p.age"#
+    )
+    .is_err());
+    assert!(query::execute(&mut g, r#"MATCH (p:Person) RETURN p.name ORDER BY x.age"#).is_err());
+
     let r = q(
         &mut g,
         r#"MATCH (p:Person) RETURN avg(p.age) AS a, max(p.age) AS m"#,
