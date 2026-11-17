@@ -1327,8 +1327,8 @@ pub fn edge_value(g: &Graph, id: u64) -> Value {
 /// `max_millis` and `max_steps` bound the statement itself, not its result:
 /// matching stops with an error, and the graph is released, once the
 /// statement has run that long or taken that many matching steps (a step is
-/// one binding tried: a candidate walked from, a relationship followed, a
-/// combination of pattern parts). `max_millis` needs a clock and is ignored
+/// one candidate checked, one edge scanned, one neighbour looked at or one
+/// combination of pattern parts tried, whether it matches or not). `max_millis` needs a clock and is ignored
 /// on wasm32; `max_steps` works everywhere.
 #[derive(Clone, Copy, Debug)]
 pub struct QueryLimits {
@@ -1389,7 +1389,9 @@ pub(crate) fn meter(limits: &QueryLimits) -> MeterGuard {
     MeterGuard(METER.with(|m| m.replace(next)))
 }
 /// One matching step of the running statement: an error once its budget is
-/// spent. The clock is read every 1,024 steps.
+/// spent. A step is one candidate checked, one edge scanned or one
+/// neighbour looked at, matched or not, so a scan that rejects everything
+/// counts too. The clock is read every 256 steps (a few microseconds of work).
 #[inline]
 pub(crate) fn tick() -> Result<()> {
     METER.with(|cell| {
@@ -1405,7 +1407,7 @@ pub(crate) fn tick() -> Result<()> {
         m.steps_left -= 1;
         m.ticks = m.ticks.wrapping_add(1);
         #[cfg(not(target_arch = "wasm32"))]
-        if m.ticks % 1024 == 0 {
+        if m.ticks % 256 == 0 {
             if let Some(d) = m.deadline {
                 if std::time::Instant::now() >= d {
                     cell.set(Some(m));
@@ -2485,6 +2487,8 @@ fn match_chain_filtered(
 
     let mut go = true;
     for_each_candidate(g, pat, &binds, &pins, prime, &mut |id| {
+        // every candidate checked is a step, matched or not
+        tick()?;
         if !already && !node_matches(g, pat, id, &binds) {
             return Ok(true);
         }
@@ -2533,6 +2537,11 @@ fn match_from_edges(
     let (lp, rp) = (&chain.nodes[ri], &chain.nodes[ri + 1]);
     let mut result = Ok(true);
     g.scan_type_edges(t, &mut |e| {
+        // every edge scanned is a step, matched or not
+        if let Err(err) = tick() {
+            result = Err(err);
+            return false;
+        }
         if !edge_props_match(g, rel, e.id, &binds) {
             return true;
         }
@@ -2739,6 +2748,7 @@ fn walk(
             for node in &frontier {
                 tick()?;
                 for adj in g.neighbors(*node, dir, only) {
+                    tick()?;
                     if !type_ids.is_empty() && !type_ids.contains(&adj.etype) {
                         continue;
                     }
@@ -2786,6 +2796,7 @@ fn walk(
         None
     };
     for adj in g.neighbors(current, dir, only) {
+        tick()?;
         if !type_ids.is_empty() && !type_ids.contains(&adj.etype) {
             continue;
         }

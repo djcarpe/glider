@@ -103,3 +103,91 @@ fn a_statement_within_its_budget_answers() {
     )
     .is_ok());
 }
+
+// Candidates rejected before any binding still count: for each of 30,000
+// `a`, a label scan of 30,000 `b` that all fail the property test, 900
+// million checks with no match ever made.
+fn functions(n: u64) -> Graph {
+    let mut g = Graph::memory();
+    g.autocommit = false;
+    for i in 0..n {
+        g.add_node(
+            &["Function".into()],
+            vec![("name".into(), Value::Text(format!("fn_{i}")))],
+        )
+        .unwrap();
+    }
+    g.commit().unwrap();
+    g.autocommit = true;
+    g
+}
+
+const REJECTING: &str = "MATCH (a:Function), (b:Function {name:'zzz'}) RETURN count(*)";
+
+#[test]
+fn rejected_candidates_count_against_the_time_budget() {
+    let mut g = functions(30_000);
+    let t = Instant::now();
+    let err = query::execute_capped(&mut g, REJECTING, &[], budget(Some(1_000), None))
+        .err()
+        .expect("stopped");
+    assert!(err.to_string().contains("time budget of 1000 ms"), "{err}");
+    assert!(
+        t.elapsed() < Duration::from_millis(1_300),
+        "{:?}",
+        t.elapsed()
+    );
+    let t = Instant::now();
+    let err = Cursor::open(&mut g, REJECTING, &[], budget(Some(1_000), None))
+        .err()
+        .expect("stopped");
+    assert!(err.to_string().contains("time budget"), "{err}");
+    assert!(
+        t.elapsed() < Duration::from_millis(1_300),
+        "{:?}",
+        t.elapsed()
+    );
+}
+
+#[test]
+fn rejected_candidates_count_against_the_step_budget() {
+    let mut g = functions(30_000);
+    let t = Instant::now();
+    let err = query::execute_capped(&mut g, REJECTING, &[], budget(None, Some(100_000)))
+        .err()
+        .expect("stopped");
+    assert!(err.to_string().contains("100000 matching steps"), "{err}");
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+}
+
+#[test]
+fn edges_scanned_and_neighbours_rejected_count_too() {
+    // a typed scan of edges whose properties never match, and a walk from
+    // every node whose neighbours never match: no binding is ever made
+    let mut g = functions(2_000);
+    for i in 0..2_000u64 {
+        query::execute(
+            &mut g,
+            &format!("MATCH (a:Function {{name: 'fn_{i}'}}), (b:Function {{name: 'fn_{}'}}) CREATE (a)-[:CALLS {{w: 1}}]->(b)", (i + 1) % 2_000),
+        )
+        .unwrap();
+    }
+    let err = query::execute_capped(
+        &mut g,
+        "MATCH (a:Function), (x)-[:CALLS {w: 2}]->(y) RETURN count(*)",
+        &[],
+        budget(None, Some(50_000)),
+    )
+    .err()
+    .expect("stopped");
+    assert!(err.to_string().contains("matching steps"), "{err}");
+    let err = query::execute_capped(
+        &mut g,
+        "MATCH (a:Function), (b:Function)-->(c {name: 'zzz'}) RETURN count(*)",
+        &[],
+        budget(None, Some(50_000)),
+    )
+    .err()
+    .expect("stopped");
+    assert!(err.to_string().contains("matching steps"), "{err}");
+}
