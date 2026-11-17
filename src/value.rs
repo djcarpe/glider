@@ -131,7 +131,7 @@ impl Value {
             Value::Int(i) => out.push_str(&i.to_string()),
             Value::Float(f) => {
                 if f.is_finite() {
-                    out.push_str(&format!("{}", f));
+                    write_float(*f, out);
                 } else {
                     out.push_str("null");
                 }
@@ -208,6 +208,16 @@ impl From<&str> for Value {
 impl From<String> for Value {
     fn from(v: String) -> Self {
         Value::Text(v)
+    }
+}
+
+/// A float as JSON that reads back as a float: a whole one keeps its `.0`
+/// (`3.0`, not `3`), or it would come back an integer.
+fn write_float(f: f64, out: &mut String) {
+    let text = f.to_string();
+    out.push_str(&text);
+    if !text.contains(['.', 'e', 'E']) {
+        out.push_str(".0");
     }
 }
 
@@ -298,7 +308,8 @@ fn write_json(j: &Json, out: &mut String) {
         Json::Null => out.push_str("null"),
         Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Json::Int(i) => out.push_str(&i.to_string()),
-        Json::Float(f) => out.push_str(&f.to_string()),
+        Json::Float(f) if f.is_finite() => write_float(*f, out),
+        Json::Float(_) => out.push_str("null"),
         Json::Text(t) => write_json_string(t, out),
         Json::Array(a) => {
             out.push('[');
