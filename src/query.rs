@@ -1323,18 +1323,102 @@ pub fn edge_value(g: &Graph, id: u64) -> Value {
 // ------------------------------------------------------------------- execute
 
 /// Caps on one materialized response. Cursor caps apply to each batch.
+///
+/// `max_millis` and `max_steps` bound the statement itself, not its result:
+/// matching stops with an error, and the graph is released, once the
+/// statement has run that long or taken that many matching steps (a step is
+/// one binding tried: a candidate walked from, a relationship followed, a
+/// combination of pattern parts). `max_millis` needs a clock and is ignored
+/// on wasm32; `max_steps` works everywhere.
 #[derive(Clone, Copy, Debug)]
 pub struct QueryLimits {
     pub max_rows: usize,
     pub max_bytes: u64,
+    pub max_millis: Option<u64>,
+    pub max_steps: Option<u64>,
 }
 impl Default for QueryLimits {
     fn default() -> Self {
         Self {
             max_rows: 10_000,
             max_bytes: 8 << 20,
+            max_millis: None,
+            max_steps: None,
         }
     }
+}
+
+/// The running statement's budget: when it must stop, and how many matching
+/// steps it has left. Set around a statement by [`execute_capped`] and
+/// [`Cursor::open`]; checked by [`tick`] in the matching loops.
+#[derive(Clone, Copy, Debug)]
+struct Meter {
+    #[cfg(not(target_arch = "wasm32"))]
+    deadline: Option<std::time::Instant>,
+    #[cfg(not(target_arch = "wasm32"))]
+    millis: u64,
+    steps_left: u64,
+    steps: u64,
+    ticks: u32,
+}
+thread_local! { static METER: std::cell::Cell<Option<Meter>> = const { std::cell::Cell::new(None) }; }
+pub(crate) struct MeterGuard(Option<Meter>);
+impl Drop for MeterGuard {
+    fn drop(&mut self) {
+        METER.with(|m| m.set(self.0));
+    }
+}
+/// Starts metering the statement about to run on this thread, if `limits`
+/// bound it; the guard puts the previous meter back.
+pub(crate) fn meter(limits: &QueryLimits) -> MeterGuard {
+    let next = if limits.max_millis.is_none() && limits.max_steps.is_none() {
+        None
+    } else {
+        Some(Meter {
+            #[cfg(not(target_arch = "wasm32"))]
+            deadline: limits
+                .max_millis
+                .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms)),
+            #[cfg(not(target_arch = "wasm32"))]
+            millis: limits.max_millis.unwrap_or(0),
+            steps_left: limits.max_steps.unwrap_or(u64::MAX),
+            steps: limits.max_steps.unwrap_or(0),
+            ticks: 0,
+        })
+    };
+    MeterGuard(METER.with(|m| m.replace(next)))
+}
+/// One matching step of the running statement: an error once its budget is
+/// spent. The clock is read every 1,024 steps.
+#[inline]
+pub(crate) fn tick() -> Result<()> {
+    METER.with(|cell| {
+        let Some(mut m) = cell.get() else {
+            return Ok(());
+        };
+        if m.steps_left == 0 {
+            return Err(Error::Msg(format!(
+                "statement stopped: it took more than its budget of {} matching steps",
+                m.steps
+            )));
+        }
+        m.steps_left -= 1;
+        m.ticks = m.ticks.wrapping_add(1);
+        #[cfg(not(target_arch = "wasm32"))]
+        if m.ticks % 1024 == 0 {
+            if let Some(d) = m.deadline {
+                if std::time::Instant::now() >= d {
+                    cell.set(Some(m));
+                    return Err(Error::Msg(format!(
+                        "statement stopped: it ran past its time budget of {} ms",
+                        m.millis
+                    )));
+                }
+            }
+        }
+        cell.set(Some(m));
+        Ok(())
+    })
 }
 thread_local! { static LIMITS: std::cell::Cell<Option<QueryLimits>> = const { std::cell::Cell::new(None) }; }
 struct LimitsGuard(Option<QueryLimits>);
@@ -1361,6 +1445,7 @@ pub fn execute_capped(
         return Err(budget_error());
     }
     let _guard = LimitsGuard(LIMITS.with(|l| l.replace(Some(limits))));
+    let _meter = meter(&limits);
     let result = execute_with(g, src, params)?;
     if result.rows.len() > limits.max_rows
         || result.rows.iter().map(|r| row_bytes(r)).sum::<u64>()
@@ -2361,6 +2446,7 @@ fn match_all(
     filter: Option<&Expr>,
     sink: &mut Sink<'_>,
 ) -> Result<bool> {
+    tick()?;
     if i == patterns.len() {
         if let Some(f) = filter {
             if !eval(g, f, &binds).truthy() {
@@ -2613,6 +2699,7 @@ fn walk(
     used: &[u64],
     out: &mut Sink<'_>,
 ) -> Result<bool> {
+    tick()?;
     if i >= steps.len() {
         return out(binds);
     }
@@ -2650,6 +2737,7 @@ fn walk(
                 None
             };
             for node in &frontier {
+                tick()?;
                 for adj in g.neighbors(*node, dir, only) {
                     if !type_ids.is_empty() && !type_ids.contains(&adj.etype) {
                         continue;
