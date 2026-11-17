@@ -191,3 +191,25 @@ fn edges_scanned_and_neighbours_rejected_count_too() {
     .expect("stopped");
     assert!(err.to_string().contains("matching steps"), "{err}");
 }
+
+// Not a budget: a cursor spools nodes as JSON, and a whole float must come
+// back a float (it came back 3 for 3.0).
+#[test]
+fn whole_floats_survive_the_cursor_spool() {
+    let mut g = Graph::memory();
+    query::execute(&mut g, "CREATE (:Bar {length: 3.0, w: 2.5, n: 4})").unwrap();
+    let mut c = Cursor::open(
+        &mut g,
+        "MATCH (b:Bar) RETURN b",
+        &[],
+        QueryLimits::default(),
+    )
+    .unwrap();
+    let (batch, _) = c.next_batch().unwrap();
+    let Value::Text(json) = &batch.rows[0][0] else {
+        panic!("{:?}", batch.rows[0][0])
+    };
+    assert!(json.contains("\"length\":3.0"), "{json}");
+    assert!(json.contains("\"n\":4"), "{json}");
+    assert!(json.contains("\"w\":2.5"), "{json}");
+}
