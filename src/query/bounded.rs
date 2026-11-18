@@ -70,8 +70,14 @@ impl Cursor {
             if charge > limits.max_bytes {
                 return Err(budget_error());
             }
+            check_row(&row)?;
+            // The row's values one after another, not as one list: a list
+            // around them would be a level deeper than any value may be.
             let mut bytes = Vec::new();
-            codec::put_value(&mut bytes, &Value::List(row));
+            codec::put_varint(&mut bytes, row.len() as u64);
+            for v in &row {
+                codec::put_value(&mut bytes, v);
+            }
             writer.write_all(&charge.to_le_bytes())?;
             writer.write_all(&(bytes.len() as u64).to_le_bytes())?;
             writer.write_all(&bytes)?;
@@ -98,7 +104,7 @@ impl Cursor {
                 let mut projection = Projection::new(kind, false, order, 0, None, g.query_memory());
                 let mut seen = 0usize;
                 let mut taken = 0usize;
-                match_all(g, patterns, 0, Vec::new(), filter.as_ref(), &mut |binds| {
+                match_all(g, patterns, filter.as_ref(), &mut |binds| {
                     projection.resolve(Some(&binds))?;
                     if limit.map(|n| taken >= n).unwrap_or(false) {
                         return Ok(false);
@@ -175,9 +181,15 @@ impl Cursor {
             }
             let mut bytes = vec![0; len as usize];
             self.reader.read_exact(&mut bytes)?;
-            let Value::List(row) = codec::Reader::new(&bytes).value().map_err(Error::Msg)? else {
+            let mut r = codec::Reader::new(&bytes);
+            let n = r.varint().map_err(Error::Msg)? as usize;
+            if n > bytes.len() {
                 return Err(Error::Msg("invalid cursor spool".into()));
-            };
+            }
+            let mut row = Vec::with_capacity(n);
+            for _ in 0..n {
+                row.push(r.value().map_err(Error::Msg)?);
+            }
             rows.push(row);
             self.remaining -= 1;
             used += charge;
@@ -293,8 +305,8 @@ pub fn import_jsonl_from(
             let props = match j.get("props") {
                 Some(crate::value::Json::Object(fields)) => fields
                     .iter()
-                    .map(|(k, v)| (k.clone(), v.to_value()))
-                    .collect(),
+                    .map(|(k, v)| Ok((k.clone(), v.try_value().map_err(Error::Msg)?)))
+                    .collect::<Result<Vec<_>>>()?,
                 _ => Vec::new(),
             };
             let kind = j.get("type").and_then(|v| v.as_str()).unwrap_or("node");

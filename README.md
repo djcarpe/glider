@@ -148,6 +148,9 @@ STATS   SCHEMA   COMPACT   CLEAR   BEGIN   COMMIT   ROLLBACK   HELP
 - **aggregates** `count sum avg min max collect`, with implicit grouping on the
   non-aggregate return items, as Cypher does.
 
+Expressions nest at most 64 levels deep (see [Limits](#limits)); chains of
+`AND`, `OR`, `+` or `*` and lists of any length are flat, not deep.
+
 Each statement is a transaction: it commits whole, or on an error leaves no
 trace. `BEGIN` groups the statements that follow into one transaction;
 `COMMIT` makes it durable, `ROLLBACK` discards it. `COMPACT` checkpoints.
@@ -425,6 +428,53 @@ Honest limits, so you find them here rather than in production:
   Deliberate, to avoid combinatorial blowup.
 - **`betweenness` is O(n·m).** Use `samples:` above a few thousand nodes.
 - **No authentication on the HTTP server.** Bind it to localhost.
+- **Nesting is limited to 64 levels.** See below.
+
+### Limits
+
+Nested structures are walked by recursion, and an embedded database does
+not choose its thread's stack: a BEAM dirty scheduler, an iOS secondary
+thread and wasm give it a few hundred kilobytes. So nesting has one limit,
+`glider::value::MAX_DEPTH`, the same in the parser, the evaluator, the
+codecs and the bindings. Past it, input is refused with an error that names
+the construct and the limit (`expression nested deeper than 64 levels`);
+nothing is changed and the handle answers the next statement. Structures
+that are long rather than deep have no depth limit at all.
+
+| | limit |
+|---|---|
+| expression nesting: parentheses, list literals, unary `-`, `NOT`, subscripts and slices, function calls, `IN` lists, in any mix | 64 levels |
+| lists within lists, in any value: a literal, a parameter, a stored property, an imported or decoded one, a result | 64 levels |
+| `EXPLAIN EXPLAIN ...` | 64 |
+| a JSON document (an import line, HTTP or C ABI parameters) | 200 levels, its lists 64 |
+| `AND`/`OR` conditions, `+ -` and `* /` terms, list and `IN` items, `SET` items, comma-separated patterns, relationships in a pattern | none: size and memory |
+
+A list past the limit found in a page or a log record is damage, reported
+as any other undecodable bytes are. A statement that would build a deeper
+list than it can store (`RETURN [n.list]`) is refused rather than answered.
+The first four comma-separated patterns are matched as they always were;
+each one after them is matched into a spool per binding, so a `LIMIT` that
+stops early may have matched the rest of one pattern's spool for nothing.
+
+The deepest input each limit accepts, run on the smallest thread stack it
+completes on (`tests/depth.rs` runs everything on 256 KiB, in debug):
+
+| input, at the limit | debug | release |
+|---|---|---|
+| a trivial statement, for scale (`MATCH (n) RETURN n.x`) | 55 KiB | ≤ 16 KiB |
+| 64 parentheses; `EXPLAIN` × 64; 10,000 `AND` conditions or `+` terms | 55 KiB | ≤ 16 KiB |
+| a list 64 deep: literal, parameter, JSON parameter, import line | 86–89 KiB | ≤ 16 KiB |
+| the same stored, read back, read through a cursor | 59–76 KiB | ≤ 16 KiB |
+| `NOT` × 64 | 78 KiB | ≤ 16 KiB |
+| subscripts, slices, unary `-`, `(1 + (1 + ...))` 64 deep | 92–97 KiB | ≤ 25 KiB |
+| calls nested 64 deep, in `RETURN` or `ORDER BY` | 97 KiB | 28 KiB |
+| `CALL` with an argument 64 deep | 114 KiB | 28 KiB |
+| a pattern of 300 relationships; 1,000 comma-separated patterns | 57 KiB; 79 KiB | ≤ 16 KiB; 26 KiB |
+| the worst found: 64-deep expressions in `WHERE`, `RETURN`, `ORDER BY` and two patterns' properties, over five patterns | 131 KiB | 39 KiB |
+
+A probe binary-searched the thread stack each needs, in child processes (to
+1 KiB; it starts at 16 KiB). The worst case leaves 125 KiB of a 256 KiB
+stack in debug, 217 KiB optimised.
 
 ## Tests
 

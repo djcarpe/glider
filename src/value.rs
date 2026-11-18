@@ -1,7 +1,83 @@
 //! The property value type, plus a small self-contained JSON codec.
+//!
+//! A list may hold lists, and a statement, a parameter, an import or a
+//! damaged page can say how deeply. Everything that walks a value — compare,
+//! clone, drop, render, encode, decode, the BEAM binding — follows that
+//! nesting down by recursion, so the depth is bounded once for all of them:
+//! [`MAX_DEPTH`] levels, checked wherever values come in and refused past
+//! it, never truncated. The readers that see input first (the JSON parser
+//! here, the record codec) hold what they are still filling on an explicit
+//! stack rather than recursing, so a document nested a million deep costs
+//! them a vector, not the thread's stack, and they say no at the limit.
 
 use std::cmp::Ordering;
 use std::fmt;
+
+/// How deeply anything glider reads may nest: lists within lists, and in a
+/// statement, expressions within expressions (`EXPLAIN` within `EXPLAIN`
+/// too), and the hops of one pattern chain. One limit, the same in the
+/// parser, the evaluator, the codecs and the bindings, so a value that one
+/// of them accepts the others can carry.
+///
+/// It exists because each of those walks a nested structure by recursion,
+/// and a thread's stack is not something an embedded database gets to
+/// choose: a BEAM dirty scheduler, an iOS secondary thread and wasm all
+/// give it a few hundred kilobytes. Sixty-four levels of the deepest of
+/// them fit in a small part of that even in a debug build. Structures that
+/// are long rather than deep — `AND` chains, long lists, many patterns —
+/// do not nest and are bounded by size and memory instead.
+pub const MAX_DEPTH: usize = 64;
+
+/// How deeply a JSON document may nest. Deeper than [`MAX_DEPTH`] because a
+/// document wraps its values: an export line holds a 64-deep list two
+/// objects down, and nested objects become text, which has no depth. The
+/// parser is iterative, so this bounds only what the parsed tree costs to
+/// walk (and drop) afterwards.
+pub const MAX_JSON_DEPTH: usize = 200;
+
+/// The error for something nested past [`MAX_DEPTH`], naming the construct:
+/// `list nested deeper than 64 levels`.
+pub fn too_deep(what: &str) -> String {
+    format!("{what} nested deeper than {MAX_DEPTH} levels")
+}
+
+/// How many lists deep `v` is: 0 for a scalar, 1 for `[1]`. Iterative, so
+/// it can be asked of a value however deep. Stops counting past
+/// [`MAX_DEPTH`] + 1, which is all any caller needs to know.
+pub fn depth(v: &Value) -> usize {
+    let Value::List(items) = v else {
+        return 0;
+    };
+    // The lists open around the current position, innermost last.
+    let mut open = vec![items.iter()];
+    let mut deepest = 1;
+    while let Some(items) = open.last_mut() {
+        match items.next() {
+            Some(Value::List(inner)) => {
+                if open.len() > MAX_DEPTH {
+                    return MAX_DEPTH + 1;
+                }
+                open.push(inner.iter());
+                deepest = deepest.max(open.len());
+            }
+            Some(_) => {}
+            None => {
+                open.pop();
+            }
+        }
+    }
+    deepest
+}
+
+/// `Err(too_deep("list"))` when `v` holds lists nested past [`MAX_DEPTH`].
+/// It is what stands between a parameter, a value written through the API
+/// or a result handed out, and everything below that recurses.
+pub fn check_depth(v: &Value) -> Result<(), String> {
+    if depth(v) > MAX_DEPTH {
+        return Err(too_deep("list"));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug)]
 pub enum Value {
@@ -15,21 +91,27 @@ pub enum Value {
 
 impl Value {
     /// Conservative retained heap cost, including spare capacity and headers.
+    /// Iterative: it is asked of parameters before their depth is known.
     pub fn memory_bytes(&self) -> u64 {
-        let extra = match self {
-            Value::Text(s) => s.capacity() as u64,
-            Value::List(v) => {
-                v.capacity() as u64 * std::mem::size_of::<Value>() as u64
-                    + v.iter()
-                        .map(|v| {
-                            v.memory_bytes()
-                                .saturating_sub(std::mem::size_of::<Value>() as u64)
-                        })
-                        .sum::<u64>()
-            }
-            _ => 0,
+        let size = std::mem::size_of::<Value>() as u64;
+        let items = match self {
+            Value::Text(s) => return size + s.capacity() as u64,
+            Value::List(v) => v,
+            _ => return size,
         };
-        std::mem::size_of::<Value>() as u64 + extra
+        let mut total = size;
+        let mut open = vec![items];
+        while let Some(items) = open.pop() {
+            total += items.capacity() as u64 * size;
+            for v in items {
+                match v {
+                    Value::Text(s) => total += s.capacity() as u64,
+                    Value::List(inner) => open.push(inner),
+                    _ => {}
+                }
+            }
+        }
+        total
     }
 
     pub fn type_name(&self) -> &'static str {
@@ -124,28 +206,44 @@ impl Value {
         s
     }
 
+    /// The value as JSON. Iterative: the lists still open are a stack of
+    /// iterators, so rendering costs no thread stack however deep the
+    /// value is.
     pub fn write_json(&self, out: &mut String) {
-        match self {
-            Value::Null => out.push_str("null"),
-            Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-            Value::Int(i) => out.push_str(&i.to_string()),
-            Value::Float(f) => {
-                if f.is_finite() {
-                    write_float(*f, out);
-                } else {
-                    out.push_str("null");
+        let mut open: Vec<std::slice::Iter<'_, Value>> = Vec::new();
+        let mut next = Some(self);
+        loop {
+            if let Some(v) = next.take() {
+                match v {
+                    Value::Null => out.push_str("null"),
+                    Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+                    Value::Int(i) => out.push_str(&i.to_string()),
+                    Value::Float(f) if f.is_finite() => write_float(*f, out),
+                    Value::Float(_) => out.push_str("null"),
+                    Value::Text(t) => write_json_string(t, out),
+                    Value::List(l) => {
+                        out.push('[');
+                        let mut items = l.iter();
+                        next = items.next();
+                        open.push(items);
+                        continue;
+                    }
                 }
             }
-            Value::Text(t) => write_json_string(t, out),
-            Value::List(l) => {
-                out.push('[');
-                for (i, v) in l.iter().enumerate() {
-                    if i > 0 {
-                        out.push(',');
-                    }
-                    v.write_json(out);
+            // A value is done: the next item of the innermost open list, or
+            // close it.
+            let Some(items) = open.last_mut() else {
+                return;
+            };
+            match items.next() {
+                Some(v) => {
+                    out.push(',');
+                    next = Some(v);
                 }
-                out.push(']');
+                None => {
+                    out.push(']');
+                    open.pop();
+                }
             }
         }
     }
@@ -283,17 +381,40 @@ impl Json {
     }
 
     /// Flatten to a property value. Objects become their JSON text, since the
-    /// property model is deliberately flat.
+    /// property model is deliberately flat, and so does a list nested past
+    /// [`MAX_DEPTH`]: this never fails. Input that is going into a database
+    /// uses [`Json::try_value`], which refuses such a list instead.
     pub fn to_value(&self) -> Value {
-        match self {
+        self.value_at(1, false).unwrap_or(Value::Null)
+    }
+
+    /// As [`Json::to_value`], but a list nested deeper than [`MAX_DEPTH`]
+    /// is an error (`list nested deeper than 64 levels`), not text.
+    pub fn try_value(&self) -> Result<Value, String> {
+        self.value_at(1, true)
+    }
+
+    /// `depth` is the list depth this value would sit at. Recursion stops at
+    /// the limit (past it a list is text or an error), so it is bounded
+    /// however deep the document.
+    fn value_at(&self, depth: usize, strict: bool) -> Result<Value, String> {
+        Ok(match self {
             Json::Null => Value::Null,
             Json::Bool(b) => Value::Bool(*b),
             Json::Int(i) => Value::Int(*i),
             Json::Float(f) => Value::Float(*f),
             Json::Text(t) => Value::Text(t.clone()),
-            Json::Array(a) => Value::List(a.iter().map(|j| j.to_value()).collect()),
+            Json::Array(_) if depth > MAX_DEPTH && strict => return Err(too_deep("list")),
+            Json::Array(_) if depth > MAX_DEPTH => Value::Text(json_to_string(self)),
+            Json::Array(a) => {
+                let mut items = Vec::with_capacity(a.len());
+                for j in a {
+                    items.push(j.value_at(depth + 1, strict)?);
+                }
+                Value::List(items)
+            }
             Json::Object(_) => Value::Text(json_to_string(self)),
-        }
+        })
     }
 }
 
@@ -303,48 +424,78 @@ pub fn json_to_string(j: &Json) -> String {
     out
 }
 
+/// A container being written: the rest of its items.
+enum Writing<'a> {
+    Array(std::slice::Iter<'a, Json>),
+    Object(std::slice::Iter<'a, (String, Json)>),
+}
+
+/// The document as JSON, iteratively, as [`Value::write_json`].
 fn write_json(j: &Json, out: &mut String) {
-    match j {
-        Json::Null => out.push_str("null"),
-        Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Json::Int(i) => out.push_str(&i.to_string()),
-        Json::Float(f) if f.is_finite() => write_float(*f, out),
-        Json::Float(_) => out.push_str("null"),
-        Json::Text(t) => write_json_string(t, out),
-        Json::Array(a) => {
-            out.push('[');
-            for (i, v) in a.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
+    let mut open: Vec<Writing<'_>> = Vec::new();
+    let mut next = Some(j);
+    loop {
+        if let Some(j) = next.take() {
+            match j {
+                Json::Null => out.push_str("null"),
+                Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+                Json::Int(i) => out.push_str(&i.to_string()),
+                Json::Float(f) if f.is_finite() => write_float(*f, out),
+                Json::Float(_) => out.push_str("null"),
+                Json::Text(t) => write_json_string(t, out),
+                Json::Array(a) => {
+                    out.push('[');
+                    let mut items = a.iter();
+                    next = items.next();
+                    open.push(Writing::Array(items));
+                    continue;
                 }
-                write_json(v, out);
+                Json::Object(fields) => {
+                    out.push('{');
+                    let mut items = fields.iter();
+                    if let Some((k, v)) = items.next() {
+                        write_json_string(k, out);
+                        out.push(':');
+                        next = Some(v);
+                    }
+                    open.push(Writing::Object(items));
+                    continue;
+                }
             }
-            out.push(']');
         }
-        Json::Object(fields) => {
-            out.push('{');
-            for (i, (k, v)) in fields.iter().enumerate() {
-                if i > 0 {
+        match open.last_mut() {
+            None => return,
+            Some(Writing::Array(items)) => match items.next() {
+                Some(v) => {
                     out.push(',');
+                    next = Some(v);
                 }
-                write_json_string(k, out);
-                out.push(':');
-                write_json(v, out);
-            }
-            out.push('}');
+                None => {
+                    out.push(']');
+                    open.pop();
+                }
+            },
+            Some(Writing::Object(items)) => match items.next() {
+                Some((k, v)) => {
+                    out.push(',');
+                    write_json_string(k, out);
+                    out.push(':');
+                    next = Some(v);
+                }
+                None => {
+                    out.push('}');
+                    open.pop();
+                }
+            },
         }
     }
 }
 
 pub fn parse_json(src: &str) -> Result<Json, String> {
     let b = src.as_bytes();
-    let mut p = JsonParser {
-        b,
-        pos: 0,
-        depth: 0,
-    };
+    let mut p = JsonParser { b, pos: 0 };
     p.ws();
-    let v = p.value()?;
+    let v = p.document()?;
     p.ws();
     if p.pos != b.len() {
         return Err(format!("trailing input at byte {}", p.pos));
@@ -355,7 +506,13 @@ pub fn parse_json(src: &str) -> Result<Json, String> {
 struct JsonParser<'a> {
     b: &'a [u8],
     pos: usize,
-    depth: u32,
+}
+
+/// A container still being filled: an array's items so far, or an
+/// object's fields and the key whose value comes next.
+enum Filling {
+    Array(Vec<Json>),
+    Object(Vec<(String, Json)>, String),
 }
 
 impl<'a> JsonParser<'a> {
@@ -378,20 +535,105 @@ impl<'a> JsonParser<'a> {
         }
     }
 
-    fn value(&mut self) -> Result<Json, String> {
-        if self.depth > 200 {
-            return Err("json nested too deeply".into());
+    /// One whole value. Containers are opened onto `open` and closed off
+    /// it, so nesting costs heap, not stack; past [`MAX_JSON_DEPTH`] open
+    /// containers the document is refused.
+    fn document(&mut self) -> Result<Json, String> {
+        let mut open: Vec<Filling> = Vec::new();
+        loop {
+            // Here a value starts: a scalar completes at once, a container
+            // opens (or, if empty, completes).
+            let mut done = match self.peek() {
+                None => return Err("unexpected end of json".into()),
+                Some(c @ (b'[' | b'{')) => {
+                    if open.len() >= MAX_JSON_DEPTH {
+                        return Err(format!("json nested deeper than {MAX_JSON_DEPTH} levels"));
+                    }
+                    self.pos += 1;
+                    self.ws();
+                    if c == b'[' {
+                        if self.peek() == Some(b']') {
+                            self.pos += 1;
+                            Json::Array(Vec::new())
+                        } else {
+                            open.push(Filling::Array(Vec::new()));
+                            continue;
+                        }
+                    } else if self.peek() == Some(b'}') {
+                        self.pos += 1;
+                        Json::Object(Vec::new())
+                    } else {
+                        let key = self.key()?;
+                        open.push(Filling::Object(Vec::new(), key));
+                        continue;
+                    }
+                }
+                Some(b'"') => Json::Text(self.string()?),
+                Some(b't') => self.lit("true", Json::Bool(true))?,
+                Some(b'f') => self.lit("false", Json::Bool(false))?,
+                Some(b'n') => self.lit("null", Json::Null)?,
+                Some(_) => self.number()?,
+            };
+            // A value is complete: it goes into the innermost open
+            // container, which then takes its next item or closes, and a
+            // closed container is itself a completed value.
+            loop {
+                let Some(mut top) = open.pop() else {
+                    return Ok(done);
+                };
+                self.ws();
+                let closed = match &mut top {
+                    Filling::Array(items) => {
+                        items.push(done);
+                        match self.peek() {
+                            Some(b',') => {
+                                self.pos += 1;
+                                self.ws();
+                                false
+                            }
+                            Some(b']') => {
+                                self.pos += 1;
+                                true
+                            }
+                            _ => return Err(format!("expected ',' or ']' at byte {}", self.pos)),
+                        }
+                    }
+                    Filling::Object(fields, key) => {
+                        fields.push((std::mem::take(key), done));
+                        match self.peek() {
+                            Some(b',') => {
+                                self.pos += 1;
+                                *key = self.key()?;
+                                false
+                            }
+                            Some(b'}') => {
+                                self.pos += 1;
+                                true
+                            }
+                            _ => return Err(format!("expected ',' or '}}' at byte {}", self.pos)),
+                        }
+                    }
+                };
+                if !closed {
+                    open.push(top);
+                    break;
+                }
+                done = match top {
+                    Filling::Array(items) => Json::Array(items),
+                    Filling::Object(fields, _) => Json::Object(fields),
+                };
+            }
         }
-        match self.peek() {
-            None => Err("unexpected end of json".into()),
-            Some(b'{') => self.object(),
-            Some(b'[') => self.array(),
-            Some(b'"') => Ok(Json::Text(self.string()?)),
-            Some(b't') => self.lit("true", Json::Bool(true)),
-            Some(b'f') => self.lit("false", Json::Bool(false)),
-            Some(b'n') => self.lit("null", Json::Null),
-            Some(_) => self.number(),
-        }
+    }
+
+    /// An object key and its colon, leaving the position at its value.
+    fn key(&mut self) -> Result<String, String> {
+        self.ws();
+        let k = self.string()?;
+        self.ws();
+        self.eat(b':')?;
+        self.ws();
+        Ok(k)
     }
 
     fn lit(&mut self, word: &str, v: Json) -> Result<Json, String> {
@@ -401,69 +643,6 @@ impl<'a> JsonParser<'a> {
         } else {
             Err(format!("bad literal at byte {}", self.pos))
         }
-    }
-
-    fn object(&mut self) -> Result<Json, String> {
-        self.eat(b'{')?;
-        self.depth += 1;
-        let mut fields = Vec::new();
-        self.ws();
-        if self.peek() == Some(b'}') {
-            self.pos += 1;
-            self.depth -= 1;
-            return Ok(Json::Object(fields));
-        }
-        loop {
-            self.ws();
-            let k = self.string()?;
-            self.ws();
-            self.eat(b':')?;
-            self.ws();
-            let v = self.value()?;
-            fields.push((k, v));
-            self.ws();
-            match self.peek() {
-                Some(b',') => {
-                    self.pos += 1;
-                }
-                Some(b'}') => {
-                    self.pos += 1;
-                    break;
-                }
-                _ => return Err(format!("expected ',' or '}}' at byte {}", self.pos)),
-            }
-        }
-        self.depth -= 1;
-        Ok(Json::Object(fields))
-    }
-
-    fn array(&mut self) -> Result<Json, String> {
-        self.eat(b'[')?;
-        self.depth += 1;
-        let mut items = Vec::new();
-        self.ws();
-        if self.peek() == Some(b']') {
-            self.pos += 1;
-            self.depth -= 1;
-            return Ok(Json::Array(items));
-        }
-        loop {
-            self.ws();
-            items.push(self.value()?);
-            self.ws();
-            match self.peek() {
-                Some(b',') => {
-                    self.pos += 1;
-                }
-                Some(b']') => {
-                    self.pos += 1;
-                    break;
-                }
-                _ => return Err(format!("expected ',' or ']' at byte {}", self.pos)),
-            }
-        }
-        self.depth -= 1;
-        Ok(Json::Array(items))
     }
 
     fn string(&mut self) -> Result<String, String> {

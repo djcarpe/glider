@@ -175,6 +175,10 @@ glider implements a Cypher-flavoured subset. Three divergences bite most often:
 - **`count()` over zero matches returns zero rows**, not one row holding `0`.
   Use `db.stats()` when you want a count that is always present.
 - `count(DISTINCT x)` is not supported; `RETURN DISTINCT` is.
+- **Nesting stops at 64 levels**: parentheses, nested lists (in a query, a
+  parameter or a stored value), `NOT` and `-` chains, subscripts, nested
+  calls. Deeper is an error, never a crash; long `AND` chains, sums and
+  lists are not deep and have no such limit. glider's README, "Limits".
 
 ## Timing
 

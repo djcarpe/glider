@@ -900,6 +900,14 @@ fn delete_prefix(p: &Pager, t: Tree, prefix: &[u8]) -> SResult<()> {
     }
 }
 
+/// A bulk load's values are held to the depth any stored value is.
+fn check_props(props: &[(u32, Value)]) -> Result<()> {
+    for (_, v) in props {
+        crate::value::check_depth(v).map_err(Error::Msg)?;
+    }
+    Ok(())
+}
+
 fn op_record(op: &Op) -> Vec<u8> {
     op.encode_record()
 }
@@ -1926,6 +1934,22 @@ impl Graph {
     /// Log and apply one op. A failure rolls the whole open transaction
     /// back, so nothing is left half-done.
     fn exec(&mut self, op: Op) -> Result<()> {
+        // Checked before anything is logged, so a refused value leaves the
+        // transaction exactly as it was. Every value written passes here
+        // (statements, the API, imports; recovery replays only what once
+        // did), which is what keeps a too-deep list out of the log and the
+        // pages.
+        let values: &[(String, Value)] = match &op {
+            Op::NodeAdd { props, .. } | Op::EdgeAdd { props, .. } => props,
+            Op::NodeSet { value, .. } | Op::EdgeSet { value, .. } => {
+                crate::value::check_depth(value).map_err(Error::Msg)?;
+                &[]
+            }
+            _ => &[],
+        };
+        for (_, v) in values {
+            crate::value::check_depth(v).map_err(Error::Msg)?;
+        }
         self.forget_reads();
         let rec = op_record(&op);
         let r = self.db.log(&rec).and_then(|_| {
@@ -2012,6 +2036,7 @@ impl Graph {
                     return;
                 }
                 let r = (|| -> Result<()> {
+                    check_props(props)?;
                     let mut ls = labels.to_vec();
                     dedup(&mut ls);
                     b.push(&node_key(id), &encode_node(&ls, props))?;
@@ -2058,6 +2083,7 @@ impl Graph {
                     return;
                 }
                 let r = (|| -> Result<()> {
+                    check_props(props)?;
                     b.push(&node_key(id), &encode_edge(from, to, t, props))?;
                     adj_s
                         .push(&adj_key(from, OUT, t, id), &adj_val(to))

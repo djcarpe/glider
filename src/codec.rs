@@ -1,7 +1,16 @@
 //! Little binary codec used by the on-disk log. Varints for ids and lengths,
 //! CRC32 (IEEE) for record integrity.
+//!
+//! The bytes a reader is handed are input: a replica's log and pages come
+//! from object storage, and any page can be damaged. A list is a tag and a
+//! count followed by its items, so the bytes alone say how deeply lists
+//! nest. Readers therefore keep the lists they are inside on an explicit
+//! stack instead of recursing, and a list nested past
+//! [`MAX_DEPTH`](crate::value::MAX_DEPTH) is an error like any other
+//! undecodable record: no writer produces one, since values are checked
+//! before they are logged.
 
-use crate::value::Value;
+use crate::value::{too_deep, Value, MAX_DEPTH};
 
 pub fn put_u8(out: &mut Vec<u8>, v: u8) {
     out.push(v);
@@ -149,24 +158,96 @@ impl<'a> Reader<'a> {
     }
 
     pub fn value(&mut self) -> Result<Value, String> {
-        match self.u8()? {
-            0 => Ok(Value::Null),
-            1 => Ok(Value::Bool(self.u8()? != 0)),
-            2 => Ok(Value::Int(self.ivarint()?)),
-            3 => Ok(Value::Float(self.f64()?)),
-            4 => Ok(Value::Text(self.string()?)),
-            5 => {
-                let n = self.varint()? as usize;
-                if n > self.remaining() + 1 {
-                    return Err("list length exceeds record".into());
+        // The lists being filled, innermost last, each with the count of
+        // items it still expects.
+        let mut open: Vec<(Vec<Value>, usize)> = Vec::new();
+        loop {
+            let mut done = match self.u8()? {
+                0 => Value::Null,
+                1 => Value::Bool(self.u8()? != 0),
+                2 => Value::Int(self.ivarint()?),
+                3 => Value::Float(self.f64()?),
+                4 => Value::Text(self.string()?),
+                5 => {
+                    let n = self.list_len(open.len())?;
+                    if n > 0 {
+                        open.push((Vec::with_capacity(n.min(1024)), n));
+                        continue;
+                    }
+                    Value::List(Vec::new())
                 }
-                let mut items = Vec::with_capacity(n.min(1024));
-                for _ in 0..n {
-                    items.push(self.value()?);
+                other => return Err(format!("unknown value tag {}", other)),
+            };
+            // A finished value fills its list, which may finish in turn.
+            loop {
+                let Some((items, left)) = open.last_mut() else {
+                    return Ok(done);
+                };
+                items.push(done);
+                *left -= 1;
+                if *left > 0 {
+                    break;
                 }
-                Ok(Value::List(items))
+                done = match open.pop() {
+                    Some((items, _)) => Value::List(items),
+                    None => return Err("list stack underflow".into()),
+                };
             }
-            other => Err(format!("unknown value tag {}", other)),
+        }
+    }
+
+    /// A list's item count, read after its tag, for a list inside `open`
+    /// others. Refuses a count the record cannot hold and a list nested
+    /// past the limit.
+    fn list_len(&mut self, open: usize) -> Result<usize, String> {
+        if open >= MAX_DEPTH {
+            return Err(too_deep("list"));
+        }
+        let n = self.varint()? as usize;
+        if n > self.remaining() + 1 {
+            return Err("list length exceeds record".into());
+        }
+        Ok(n)
+    }
+
+    /// Step over one value, checking strings only if `check_utf8`.
+    /// Iterative, with the depth limit [`Reader::value`] has, so it accepts
+    /// exactly what `value` accepts.
+    fn skip(&mut self, check_utf8: bool) -> Result<(), String> {
+        // Items still to step over in each open list, innermost last.
+        let mut open: Vec<usize> = Vec::new();
+        loop {
+            match self.u8()? {
+                0 => {}
+                1 => self.advance(1)?,
+                2 => {
+                    self.ivarint()?;
+                }
+                3 => self.advance(8)?,
+                4 if check_utf8 => self.skip_str()?,
+                4 => {
+                    let len = self.varint()? as usize;
+                    self.advance(len)?;
+                }
+                5 => {
+                    let n = self.list_len(open.len())?;
+                    if n > 0 {
+                        open.push(n);
+                        continue;
+                    }
+                }
+                other => return Err(format!("unknown value tag {}", other)),
+            }
+            loop {
+                let Some(left) = open.last_mut() else {
+                    return Ok(());
+                };
+                *left -= 1;
+                if *left > 0 {
+                    break;
+                }
+                open.pop();
+            }
         }
     }
 
@@ -214,50 +295,13 @@ impl<'a> Reader<'a> {
     /// integrity is already established — a checksummed image — where
     /// re-validating UTF-8 in every skipped text would dominate a lookup.
     pub fn skip_value_trusted(&mut self) -> Result<(), String> {
-        match self.u8()? {
-            0 => Ok(()),
-            1 => self.advance(1),
-            2 => self.ivarint().map(|_| ()),
-            3 => self.advance(8),
-            4 => {
-                let len = self.varint()? as usize;
-                self.advance(len)
-            }
-            5 => {
-                let n = self.varint()? as usize;
-                if n > self.remaining() + 1 {
-                    return Err("list length exceeds record".into());
-                }
-                for _ in 0..n {
-                    self.skip_value_trusted()?;
-                }
-                Ok(())
-            }
-            other => Err(format!("unknown value tag {}", other)),
-        }
+        self.skip(false)
     }
 
     /// Step over a value without allocating it. Accepts exactly what
     /// `value` accepts.
     pub fn skip_value(&mut self) -> Result<(), String> {
-        match self.u8()? {
-            0 => Ok(()),
-            1 => self.advance(1),
-            2 => self.ivarint().map(|_| ()),
-            3 => self.advance(8),
-            4 => self.skip_str(),
-            5 => {
-                let n = self.varint()? as usize;
-                if n > self.remaining() + 1 {
-                    return Err("list length exceeds record".into());
-                }
-                for _ in 0..n {
-                    self.skip_value()?;
-                }
-                Ok(())
-            }
-            other => Err(format!("unknown value tag {}", other)),
-        }
+        self.skip(true)
     }
 }
 

@@ -22,7 +22,7 @@ use crate::algo::{self, Adjacency};
 use crate::graph::{Dir, Error, Graph, Projection as AlgoView, Result, Tier};
 use crate::ooc::StateVec;
 use crate::telemetry;
-use crate::value::{parse_json, write_json_string, Value};
+use crate::value::{check_depth, parse_json, too_deep, write_json_string, Value, MAX_DEPTH};
 use std::collections::BTreeMap;
 
 // ------------------------------------------------------------------- tokens
@@ -315,10 +315,15 @@ enum Expr {
     Var(String),
     Prop(String, String),
     Not(Box<Expr>),
-    And(Box<Expr>, Box<Expr>),
-    Or(Box<Expr>, Box<Expr>),
+    /// `a AND b AND ...`, flat however long; true when every item is.
+    And(Vec<Expr>),
+    /// `a OR b OR ...`, flat however long.
+    Or(Vec<Expr>),
     Cmp(String, Box<Expr>, Box<Expr>),
-    Arith(char, Box<Expr>, Box<Expr>),
+    /// `a + b - c ...` or `a * b / c ...`: the first operand, then each
+    /// operation applied to the result so far, left to right. Flat, so a
+    /// sum of ten thousand terms is one level deep. `-x` is `0 - x`.
+    Arith(Box<Expr>, Vec<(char, Expr)>),
     IsNull(Box<Expr>, bool),
     In(Box<Expr>, Vec<Expr>),
     Func(String, Vec<Expr>),
@@ -333,22 +338,53 @@ impl Expr {
     /// Default column name, matching what the user typed closely enough that
     /// `ORDER BY n.name` can find the column produced by `RETURN n.name`.
     fn alias(&self) -> String {
+        let mut out = String::new();
+        self.write_alias(&mut out);
+        out
+    }
+
+    // Plain loops rather than iterator chains here and in `vars`: these
+    // recurse once per level of the expression, and in a debug build each
+    // adapter is a stack frame of its own.
+    fn write_alias(&self, out: &mut String) {
         match self {
-            Expr::Var(v) => v.clone(),
-            Expr::Prop(v, k) => format!("{}.{}", v, k),
-            Expr::Func(name, args) => {
-                let inner: Vec<String> = args.iter().map(|a| a.alias()).collect();
-                format!("{}({})", name.to_lowercase(), inner.join(", "))
+            Expr::Var(v) => out.push_str(v),
+            Expr::Prop(v, k) => {
+                out.push_str(v);
+                out.push('.');
+                out.push_str(k);
             }
-            Expr::Lit(v) => v.to_string(),
-            Expr::Index(e, i) => format!("{}[{}]", e.alias(), i.alias()),
-            Expr::Slice(e, a, b) => format!(
-                "{}[{}..{}]",
-                e.alias(),
-                a.as_ref().map(|x| x.alias()).unwrap_or_default(),
-                b.as_ref().map(|x| x.alias()).unwrap_or_default()
-            ),
-            _ => "expr".to_string(),
+            Expr::Func(name, args) => {
+                out.push_str(&name.to_lowercase());
+                out.push('(');
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    a.write_alias(out);
+                }
+                out.push(')');
+            }
+            Expr::Lit(v) => out.push_str(&v.to_string()),
+            Expr::Index(e, i) => {
+                e.write_alias(out);
+                out.push('[');
+                i.write_alias(out);
+                out.push(']');
+            }
+            Expr::Slice(e, a, b) => {
+                e.write_alias(out);
+                out.push('[');
+                if let Some(a) = a {
+                    a.write_alias(out);
+                }
+                out.push_str("..");
+                if let Some(b) = b {
+                    b.write_alias(out);
+                }
+                out.push(']');
+            }
+            _ => out.push_str("expr"),
         }
     }
 
@@ -358,22 +394,32 @@ impl Expr {
             Expr::Var(v) | Expr::Prop(v, _) => out.push(v.clone()),
             Expr::Lit(_) => {}
             Expr::Not(a) | Expr::IsNull(a, _) => a.vars(out),
-            Expr::And(a, b)
-            | Expr::Or(a, b)
-            | Expr::Cmp(_, a, b)
-            | Expr::Arith(_, a, b)
-            | Expr::Index(a, b) => {
+            Expr::Cmp(_, a, b) | Expr::Index(a, b) => {
                 a.vars(out);
                 b.vars(out);
             }
+            Expr::Arith(a, rest) => {
+                a.vars(out);
+                for (_, x) in rest {
+                    x.vars(out);
+                }
+            }
             Expr::In(a, xs) => {
                 a.vars(out);
-                xs.iter().for_each(|x| x.vars(out));
+                for x in xs {
+                    x.vars(out);
+                }
             }
-            Expr::Func(_, xs) | Expr::List(xs) => xs.iter().for_each(|x| x.vars(out)),
+            Expr::And(xs) | Expr::Or(xs) | Expr::Func(_, xs) | Expr::List(xs) => {
+                for x in xs {
+                    x.vars(out);
+                }
+            }
             Expr::Slice(a, b, c) => {
                 a.vars(out);
-                b.iter().chain(c.iter()).for_each(|x| x.vars(out));
+                for x in [b, c].into_iter().flatten() {
+                    x.vars(out);
+                }
             }
         }
     }
@@ -481,16 +527,13 @@ impl Stmt {
     }
 }
 
-fn parse(src: &str) -> Result<Stmt> {
-    parse_with(src, &[])
-}
-
-fn parse_with(src: &str, params: &[(String, Value)]) -> Result<Stmt> {
-    parse_checked(src, params).map(|(s, _)| s)
-}
-
 /// The statement, and the extension functions it calls.
 fn parse_checked(src: &str, params: &[(String, Value)]) -> Result<(Stmt, Vec<String>)> {
+    // A parameter becomes tokens by recursion over its lists, and then a
+    // literal: refused here if it is deeper than any value may be.
+    for (_, v) in params {
+        check_depth(v).map_err(Error::Msg)?;
+    }
     let toks = lex_with(src, params)?;
     if toks.is_empty() {
         return Err(Error::Msg("empty statement".into()));
@@ -500,10 +543,10 @@ fn parse_checked(src: &str, params: &[(String, Value)]) -> Result<(Stmt, Vec<Str
         pos: 0,
         ext_funcs: Vec::new(),
     };
-    let stmt = parse_stmt(&mut p, src)?;
+    let stmt = parse_stmt(&mut p)?;
     // Whatever the grammar didn't consume is a mistake, not something to drop:
     // `RETURN x LIMIT 10, count(n)` used to run as `RETURN x`, ignoring the rest.
-    if !matches!(stmt, Stmt::Explain(_)) && !p.at_end() {
+    if !p.at_end() {
         return Err(Error::Msg(format!(
             "unexpected {} after the end of the statement",
             describe_tok(p.peek())
@@ -523,14 +566,26 @@ fn describe_tok(t: Option<&Tok>) -> String {
     }
 }
 
-fn parse_stmt(p: &mut Parser, src: &str) -> Result<Stmt> {
-    if p.eat_kw("EXPLAIN") {
-        let rest: String = src
-            .trim_start()
-            .get("EXPLAIN".len()..)
-            .unwrap_or("")
-            .to_string();
-        return Ok(Stmt::Explain(Box::new(parse(&rest)?)));
+fn parse_stmt(p: &mut Parser) -> Result<Stmt> {
+    if p.is_kw("EXPLAIN") {
+        // `EXPLAIN EXPLAIN ...` nests: counted here, then the statement
+        // under them parsed once, rather than each EXPLAIN re-parsing the
+        // text after it. The functions it calls are not checked: EXPLAIN
+        // runs none of them.
+        let mut n = 0;
+        while p.eat_kw("EXPLAIN") {
+            n += 1;
+            if n > MAX_DEPTH {
+                return Err(Error::Msg(too_deep("EXPLAIN")));
+            }
+        }
+        let funcs = p.ext_funcs.len();
+        let mut stmt = parse_stmt(p)?;
+        p.ext_funcs.truncate(funcs);
+        for _ in 0..n {
+            stmt = Stmt::Explain(Box::new(stmt));
+        }
+        return Ok(stmt);
     }
 
     if p.eat_kw("MATCH") {
@@ -921,254 +976,489 @@ fn parse_prop_map(p: &mut Parser) -> Result<Vec<(String, Expr)>> {
     Ok(props)
 }
 
-// Precedence: OR < AND < NOT < comparison < additive < multiplicative < atom
+// ---------------------------------------------------------- expression parser
+//
+// Precedence: OR < AND < NOT < comparison < additive < multiplicative < atom,
+// where an atom is a primary followed by any number of subscripts:
+//
+//   expr       = and (OR and)*
+//   and        = not (AND not)*
+//   not        = (NOT | !) not | comparison
+//   comparison = additive [IS [NOT] NULL | IN [expr, ...] | CONTAINS additive
+//                | STARTS WITH additive | ENDS WITH additive | op additive]
+//   additive   = multiplicative ((+ | -) multiplicative)*
+//   multiplicative = atom ((* | /) atom)*
+//   atom       = primary ([expr] | [expr..expr] | [..expr] | [expr..])*
+//   primary    = literal | (expr) | [expr, ...] | - atom | name | name.key
+//                | name(expr, ...) | ns.name(expr, ...) | name(*)
+//
+// This used to be that grammar written as recursive functions, one per
+// rule, which cost nine stack frames per parenthesis and crashed the host
+// process (a BEAM VM, an app) on a few hundred bytes of `(`. It is now the
+// same grammar run as a machine: where a rule function would call another
+// and then carry on, the machine pushes a `K` saying how it would carry on,
+// and works on the inner rule; when that rule has produced an expression,
+// it pops the `K` and carries on. The stack lives on the heap and holds at
+// most a few entries per level of nesting, and nesting is bounded.
+//
+// Two limits, both [`MAX_DEPTH`]: open brackets of any kind (parentheses,
+// lists, arguments, subscripts, `IN` lists) and prefix operators still
+// waiting for their operand, so the machine's stack stays small; and the
+// depth of the expression tree built, which is what everything that walks
+// it afterwards (evaluating, naming, cloning, dropping) recurses through.
+// Chains of one operator (`AND`, `OR`, `+` and `-`, `*` and `/`) are built
+// flat, a first operand and a list of the rest, so ten thousand conditions
+// are one level deep, not ten thousand.
+
+/// Where the parser goes back to once the rule it is working on has produced
+/// an expression. Each is the rest of one rule's function body.
+enum K {
+    /// `and (OR and)*`: the `and`s so far.
+    Or(Vec<Expr>, usize),
+    /// `not (AND not)*`: the `not`s so far.
+    And(Vec<Expr>, usize),
+    /// So many `NOT`s waiting for a comparison.
+    Not(usize),
+    /// A comparison's left side is parsing; then its operator, if any.
+    CmpLeft,
+    /// `left op` waits for its right side.
+    CmpRight(&'static str, Box<Expr>, usize),
+    /// `left IN [` and the items so far.
+    In(Box<Expr>, Vec<Expr>, usize),
+    /// An additive chain: the first operand and the rest so far, and the
+    /// operator before the operand being parsed.
+    Add(Option<Box<Expr>>, Vec<(char, Expr)>, char, usize),
+    /// A multiplicative chain, as `Add`.
+    Mul(Option<Box<Expr>>, Vec<(char, Expr)>, char, usize),
+    /// A primary is parsing; subscripts may follow it.
+    Postfix,
+    /// `e[` waits for the first expression inside.
+    Subscript(Box<Expr>, usize),
+    /// `e[start..` waits for the end.
+    SliceEnd(Box<Expr>, Option<Box<Expr>>, usize),
+    /// `(` waits for its `)`.
+    Paren,
+    /// `[` and the items so far.
+    List(Vec<Expr>, usize),
+    /// `name(` and the arguments so far; whether `name` is an extension's.
+    Args(String, Vec<Expr>, bool, usize),
+    /// Unary minus, waiting for its atom.
+    Neg,
+}
+
+impl K {
+    /// Whether this entry is a level of nesting: a bracket that is open or
+    /// a prefix operator still waiting. `Not` counts each of its `NOT`s.
+    fn nesting(&self) -> usize {
+        match self {
+            K::Not(n) => *n,
+            K::In(..)
+            | K::Subscript(..)
+            | K::SliceEnd(..)
+            | K::Paren
+            | K::List(..)
+            | K::Args(..)
+            | K::Neg => 1,
+            _ => 0,
+        }
+    }
+}
+
+/// The rule the parser is about to work on.
+#[derive(Clone, Copy)]
+enum Rule {
+    Expr,
+    Not,
+    Additive,
+    Atom,
+}
+
+fn too_deep_expr() -> Error {
+    Error::Msg(crate::value::too_deep("expression"))
+}
+
+/// A node over children whose deepest is `child` deep: one deeper, refused
+/// past the limit.
+fn deeper(child: usize) -> Result<usize> {
+    if child >= MAX_DEPTH {
+        return Err(too_deep_expr());
+    }
+    Ok(child + 1)
+}
+
 fn parse_expr(p: &mut Parser) -> Result<Expr> {
-    parse_or(p)
-}
-
-fn parse_or(p: &mut Parser) -> Result<Expr> {
-    let mut left = parse_and(p)?;
-    while p.eat_kw("OR") {
-        let right = parse_and(p)?;
-        left = Expr::Or(Box::new(left), Box::new(right));
-    }
-    Ok(left)
-}
-
-fn parse_and(p: &mut Parser) -> Result<Expr> {
-    let mut left = parse_not(p)?;
-    while p.eat_kw("AND") {
-        let right = parse_not(p)?;
-        left = Expr::And(Box::new(left), Box::new(right));
-    }
-    Ok(left)
-}
-
-fn parse_not(p: &mut Parser) -> Result<Expr> {
-    if p.eat_kw("NOT") || p.eat_sym("!") {
-        return Ok(Expr::Not(Box::new(parse_not(p)?)));
-    }
-    parse_comparison(p)
-}
-
-fn parse_comparison(p: &mut Parser) -> Result<Expr> {
-    let left = parse_additive(p)?;
-
-    if p.eat_kw("IS") {
-        let negated = p.eat_kw("NOT");
-        p.expect_kw("NULL")?;
-        return Ok(Expr::IsNull(Box::new(left), !negated));
-    }
-    if p.eat_kw("IN") {
-        p.expect_sym("[")?;
-        let mut items = Vec::new();
-        if !p.eat_sym("]") {
-            loop {
-                items.push(parse_expr(p)?);
-                if !p.eat_sym(",") {
-                    break;
+    let mut stack: Vec<K> = Vec::new();
+    // Levels of nesting on `stack`: kept as a count so the check is O(1).
+    let mut nesting = 0usize;
+    let mut rule = Rule::Expr;
+    loop {
+        // Descend: push the continuation of each rule on the way down to a
+        // primary, which is either a leaf (`done`) or opens a bracket and
+        // starts a new expression inside it.
+        let mut done: (Expr, usize) = loop {
+            match rule {
+                Rule::Expr => {
+                    stack.push(K::Or(Vec::new(), 0));
+                    stack.push(K::And(Vec::new(), 0));
+                    rule = Rule::Not;
+                    continue;
                 }
-            }
-            p.expect_sym("]")?;
-        }
-        return Ok(Expr::In(Box::new(left), items));
-    }
-    if p.eat_kw("CONTAINS") {
-        return Ok(Expr::Cmp(
-            "contains".into(),
-            Box::new(left),
-            Box::new(parse_additive(p)?),
-        ));
-    }
-    if p.is_kw("STARTS") {
-        p.pos += 1;
-        p.expect_kw("WITH")?;
-        return Ok(Expr::Cmp(
-            "starts".into(),
-            Box::new(left),
-            Box::new(parse_additive(p)?),
-        ));
-    }
-    if p.is_kw("ENDS") {
-        p.pos += 1;
-        p.expect_kw("WITH")?;
-        return Ok(Expr::Cmp(
-            "ends".into(),
-            Box::new(left),
-            Box::new(parse_additive(p)?),
-        ));
-    }
-
-    for op in ["<>", "!=", "<=", ">=", "=", "<", ">"] {
-        if p.is_sym(op) {
-            p.pos += 1;
-            let right = parse_additive(p)?;
-            return Ok(Expr::Cmp(op.to_string(), Box::new(left), Box::new(right)));
-        }
-    }
-    Ok(left)
-}
-
-fn parse_additive(p: &mut Parser) -> Result<Expr> {
-    let mut left = parse_multiplicative(p)?;
-    loop {
-        if p.is_sym("+") {
-            p.pos += 1;
-            left = Expr::Arith('+', Box::new(left), Box::new(parse_multiplicative(p)?));
-        } else if p.is_sym("-") {
-            p.pos += 1;
-            left = Expr::Arith('-', Box::new(left), Box::new(parse_multiplicative(p)?));
-        } else {
-            return Ok(left);
-        }
-    }
-}
-
-fn parse_multiplicative(p: &mut Parser) -> Result<Expr> {
-    let mut left = parse_atom(p)?;
-    loop {
-        if p.is_sym("*") {
-            p.pos += 1;
-            left = Expr::Arith('*', Box::new(left), Box::new(parse_atom(p)?));
-        } else if p.is_sym("/") {
-            p.pos += 1;
-            left = Expr::Arith('/', Box::new(left), Box::new(parse_atom(p)?));
-        } else {
-            return Ok(left);
-        }
-    }
-}
-
-/// An atom followed by any number of subscripts: `labels(n)[0]`,
-/// `n.tags[1..3]`, `[1, 2, 3][-1]`.
-fn parse_atom(p: &mut Parser) -> Result<Expr> {
-    let mut e = parse_primary(p)?;
-    while p.eat_sym("[") {
-        if p.eat_sym("..") {
-            let end = if p.is_sym("]") {
-                None
-            } else {
-                Some(Box::new(parse_expr(p)?))
-            };
-            p.expect_sym("]")?;
-            e = Expr::Slice(Box::new(e), None, end);
-            continue;
-        }
-        let first = parse_expr(p)?;
-        if p.eat_sym("..") {
-            let end = if p.is_sym("]") {
-                None
-            } else {
-                Some(Box::new(parse_expr(p)?))
-            };
-            p.expect_sym("]")?;
-            e = Expr::Slice(Box::new(e), Some(Box::new(first)), end);
-        } else {
-            p.expect_sym("]")?;
-            e = Expr::Index(Box::new(e), Box::new(first));
-        }
-    }
-    Ok(e)
-}
-
-fn parse_primary(p: &mut Parser) -> Result<Expr> {
-    match p.peek().cloned() {
-        Some(Tok::Int(v)) => {
-            p.pos += 1;
-            Ok(Expr::Lit(Value::Int(v)))
-        }
-        Some(Tok::Float(v)) => {
-            p.pos += 1;
-            Ok(Expr::Lit(Value::Float(v)))
-        }
-        Some(Tok::Str(s)) => {
-            p.pos += 1;
-            Ok(Expr::Lit(Value::Text(s)))
-        }
-        Some(Tok::Sym(s)) if s == "(" => {
-            p.pos += 1;
-            let e = parse_expr(p)?;
-            p.expect_sym(")")?;
-            Ok(e)
-        }
-        Some(Tok::Sym(s)) if s == "[" => {
-            p.pos += 1;
-            let mut items = Vec::new();
-            if !p.eat_sym("]") {
-                loop {
-                    items.push(parse_expr(p)?);
-                    if !p.eat_sym(",") {
-                        break;
+                Rule::Not => {
+                    let mut n = 0;
+                    while p.eat_kw("NOT") || p.eat_sym("!") {
+                        n += 1;
                     }
-                }
-                p.expect_sym("]")?;
-            }
-            Ok(Expr::List(items))
-        }
-        Some(Tok::Sym(s)) if s == "-" => {
-            p.pos += 1;
-            Ok(Expr::Arith(
-                '-',
-                Box::new(Expr::Lit(Value::Int(0))),
-                Box::new(parse_atom(p)?),
-            ))
-        }
-        Some(Tok::Ident(name)) => {
-            p.pos += 1;
-            let lower = name.to_lowercase();
-            if lower == "true" {
-                return Ok(Expr::Lit(Value::Bool(true)));
-            }
-            if lower == "false" {
-                return Ok(Expr::Lit(Value::Bool(false)));
-            }
-            if lower == "null" {
-                return Ok(Expr::Lit(Value::Null));
-            }
-            if p.is_sym("(") {
-                p.pos += 1;
-                let mut args = Vec::new();
-                if p.eat_sym("*") {
-                    args.push(Expr::Lit(Value::Text("*".into())));
-                    p.expect_sym(")")?;
-                    return Ok(Expr::Func(lower, args));
-                }
-                if !p.eat_sym(")") {
-                    loop {
-                        args.push(parse_expr(p)?);
-                        if !p.eat_sym(",") {
-                            break;
+                    if n > 0 {
+                        nesting += n;
+                        if nesting > MAX_DEPTH {
+                            return Err(too_deep_expr());
                         }
+                        stack.push(K::Not(n));
                     }
-                    p.expect_sym(")")?;
+                    stack.push(K::CmpLeft);
+                    rule = Rule::Additive;
+                    continue;
                 }
-                return Ok(Expr::Func(lower, args));
+                Rule::Additive => {
+                    stack.push(K::Add(None, Vec::new(), '+', 0));
+                    stack.push(K::Mul(None, Vec::new(), '*', 0));
+                    rule = Rule::Atom;
+                    continue;
+                }
+                Rule::Atom => stack.push(K::Postfix),
             }
-            if p.eat_sym(".") {
-                let key = p.ident()?;
-                // `ns.fn(...)`: a function from an extension. A property
-                // can't be called, so this reads unambiguously.
-                if p.eat_sym("(") {
-                    let qualified = format!("{}.{}", lower, key.to_lowercase());
-                    let mut args = Vec::new();
-                    if !p.eat_sym(")") {
-                        loop {
-                            args.push(parse_expr(p)?);
-                            if !p.eat_sym(",") {
-                                break;
+            // A primary: a leaf is done; a bracket or a unary minus opens,
+            // giving its continuation and the rule its inside starts with.
+            let (k, inner) = match p.peek().cloned() {
+                Some(Tok::Int(v)) => {
+                    p.pos += 1;
+                    break (Expr::Lit(Value::Int(v)), 0);
+                }
+                Some(Tok::Float(v)) => {
+                    p.pos += 1;
+                    break (Expr::Lit(Value::Float(v)), 0);
+                }
+                Some(Tok::Str(s)) => {
+                    p.pos += 1;
+                    break (Expr::Lit(Value::Text(s)), 0);
+                }
+                Some(Tok::Sym(s)) if s == "(" => {
+                    p.pos += 1;
+                    (K::Paren, Rule::Expr)
+                }
+                Some(Tok::Sym(s)) if s == "[" => {
+                    p.pos += 1;
+                    if p.eat_sym("]") {
+                        break (Expr::List(Vec::new()), 1);
+                    }
+                    (K::List(Vec::new(), 0), Rule::Expr)
+                }
+                Some(Tok::Sym(s)) if s == "-" => {
+                    p.pos += 1;
+                    (K::Neg, Rule::Atom)
+                }
+                Some(Tok::Ident(name)) => {
+                    p.pos += 1;
+                    let lower = name.to_lowercase();
+                    match lower.as_str() {
+                        "true" => break (Expr::Lit(Value::Bool(true)), 0),
+                        "false" => break (Expr::Lit(Value::Bool(false)), 0),
+                        "null" => break (Expr::Lit(Value::Null), 0),
+                        _ => {}
+                    }
+                    if p.eat_sym("(") {
+                        if p.eat_sym("*") {
+                            p.expect_sym(")")?;
+                            break (
+                                Expr::Func(lower, vec![Expr::Lit(Value::Text("*".into()))]),
+                                1,
+                            );
+                        }
+                        if p.eat_sym(")") {
+                            break (Expr::Func(lower, Vec::new()), 1);
+                        }
+                        (K::Args(lower, Vec::new(), false, 0), Rule::Expr)
+                    } else if p.eat_sym(".") {
+                        let key = p.ident()?;
+                        // `ns.fn(...)`: a function from an extension. A
+                        // property can't be called, so this reads
+                        // unambiguously.
+                        if !p.eat_sym("(") {
+                            break (Expr::Prop(name, key), 0);
+                        }
+                        let qualified = format!("{}.{}", lower, key.to_lowercase());
+                        if p.eat_sym(")") {
+                            p.ext_funcs.push(qualified.clone());
+                            break (Expr::Func(qualified, Vec::new()), 1);
+                        }
+                        (K::Args(qualified, Vec::new(), true, 0), Rule::Expr)
+                    } else {
+                        break (Expr::Var(name), 0);
+                    }
+                }
+                other => return Err(Error::Msg(format!("unexpected token {:?}", other))),
+            };
+            nesting += 1;
+            if nesting > MAX_DEPTH {
+                return Err(too_deep_expr());
+            }
+            stack.push(k);
+            rule = inner;
+        };
+
+        // Ascend: hand the finished expression to the continuations, which
+        // build on it until one needs another expression parsed (`rule`),
+        // or the stack is empty and this is the whole expression.
+        rule = loop {
+            let Some(k) = stack.pop() else {
+                return Ok(done.0);
+            };
+            nesting -= k.nesting();
+            let (e, d) = done;
+            done = match k {
+                K::Or(mut items, deepest) => {
+                    items.push(e);
+                    let deepest = deepest.max(d);
+                    if p.eat_kw("OR") {
+                        stack.push(K::Or(items, deepest));
+                        stack.push(K::And(Vec::new(), 0));
+                        break Rule::Not;
+                    }
+                    chain(items, deepest, Expr::Or)?
+                }
+                K::And(mut items, deepest) => {
+                    items.push(e);
+                    let deepest = deepest.max(d);
+                    if p.eat_kw("AND") {
+                        stack.push(K::And(items, deepest));
+                        break Rule::Not;
+                    }
+                    chain(items, deepest, Expr::And)?
+                }
+                K::Not(n) => {
+                    let mut e = e;
+                    for _ in 0..n {
+                        e = Expr::Not(Box::new(e));
+                    }
+                    let d = d + n;
+                    if d > MAX_DEPTH {
+                        return Err(too_deep_expr());
+                    }
+                    (e, d)
+                }
+                K::CmpLeft => {
+                    let left = Box::new(e);
+                    if p.eat_kw("IS") {
+                        let negated = p.eat_kw("NOT");
+                        p.expect_kw("NULL")?;
+                        (Expr::IsNull(left, !negated), deeper(d)?)
+                    } else if p.eat_kw("IN") {
+                        p.expect_sym("[")?;
+                        if p.eat_sym("]") {
+                            (Expr::In(left, Vec::new()), deeper(d)?)
+                        } else {
+                            nesting += 1;
+                            if nesting > MAX_DEPTH {
+                                return Err(too_deep_expr());
                             }
+                            stack.push(K::In(left, Vec::new(), d));
+                            break Rule::Expr;
                         }
-                        p.expect_sym(")")?;
+                    } else {
+                        let op = if p.eat_kw("CONTAINS") {
+                            Some("contains")
+                        } else if p.is_kw("STARTS") {
+                            p.pos += 1;
+                            p.expect_kw("WITH")?;
+                            Some("starts")
+                        } else if p.is_kw("ENDS") {
+                            p.pos += 1;
+                            p.expect_kw("WITH")?;
+                            Some("ends")
+                        } else {
+                            ["<>", "!=", "<=", ">=", "=", "<", ">"]
+                                .into_iter()
+                                .find(|op| p.eat_sym(op))
+                        };
+                        match op {
+                            Some(op) => {
+                                stack.push(K::CmpRight(op, left, d));
+                                break Rule::Additive;
+                            }
+                            None => (*left, d),
+                        }
                     }
-                    p.ext_funcs.push(qualified.clone());
-                    return Ok(Expr::Func(qualified, args));
                 }
-                return Ok(Expr::Prop(name, key));
-            }
-            Ok(Expr::Var(name))
-        }
-        other => Err(Error::Msg(format!("unexpected token {:?}", other))),
+                K::CmpRight(op, left, ld) => (
+                    Expr::Cmp(op.to_string(), left, Box::new(e)),
+                    deeper(ld.max(d))?,
+                ),
+                K::In(left, mut items, deepest) => {
+                    items.push(e);
+                    let deepest = deepest.max(d);
+                    if p.eat_sym(",") {
+                        nesting += 1;
+                        stack.push(K::In(left, items, deepest));
+                        break Rule::Expr;
+                    }
+                    p.expect_sym("]")?;
+                    (Expr::In(left, items), deeper(deepest)?)
+                }
+                K::Add(first, mut rest, op, deepest) => {
+                    let deepest = deepest.max(d);
+                    let first = match first {
+                        None => Box::new(e),
+                        Some(first) => {
+                            rest.push((op, e));
+                            first
+                        }
+                    };
+                    let next = if p.eat_sym("+") {
+                        Some('+')
+                    } else if p.eat_sym("-") {
+                        Some('-')
+                    } else {
+                        None
+                    };
+                    match next {
+                        Some(op) => {
+                            stack.push(K::Add(Some(first), rest, op, deepest));
+                            stack.push(K::Mul(None, Vec::new(), '*', 0));
+                            break Rule::Atom;
+                        }
+                        None => arith_chain(first, rest, deepest)?,
+                    }
+                }
+                K::Mul(first, mut rest, op, deepest) => {
+                    let deepest = deepest.max(d);
+                    let first = match first {
+                        None => Box::new(e),
+                        Some(first) => {
+                            rest.push((op, e));
+                            first
+                        }
+                    };
+                    let next = if p.eat_sym("*") {
+                        Some('*')
+                    } else if p.eat_sym("/") {
+                        Some('/')
+                    } else {
+                        None
+                    };
+                    match next {
+                        Some(op) => {
+                            stack.push(K::Mul(Some(first), rest, op, deepest));
+                            break Rule::Atom;
+                        }
+                        None => arith_chain(first, rest, deepest)?,
+                    }
+                }
+                K::Postfix => {
+                    if !p.eat_sym("[") {
+                        (e, d)
+                    } else {
+                        nesting += 1;
+                        if nesting > MAX_DEPTH {
+                            return Err(too_deep_expr());
+                        }
+                        if p.eat_sym("..") {
+                            if p.eat_sym("]") {
+                                nesting -= 1;
+                                stack.push(K::Postfix);
+                                (Expr::Slice(Box::new(e), None, None), deeper(d)?)
+                            } else {
+                                stack.push(K::SliceEnd(Box::new(e), None, d));
+                                break Rule::Expr;
+                            }
+                        } else {
+                            stack.push(K::Subscript(Box::new(e), d));
+                            break Rule::Expr;
+                        }
+                    }
+                }
+                K::Subscript(base, bd) => {
+                    let d = bd.max(d);
+                    if p.eat_sym("..") {
+                        if p.eat_sym("]") {
+                            stack.push(K::Postfix);
+                            (Expr::Slice(base, Some(Box::new(e)), None), deeper(d)?)
+                        } else {
+                            nesting += 1;
+                            stack.push(K::SliceEnd(base, Some(Box::new(e)), d));
+                            break Rule::Expr;
+                        }
+                    } else {
+                        p.expect_sym("]")?;
+                        stack.push(K::Postfix);
+                        (Expr::Index(base, Box::new(e)), deeper(d)?)
+                    }
+                }
+                K::SliceEnd(base, start, bd) => {
+                    p.expect_sym("]")?;
+                    stack.push(K::Postfix);
+                    (
+                        Expr::Slice(base, start, Some(Box::new(e))),
+                        deeper(bd.max(d))?,
+                    )
+                }
+                K::Paren => {
+                    p.expect_sym(")")?;
+                    (e, d)
+                }
+                K::List(mut items, deepest) => {
+                    items.push(e);
+                    let deepest = deepest.max(d);
+                    if p.eat_sym(",") {
+                        nesting += 1;
+                        stack.push(K::List(items, deepest));
+                        break Rule::Expr;
+                    }
+                    p.expect_sym("]")?;
+                    (Expr::List(items), deeper(deepest)?)
+                }
+                K::Args(name, mut args, ext, deepest) => {
+                    args.push(e);
+                    let deepest = deepest.max(d);
+                    if p.eat_sym(",") {
+                        nesting += 1;
+                        stack.push(K::Args(name, args, ext, deepest));
+                        break Rule::Expr;
+                    }
+                    p.expect_sym(")")?;
+                    if ext {
+                        p.ext_funcs.push(name.clone());
+                    }
+                    (Expr::Func(name, args), deeper(deepest)?)
+                }
+                K::Neg => (
+                    Expr::Arith(Box::new(Expr::Lit(Value::Int(0))), vec![('-', e)]),
+                    deeper(d)?,
+                ),
+            };
+        };
     }
+}
+
+/// An `AND` or `OR` of `items`: the item itself when there is one.
+fn chain(
+    mut items: Vec<Expr>,
+    deepest: usize,
+    node: fn(Vec<Expr>) -> Expr,
+) -> Result<(Expr, usize)> {
+    if items.len() == 1 {
+        if let Some(e) = items.pop() {
+            return Ok((e, deepest));
+        }
+    }
+    Ok((node(items), deeper(deepest)?))
+}
+
+/// An arithmetic chain: `first` itself when nothing follows it.
+fn arith_chain(first: Box<Expr>, rest: Vec<(char, Expr)>, deepest: usize) -> Result<(Expr, usize)> {
+    if rest.is_empty() {
+        return Ok((*first, deepest));
+    }
+    Ok((Expr::Arith(first, rest), deeper(deepest)?))
 }
 
 fn const_value(e: &Expr) -> Result<Value> {
@@ -1181,17 +1471,23 @@ fn const_value(e: &Expr) -> Result<Value> {
             }
             Ok(Value::List(out))
         }
-        Expr::Arith('-', a, b) => {
+        Expr::Arith(first, rest) if rest.iter().all(|(op, _)| *op == '-') => {
             // `-5` parses as `0 - 5`; keep it an Int so a negative literal in
             // CREATE or CALL does not silently become a float.
-            let (x, y) = (const_value(a)?, const_value(b)?);
-            if let (Value::Int(x), Value::Int(y)) = (&x, &y) {
-                return Ok(Value::Int(x - y));
+            let mut x = const_value(first)?;
+            for (_, e) in rest {
+                let y = const_value(e)?;
+                x = match (&x, &y) {
+                    (Value::Int(a), Value::Int(b)) if a.checked_sub(*b).is_some() => {
+                        Value::Int(a - b)
+                    }
+                    _ => match (x.as_f64(), y.as_f64()) {
+                        (Some(a), Some(b)) => Value::Float(a - b),
+                        _ => return Err(Error::Msg("expected a constant".into())),
+                    },
+                };
             }
-            match (x.as_f64(), y.as_f64()) {
-                (Some(x), Some(y)) => Ok(Value::Float(x - y)),
-                _ => Err(Error::Msg("expected a constant".into())),
-            }
+            Ok(x)
         }
         _ => Err(Error::Msg("expected a constant value".into())),
     }
@@ -1456,6 +1752,33 @@ pub fn execute_capped(
         return Err(budget_error());
     }
     Ok(result)
+}
+
+/// Whether `src` is `BEGIN`, `COMMIT` or `ROLLBACK`: a statement that opens
+/// or closes the handle's transaction rather than doing anything itself.
+/// Read with the lexer's rules (any case, after whitespace, `//` comments
+/// and `;`, backticks or not), so a binding that keeps transactions itself
+/// can refuse them as text and be sure that what it refused is what would
+/// have run.
+pub fn controls_transaction(src: &str) -> bool {
+    let mut rest = src;
+    loop {
+        rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == ';');
+        match rest.strip_prefix("//") {
+            Some(comment) => rest = comment.find('\n').map_or("", |i| &comment[i..]),
+            None => break,
+        }
+    }
+    let word = match rest.strip_prefix('`') {
+        Some(quoted) => quoted.split('`').next().unwrap_or(""),
+        None => rest
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .next()
+            .unwrap_or(""),
+    };
+    ["BEGIN", "COMMIT", "ROLLBACK"]
+        .iter()
+        .any(|kw| word.eq_ignore_ascii_case(kw))
 }
 
 pub fn execute(g: &mut Graph, src: &str) -> Result<QueryResult> {
@@ -1911,7 +2234,7 @@ fn exec_match(
     match tail {
         Tail::Count => {
             let mut n = 0usize;
-            match_all(g, patterns, 0, Vec::new(), filter, &mut |_| {
+            match_all(g, patterns, filter, &mut |_| {
                 n += 1;
                 Ok(true)
             })?;
@@ -1929,20 +2252,13 @@ fn exec_match(
             }
             let mut proj = Projection::new(kind, *distinct, order, *skip, *limit, g.query_memory());
             let mut err = None;
-            match_all(
-                g,
-                patterns,
-                0,
-                Vec::new(),
-                filter,
-                &mut |b| match proj.push(g, b) {
-                    Ok(go) => Ok(go),
-                    Err(e) => {
-                        err = Some(e);
-                        Ok(false)
-                    }
-                },
-            )?;
+            match_all(g, patterns, filter, &mut |b| match proj.push(g, b) {
+                Ok(go) => Ok(go),
+                Err(e) => {
+                    err = Some(e);
+                    Ok(false)
+                }
+            })?;
             if let Some(e) = err {
                 return Err(e);
             }
@@ -2151,7 +2467,7 @@ fn exec_write(
     tail: &Tail,
 ) -> Result<QueryResult> {
     let mut spool = Spool::new();
-    match_all(g, patterns, 0, Vec::new(), filter, &mut |b| {
+    match_all(g, patterns, filter, &mut |b| {
         spool.push(&b);
         Ok(true)
     })?;
@@ -2322,9 +2638,10 @@ fn flip(d: Dir) -> Dir {
 fn pinned_ids(filter: Option<&Expr>, out: &mut Vec<(String, u64)>) {
     let Some(expr) = filter else { return };
     match expr {
-        Expr::And(a, b) => {
-            pinned_ids(Some(a), out);
-            pinned_ids(Some(b), out);
+        Expr::And(items) => {
+            for e in items {
+                pinned_ids(Some(e), out);
+            }
         }
         Expr::Cmp(op, a, b) if op == "=" => {
             for (x, y) in [(a, b), (b, a)] {
@@ -2440,17 +2757,100 @@ type Sink<'a> = dyn FnMut(Binds) -> Result<bool> + 'a;
 /// Match the comma-separated chains left to right, each against every
 /// binding the previous ones produced, then apply WHERE, streaming the
 /// survivors into `sink`. Returns false if the sink stopped it.
+///
+/// Each chain is matched inside the callback of the one before, a few stack
+/// frames per chain, and programs write hundreds of chains. So only the
+/// first [`STREAMED_CHAINS`] are matched that way. Each chain after them
+/// is matched for one binding at a time into a spool (on disk past the
+/// working memory), and a loop walks those spools depth first, so the
+/// stack stays the same however many chains there are. Rows come out in
+/// the same order. The price, for those later chains only, is that a
+/// `LIMIT` stopping early may have matched the rest of one chain's spool
+/// for nothing; nearly every statement has fewer chains and never spools.
 fn match_all(
+    g: &Graph,
+    patterns: &[Chain],
+    filter: Option<&Expr>,
+    sink: &mut Sink<'_>,
+) -> Result<bool> {
+    if patterns.len() <= STREAMED_CHAINS {
+        return match_from(g, patterns, 0, Vec::new(), filter, true, sink);
+    }
+    let (head, tail) = patterns.split_at(STREAMED_CHAINS);
+    let mut run = || {
+        match_from(g, head, 0, Vec::new(), filter, false, &mut |b| {
+            match_spooled(g, tail, b, filter, sink)
+        })
+    };
+    if crate::ooc::budget_left().is_some() {
+        run()
+    } else {
+        crate::ooc::with_budget(g.algorithm_memory(), g.temp_dir(), run)
+    }
+}
+
+/// How many chains are matched by recursion. Each costs about 4 KiB of
+/// stack in a debug build, and the rest of a statement's deepest path (an
+/// expression nested to the limit in WHERE, evaluated at the bottom of it)
+/// must fit beside them: see the stack table in the README's Limits.
+const STREAMED_CHAINS: usize = 4;
+
+/// The chains of `tail`, each matched for one binding into a spool, walked
+/// depth first from a loop: `open[k]` holds the matches of `tail[k]` for
+/// the binding currently taken from `open[k - 1]`.
+fn match_spooled(
+    g: &Graph,
+    tail: &[Chain],
+    binds: Binds,
+    filter: Option<&Expr>,
+    sink: &mut Sink<'_>,
+) -> Result<bool> {
+    let spool = |chain: &Chain, binds: Binds| -> Result<Spool> {
+        let mut spool = Spool::new();
+        match_chain_filtered(g, chain, binds, filter, &mut |b| {
+            spool.push(&b);
+            Ok(true)
+        })?;
+        Ok(spool)
+    };
+    let mut open = vec![spool(&tail[0], binds)?];
+    while let Some(top) = open.last_mut() {
+        let Some(binds) = top.next() else {
+            open.pop();
+            continue;
+        };
+        tick()?;
+        if open.len() < tail.len() {
+            let next = spool(&tail[open.len()], binds)?;
+            open.push(next);
+            continue;
+        }
+        if let Some(f) = filter {
+            if !eval(g, f, &binds).truthy() {
+                continue;
+            }
+        }
+        if !sink(binds)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The chains from `i` on, matched by recursion. `last` says whether these
+/// are the statement's final chains, after which WHERE applies.
+fn match_from(
     g: &Graph,
     patterns: &[Chain],
     i: usize,
     binds: Binds,
     filter: Option<&Expr>,
+    last: bool,
     sink: &mut Sink<'_>,
 ) -> Result<bool> {
     tick()?;
     if i == patterns.len() {
-        if let Some(f) = filter {
+        if let (true, Some(f)) = (last, filter) {
             if !eval(g, f, &binds).truthy() {
                 return Ok(true);
             }
@@ -2458,7 +2858,7 @@ fn match_all(
         return sink(binds);
     }
     match_chain_filtered(g, &patterns[i], binds, filter, &mut |b| {
-        match_all(g, patterns, i + 1, b, filter, sink)
+        match_from(g, patterns, i + 1, b, filter, last, sink)
     })
 }
 
@@ -2502,7 +2902,7 @@ fn match_chain_filtered(
         }
         let mut bound = vec![None; chain.nodes.len()];
         bound[plan.anchor] = Some(id);
-        go = walk(g, chain, &plan.steps, 0, b, bound, &[], out)?;
+        go = walk(g, chain, &plan.steps, b, bound, Vec::new(), out)?;
         Ok(go)
     })?;
     Ok(go)
@@ -2566,7 +2966,7 @@ fn match_from_edges(
             let mut bound = vec![None; chain.nodes.len()];
             bound[ri] = Some(a);
             bound[ri + 1] = Some(b_);
-            match walk(g, chain, &plan.steps, 0, b, bound, &[e.id], out) {
+            match walk(g, chain, &plan.steps, b, bound, vec![e.id], out) {
                 Ok(true) => {}
                 other => {
                     result = other;
@@ -2697,143 +3097,220 @@ fn for_each_candidate(
 /// Execute the plan, one step at a time, backtracking on failure.
 /// `used` holds the relationships this path has already traversed: as in
 /// Cypher, a match may not use the same relationship twice.
-#[allow(clippy::too_many_arguments)]
+///
+/// This was a recursion, one level per relationship of the chain, which a
+/// long enough pattern turned into a stack overflow. It is a loop over an
+/// explicit stack of [`Reach`]es now, one per step on the current path, so
+/// a chain of any length costs heap in proportion to its length and no
+/// stack. The path's bindings, bound nodes and used relationships are one
+/// stack each, cut back to a step's starting point before it tries its
+/// next candidate.
 fn walk(
     g: &Graph,
     chain: &Chain,
     steps: &[Step],
-    i: usize,
-    binds: Binds,
-    bound: Vec<Option<u64>>,
-    used: &[u64],
+    mut binds: Binds,
+    mut bound: Vec<Option<u64>>,
+    mut used: Vec<u64>,
     out: &mut Sink<'_>,
 ) -> Result<bool> {
+    /// A step on the current path, and where its bindings started.
+    struct Level {
+        reach: Reach,
+        binds: usize,
+        used: usize,
+    }
     tick()?;
-    if i >= steps.len() {
+    let Some(&first) = steps.first() else {
         return out(binds);
-    }
-    let step = steps[i];
-    let rel = &chain.rels[step.rel];
-    let target_pat = &chain.nodes[step.to];
-    let dir = if step.reversed {
-        flip(rel.dir)
-    } else {
-        rel.dir
     };
-    let current = match bound[step.from] {
-        Some(id) => id,
-        None => return Ok(true),
-    };
+    let mut levels = Vec::new();
+    if let Some(reach) = bound[first.from].and_then(|at| Reach::new(g, chain, first, at)) {
+        levels.push(Level {
+            reach,
+            binds: binds.len(),
+            used: used.len(),
+        });
+    }
+    while !levels.is_empty() {
+        let i = levels.len() - 1;
+        let step = steps[i];
+        let level = &mut levels[i];
+        binds.truncate(level.binds);
+        used.truncate(level.used);
+        let Some((node, edge)) = level.reach.next(g, chain, step, &binds, &used)? else {
+            levels.pop();
+            continue;
+        };
+        let fits = edge.map_or(true, |e| {
+            bind(&mut binds, &chain.rels[step.rel].var, Bind::Edge(e))
+        }) && bind(&mut binds, &chain.nodes[step.to].var, Bind::Node(node));
+        if !fits {
+            continue;
+        }
+        bound[step.to] = Some(node);
+        used.extend(edge);
+        tick()?;
+        let Some(&next) = steps.get(i + 1) else {
+            if !out(binds.clone())? {
+                return Ok(false);
+            }
+            continue;
+        };
+        if let Some(reach) = bound[next.from].and_then(|at| Reach::new(g, chain, next, at)) {
+            levels.push(Level {
+                reach,
+                binds: binds.len(),
+                used: used.len(),
+            });
+        }
+    }
+    Ok(true)
+}
 
-    let type_ids: Vec<u32> = rel
-        .types
-        .iter()
-        .filter_map(|t| g.strings.lookup(t))
-        .collect();
-    if !rel.types.is_empty() && type_ids.len() != rel.types.len() {
-        return Ok(true);
+/// What one step of a walk reaches from a bound node: the target nodes, each
+/// with the relationship it was reached over when the step is one hop.
+/// Produced as the walk asks, so a variable-length step expands one depth
+/// at a time and a `LIMIT` still stops it early.
+struct Reach {
+    type_ids: Vec<u32>,
+    dir: Dir,
+    /// One hop: the adjacency, filtered as it is taken.
+    adj: std::vec::IntoIter<crate::graph::Adj>,
+    /// Variable length: the breadth-first expansion.
+    var: Option<Expansion>,
+}
+
+struct Expansion {
+    frontier: Vec<u64>,
+    seen: crate::graph::IdSet,
+    depth: u32,
+    min: u32,
+    max: u32,
+    /// Nodes found at the depth just expanded, not yet handed out.
+    ready: std::vec::IntoIter<u64>,
+}
+
+impl Reach {
+    /// None when the step can reach nothing: it names only relationship
+    /// types that were never written.
+    #[inline(never)]
+    fn new(g: &Graph, chain: &Chain, step: Step, current: u64) -> Option<Reach> {
+        let rel = &chain.rels[step.rel];
+        let dir = if step.reversed {
+            flip(rel.dir)
+        } else {
+            rel.dir
+        };
+        let type_ids: Vec<u32> = rel
+            .types
+            .iter()
+            .filter_map(|t| g.strings.lookup(t))
+            .collect();
+        // `[:A|:B]` where no A was ever written still matches the Bs; only
+        // when none of the types exists is there nothing to walk.
+        if !rel.types.is_empty() && type_ids.is_empty() {
+            return None;
+        }
+        if let Some((min, max)) = rel.hops {
+            let mut seen = crate::graph::id_set();
+            seen.insert(current);
+            return Some(Reach {
+                type_ids,
+                dir,
+                adj: Vec::new().into_iter(),
+                var: Some(Expansion {
+                    frontier: vec![current],
+                    seen,
+                    depth: 0,
+                    min,
+                    max,
+                    ready: Vec::new().into_iter(),
+                }),
+            });
+        }
+        // One type: a range scan of just that type's adjacency.
+        let only = if type_ids.len() == 1 {
+            Some(type_ids[0])
+        } else {
+            None
+        };
+        Some(Reach {
+            adj: g.neighbors(current, dir, only).into_iter(),
+            type_ids,
+            dir,
+            var: None,
+        })
     }
 
-    if let Some((min, max)) = rel.hops {
-        let mut frontier = vec![current];
-        let mut seen = crate::graph::id_set();
-        seen.insert(current);
-        for depth in 1..=max {
-            let mut next = Vec::new();
-            let only = if type_ids.len() == 1 {
-                Some(type_ids[0])
+    #[inline(never)]
+    fn next(
+        &mut self,
+        g: &Graph,
+        chain: &Chain,
+        step: Step,
+        binds: &Binds,
+        used: &[u64],
+    ) -> Result<Option<(u64, Option<u64>)>> {
+        let rel = &chain.rels[step.rel];
+        let target = &chain.nodes[step.to];
+        let Some(x) = self.var.as_mut() else {
+            for adj in self.adj.by_ref() {
+                tick()?;
+                if !self.type_ids.is_empty() && !self.type_ids.contains(&adj.etype) {
+                    continue;
+                }
+                if used.contains(&adj.edge) {
+                    continue;
+                }
+                if !edge_props_match(g, rel, adj.edge, binds) {
+                    continue;
+                }
+                if !node_matches(g, target, adj.other, binds) {
+                    continue;
+                }
+                return Ok(Some((adj.other, Some(adj.edge))));
+            }
+            return Ok(None);
+        };
+        loop {
+            for id in x.ready.by_ref() {
+                if node_matches(g, target, id, binds) {
+                    return Ok(Some((id, None)));
+                }
+            }
+            if x.depth >= x.max || x.frontier.is_empty() {
+                return Ok(None);
+            }
+            x.depth += 1;
+            let only = if self.type_ids.len() == 1 {
+                Some(self.type_ids[0])
             } else {
                 None
             };
-            for node in &frontier {
+            let mut next = Vec::new();
+            for node in &x.frontier {
                 tick()?;
-                for adj in g.neighbors(*node, dir, only) {
+                for adj in g.neighbors(*node, self.dir, only) {
                     tick()?;
-                    if !type_ids.is_empty() && !type_ids.contains(&adj.etype) {
+                    if !self.type_ids.is_empty() && !self.type_ids.contains(&adj.etype) {
                         continue;
                     }
-                    if !rel.props.is_empty() && !edge_props_match(g, rel, adj.edge, &binds) {
+                    if !rel.props.is_empty() && !edge_props_match(g, rel, adj.edge, binds) {
                         continue;
                     }
-                    if !seen.insert(adj.other) {
+                    if !x.seen.insert(adj.other) {
                         continue;
                     }
                     next.push(adj.other);
                 }
             }
-            if depth >= min {
-                for id in &next {
-                    if !node_matches(g, target_pat, *id, &binds) {
-                        continue;
-                    }
-                    let mut b = binds.clone();
-                    if let Some(v) = &target_pat.var {
-                        match lookup(&b, v) {
-                            Some(existing) if existing != Bind::Node(*id) => continue,
-                            Some(_) => {}
-                            None => b.push((v.clone(), Bind::Node(*id))),
-                        }
-                    }
-                    let mut bound2 = bound.clone();
-                    bound2[step.to] = Some(*id);
-                    if !walk(g, chain, steps, i + 1, b, bound2, used, out)? {
-                        return Ok(false);
-                    }
-                }
+            if x.depth >= x.min {
+                x.ready = next.clone().into_iter();
             }
-            frontier = next;
-            if frontier.is_empty() {
-                break;
-            }
-        }
-        return Ok(true);
-    }
-
-    // One type: a range scan of just that type's adjacency.
-    let only = if type_ids.len() == 1 {
-        Some(type_ids[0])
-    } else {
-        None
-    };
-    for adj in g.neighbors(current, dir, only) {
-        tick()?;
-        if !type_ids.is_empty() && !type_ids.contains(&adj.etype) {
-            continue;
-        }
-        if used.contains(&adj.edge) {
-            continue;
-        }
-        if !edge_props_match(g, rel, adj.edge, &binds) {
-            continue;
-        }
-        if !node_matches(g, target_pat, adj.other, &binds) {
-            continue;
-        }
-        let mut b = binds.clone();
-        if let Some(v) = &rel.var {
-            match lookup(&b, v) {
-                Some(existing) if existing != Bind::Edge(adj.edge) => continue,
-                Some(_) => {}
-                None => b.push((v.clone(), Bind::Edge(adj.edge))),
-            }
-        }
-        if let Some(v) = &target_pat.var {
-            match lookup(&b, v) {
-                Some(existing) if existing != Bind::Node(adj.other) => continue,
-                Some(_) => {}
-                None => b.push((v.clone(), Bind::Node(adj.other))),
-            }
-        }
-        let mut bound2 = bound.clone();
-        bound2[step.to] = Some(adj.other);
-        let mut used2 = Vec::with_capacity(used.len() + 1);
-        used2.extend_from_slice(used);
-        used2.push(adj.edge);
-        if !walk(g, chain, steps, i + 1, b, bound2, &used2, out)? {
-            return Ok(false);
+            x.frontier = next;
         }
     }
-    Ok(true)
 }
 
 /// Whether node `id` satisfies a pattern's labels and properties. Ids come
@@ -3122,7 +3599,10 @@ struct Projection<'q> {
     order: &'q [(Expr, bool)],
     skip: usize,
     limit: Option<usize>,
-    items: Option<Vec<(Expr, String)>>,
+    /// The columns: the statement's own expressions, borrowed (cloning a
+    /// deep expression is a recursion of its own), or for `RETURN *` the
+    /// first row's variables.
+    items: Option<Vec<(std::borrow::Cow<'q, Expr>, String)>>,
     keys: Vec<(usize, bool)>,
     /// Columns the caller sees; any after these are ORDER BY keys that were
     /// not returned, evaluated per row for sorting and dropped at the end.
@@ -3200,12 +3680,16 @@ impl<'q> Projection<'q> {
         if self.items.is_some() {
             return Ok(());
         }
-        let items: Vec<(Expr, String)> = match self.kind {
-            ReturnKind::Items(items) => items.clone(),
+        use std::borrow::Cow;
+        let items: Vec<(Cow<'q, Expr>, String)> = match self.kind {
+            ReturnKind::Items(items) => items
+                .iter()
+                .map(|(e, alias)| (Cow::Borrowed(e), alias.clone()))
+                .collect(),
             ReturnKind::All => first
                 .map(|b| {
                     b.iter()
-                        .map(|(k, _)| (Expr::Var(k.to_string()), k.to_string()))
+                        .map(|(k, _)| (Cow::Owned(Expr::Var(k.to_string())), k.to_string()))
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -3234,7 +3718,7 @@ impl<'q> Projection<'q> {
                     && !e.is_aggregate()
                     && reads_only(e, &known) =>
                 {
-                    items.push((e.clone(), alias));
+                    items.push((Cow::Borrowed(e), alias));
                     items.len() - 1
                 }
                 None => {
@@ -3399,6 +3883,12 @@ impl<'q> Projection<'q> {
                 r.truncate(self.shown);
             }
         }
+        // A result is input to whatever reads it (a binding, a cursor's
+        // spool), so it is held to the depth stored values are. A statement
+        // can build a deeper list than it can store: `[n.list]`.
+        for row in &final_rows {
+            check_row(row)?;
+        }
         Ok(QueryResult {
             columns,
             rows: final_rows,
@@ -3408,128 +3898,239 @@ impl<'q> Projection<'q> {
     }
 }
 
+/// `Err` when a result value is nested deeper than a stored one may be.
+pub(crate) fn check_row(row: &[Value]) -> Result<()> {
+    for v in row {
+        check_depth(v).map_err(Error::Msg)?;
+    }
+    Ok(())
+}
+
 // -------------------------------------------------------------- expressions
+
+// The evaluator recurses once per level of the expression tree, which the
+// parser bounds at MAX_DEPTH. What each level costs is kept small: `eval`
+// only dispatches, each node's work is a function of its own that holds
+// just the values its children produced, and whatever does not recurse
+// (comparing, arithmetic, the scalar functions) is a leaf function the
+// recursion never passes through. In a debug build, where every temporary
+// of a function gets its own stack slot, one large `match` doing all of it
+// cost about four kilobytes per level.
 
 fn eval(g: &Graph, e: &Expr, binds: &Binds) -> Value {
     match e {
         Expr::Lit(v) => v.clone(),
-        Expr::List(items) => Value::List(items.iter().map(|i| eval(g, i, binds)).collect()),
-        Expr::Var(v) => match lookup(binds, v) {
-            Some(Bind::Node(id)) => node_value(g, id),
-            Some(Bind::Edge(id)) => edge_value(g, id),
-            None => Value::Null,
-        },
-        Expr::Prop(var, key) => match lookup(binds, var) {
-            Some(Bind::Node(id)) => g.node_prop(id, key).unwrap_or(Value::Null),
-            Some(Bind::Edge(id)) => g.edge_prop(id, key).unwrap_or(Value::Null),
-            None => Value::Null,
-        },
-        Expr::Not(inner) => Value::Bool(!eval(g, inner, binds).truthy()),
-        Expr::And(a, b) => Value::Bool(eval(g, a, binds).truthy() && eval(g, b, binds).truthy()),
-        Expr::Or(a, b) => Value::Bool(eval(g, a, binds).truthy() || eval(g, b, binds).truthy()),
-        Expr::IsNull(inner, want_null) => {
-            let is_null = matches!(eval(g, inner, binds), Value::Null);
-            Value::Bool(is_null == *want_null)
-        }
-        Expr::In(inner, items) => {
-            let v = eval(g, inner, binds);
-            Value::Bool(items.iter().any(|i| eval(g, i, binds) == v))
-        }
-        Expr::Cmp(op, a, b) => {
-            let (x, y) = (eval(g, a, binds), eval(g, b, binds));
-            let result = match op.as_str() {
-                "=" => x == y,
-                "<>" | "!=" => x != y,
-                "<" => x.total_cmp(&y) == std::cmp::Ordering::Less,
-                "<=" => x.total_cmp(&y) != std::cmp::Ordering::Greater,
-                ">" => x.total_cmp(&y) == std::cmp::Ordering::Greater,
-                ">=" => x.total_cmp(&y) != std::cmp::Ordering::Less,
-                "contains" => x.to_string().contains(&y.to_string()),
-                "starts" => x.to_string().starts_with(&y.to_string()),
-                "ends" => x.to_string().ends_with(&y.to_string()),
-                _ => false,
-            };
-            Value::Bool(result)
-        }
-        Expr::Arith(op, a, b) => {
-            let (x, y) = (eval(g, a, binds), eval(g, b, binds));
-            if *op == '+' {
-                if let (Value::Text(_), _) | (_, Value::Text(_)) = (&x, &y) {
-                    return Value::Text(format!("{}{}", x, y));
-                }
-            }
-            let (Some(xf), Some(yf)) = (x.as_f64(), y.as_f64()) else {
-                return Value::Null;
-            };
-            let both_int = matches!(x, Value::Int(_)) && matches!(y, Value::Int(_));
-            let out = match op {
-                '+' => xf + yf,
-                '-' => xf - yf,
-                '*' => xf * yf,
-                '/' => {
-                    if yf == 0.0 {
-                        return Value::Null;
-                    }
-                    xf / yf
-                }
-                _ => return Value::Null,
-            };
-            if both_int && *op != '/' {
-                Value::Int(out as i64)
-            } else {
-                Value::Float(out)
-            }
-        }
+        Expr::Var(v) => eval_var(g, v, binds),
+        Expr::Prop(var, key) => eval_prop(g, var, key, binds),
+        Expr::List(items) => eval_list(g, items, binds),
+        Expr::Not(inner) => eval_not(g, inner, binds),
+        Expr::And(items) => eval_and(g, items, binds),
+        Expr::Or(items) => eval_or(g, items, binds),
+        Expr::IsNull(inner, want_null) => eval_is_null(g, inner, *want_null, binds),
+        Expr::In(inner, items) => eval_in(g, inner, items, binds),
+        Expr::Cmp(op, a, b) => eval_cmp(g, op, a, b, binds),
+        Expr::Arith(first, rest) => eval_arith(g, first, rest, binds),
         Expr::Func(name, args) => eval_func(g, name, args, binds),
-        Expr::Index(e, i) => {
-            let (v, i) = (eval(g, e, binds), eval(g, i, binds));
-            let Value::Int(i) = i else { return Value::Null };
-            match v {
-                Value::List(items) => position(i, items.len())
-                    .map(|k| items[k].clone())
-                    .unwrap_or(Value::Null),
-                Value::Text(t) => {
-                    let chars: Vec<char> = t.chars().collect();
-                    position(i, chars.len())
-                        .map(|k| Value::Text(chars[k].to_string()))
-                        .unwrap_or(Value::Null)
-                }
+        Expr::Index(e, i) => eval_index(g, e, i, binds),
+        Expr::Slice(e, a, b) => eval_slice(g, e, a.as_deref(), b.as_deref(), binds),
+    }
+}
+
+#[inline(never)]
+fn eval_var(g: &Graph, v: &str, binds: &Binds) -> Value {
+    match lookup(binds, v) {
+        Some(Bind::Node(id)) => node_value(g, id),
+        Some(Bind::Edge(id)) => edge_value(g, id),
+        None => Value::Null,
+    }
+}
+
+#[inline(never)]
+fn eval_prop(g: &Graph, var: &str, key: &str, binds: &Binds) -> Value {
+    match lookup(binds, var) {
+        Some(Bind::Node(id)) => g.node_prop(id, key).unwrap_or(Value::Null),
+        Some(Bind::Edge(id)) => g.edge_prop(id, key).unwrap_or(Value::Null),
+        None => Value::Null,
+    }
+}
+
+#[inline(never)]
+fn eval_list(g: &Graph, items: &[Expr], binds: &Binds) -> Value {
+    let mut out = Vec::with_capacity(items.len());
+    for i in items {
+        out.push(eval(g, i, binds));
+    }
+    Value::List(out)
+}
+
+#[inline(never)]
+fn eval_not(g: &Graph, inner: &Expr, binds: &Binds) -> Value {
+    Value::Bool(!eval(g, inner, binds).truthy())
+}
+
+#[inline(never)]
+fn eval_and(g: &Graph, items: &[Expr], binds: &Binds) -> Value {
+    for i in items {
+        if !eval(g, i, binds).truthy() {
+            return Value::Bool(false);
+        }
+    }
+    Value::Bool(true)
+}
+
+#[inline(never)]
+fn eval_or(g: &Graph, items: &[Expr], binds: &Binds) -> Value {
+    for i in items {
+        if eval(g, i, binds).truthy() {
+            return Value::Bool(true);
+        }
+    }
+    Value::Bool(false)
+}
+
+#[inline(never)]
+fn eval_is_null(g: &Graph, inner: &Expr, want_null: bool, binds: &Binds) -> Value {
+    let is_null = matches!(eval(g, inner, binds), Value::Null);
+    Value::Bool(is_null == want_null)
+}
+
+#[inline(never)]
+fn eval_in(g: &Graph, inner: &Expr, items: &[Expr], binds: &Binds) -> Value {
+    let v = eval(g, inner, binds);
+    for i in items {
+        if eval(g, i, binds) == v {
+            return Value::Bool(true);
+        }
+    }
+    Value::Bool(false)
+}
+
+#[inline(never)]
+fn eval_cmp(g: &Graph, op: &str, a: &Expr, b: &Expr, binds: &Binds) -> Value {
+    let x = eval(g, a, binds);
+    let y = eval(g, b, binds);
+    Value::Bool(compare(op, &x, &y))
+}
+
+#[inline(never)]
+fn compare(op: &str, x: &Value, y: &Value) -> bool {
+    match op {
+        "=" => x == y,
+        "<>" | "!=" => x != y,
+        "<" => x.total_cmp(y) == std::cmp::Ordering::Less,
+        "<=" => x.total_cmp(y) != std::cmp::Ordering::Greater,
+        ">" => x.total_cmp(y) == std::cmp::Ordering::Greater,
+        ">=" => x.total_cmp(y) != std::cmp::Ordering::Less,
+        "contains" => x.to_string().contains(&y.to_string()),
+        "starts" => x.to_string().starts_with(&y.to_string()),
+        "ends" => x.to_string().ends_with(&y.to_string()),
+        _ => false,
+    }
+}
+
+/// A chain left to right: `a - b - c` is `(a - b) - c`, exactly as the
+/// nested binary operations it used to be parsed into.
+#[inline(never)]
+fn eval_arith(g: &Graph, first: &Expr, rest: &[(char, Expr)], binds: &Binds) -> Value {
+    let mut acc = eval(g, first, binds);
+    for (op, e) in rest {
+        let y = eval(g, e, binds);
+        acc = arith(*op, acc, y);
+    }
+    acc
+}
+
+#[inline(never)]
+fn arith(op: char, x: Value, y: Value) -> Value {
+    if op == '+' {
+        if let (Value::Text(_), _) | (_, Value::Text(_)) = (&x, &y) {
+            return Value::Text(format!("{}{}", x, y));
+        }
+    }
+    let (Some(xf), Some(yf)) = (x.as_f64(), y.as_f64()) else {
+        return Value::Null;
+    };
+    let both_int = matches!(x, Value::Int(_)) && matches!(y, Value::Int(_));
+    let out = match op {
+        '+' => xf + yf,
+        '-' => xf - yf,
+        '*' => xf * yf,
+        '/' => {
+            if yf == 0.0 {
+                return Value::Null;
+            }
+            xf / yf
+        }
+        _ => return Value::Null,
+    };
+    if both_int && op != '/' {
+        Value::Int(out as i64)
+    } else {
+        Value::Float(out)
+    }
+}
+
+#[inline(never)]
+fn eval_index(g: &Graph, e: &Expr, i: &Expr, binds: &Binds) -> Value {
+    let v = eval(g, e, binds);
+    let i = eval(g, i, binds);
+    index(v, i)
+}
+
+#[inline(never)]
+fn index(v: Value, i: Value) -> Value {
+    let Value::Int(i) = i else { return Value::Null };
+    match v {
+        Value::List(items) => position(i, items.len())
+            .map(|k| items[k].clone())
+            .unwrap_or(Value::Null),
+        Value::Text(t) => {
+            let chars: Vec<char> = t.chars().collect();
+            position(i, chars.len())
+                .map(|k| Value::Text(chars[k].to_string()))
+                .unwrap_or(Value::Null)
+        }
+        _ => Value::Null,
+    }
+}
+
+#[inline(never)]
+fn eval_slice(g: &Graph, e: &Expr, a: Option<&Expr>, b: Option<&Expr>, binds: &Binds) -> Value {
+    let v = eval(g, e, binds);
+    let a = a.map(|x| eval(g, x, binds));
+    let b = b.map(|x| eval(g, x, binds));
+    slice(v, a, b)
+}
+
+#[inline(never)]
+fn slice(v: Value, a: Option<Value>, b: Option<Value>) -> Value {
+    let bound = |x: &Option<Value>, len: usize, default: usize| -> Option<usize> {
+        match x {
+            None => Some(default),
+            Some(Value::Int(i)) if *i < 0 => Some(len.saturating_sub(i.unsigned_abs() as usize)),
+            Some(Value::Int(i)) => Some((*i as usize).min(len)),
+            Some(_) => None,
+        }
+    };
+    match v {
+        Value::List(items) => {
+            let len = items.len();
+            match (bound(&a, len, 0), bound(&b, len, len)) {
+                (Some(x), Some(y)) if x < y => Value::List(items[x..y].to_vec()),
+                (Some(_), Some(_)) => Value::List(Vec::new()),
                 _ => Value::Null,
             }
         }
-        Expr::Slice(e, a, b) => {
-            let v = eval(g, e, binds);
-            let bound = |x: &Option<Box<Expr>>, len: usize, default: usize| -> Option<usize> {
-                match x.as_ref().map(|x| eval(g, x, binds)) {
-                    None => Some(default),
-                    Some(Value::Int(i)) if i < 0 => {
-                        Some(len.saturating_sub(i.unsigned_abs() as usize))
-                    }
-                    Some(Value::Int(i)) => Some((i as usize).min(len)),
-                    Some(_) => None,
-                }
-            };
-            match v {
-                Value::List(items) => {
-                    let len = items.len();
-                    match (bound(a, len, 0), bound(b, len, len)) {
-                        (Some(x), Some(y)) if x < y => Value::List(items[x..y].to_vec()),
-                        (Some(_), Some(_)) => Value::List(Vec::new()),
-                        _ => Value::Null,
-                    }
-                }
-                Value::Text(t) => {
-                    let chars: Vec<char> = t.chars().collect();
-                    let len = chars.len();
-                    match (bound(a, len, 0), bound(b, len, len)) {
-                        (Some(x), Some(y)) if x < y => Value::Text(chars[x..y].iter().collect()),
-                        (Some(_), Some(_)) => Value::Text(String::new()),
-                        _ => Value::Null,
-                    }
-                }
+        Value::Text(t) => {
+            let chars: Vec<char> = t.chars().collect();
+            let len = chars.len();
+            match (bound(&a, len, 0), bound(&b, len, len)) {
+                (Some(x), Some(y)) if x < y => Value::Text(chars[x..y].iter().collect()),
+                (Some(_), Some(_)) => Value::Text(String::new()),
                 _ => Value::Null,
             }
         }
+        _ => Value::Null,
     }
 }
 
@@ -3539,17 +4140,44 @@ fn position(i: i64, len: usize) -> Option<usize> {
     (k >= 0 && (k as usize) < len).then_some(k as usize)
 }
 
+/// A function call. The arguments are evaluated here, which is the only
+/// recursion; `call` then does the work without passing through `eval`
+/// again. A variable argument is not evaluated here: most functions want
+/// its binding (`id(n)`), and evaluating a node renders it.
+#[inline(never)]
 fn eval_func(g: &Graph, name: &str, args: &[Expr], binds: &Binds) -> Value {
+    let mut vals = Vec::with_capacity(args.len());
+    for a in args {
+        vals.push(match a {
+            Expr::Var(_) => None,
+            a => Some(eval(g, a, binds)),
+        });
+    }
+    call(g, name, args, vals, binds)
+}
+
+#[inline(never)]
+fn call(
+    g: &Graph,
+    name: &str,
+    args: &[Expr],
+    mut vals: Vec<Option<Value>>,
+    binds: &Binds,
+) -> Value {
     let arg_bind = |i: usize| -> Option<Bind> {
         match args.get(i) {
             Some(Expr::Var(v)) => lookup(binds, v),
             _ => None,
         }
     };
-    let val = |i: usize| -> Value {
-        args.get(i)
-            .map(|a| eval(g, a, binds))
-            .unwrap_or(Value::Null)
+    // An argument's value: computed by `eval_func`, or a variable's
+    // rendering, which does not recurse.
+    let mut val = |i: usize| -> Value {
+        match (vals.get_mut(i).and_then(Option::take), args.get(i)) {
+            (Some(v), _) => v,
+            (None, Some(Expr::Var(v))) => eval_var(g, v, binds),
+            _ => Value::Null,
+        }
     };
 
     if name.contains('.') {
@@ -3562,7 +4190,6 @@ fn eval_func(g: &Graph, name: &str, args: &[Expr], binds: &Binds) -> Value {
             .collect();
         return crate::ext::eval(g, name, &args);
     }
-
     match name {
         "id" => match arg_bind(0) {
             Some(Bind::Node(id)) | Some(Bind::Edge(id)) => Value::Int(id as i64),
@@ -4357,6 +4984,18 @@ fn label_of(g: &Graph, id: u64) -> Value {
 pub fn import_jsonl(g: &mut Graph, text: &str) -> Result<(usize, usize)> {
     let was_auto = g.autocommit;
     g.autocommit = false;
+    let result = import_lines(g, text);
+    // A refused line takes the uncommitted part of the import with it, as
+    // `import_jsonl_from` does, and the handle goes back to autocommit;
+    // inside the caller's own transaction, that transaction decides.
+    if result.is_err() && was_auto {
+        let _ = g.rollback();
+    }
+    g.autocommit = was_auto;
+    result
+}
+
+fn import_lines(g: &mut Graph, text: &str) -> Result<(usize, usize)> {
     let mut id_map: HashMap<String, u64> = HashMap::new();
     let mut nodes = 0;
     let mut edges = 0;
@@ -4366,13 +5005,14 @@ pub fn import_jsonl(g: &mut Graph, text: &str) -> Result<(usize, usize)> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let j = parse_json(line).map_err(|e| Error::Msg(format!("line {}: {}", lineno + 1, e)))?;
+        let at = |e: String| Error::Msg(format!("line {}: {}", lineno + 1, e));
+        let j = parse_json(line).map_err(at)?;
         let kind = j.get("type").and_then(|v| v.as_str()).unwrap_or("node");
         let props: Vec<(String, Value)> = match j.get("props") {
             Some(crate::value::Json::Object(fields)) => fields
                 .iter()
-                .map(|(k, v)| (k.clone(), v.to_value()))
-                .collect(),
+                .map(|(k, v)| Ok((k.clone(), v.try_value().map_err(at)?)))
+                .collect::<Result<_>>()?,
             _ => Vec::new(),
         };
         if kind == "edge" || kind == "rel" || kind == "relationship" {
@@ -4413,7 +5053,6 @@ pub fn import_jsonl(g: &mut Graph, text: &str) -> Result<(usize, usize)> {
         }
     }
     g.commit()?;
-    g.autocommit = was_auto;
     Ok((nodes, edges))
 }
 

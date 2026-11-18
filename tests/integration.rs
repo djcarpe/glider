@@ -1300,3 +1300,56 @@ fn subscripts_group_and_limit_and_trailing_tokens_are_errors() {
     assert_eq!(r.rows.len(), 10);
     let _ = std::fs::remove_file(&path);
 }
+
+/// `[:A|:B]` matches the Bs while no A has ever been written. It used to
+/// match nothing: a type that was never interned made the whole step fail.
+#[test]
+fn alternative_types_match_while_one_was_never_written() {
+    let mut g = Graph::memory();
+    q(&mut g, "CREATE (a:P {i: 0})-[:B]->(b:P {i: 1})");
+    for pattern in [
+        "MATCH (a)-[:A|:B]->(b) RETURN b.i",
+        "MATCH (a)-[e:A|:B]->(b) RETURN b.i",
+        "MATCH (a)-[:A|:B*1..2]->(b) RETURN b.i",
+        "MATCH (b)<-[:B|:A]-(a) RETURN b.i",
+    ] {
+        assert_eq!(
+            q(&mut g, pattern).rows,
+            vec![vec![Value::Int(1)]],
+            "{pattern}"
+        );
+    }
+    assert!(q(&mut g, "MATCH (a)-[:A|:C]->(b) RETURN b.i")
+        .rows
+        .is_empty());
+}
+
+/// Transaction control as text, the way a binding that owns transactions
+/// recognises it: as the lexer reads it, and nothing else.
+#[test]
+fn transaction_control_is_recognised_as_the_lexer_reads_it() {
+    use glider::query::controls_transaction;
+    for src in [
+        "BEGIN",
+        "begin",
+        "  Commit;",
+        "ROLLBACK",
+        "// open one\n  BEGIN",
+        ";;\n\tbegin // trailing",
+        "`BEGIN`",
+        "// a\n// b\nrollback",
+    ] {
+        assert!(controls_transaction(src), "{src:?}");
+    }
+    for src in [
+        "MATCH (n) RETURN n",
+        "BEGINS",
+        "// BEGIN",
+        "/ BEGIN",
+        "EXPLAIN BEGIN",
+        "CREATE (:BEGIN)",
+        "",
+    ] {
+        assert!(!controls_transaction(src), "{src:?}");
+    }
+}
