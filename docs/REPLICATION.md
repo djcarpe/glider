@@ -23,7 +23,7 @@ A replica is **base snapshots plus the log shipped after them**:
   96348bfb24205901.../                 <- generation (one per database)
     base/
       0000000000000059/                <- the pages of one checkpoint, covering log up to 0x59
-        db  data/00000001.seg  base.json
+        db  data/00000001.seg  hot  base.json
     segments/
       0000000000000059.seg             <- log bytes from 0x59, whole transactions
       0000000000013f20.seg
@@ -33,6 +33,13 @@ A replica is **base snapshots plus the log shipped after them**:
 Restoring is: copy the newest base, lay the log shipped after it beside it,
 open. Opening replays that log, through the same code that ran it the first
 time.
+
+`hot` is there when the writer keeps a hot set (`--hot-size`): the list of
+the pages it found used often, as of that checkpoint. Restore lays it beside
+the database as `<db>-hot`, so the first open with a hot set loads those
+pages before its first query ([HOT.md](HOT.md)). It is advice, checked page
+by page; a base without it restores as before, and a build that does not
+know it restores without it.
 
 The tailer is a separate process and never blocks the writer. Three rules
 keep it correct:

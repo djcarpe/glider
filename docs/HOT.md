@@ -40,15 +40,17 @@ pages that are **used often**, which is not the same as recently:
   goes, or another database's, rather than the statement failing).
 - **Hot follows the data, not the page number.** A page is copied before it
   is changed (copy-on-write); the copy inherits the heat.
-- **Hot is remembered** (part B; not built yet). At each checkpoint and
-  on close the list of hot page numbers is written beside the database
-  (`<db>-hot`). At open it is read back and those pages are loaded before
-  the first query. The file is advice: if it is missing, stale or damaged,
-  the database opens exactly as it would without it, and anything in it
-  that is not a live page of this database is skipped.
-- **Hot travels with a base** (part B; not built yet). A replica's base
-  carries the list (`<generation>/base/<lsn>/hot`), so a database restored
-  from object storage is warm on the pages its source found hot.
+- **Hot is remembered.** At each checkpoint and on a clean close the list
+  of hot page numbers is written beside the database (`<db>-hot`). At the
+  next open it is read back and those pages are loaded, and made hot,
+  before `open` returns. The file is advice: if it is missing, damaged,
+  another database's or from a checkpoint the file never reached, the
+  database opens exactly as it would without it, and a page in it that is
+  not, now, the data it named is not loaded (see *Remembering it*).
+- **Hot travels with a base.** A replica's base carries the list of the
+  checkpoint it copies (`<generation>/base/<lsn>/hot`), and a restore lays
+  it beside the database, so a database restored from object storage is
+  warm on the pages its source found hot.
 
 `hot_size` is zero by default, and zero is exactly the engine without any of
 this: no counting, no file.
@@ -160,41 +162,105 @@ On the benchmark machine the difference on a hit is inside the noise (see
 - **Heat needs residence.** A page earns heat only while it is in the
   cache. A workload whose scans flush the cache between every use of its
   pages never warms them up: the sweep evicts them before their fourth
-  tick. Warm-up has to happen in stretches the cache can hold (part B's
-  list from a previous open is the other way in).
+  tick. Warm-up has to happen in stretches the cache can hold (the list
+  from a previous open is the other way in).
 - **Long scans are time.** The clock is lookups, so a scan's own lookups
   cool the hot set too. A hot page survives about 80 ticks without being
   read (`80 * max(frames, 1024)` lookups): through a scan of about 80
   times the cache, more for caches of under 1024 frames, not through
   arbitrarily long ones.
-- **No list across opens yet.** Every open is cold until part B.
+- **Loading is part of opening.** The list is loaded before `open`
+  returns, on the opening thread: at most the hot set's room in page reads
+  (`hot_size` bytes), in page order. Nothing runs in the background, so no
+  query ever races it; an open with a 32 MiB hot set of 16 KiB pages does
+  up to 2,048 reads before it returns.
+- **The first entries, not the first good ones.** The loader looks at as
+  many entries as the set has room for, hottest first, and skips the bad
+  ones; it does not read further down the list to make up for them. A list
+  from an older checkpoint (see below) can leave the set part empty.
+- **A stale entry costs a read.** Whether a listed page still holds what it
+  held needs its header: such an entry is read, found out, and dropped,
+  not kept in the cache.
+- **Opens without a hot set leave the list as it was.** They neither read
+  nor write it, so it ages while they change the database, and is worth
+  less, page by page, at the next open that has one.
+- **Not synced.** After a power loss the list may be missing or empty;
+  the database opens cold.
 
 ## Reading it
 
 `STATS` (when the database has a hot set), `Graph::stats`, `pager::Stats`
 and the telemetry snapshot report `hot_pages` (resident now), `hot_hits`
 (lookups that found their page hot), `promotions`, `demotions` and
-`prewarmed` (loaded from the list at open; always 0 until part B). `STATS`
+`prewarmed` (pages loaded from the list at open, and made hot). `STATS`
 and `Stats` also give `hot_capacity`, the places the set has:
 `min(hot_size / page_size, frames / 2)`. In OpenTelemetry and Prometheus
 they are `glider.db.cache.hot.{resident,hits,promotions,demotions,prewarmed}`.
 
-## For part B
+## Remembering it
 
-`Pager` (and `Graph`, through `pager()`) already has what loading and
-saving a list need:
+`src/storage/hotlist.rs` has the format and the checks; in short:
 
-- `Pager::hot_pages() -> Vec<u64>`: the hot page numbers now, hottest
-  first. Call it between transactions; every number in it is a live page
-  of the committed state or of the open transaction.
-- `Pager::get(pno)` then `Pager::mark_hot(pno) -> bool`: makes a page that
-  is in the cache hot now, at heat 4, as if just promoted. False if it is
-  not resident, there is no hot set, or the set is full of pages at least
-  as hot. It does not count `prewarmed`; `hot::Hot::prewarmed` is the
-  counter to bump.
-- `Pager::set_hot_size(bytes)`, called by `Graph::open_opts` after
-  recovery; load a list after it, so the replayed log does not count as
-  use.
+```
+0     8   magic "GLIDERHT"
+8     4   version (1)
+12    4   page size
+16    16  generation
+32    8   epoch of the checkpoint it was taken at (the superblock's)
+40    8   n
+48    8n  page numbers, hottest first
+48+8n 4   CRC-32 of everything before it
+```
+
+- **Written** by `Db::checkpoint` just before it writes the superblock,
+  under the epoch that superblock will carry, and on a clean close (one
+  with no open transaction) whether or not that close checkpoints, to
+  `<db>-hot.tmp` and renamed over `<db>-hot`: a reader sees the old list
+  or the new one, and whoever sees a new superblock finds its list. A
+  checkpoint that then fails leaves a list of a checkpoint the file never
+  reached, which the next open passes over. Its cost is the hot set, 8 bytes a
+  page, never the database. With `hot_size` 0 nothing is written, and an
+  existing list is left alone.
+- **Read** by `Graph::open_opts` after recovery and after the hot set is
+  turned on (`Db::prewarm`, `Pager::prewarm`), before the schema is
+  loaded and before `open` returns. Not read with `hot_size` 0. The whole
+  list is passed over when it is not whole (length, checksum), is another
+  database's (generation, page size), or was taken at a checkpoint newer
+  than the one the database opened from (an older copy of the file put
+  back beside a newer list).
+- **Each page** is then checked. Skipped without a read: numbers past the
+  high-water mark, the superblocks, and pages in any free list (free, freed
+  since and waiting for a checkpoint, held for a backup, or the free list's
+  own pages). Read, then dropped: a page whose header epoch is after the
+  list's. Pages are copy-on-write, so a number handed out again carries the
+  epoch of its new data, and a page whose epoch is not after the list's
+  holds exactly what it held when the list was written. That is what lets
+  an older list (from before a crash whose log was replayed, or before
+  opens without a hot set) be used for what is left of it.
+- **Loading never makes room by taking a hot frame**, this database's or
+  another's, nor a frame the process's budget does not have: a page goes
+  into a new frame if the pool has one, or in place of one of this
+  database's own cold frames, and when neither is there loading stops.
+  Loaded pages are hot at once, at heat 4, as if just promoted, and count
+  in `prewarmed`. Loading is not a lookup: it does not move the clock.
+- **Carried.** `replica::Tailer::copy_base` reads the writer's list before
+  it copies the pages and puts it in the base as `hot` when it is this
+  database's and not newer than the checkpoint copied (the writer writes
+  it before that checkpoint's superblock, so it is that checkpoint's
+  unless a later checkpoint has replaced it, and then the base goes
+  without).
+  glider-stream uploads it with the base, before `base.json`, and drops it
+  from the spool with the pages. `replica::restore` (and so
+  `glider wal restore` and `glider-stream restore`) lays it beside the
+  restored database as `<db>-hot`. The restore's own check opens without a
+  hot set, replays the log and checkpoints; the list is then older than the
+  database, and the first open with a hot set loads what the log did not
+  rewrite. Builds without this ignore the file in a base, and restore as
+  before.
+
+`Pager::hot_pages()`, `Pager::mark_hot(pno)` and `Pager::set_hot_size` are
+the pieces this is made of; `Pager::hot_list()` and `Pager::prewarm()` put
+them together.
 
 ## Measured
 
@@ -213,6 +279,7 @@ identical in every run.
 ```
 hotbench scans    --dir D [--people 5000] --hot-mb H [--scan 0]
 hotbench pressure --dir D --hot-mb H
+hotbench reopen   --dir D --hot-mb 1 --list 0|1 [--restore 1] [--lookups 100]
 ```
 
 | workload | hot set | lookup reads (20,000 lookups) | p50 | p99 | hot pages |
@@ -245,3 +312,23 @@ hotbench pressure --dir D --hot-mb H
 - **Hits:** with every page resident, the hot set's bookkeeping is not
   measurable on this machine: the two rows differ by less than the spread
   between runs of the same row (7.9 to 12.1 µs at p50 without it).
+
+**Across opens** (`reopen`; the `scans` database, 1,000 people, warmed
+with a 1 MiB hot set and closed, then opened again; three runs of each,
+the median shown, reads identical in every run):
+
+| second open | list | `open` | pages read by `open` | loaded | first 100 lookups: reads | p50 | first 2,000 lookups: reads |
+|---|---|---|---|---|---|---|---|
+| the database | none | 0.26 ms | 2 | 0 | 41 | 15.0 µs | 44 |
+| | its own | 0.92 ms | 46 | 44 | **0** | 13.2 µs | **0** |
+| restored from a replica | none | 0.24 ms | 2 | 0 | 41 | 15.9 µs | 44 |
+| | the base's | 4.8 ms | 46 | 44 | **0** | 12.3 µs | **0** |
+
+- The list moves the 44 reads the first lookups would have made into
+  `open`, in page order, and the lookups after it read nothing. Without
+  it, 41 of the 44 come in the first hundred lookups.
+- The restored database was opened once before, without a hot set, as
+  `glider wal restore` checks what it restored; its list was still whole.
+  Its slower `open` (4 to 8 ms against about 1) was the same in every
+  run and is not explained here: the 44 reads are the same pages of a
+  file written moments before.

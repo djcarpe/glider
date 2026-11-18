@@ -1,8 +1,9 @@
 //! The hot set under one process budget (`budget::configure`, as
 //! memory_budget.rs uses it): another database's need for memory takes cold
 //! frames first, wherever they are, and hot ones only when cold ones are not
-//! enough; and the bounds hold for several databases at every step. Its own
-//! file, because the budget is process-wide and set once.
+//! enough; the bounds hold for several databases at every step; and a hot
+//! list loaded at open stays inside the budget. Its own file, because the
+//! budget is process-wide and set once.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -10,7 +11,7 @@ use std::sync::Mutex;
 use glider::budget::{self, MemoryBudget, ProcessBudget};
 use glider::graph::{Dir, Graph, OpenOptions};
 use glider::query;
-use glider::storage::pager;
+use glider::storage::{hotlist, pager};
 use glider::store::Sync;
 use glider::value::Value;
 
@@ -301,4 +302,62 @@ fn bounds_hold_for_several_databases_with_hot_sets_at_every_step() {
         drop(g);
         cleanup(&path);
     }
+}
+
+/// Property 6 of the remembered hot set: loading a list at open under a
+/// small process budget never takes the pool past its limit, takes no hot
+/// frame of another database, and loads what fits; with room, it loads the
+/// whole list.
+#[test]
+fn loading_a_list_under_a_small_budget_stays_inside_it() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let b = process();
+    let _restore = Restore;
+    let (pa, pb) = (temp("list-a"), temp("list-b"));
+    let mut a = open(&pa, 256 << 10, 64 << 10);
+    build(&mut a, 3000);
+    for _ in 0..40 {
+        look_up_people(&mut a);
+    }
+    drop(a);
+    let listed = hotlist::read(&hotlist::path(&pa), u64::MAX)
+        .unwrap()
+        .pages
+        .len() as u64;
+    assert!(listed > 8, "{listed} pages listed");
+    let a = open(&pa, 256 << 10, 64 << 10);
+    assert_eq!(a.pager_stats().prewarmed, listed, "with room, all of it");
+    drop(a);
+
+    // B: a warm hot set, and its scans fill the pool.
+    let mut bdb = open(&pb, 4 << 20, 64 << 10);
+    build(&mut bdb, 12_000);
+    for _ in 0..40 {
+        look_up_people(&mut bdb);
+    }
+    scan(&mut bdb);
+    let b_hot = bdb.hot_pages();
+    assert!(!b_hot.is_empty());
+    // Room for B's hot frames and eight more: B's cold ones go.
+    let limit = (b_hot.len() as u64 + 8) * CHARGE;
+    let used = pager::resize_shared_cache(limit).unwrap();
+    assert!(used <= limit, "{used} over {limit}");
+
+    let mut a = open(&pa, 256 << 10, 64 << 10);
+    assert!(
+        b.cache.used() <= b.cache.limit(),
+        "the pool holds {} of {}",
+        b.cache.used(),
+        b.cache.limit()
+    );
+    let s = a.pager_stats();
+    assert_eq!(s.prewarmed, 8, "what fits: {s:?}");
+    assert_eq!(bdb.hot_pages(), b_hot, "B's hot frames are B's");
+    a.check_hot_set().unwrap();
+    look_up_people(&mut a);
+    assert!(b.cache.used() <= b.cache.limit());
+    drop(a);
+    drop(bdb);
+    cleanup(&pa);
+    cleanup(&pb);
 }

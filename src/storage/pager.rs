@@ -29,7 +29,9 @@
 //! process's budget is short, other databases' cold frames go before any
 //! hot one. What "often" is, and why it costs a lookup constant work, is in
 //! [`super::hot`]; the pager tells it of every frame read, filled, emptied
-//! or moved, and of every page copied or freed.
+//! or moved, and of every page copied or freed. [`Pager::hot_list`] and
+//! [`Pager::prewarm`] are the two ends of remembering it across opens
+//! ([`super::hotlist`]).
 //!
 //! **Reuse.** A page freed by a commit is reusable immediately unless the
 //! durable (checkpointed) state still refers to it; those wait for the next
@@ -800,6 +802,139 @@ impl Pager {
             return false;
         };
         f.cache.hot.as_deref_mut().is_some_and(|h| h.mark(i))
+    }
+
+    /// The epoch of the checkpoint in force: the one a crash would reopen.
+    pub fn durable_epoch(&self) -> u64 {
+        self.lock().durable
+    }
+
+    /// The epoch the next checkpoint will write: the committed state's.
+    pub fn committed_epoch(&self) -> u64 {
+        self.lock().epoch - 1
+    }
+
+    /// The hot set as a list to keep beside the database (see
+    /// [`super::hotlist`]), or None without one, under the epoch of the
+    /// checkpoint in force. Taken between transactions, every page in it is
+    /// a page of the committed state.
+    pub fn hot_list(&self) -> Option<super::hotlist::List> {
+        let has = matches!(&self.lock().store, Store::File(f) if f.cache.hot.is_some());
+        if !has {
+            return None;
+        }
+        let pages = self.hot_pages();
+        let g = self.lock();
+        Some(super::hotlist::List {
+            page_size: g.ps as u32,
+            generation: g.generation,
+            epoch: g.durable,
+            pages,
+        })
+    }
+
+    /// Load pages remembered as hot by a list taken at checkpoint `as_of`,
+    /// hottest first, and make them hot; returns how many were. At most as
+    /// many as the hot set has room for are looked at, so at most that many
+    /// pages are read. A page is skipped, unread, when it is not a page of
+    /// the database now (past the high-water mark or in a free list), and
+    /// after reading when its epoch is after `as_of` (its number holds other
+    /// data now). Loading takes no hot frame, of this database or another,
+    /// and no frame the process's budget does not have: it stops instead.
+    /// Call it at open, before the first query.
+    pub fn prewarm(&self, pnos: &[u64], as_of: u64) -> u64 {
+        let mut g = self.lock();
+        let g = &mut *g;
+        let Store::File(f) = &mut g.store else {
+            return 0;
+        };
+        let Some(h) = f.cache.hot.as_deref() else {
+            return 0;
+        };
+        let room = h.capacity().saturating_sub(h.len());
+        let mut want: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for &pno in pnos {
+            if want.len() >= room {
+                break;
+            }
+            if (2..g.hw).contains(&pno) {
+                want.insert(pno);
+            }
+        }
+        for pno in g
+            .free
+            .iter()
+            .chain(&g.pending)
+            .chain(&g.held)
+            .chain(&g.chain)
+        {
+            want.remove(pno);
+        }
+        let mut want: Vec<u64> = want.into_iter().collect();
+        // Page order: sequential reads where the pages are contiguous.
+        want.sort_unstable();
+        // Frames that may be evicted for a page: cold, and held by nobody.
+        // At open nothing holds a page; readers can only let go of more.
+        let mut spare = f
+            .cache
+            .frames
+            .iter()
+            .enumerate()
+            .filter(|(i, fr)| !h.is_hot(*i) && Arc::strong_count(&fr.data) == 1)
+            .count();
+        let mut made = 0u64;
+        for pno in want {
+            let Store::File(f) = &mut g.store else {
+                break;
+            };
+            let at = match f.cache.map.get(&pno) {
+                Some(&i) if page::epoch(&f.cache.frames[i].data) <= as_of => Some(i),
+                Some(_) => continue,
+                None => None,
+            };
+            let i = match at {
+                Some(i) => i,
+                None => {
+                    let Ok(b) = g.read_page(pno) else {
+                        continue;
+                    };
+                    if page::epoch(&b) > as_of {
+                        continue;
+                    }
+                    let Store::File(f) = &mut g.store else {
+                        break;
+                    };
+                    if f.cache.frames.len() < f.cache.cap && f.cache.reserve_frame() {
+                        f.cache.push(pno, b.into(), false)
+                    } else if spare > 0 {
+                        // The sweep takes a cold frame; one exists.
+                        spare -= 1;
+                        match g.cache_insert(pno, b.into(), false) {
+                            Ok(i) => i,
+                            Err(_) => break,
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            };
+            let Store::File(f) = &mut g.store else {
+                break;
+            };
+            let Some(h) = f.cache.hot.as_deref_mut() else {
+                break;
+            };
+            if !h.mark(i) {
+                break;
+            }
+            if at.is_some() {
+                // A cold frame of its own became hot: one fewer to evict.
+                spare = spare.saturating_sub(1);
+            }
+            h.prewarmed += 1;
+            made += 1;
+        }
+        made
     }
 
     /// The hot set's bookkeeping holds together, and every hot page is a

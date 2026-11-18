@@ -1101,6 +1101,9 @@ impl Graph {
         let (db, _) = Db::open(path, &cfg, &mut |p, rec| replay(p, &mut sch, rec))?;
         // After recovery: replaying the log is not the workload.
         db.pager().set_hot_size(opts.hot_size);
+        // What was hot when the database was last open, loaded before
+        // `open` returns, so the first query finds it in memory.
+        db.prewarm();
         let mut g = Graph::init(db)?;
         g.work_mem = opts.work_mem;
         Ok(g)

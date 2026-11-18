@@ -520,8 +520,10 @@ fn one_pass_over_a_label_makes_no_leaf_hot() {
     build(&mut g, ITEMS);
     drop(g);
     for pass in ["records", "scan"] {
+        // From cold: without the list an earlier open left (hot_list.rs).
+        let _ = std::fs::remove_file(glider::storage::hotlist::path(&path));
         let mut g = open(&path, 32 << 10);
-        assert!(g.hot_pages().is_empty(), "every open is cold");
+        assert!(g.hot_pages().is_empty(), "an open without a list is cold");
         let item = g.strings.lookup("Item").unwrap();
         if pass == "records" {
             let mut from = 0;
@@ -673,7 +675,7 @@ fn stats_and_telemetry_report_the_hot_set() {
         assert_eq!(
             (m.prewarmed, ps.prewarmed),
             (0, 0),
-            "nothing loads a list yet"
+            "a database built in this open loaded no list"
         );
         if hot == 0 {
             assert_eq!(ps.hot_capacity, 0);

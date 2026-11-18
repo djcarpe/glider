@@ -7,6 +7,8 @@
 //!                     [--hot-mb 0] [--rounds 10] [--lookups 2000] [--scan 1]
 //!   hotbench pressure --dir D [--people 1000] [--items 400000] [--cache-mb 8]
 //!                     [--hot-mb 0] [--pool-mb 12] [--rounds 10] [--lookups 2000]
+//!   hotbench reopen   --dir D [--people 1000] [--items 1000000] [--cache-mb 8]
+//!                     [--hot-mb 1] [--list 1] [--restore 0] [--lookups 2000]
 //!
 //! `scans`: one database. Its people are looked up until warm; then each
 //! round is a full scan of a label many times the cache (`MATCH (n:Item)
@@ -18,6 +20,15 @@
 //! people are looked up until warm; then each round B, whose cache could
 //! hold four times the budget, scans a label larger than the budget while A
 //! sits idle, and then A's lookups are timed.
+//!
+//! `reopen`: the `scans` database is opened with a hot set, warmed and
+//! closed, which leaves its hot list beside it; then it is opened again and
+//! its first lookups timed, with that list (`--list 1`) or without it
+//! (`--list 0`). With `--restore 1` the second open is of a copy restored
+//! from a replica of it (`replica::tail`, `replica::restore`, then an open
+//! without a hot set, as `glider wal restore` checks what it restored). The
+//! line adds the time `open` took, the pages it read and the pages it
+//! loaded from the list.
 //!
 //! Databases are built in D on first use and reused (delete D to rebuild);
 //! the hot set is an open option, so one file serves both runs. The
@@ -284,19 +295,78 @@ fn pressure(a: &Args, dir: &Path) {
     print("pressure", a, items, &ga, r, extra);
 }
 
+fn reopen(a: &Args, dir: &Path) {
+    let (people, items) = (a.num("--people", 1000), a.num("--items", 1_000_000));
+    let (cache, hot) = (a.num("--cache-mb", 8), a.num("--hot-mb", 1));
+    let path = dir.join(format!("scans-{people}-{items}.gldb"));
+    build(&path, people, items);
+    // Warm, and close: the close writes the list.
+    drop({
+        let g = open(&path, cache, hot);
+        warm(&g, people);
+        g
+    });
+    let mut target = path.clone();
+    if a.num("--restore", 0) > 0 {
+        let replica = dir.join("reopen-replica");
+        let out = dir.join("reopen-restored.gldb");
+        let _ = std::fs::remove_dir_all(&replica);
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(glider::storage::hotlist::path(&out));
+        let once = glider::wal::TailOptions {
+            once: true,
+            quiet: true,
+            ..glider::wal::TailOptions::default()
+        };
+        glider::replica::tail(&path, &replica, &once).unwrap();
+        glider::replica::restore(&replica, None, None, &out).unwrap();
+        drop(open(&out, cache, 0));
+        target = out;
+    }
+    if a.num("--list", 1) == 0 {
+        let _ = std::fs::remove_file(glider::storage::hotlist::path(&target));
+    }
+    let t = Instant::now();
+    let g = open(&target, cache, hot);
+    let open_ms = t.elapsed().as_secs_f64() * 1e3;
+    let at_open = g.pager_stats();
+    let mut r = Report {
+        times: Vec::new(),
+        reads: 0,
+        scans_ms: Vec::new(),
+    };
+    let mut seed = 7;
+    r.reads = timed(
+        &g,
+        people,
+        a.num("--lookups", 2000),
+        &mut seed,
+        &mut r.times,
+    );
+    let extra = format!(
+        ",\"list\":{},\"restored\":{},\"open_ms\":{open_ms:.2},\"open_reads\":{},\"prewarmed\":{}",
+        a.num("--list", 1),
+        a.num("--restore", 0),
+        at_open.reads,
+        at_open.prewarmed,
+    );
+    print("reopen", a, items, &g, r, extra);
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let a = Args(args);
     let Some(dir) = a.get("--dir").map(PathBuf::from) else {
-        eprintln!("usage: hotbench scans|pressure --dir D [options]; see the source");
+        eprintln!("usage: hotbench scans|pressure|reopen --dir D [options]; see the source");
         std::process::exit(2);
     };
     std::fs::create_dir_all(&dir).unwrap();
     match a.0.first().map(|s| s.as_str()) {
         Some("scans") => scans(&a, &dir),
         Some("pressure") => pressure(&a, &dir),
+        Some("reopen") => reopen(&a, &dir),
         _ => {
-            eprintln!("usage: hotbench scans|pressure --dir D [options]; see the source");
+            eprintln!("usage: hotbench scans|pressure|reopen --dir D [options]; see the source");
             std::process::exit(2);
         }
     }

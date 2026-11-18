@@ -6,6 +6,7 @@
 //! ```text
 //! <dir>/<generation>/base/<lsn>/db              pages of one checkpoint
 //! <dir>/<generation>/base/<lsn>/data/*.seg      (its segment files, if any)
+//! <dir>/<generation>/base/<lsn>/hot             (its hot list, if it had one)
 //! <dir>/<generation>/base/<lsn>/base.json       written last: the base is whole
 //! <dir>/<generation>/segments/<lsn>.seg         log bytes from <lsn>, whole transactions
 //! <dir>/<generation>/manifest.jsonl             when each segment was shipped
@@ -21,6 +22,10 @@
 //!
 //! Restore takes the newest base at or before the target time, lays the log
 //! shipped after it beside it, and opens the result, which replays that log.
+//! A base carries the writer's hot list (`storage::hotlist`) when it has
+//! one, and restore lays it beside the database as `<db>-hot`, so the first
+//! open with a hot set is warm on what the source found hot. Builds that do
+//! not know the file restore without it.
 
 use std::fs::{self, File};
 use std::io::{self, BufRead, Read, Write};
@@ -216,6 +221,16 @@ impl Tailer<'_> {
         let tmp = root.join(format!("{name}.partial"));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(tmp.join("data"))?;
+        // The writer writes its hot list just before the checkpoint's
+        // superblock, so the list there now is this checkpoint's, unless a
+        // later checkpoint has replaced it, which makes it not this base's.
+        let hot =
+            crate::storage::hotlist::read(&crate::storage::hotlist::path(self.db), sb.high_water)
+                .filter(|l| {
+                    l.generation == sb.generation
+                        && l.page_size as usize == sb.page_size
+                        && l.epoch <= sb.epoch
+                });
         let segs = sb.high_water.div_ceil(sb.seg_pages.max(1)).max(1) as usize;
         let mut bytes = 0u64;
         let mut refreshed = Instant::now();
@@ -260,6 +275,9 @@ impl Tailer<'_> {
             }
             to.flush()?;
             to.get_ref().sync_all()?;
+        }
+        if let Some(list) = hot {
+            fs::write(tmp.join("hot"), list.encode())?;
         }
         let ts = wal::now_unix();
         let mut meta = File::create(tmp.join("base.json"))?;
@@ -632,6 +650,13 @@ pub fn restore(
             fs::create_dir_all(dst.parent().unwrap())?;
             fs::copy(e.path(), dst)?;
         }
+    }
+    // The hot list the base carries, if it has one: advice for the first
+    // open with a hot set, which checks it page by page.
+    let hot = crate::storage::hotlist::path(out);
+    let _ = fs::remove_file(&hot);
+    if src.join("hot").is_file() {
+        let _ = fs::copy(src.join("hot"), &hot);
     }
 
     // Log after the base, up to the first gap or the target time.
