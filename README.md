@@ -27,6 +27,7 @@ glider social.gldb browser             # same, and open the console in your brow
 glider :memory:                        # throwaway graph, nothing hits disk
 glider :memory: --max-memory 4G        # ... that may use at most 4 GiB
 glider big.gldb --cache-size 256M      # a file of any size, in about 256 MiB of RAM
+glider big.gldb --cache-size 256M --hot-size 32M  # ... keeping the pages used most through scans, and across opens (docs/HOT.md)
 ```
 
 ```
@@ -506,7 +507,7 @@ include/        glider.h, the C ABI header
 ts/             TypeScript/wasm bindings
 ui/             browser console (React + Vite)
 scripts/        cross-compilation helpers
-docs/           design notes: EXTENSIONS, MOBILE, REPLICATION, STREAM, REVIEW, TODO
+docs/           design notes: EXTENSIONS, HOT, MOBILE, REPLICATION, STREAM, REVIEW, TODO
 ```
 
 ## Licence

@@ -330,21 +330,57 @@ enum Mode {
     Reopen,
     /// `:memory:` against a tight `max_memory`.
     Full,
+    /// As File and Reopen, with a hot set of this many bytes.
+    Hot(u64),
+    HotReopen(u64),
 }
 
-fn open_file(path: &std::path::Path) -> Graph {
-    Graph::open_opts(
+impl Mode {
+    fn hot(self) -> u64 {
+        match self {
+            Mode::Hot(h) | Mode::HotReopen(h) => h,
+            _ => 0,
+        }
+    }
+}
+
+fn open_file(path: &std::path::Path, hot: u64) -> Graph {
+    open_file_forced(path, hot, false)
+}
+
+/// `force`: after a simulated crash, whose lock this very process holds.
+fn open_file_forced(path: &std::path::Path, hot: u64, force: bool) -> Graph {
+    let g = Graph::open_opts(
         path,
         OpenOptions {
+            force,
             sync: Sync::Off,
             page_size: 1024,
             cache_size: 16 * 1024,
+            hot_size: hot,
             segment_size: 256 * 1024,
             checkpoint_bytes: 64 * 1024,
             ..OpenOptions::default()
         },
     )
-    .unwrap()
+    .unwrap();
+    // With a hot set, a clock of 16-lookup ticks: pages turn hot and cool
+    // within a few dozen reads, so the set fills, displaces and empties
+    // all the time among frames that cursors hold and the sweep evicts.
+    g.set_hot_tick(16);
+    g
+}
+
+/// The hot set's bounds and bookkeeping, for a file-backed subject.
+fn hot_holds(g: &Graph, ctx: &str) {
+    if !g.is_persistent() {
+        return;
+    }
+    let s = g.pager_stats();
+    assert!(s.hot_pages <= s.hot_capacity, "{ctx}: {s:?}");
+    assert!(s.hot_capacity <= 8, "{ctx}: half of a 16-frame cache");
+    assert!(s.resident_pages <= 16, "{ctx}: {s:?}");
+    g.check_hot_set().unwrap_or_else(|e| panic!("{ctx}: {e}"));
 }
 
 /// Returns how many operations hit the memory limit.
@@ -355,10 +391,16 @@ fn run(seed: u64, mode: Mode, steps: usize) -> u64 {
     let mut subject = match mode {
         Mode::Memory => Graph::memory_with_page_size(1024, u64::MAX),
         Mode::Full => Graph::memory_with_page_size(1024, 24 * 1024),
-        Mode::File | Mode::Reopen => open_file(&path),
+        Mode::File | Mode::Reopen | Mode::Hot(_) | Mode::HotReopen(_) => {
+            open_file(&path, mode.hot())
+        }
     };
     let mut r = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let mut fulls = 0u64;
+    // Pages made hot, over every open of the subject, and of those, pages
+    // loaded from the list an earlier open left.
+    let mut promoted = 0u64;
+    let mut prewarmed = 0u64;
 
     for i in 0..steps {
         let nodes = oracle.node_ids();
@@ -396,22 +438,54 @@ fn run(seed: u64, mode: Mode, steps: usize) -> u64 {
             subject.rollback().unwrap();
             subject.autocommit = true;
         }
-        if matches!(mode, Mode::Reopen) && r.chance(3) {
+        // A hot subject stays open longer: heat takes four ticks to build.
+        let reopen = if mode.hot() > 0 { 1 } else { 3 };
+        if matches!(mode, Mode::Reopen | Mode::HotReopen(_)) && r.chance(reopen) {
             if r.chance(50) {
                 subject.checkpoint().unwrap();
             }
-            drop(subject);
-            subject = open_file(&path);
+            promoted += subject.pager_stats().promotions;
+            // A hot subject sometimes crashes instead of closing: its list
+            // is then the last checkpoint's, older than what the log
+            // replays, and must be checked page by page.
+            let crash = mode.hot() > 0 && r.chance(30);
+            if crash {
+                // Mid-transaction, with the log handed to the OS (a
+                // checkpoint inside a transaction only flushes it), as a
+                // killed process leaves it under `Sync::Normal`.
+                subject.autocommit = false;
+                subject.add_node(&["Lost".into()], vec![]).unwrap();
+                subject.checkpoint().unwrap();
+                std::mem::forget(subject);
+            } else {
+                drop(subject);
+            }
+            subject = open_file_forced(&path, mode.hot(), crash);
+            prewarmed += subject.pager_stats().prewarmed;
+            hot_holds(&subject, &format!("seed {seed} {mode:?} step {i} reopened"));
         }
         if i % 40 == 39 {
             let ctx = format!("seed {seed} {mode:?} step {i}");
             assert_same(&oracle, &subject, &ctx);
             queries_same(&mut subject, &mut twin, &ctx);
             subject.verify_trees().unwrap();
+            hot_holds(&subject, &ctx);
         }
     }
     let ctx = format!("seed {seed} {mode:?} end");
     assert_same(&oracle, &subject, &ctx);
+    hot_holds(&subject, &ctx);
+    promoted += subject.pager_stats().promotions;
+    assert_eq!(
+        promoted > 0,
+        mode.hot() > 0,
+        "{ctx}: {promoted} pages made hot"
+    );
+    assert_eq!(
+        prewarmed > 0,
+        matches!(mode, Mode::HotReopen(_)),
+        "{ctx}: {prewarmed} pages loaded from lists"
+    );
     // A full graph accepts writes again once its limit is raised.
     subject.set_max_memory(u64::MAX);
     assert_eq!(
@@ -453,6 +527,26 @@ fn file_graph_with_a_tiny_cache_matches_oracle() {
 fn reopened_graph_matches_oracle() {
     for seed in seeds(3, 3) {
         run(seed, Mode::Reopen, 400);
+    }
+}
+
+/// The tiny-cache run with a hot set of every size: one page, half the
+/// cache, and a megabyte, more than the half it is allowed. Hot frames,
+/// frames held by cursors and constant eviction share sixteen frames, and
+/// every answer must be what it is without a hot set.
+#[test]
+fn file_graph_with_a_hot_set_matches_oracle() {
+    for (n, hot) in [1024u64, 8 * 1024, 1 << 20].into_iter().enumerate() {
+        for seed in seeds(6 + n as u64, 2) {
+            run(seed, Mode::Hot(hot), 400);
+        }
+    }
+}
+
+#[test]
+fn reopened_graph_with_a_hot_set_matches_oracle() {
+    for seed in seeds(9, 3) {
+        run(seed, Mode::HotReopen(8 * 1024), 400);
     }
 }
 

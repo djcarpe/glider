@@ -30,6 +30,11 @@
 //!   by [`Db::from_replica`]: a base's pages, the log after them replayed,
 //!   and a log that carries on where the replay ended.
 //!
+//! * **The hot set** (when the pager has one) is written down beside the
+//!   database at every checkpoint and on a clean close, and loaded back
+//!   from there by [`Db::prewarm`] at the next open, after recovery. See
+//!   `storage::hotlist`: the list is advice, checked before it is used.
+//!
 //! What a log record means is up to the layer above; this layer only moves
 //! bytes and keeps them transactional.
 
@@ -150,6 +155,9 @@ pub struct Db {
     /// The pager's hold state as of the last checkpoint.
     hold_at_checkpoint: (bool, u64),
     pin_checked: Option<Instant>,
+    /// The epoch of the checkpoint the database opened from, before any
+    /// replay: a hot list taken after it is not this file's.
+    opened_epoch: u64,
     /// Declared last so it is dropped last.
     _lock: Option<Lock>,
 }
@@ -176,6 +184,7 @@ impl Db {
             keep_from: None,
             hold_at_checkpoint: (false, 0),
             pin_checked: None,
+            opened_epoch: 0,
             _lock: None,
         }
     }
@@ -193,6 +202,7 @@ impl Db {
             keep_from: None,
             hold_at_checkpoint: (false, 0),
             pin_checked: None,
+            opened_epoch: 0,
             _lock: None,
         })
     }
@@ -267,6 +277,7 @@ impl Db {
             p
         };
         let from = pager.wal_lsn();
+        let opened_epoch = pager.durable_epoch();
         let mut err: Option<SError> = None;
         let (wal, rec) = Wal::open(
             path,
@@ -308,6 +319,7 @@ impl Db {
             keep_from: None,
             hold_at_checkpoint,
             pin_checked: None,
+            opened_epoch,
             _lock: Some(lock),
         };
         db.poll_pin(true)?;
@@ -488,12 +500,58 @@ impl Db {
         // superblock claims to cover it.
         w.flush()?;
         let lsn = w.committed_lsn();
+        // The hot list first: whoever sees the new superblock (a replicator
+        // copying it) finds its list. Should the checkpoint fail, the list
+        // names a checkpoint the file never reached, and is not used.
+        self.save_hot(Some(self.pager.committed_epoch()));
+        let Some(w) = &mut self.wal else {
+            return Ok(());
+        };
         self.pager.checkpoint(lsn)?;
         self.hold_at_checkpoint = self.pager.hold();
         // Keep what a replicator has yet to ship.
         w.truncate_before(lsn.min(self.keep_from.unwrap_or(u64::MAX)))?;
         self.ckpt_lsn = lsn;
         Ok(())
+    }
+
+    /// Write the hot set down beside the database (`<db>-hot`), as of the
+    /// checkpoint `epoch` is about to write, or with None the one in force
+    /// (idle, between transactions, nothing to fold in). Advice only: a
+    /// failure costs the next open its warmth, nothing else. Without a hot
+    /// set nothing is written.
+    fn save_hot(&self, epoch: Option<u64>) {
+        let (Some(path), Some(mut list)) = (&self.path, self.pager.hot_list()) else {
+            return;
+        };
+        if let Some(e) = epoch {
+            list.epoch = e;
+        }
+        let _ = super::hotlist::write(&super::hotlist::path(path), &list);
+    }
+
+    /// Load the hot set a previous open (or the base this database was
+    /// restored from) left beside it, if the pager has a hot set to load it
+    /// into and the list is this database's and not from a checkpoint it
+    /// never reached. Returns the pages made hot. See [`super::hotlist`].
+    pub fn prewarm(&self) -> u64 {
+        let Some(path) = &self.path else {
+            return 0;
+        };
+        if self.pager.hot_list().is_none() {
+            return 0;
+        }
+        let file = super::hotlist::path(path);
+        let Some(list) = super::hotlist::read(&file, self.pager.high_water()) else {
+            return 0;
+        };
+        if list.generation != self.pager.generation()
+            || list.page_size as usize != self.pager.page_size()
+            || list.epoch > self.opened_epoch
+        {
+            return 0;
+        }
+        self.pager.prewarm(&list.pages, list.epoch)
     }
 
     /// Force the log to disk, whatever the sync mode.
@@ -534,8 +592,13 @@ impl Drop for Db {
             .map(|w| w.committed_lsn() == self.ckpt_lsn)
             .unwrap_or(true)
             && self.pager.hold() == self.hold_at_checkpoint;
-        if self.wal.is_some() && !self.pager.in_txn() && !idle {
-            let _ = self.checkpoint();
+        if self.wal.is_some() && !self.pager.in_txn() {
+            if !idle {
+                let _ = self.checkpoint();
+            } else {
+                // Nothing to fold in, but what is hot may have changed.
+                self.save_hot(None);
+            }
         }
     }
 }

@@ -328,6 +328,14 @@ pub struct DbMetrics {
     pub page_hits: u64,
     pub page_misses: u64,
     pub evictions: u64,
+    /// The hot set (docs/HOT.md): pages in it now, then counters since open
+    /// of lookups that found their page hot, pages promoted and demoted, and
+    /// pages made hot at open from a previous open's list.
+    pub hot_pages: u64,
+    pub hot_hits: u64,
+    pub promotions: u64,
+    pub demotions: u64,
+    pub prewarmed: u64,
     pub commits: u64,
     pub rollbacks: u64,
     pub checkpoints: u64,
@@ -338,7 +346,8 @@ impl DbMetrics {
         format!(
             "{{\"nodes\":{},\"edges\":{},\"bytes\":{},\"memory_limit\":{},\"page_size\":{},\"resident_pages\":{},\
              \"allocated_pages\":{},\"log_bytes\":{},\"page_reads\":{},\"page_writes\":{},\"page_hits\":{},\
-             \"page_misses\":{},\"evictions\":{},\"commits\":{},\"rollbacks\":{},\"checkpoints\":{}}}",
+             \"page_misses\":{},\"evictions\":{},\"hot_pages\":{},\"hot_hits\":{},\"promotions\":{},\
+             \"demotions\":{},\"prewarmed\":{},\"commits\":{},\"rollbacks\":{},\"checkpoints\":{}}}",
             self.nodes,
             self.edges,
             self.bytes,
@@ -352,6 +361,11 @@ impl DbMetrics {
             self.page_hits,
             self.page_misses,
             self.evictions,
+            self.hot_pages,
+            self.hot_hits,
+            self.promotions,
+            self.demotions,
+            self.prewarmed,
             self.commits,
             self.rollbacks,
             self.checkpoints,
@@ -803,6 +817,41 @@ fn collect(s: &Snapshot, dbs: &[(String, DbMetrics)]) -> Vec<Metric> {
             help: "Pages evicted since open.",
             kind: Kind::Counter,
             points: per_db(&|d| Some(d.evictions)),
+        });
+        m.push(Metric {
+            name: "glider.db.cache.hot.resident",
+            unit: "{page}",
+            help: "Pages in the hot set.",
+            kind: Kind::Gauge,
+            points: per_db(&|d| Some(d.hot_pages)),
+        });
+        m.push(Metric {
+            name: "glider.db.cache.hot.hits",
+            unit: "{page}",
+            help: "Page-cache hits on hot pages since open.",
+            kind: Kind::Counter,
+            points: per_db(&|d| Some(d.hot_hits)),
+        });
+        m.push(Metric {
+            name: "glider.db.cache.hot.promotions",
+            unit: "{page}",
+            help: "Pages that joined the hot set since open.",
+            kind: Kind::Counter,
+            points: per_db(&|d| Some(d.promotions)),
+        });
+        m.push(Metric {
+            name: "glider.db.cache.hot.demotions",
+            unit: "{page}",
+            help: "Pages that left the hot set since open.",
+            kind: Kind::Counter,
+            points: per_db(&|d| Some(d.demotions)),
+        });
+        m.push(Metric {
+            name: "glider.db.cache.hot.prewarmed",
+            unit: "{page}",
+            help: "Pages made hot at open from a previous open's list.",
+            kind: Kind::Counter,
+            points: per_db(&|d| Some(d.prewarmed)),
         });
         m.push(Metric {
             name: "glider.db.io.reads",

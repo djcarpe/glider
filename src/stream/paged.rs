@@ -13,6 +13,7 @@
 //! ```text
 //! <generation>/base/<lsn:016x>/db                 pages of one checkpoint
 //! <generation>/base/<lsn:016x>/data/<n:08>.seg    its segment files, if any
+//! <generation>/base/<lsn:016x>/hot                its hot list, if it had one
 //! <generation>/base/<lsn:016x>/base.json          uploaded last: the base is whole
 //! <generation>/segments/<offset:016x>-<unix>.seg  log bytes from <offset>, whole transactions
 //! ```
@@ -383,6 +384,9 @@ impl PagedReplicator {
                 }
                 let key = base_prefix(&gen, b.lsn);
                 let mut files = vec![("db".to_string(), dir.join("db"))];
+                if dir.join("hot").is_file() {
+                    files.push(("hot".to_string(), dir.join("hot")));
+                }
                 if let Ok(rd) = fs::read_dir(dir.join("data")) {
                     let mut data: Vec<_> = rd
                         .flatten()
@@ -403,6 +407,7 @@ impl PagedReplicator {
                     .put(&format!("{key}base.json"), fs::read(dir.join("base.json"))?)?;
                 // The tailer reads only base.json; the pages can go.
                 let _ = fs::remove_file(dir.join("db"));
+                let _ = fs::remove_file(dir.join("hot"));
                 let _ = fs::remove_dir_all(dir.join("data"));
                 report.bases_uploaded += 1;
                 self.metrics.snapshots.fetch_add(1, Ordering::Relaxed);

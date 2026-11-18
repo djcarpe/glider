@@ -72,6 +72,8 @@ A failed statement's span has status ERROR with the engine's message.
 | `glider.db.log.size` (By) | `glider_db_log_size_bytes` | gauge |
 | `glider.db.cache.resident`, `glider.db.pages.allocated` | `glider_db_cache_resident`, `glider_db_pages_allocated` | gauges |
 | `glider.db.cache.{hits,misses,evictions}` | `glider_db_cache_*_total` | counters since open |
+| `glider.db.cache.hot.resident` | `glider_db_cache_hot_resident` | gauge: pages in the hot set ([HOT.md](HOT.md)) |
+| `glider.db.cache.hot.{hits,promotions,demotions,prewarmed}` | `glider_db_cache_hot_*_total` | counters since open |
 | `glider.db.io.{reads,writes}` | `glider_db_io_*_total` | counters since open |
 | `glider.db.{commits,rollbacks,checkpoints}` | `glider_db_*_total` | counters since open |
 

@@ -196,6 +196,7 @@ the tailer completes. Same commands, same config; nothing to switch on.
 ```text
 <generation>/base/<lsn:016x>/db                 pages of one checkpoint
 <generation>/base/<lsn:016x>/data/<n:08>.seg    its segment files, if any
+<generation>/base/<lsn:016x>/hot                its hot list, if the writer keeps one (HOT.md)
 <generation>/base/<lsn:016x>/base.json          uploaded last: the base is whole
 <generation>/segments/<offset:016x>-<unix>.seg  log from <offset>, whole transactions
 ```
