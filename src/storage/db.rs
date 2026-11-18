@@ -354,6 +354,23 @@ impl Db {
         Ok(())
     }
 
+    /// Start a new lineage: a memory database with a log takes a new
+    /// generation, its log carrying on at the same positions. A replicator
+    /// does this when the replica it ships to holds the database's own
+    /// generation past where the database is — the database was restored
+    /// from an earlier point and has written since — so the two histories
+    /// cannot share one generation's positions.
+    pub(crate) fn new_lineage(&mut self) -> SResult<[u8; 16]> {
+        if self.mem_log.is_none() {
+            return Err(unsupported(
+                "only a memory database with a log takes a new lineage",
+            ));
+        }
+        let generation = mint_generation()?;
+        self.pager.set_generation(generation);
+        Ok(generation)
+    }
+
     /// A memory database's log, if it has one.
     pub fn mem_log(&self) -> Option<&MemLog> {
         self.mem_log.as_ref()

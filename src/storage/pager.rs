@@ -1197,6 +1197,50 @@ pub fn read_superblock(path: &Path) -> SResult<SuperInfo> {
     })
 }
 
+/// The superblock in force in an image, from the bytes of its first
+/// segment: what [`read_superblock`] reads from a file, for an image that
+/// is in memory (a base downloaded from a replica). A restore checks it
+/// against the base's `base.json` before it loads a page.
+pub fn superblock_of(first: &[u8]) -> SResult<SuperInfo> {
+    if first.len() < page::MIN_PAGE || &first[32..40] != MAGIC {
+        return corrupt("not a paged glider database (bad magic)");
+    }
+    let ps = page::get_u32(first, 44) as usize;
+    if !page::valid_page_size(ps) {
+        return corrupt(format!("bad page size {ps}"));
+    }
+    let mut best: Option<(u64, &[u8])> = None;
+    for slot in 0..2u64 {
+        let at = slot as usize * ps;
+        let Some(b) = first.get(at..at + ps) else {
+            continue;
+        };
+        if page::check(b, slot).unwrap_or(false)
+            && page::kind(b) == page::KIND_SUPER
+            && &b[32..40] == MAGIC
+            && best.map(|(_, x)| sb_epoch(b) > sb_epoch(x)).unwrap_or(true)
+        {
+            best = Some((slot, b));
+        }
+    }
+    let Some((slot, b)) = best else {
+        return corrupt("no valid superblock");
+    };
+    let s = Super::decode(b);
+    Ok(SuperInfo {
+        slot,
+        page_size: ps,
+        epoch: s.epoch,
+        generation: s.generation,
+        wal_lsn: s.wal_lsn,
+        high_water: s.hw,
+        seg_pages: s.seg_pages,
+        pin_seen: s.pin_seen,
+        hold: s.hold,
+        bytes: b.to_vec(),
+    })
+}
+
 /// Marks a held page in the free-list chain (page numbers stay below 2^63).
 const HELD: u64 = 1 << 63;
 /// Superblock offsets: the hold nonce last honoured, and whether a hold is

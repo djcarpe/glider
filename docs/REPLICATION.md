@@ -8,6 +8,7 @@
 | Durable, normal case | `file.gldb --sync normal` | survives process death; not power loss |
 | Durable through power loss | `--sync always` | fsync per commit |
 | A durable copy elsewhere | any file + `wal tail` | see below |
+| A graph in RAM, with a copy elsewhere | `:memory:` + `Graph::enable_log` | `stream::memory`: the same replica, shipped from memory; see [TIERS.md](TIERS.md) |
 
 ## How it works
 

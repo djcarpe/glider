@@ -388,6 +388,42 @@ pub fn committed_end(db: &Path, from: u64) -> io::Result<Committed> {
     Ok(Committed::To(end))
 }
 
+/// Whether a committed transaction of `db`'s log, as it is on disk, ends at
+/// `pos`. Segments start at frame boundaries, so the frames are read from
+/// the first segment's start. A replicator asks before it carries on
+/// shipping from a position it did not ship itself — the end of the log a
+/// database was restored from — because a position past the log, or inside
+/// a transaction, would otherwise read as committed log that has merely
+/// not grown yet. (A checkpoint's own position is a commit too, whether or
+/// not the log still reaches it: the caller knows that one.)
+pub fn commit_at(db: &Path, pos: u64) -> io::Result<bool> {
+    let dir = wal_dir(db);
+    let segs = list_segments(&dir)?;
+    let Some(&first) = segs.first() else {
+        return Ok(false);
+    };
+    if first >= pos {
+        return Ok(false);
+    }
+    let mut r = SegReader::new(&dir, segs);
+    if let Err(e) = r.seek(first) {
+        return if e.kind() == io::ErrorKind::NotFound {
+            Ok(false)
+        } else {
+            Err(e)
+        };
+    }
+    while let Some((kind, _)) = r.next_record()? {
+        if r.lsn > pos {
+            break;
+        }
+        if r.lsn == pos {
+            return Ok(kind == K_TX_END);
+        }
+    }
+    Ok(false)
+}
+
 /// Copy the log bytes `[from, to)` of `db` into `out`.
 pub fn copy_range(db: &Path, from: u64, to: u64, out: &mut dyn Write) -> io::Result<()> {
     let dir = wal_dir(db);

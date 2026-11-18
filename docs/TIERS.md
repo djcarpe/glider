@@ -33,6 +33,16 @@ in any combination. A graph flown from memory today restores to a file
 tomorrow, and the other way round, on the same lineage. That is the whole
 design; the rest is how each half is done without touching a disk.
 
+Either kind, restored and replicated back to the replica it came from,
+carries that replica on: same generation, and a pass ships only what was
+written since the restore, with no new base. For a file this needs one
+thing a file did not do before: `stream::paged::restore` leaves a pin at
+the end of the log the restored file replays, so its writer keeps the log
+from there through checkpoints and the replicator can see that the
+replica's last position is a commit of the file's own history. The pin
+lapses after ten minutes (`PIN_TTL`), as every pin does; a file first
+replicated later than that takes a base.
+
 ## Shipping from memory
 
 A `:memory:` database has no log: its transactions are atomic and that is
@@ -82,12 +92,31 @@ than that. `Pager::open` reads that image from a file and
    the log below it go.
 
 A pass that fails part way has recorded nothing: the next one sends the same
-segment again, or takes a base again. Only whole transactions are ever in a
+segment again, or takes a base again. A base that failed part way is taken
+down, `base.json` first, as far as the backend allows; whatever is left has
+no `base.json` and is never read. Only whole transactions are ever in a
 segment, because both ends of it are commit positions.
 
-The first time a replicator talks to a backend it checks that the base it
-believes in is really there. A replicator pointed at an empty prefix takes a
-base however much it thinks it has shipped elsewhere.
+A replicator knows nothing of a backend until it has looked, so its first
+pass lists what the backend holds of the database's generation, then
+decides:
+
+- nothing of it (an empty prefix, or one holding only other lineages): a
+  base, however much the database has shipped elsewhere;
+- a base, and whole log after it to a position the database's log holds as
+  a commit, with nothing past that: the database's own history, so only
+  the log after it;
+- anything else, a base. When something of the generation lies past the
+  database's last commit (it was restored from an earlier point, or from
+  short of a gap or a damaged frame, and has written since), a base of that
+  generation would be older than what is there and its log would land
+  among the other history's. So the database first takes a new generation,
+  its log positions carrying on, and the replica holds the two lineages
+  side by side. A plain restore takes the most recently active.
+
+Positions are the only test of a shared history: two databases restored
+from one replica and both shipping back to it defeat it, as two writers on
+one file defeat a lock.
 
 ## Restoring into memory
 
@@ -107,14 +136,24 @@ The result is a graph on the replica's lineage: same generation, log
 positions carrying on. A replicator resumed against the backend it was
 restored from ships only what is written from then on; no new base — as
 long as the replay reached the end of what was shipped. If it stopped short,
-at a gap or a damaged frame, the position the replicator believes in is not
-in the new log, it is told that log is gone, and it takes a new base.
+at a gap, a time or a damaged frame, the replica holds the generation past
+where the graph is, and the graph's first pass takes a new generation and a
+base of it (above).
+
+A base must be whole: every file of it is its segment's pages up to the
+high-water mark, so a file of any other length, a file missing or a page
+damaged is an error, as is a `base.json` that does not describe the pages
+or a superblock of another generation or position than the key it is filed
+under. Log is lenient as a file's is: a damaged or cut-short segment ends
+the log there.
 
 ## Limits
 
 - **Memory is still the limit.** The whole graph is in RAM, bounded by
-  `max_memory`; a restore that does not fit fails with `Full` and leaves
-  nothing behind.
+  `max_memory` (and the `SLACK_PAGES` a full graph may use past it); a
+  restore that does not fit fails with `Full` and leaves nothing behind.
+- **A restore holds the base twice.** The downloaded files are held while
+  the pages are loaded from them: about twice the base, at its peak.
 - **A base in flight holds old pages.** Until a snapshot is dropped it keeps
   alive every page the writer replaced or freed since it was taken, outside
   `max_memory`'s count: a graph rewritten wholesale while its base is being
@@ -124,13 +163,23 @@ in the new log, it is told that log is gone, and it takes a new base.
 - **Not a new lineage in the browser.** A generation is made from the clock
   and the process id, and wasm has neither: there `enable_log` fails on a
   graph with no lineage yet, and only a graph restored from a replica, which
-  keeps the replica's, has a log.
+  keeps the replica's, has a log. Keys and `base.json` carry the time, so
+  there a pass fails too: in the browser a replica can be restored from,
+  not shipped to.
+- **A file does not fork.** A memory graph restored from short of its
+  replica's end takes a new generation before it ships back to it; a file
+  cannot change its generation, so a file restored as of an earlier time
+  and replicated back to the same prefix files its new base and log under
+  the generation the replica already holds past it. Replicate such a file
+  to a new prefix.
 - **A base is a whole image.** Every base uploads every page. Incremental
   bases are PAGED-6, for both kinds of database.
 - **What is in RAM and not yet shipped dies with the process.** That window
   is the interval between passes. Pass after every commit for none.
 - **One replica per memory database** keeps its log. A second replicator
   works, and takes a base whenever the first has let log go that it needs.
+- **One writer per lineage.** See "Shipping from memory": a replica cannot
+  tell two histories apart that reach the same positions.
 - **`log_cap` bounds the log, not the graph.** A burst of writes larger than
   it between passes costs a base at the next pass.
 - **No encryption, no compression,** as for files.
@@ -144,9 +193,11 @@ in the new log, it is told that log is gone, and it takes a new base.
 | `storage::pager::Snapshot` | the committed page table of a memory pager, and the image it writes |
 | `storage::pager::Pager::from_parts` | a memory pager from an image's segment files |
 | `storage::db::Db` | a memory database with a log (`enable_log`, `snapshot`, `release_log`); `from_replica` |
-| `stream::memory` | `MemoryReplicator` (capture, upload, acknowledge, and `sync` over a `Mutex<Graph>`), `restore` |
+| `storage::pager::superblock_of` | the superblock of an image in memory, which a restore checks against the key and `base.json` |
+| `stream::memory` | `MemoryReplicator` (`capture`, `upload`, `acknowledge`; `sync` over a `Mutex<Graph>`, `sync_with` over an embedder's lock; `lag`, `enforce_retention`), `restore`, `lag` |
+| `stream::paged` | what both kinds share: the keys (`base_prefix`, `base_file`, `segment_key`), `listing`, `generations`, `restore_plan`, retention (`expire`); and a file's carrying on after a restore |
 | `Graph::enable_log`, `Graph::generation` | what an embedder calls |
-| `Graph::log_span`, `log_committed_end`, `log_range`, `release_log`, `snapshot`, `from_replica` | what `stream::memory` calls |
+| `Graph::log_span`, `log_committed_end`, `log_range`, `release_log`, `snapshot`, `from_replica` | what `stream::memory` calls (and `new_lineage`, inside the crate) |
 
 Embedders with their own lock (the BEAM binding) call `capture`, `upload`
 and `acknowledge` themselves, holding the lock only for the first and the

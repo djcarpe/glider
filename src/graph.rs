@@ -2660,6 +2660,13 @@ impl Graph {
         })
     }
 
+    /// A new generation for a memory graph with a log, its log carrying on
+    /// at the same positions: for `stream::memory`, when the replica it
+    /// ships to holds this lineage past where the graph is.
+    pub(crate) fn new_lineage(&mut self) -> Result<[u8; 16]> {
+        Ok(self.db.new_lineage()?)
+    }
+
     /// A memory graph restored from a replica: the pages of a base, from
     /// its segment files' bytes in order (the database file first), then
     /// the log shipped after it — each segment with the position it starts

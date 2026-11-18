@@ -223,6 +223,17 @@ the tailer completes. Same commands, same config; nothing to switch on.
   checks every tree. `generations`, `segments` (log) and `snapshots` (bases)
   list a paged replica; `status` shows the newest base, how far the log is
   replicated, and the lag.
+- **After a restore** the database carries the replica on: replicated back
+  to the replica it was restored from, it ships only what was written since,
+  with no new base, if its first pass comes within ten minutes of the
+  restore (the restore pins the log it replayed for that long). Later, it
+  takes a base. One restored from short of the replica's end (`-timestamp`,
+  a gap) and written to has a history of its own: replicate it to a new
+  prefix, or its base and log land under the generation the replica
+  already holds past it.
+- **From memory.** A `:memory:` graph with a log ships the same objects,
+  with no spool, and a replica restores into memory as well as to a file
+  (`stream::memory`; see [TIERS.md](TIERS.md)).
 - **Size.** Objects are single PUTs, read whole on restore: fine for the
   small and mid-sized databases this is for; for bases past a few GB use
   `wal tail --exec` with a tool that does multipart uploads.
