@@ -1579,6 +1579,21 @@ fn run(g: &mut Graph, stmt: Stmt) -> Result<QueryResult> {
                     Value::Int(max.min(i64::MAX as u64) as i64),
                 ]);
             }
+            if s.hot_capacity > 0 {
+                for (name, v) in [
+                    ("hot_capacity", s.hot_capacity),
+                    ("hot_pages", s.hot_pages),
+                    ("hot_hits", s.hot_hits),
+                    ("promotions", s.promotions),
+                    ("demotions", s.demotions),
+                    ("prewarmed", s.prewarmed),
+                ] {
+                    rows.push(vec![
+                        Value::Text(name.into()),
+                        Value::Int(v.min(i64::MAX as u64) as i64),
+                    ]);
+                }
+            }
             if let Some(e) = s.integrity_error {
                 rows.push(vec![Value::Text("integrity_error".into()), Value::Text(e)]);
             }

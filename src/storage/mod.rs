@@ -14,13 +14,15 @@
 //!
 //! Layers, bottom up: [`page`] (the page header and checksums), [`pager`]
 //! (page allocation, copy-on-write transactions, the memory store, the file
-//! store and its cache, checkpoints), [`btree`] (copy-on-write B+trees over
-//! byte keys), [`keys`] (order-preserving key encodings) and [`log`] (the
-//! write-ahead log).
+//! store and its cache, checkpoints), [`hot`] (the part of that cache kept
+//! for pages used often), [`btree`] (copy-on-write B+trees over byte keys),
+//! [`keys`] (order-preserving key encodings) and [`log`] (the write-ahead
+//! log).
 
 pub mod btree;
 pub mod db;
 pub mod extsort;
+pub mod hot;
 pub mod keys;
 pub mod log;
 pub mod page;

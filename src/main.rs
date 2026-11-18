@@ -36,6 +36,10 @@ options:
   --cache-size SIZE          page cache for a file-backed database (default
                              1G). RAM use stays near this however large the
                              database grows; the database is limited by disk
+  --hot-size SIZE            how much of that cache to keep for the pages used
+                             most, through scans and other databases' demand
+                             (default 0, none; at most half the cache; see
+                             docs/HOT.md)
   --max-memory SIZE          :memory: only: the most memory the graph may use
                              (default: physical RAM). Past it, writes fail
                              cleanly and roll back
@@ -70,6 +74,7 @@ struct Options {
     /// `browser` only: skip launching the user's browser.
     no_open: bool,
     cache_size: u64,
+    hot_size: u64,
     max_memory: Option<u64>,
     checkpoint_bytes: u64,
     work_mem: u64,
@@ -181,6 +186,7 @@ fn run() -> Result<(), String> {
         addr: "127.0.0.1:7878".into(),
         bench: 50_000,
         cache_size: glider::storage::pager::DEFAULT_CACHE_BYTES,
+        hot_size: 0,
         max_memory: None,
         checkpoint_bytes: 256 << 20,
         work_mem: glider::graph::DEFAULT_WORK_MEM,
@@ -214,6 +220,11 @@ fn run() -> Result<(), String> {
                 i += 1;
                 opts.cache_size = parse_size(args.get(i).map(|s| s.as_str()).unwrap_or(""))
                     .ok_or("--cache-size takes a size, like 512M or 2G")?;
+            }
+            "--hot-size" => {
+                i += 1;
+                opts.hot_size = parse_size(args.get(i).map(|s| s.as_str()).unwrap_or(""))
+                    .ok_or("--hot-size takes a size, like 32M or 1G")?;
             }
             "--max-memory" => {
                 i += 1;
@@ -353,6 +364,7 @@ fn open_graph(opts: &Options) -> Result<Graph, String> {
         sync: opts.sync,
         force: opts.force,
         cache_size: opts.cache_size,
+        hot_size: opts.hot_size,
         checkpoint_bytes: opts.checkpoint_bytes,
         work_mem: opts.work_mem,
         ..glider::OpenOptions::default()

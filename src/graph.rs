@@ -87,6 +87,10 @@ pub struct OpenOptions {
     /// File-backed: bytes of page cache. RAM use is bounded by this plus
     /// query working memory, however large the database.
     pub cache_size: u64,
+    /// File-backed: bytes of that cache kept for pages used often, which
+    /// scans and other databases' need for memory then leave alone
+    /// (docs/HOT.md). At most half the cache; 0, the default, is no hot set.
+    pub hot_size: u64,
     /// `:memory:`: the most memory the graph may occupy. Default: the
     /// machine's physical memory.
     pub max_memory: u64,
@@ -112,6 +116,7 @@ impl Default for OpenOptions {
             sync: Sync::Normal,
             force: false,
             cache_size: pager::DEFAULT_CACHE_BYTES,
+            hot_size: 0,
             max_memory: pager::physical_memory(),
             page_size: crate::storage::page::DEFAULT_PAGE,
             segment_size: pager::DEFAULT_SEGMENT_BYTES,
@@ -1094,6 +1099,8 @@ impl Graph {
         };
         let mut sch: Option<(Interner, Indexes)> = None;
         let (db, _) = Db::open(path, &cfg, &mut |p, rec| replay(p, &mut sch, rec))?;
+        // After recovery: replaying the log is not the workload.
+        db.pager().set_hot_size(opts.hot_size);
         let mut g = Graph::init(db)?;
         g.work_mem = opts.work_mem;
         Ok(g)
@@ -2510,6 +2517,12 @@ impl Graph {
             indexes: self.indexes(),
             memory: self.pager().memory_usage(),
             cache_pages: ps.resident_pages,
+            hot_capacity: ps.hot_capacity,
+            hot_pages: ps.hot_pages,
+            hot_hits: ps.hot_hits,
+            promotions: ps.promotions,
+            demotions: ps.demotions,
+            prewarmed: ps.prewarmed,
             page_size: self.pager().page_size() as u64,
             log_bytes: self.db.log_since_checkpoint(),
             integrity_error: None,
@@ -2656,6 +2669,23 @@ impl Graph {
         self.pager().stats()
     }
 
+    /// The page numbers of the hot set, hottest first (docs/HOT.md).
+    pub fn hot_pages(&self) -> Vec<u64> {
+        self.pager().hot_pages()
+    }
+
+    /// The hot set's bookkeeping holds together and names only live pages.
+    #[doc(hidden)]
+    pub fn check_hot_set(&self) -> std::result::Result<(), String> {
+        self.pager().check_hot()
+    }
+
+    /// A short hot-set clock, for tests: ticks of `lookups` lookups.
+    #[doc(hidden)]
+    pub fn set_hot_tick(&self, lookups: u64) {
+        self.pager().set_hot_tick(lookups);
+    }
+
     /// Cheap state for telemetry: counts, cache and I/O counters, log and
     /// memory. Unlike `stats()` this walks nothing.
     pub fn telemetry(&self) -> crate::telemetry::DbMetrics {
@@ -2679,6 +2709,11 @@ impl Graph {
             page_hits: ps.hits,
             page_misses: ps.misses,
             evictions: ps.evictions,
+            hot_pages: ps.hot_pages,
+            hot_hits: ps.hot_hits,
+            promotions: ps.promotions,
+            demotions: ps.demotions,
+            prewarmed: ps.prewarmed,
             commits: ps.commits,
             rollbacks: ps.rollbacks,
             checkpoints: ps.checkpoints,
@@ -2712,6 +2747,17 @@ pub struct Stats {
     pub memory: Option<(u64, u64)>,
     /// Pages resident in memory right now.
     pub cache_pages: u64,
+    /// The most pages the hot set may hold; 0 without one.
+    pub hot_capacity: u64,
+    /// Pages in the hot set now, all of them resident.
+    pub hot_pages: u64,
+    /// Lookups that found their page hot, since open.
+    pub hot_hits: u64,
+    /// Pages that joined and left the hot set, since open.
+    pub promotions: u64,
+    pub demotions: u64,
+    /// Pages made hot at open from a previous open's list.
+    pub prewarmed: u64,
     pub page_size: u64,
     /// Log a crash right now would replay.
     pub log_bytes: u64,

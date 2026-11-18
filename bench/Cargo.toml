@@ -41,3 +41,7 @@ path = "src/bin/pagebench.rs"
 [[bin]]
 name = "ctxbench"
 path = "src/bin/ctxbench.rs"
+
+[[bin]]
+name = "hotbench"
+path = "src/bin/hotbench.rs"

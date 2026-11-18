@@ -23,6 +23,14 @@
 //! ever overwritten. That is what keeps memory bounded however large a
 //! transaction gets.
 //!
+//! **The hot set.** A file-backed cache may keep part of itself, up to
+//! `hot_size` bytes and never more than half of it, for pages used *often*
+//! ([`Pager::set_hot_size`]). The sweep passes over them, and when the
+//! process's budget is short, other databases' cold frames go before any
+//! hot one. What "often" is, and why it costs a lookup constant work, is in
+//! [`super::hot`]; the pager tells it of every frame read, filled, emptied
+//! or moved, and of every page copied or freed.
+//!
 //! **Reuse.** A page freed by a commit is reusable immediately unless the
 //! durable (checkpointed) state still refers to it; those wait for the next
 //! checkpoint. The free list is written, at each checkpoint, as a chain of
@@ -121,6 +129,19 @@ pub struct Stats {
     pub resident_pages: u64,
     /// Pages in use by the committed state and the open transaction.
     pub allocated_pages: u64,
+    /// Most pages the hot set may hold; 0 without one.
+    pub hot_capacity: u64,
+    /// Pages in the hot set now (all of them resident).
+    pub hot_pages: u64,
+    /// Lookups that found their page hot.
+    pub hot_hits: u64,
+    /// Pages that joined the hot set.
+    pub promotions: u64,
+    /// Pages that left it: cooled, displaced by a hotter page, freed, or
+    /// taken for the process's budget.
+    pub demotions: u64,
+    /// Pages made hot at open from the list of a previous one.
+    pub prewarmed: u64,
 }
 
 pub struct Pager {
@@ -192,6 +213,9 @@ struct Cache {
     hand: usize,
     pool: Option<Arc<crate::budget::Pool>>,
     charge: u64,
+    /// Frames kept for pages used often. None, the default, is the cache
+    /// exactly as it is without one: nothing counted, nothing kept.
+    hot: Option<Box<super::hot::Hot>>,
 }
 
 struct Frame {
@@ -586,6 +610,16 @@ impl Pager {
         let mut b = pg.to_vec();
         page::rehome(&mut b, new, epoch);
         g.install(new, b.into(), true)?;
+        // Hot follows the data: the copy takes the page's heat and place.
+        if let Store::File(f) = &mut g.store {
+            if let (Some(h), Some(&a), Some(&b)) = (
+                f.cache.hot.as_deref_mut(),
+                f.cache.map.get(&pno),
+                f.cache.map.get(&new),
+            ) {
+                h.inherit(a, b);
+            }
+        }
         g.txn_free.push((pno, page::epoch(&pg)));
         g.stats.copies += 1;
         Ok(new)
@@ -689,7 +723,123 @@ impl Pager {
             Store::Mem(m) => m.used / g.ps as u64,
             Store::File(f) => f.cache.frames.len() as u64,
         };
+        if let Store::File(f) = &g.store {
+            if let Some(h) = f.cache.hot.as_deref() {
+                s.hot_capacity = h.capacity() as u64;
+                s.hot_pages = h.len() as u64;
+                s.hot_hits = h.hits;
+                s.promotions = h.promotions;
+                s.demotions = h.demotions;
+                s.prewarmed = h.prewarmed;
+            }
+        }
         s
+    }
+
+    /// Keep up to `bytes` of a file-backed database's cache for pages used
+    /// often, never more than half of it (see [`super::hot`]); 0 turns it
+    /// off. Shrinking it lets the coolest pages go. A `:memory:` database
+    /// has every page in memory already and ignores it.
+    pub fn set_hot_size(&self, bytes: u64) {
+        let mut g = self.lock();
+        let ps = g.ps as u64;
+        let Store::File(f) = &mut g.store else {
+            return;
+        };
+        let cap = usize::try_from(bytes / ps)
+            .unwrap_or(usize::MAX)
+            .min(f.cache.cap / 2);
+        match f.cache.hot.as_deref_mut() {
+            Some(h) => h.resize(cap),
+            None if cap > 0 => {
+                let h = super::hot::Hot::new(cap, f.cache.cap, f.cache.frames.len());
+                f.cache.hot = Some(Box::new(h));
+            }
+            None => {}
+        }
+    }
+
+    /// Ticks of `lookups` lookups instead of the cache's own length, from
+    /// the next lookup on (see [`super::hot`]). For tests.
+    #[doc(hidden)]
+    pub fn set_hot_tick(&self, lookups: u64) {
+        if let Store::File(f) = &mut self.lock().store {
+            if let Some(h) = f.cache.hot.as_deref_mut() {
+                h.set_tick(lookups);
+            }
+        }
+    }
+
+    /// The page numbers in the hot set, hottest first: what a later open
+    /// would want back.
+    pub fn hot_pages(&self) -> Vec<u64> {
+        let g = self.lock();
+        let Store::File(f) = &g.store else {
+            return Vec::new();
+        };
+        match f.cache.hot.as_deref() {
+            Some(h) => h
+                .frames()
+                .into_iter()
+                .filter_map(|i| f.cache.frames.get(i).map(|fr| fr.pno))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Make a page that is in the cache hot now, with the heat of a page
+    /// just promoted: for loading a hot set remembered from before. Read the
+    /// page first. False if it is not in the cache, there is no hot set, or
+    /// the set is full of pages at least as hot.
+    pub fn mark_hot(&self, pno: u64) -> bool {
+        let mut g = self.lock();
+        let Store::File(f) = &mut g.store else {
+            return false;
+        };
+        let Some(&i) = f.cache.map.get(&pno) else {
+            return false;
+        };
+        f.cache.hot.as_deref_mut().is_some_and(|h| h.mark(i))
+    }
+
+    /// The hot set's bookkeeping holds together, and every hot page is a
+    /// page of the database: resident, below the high-water mark, and in
+    /// no free list. For tests; call it between transactions.
+    #[doc(hidden)]
+    pub fn check_hot(&self) -> Result<(), String> {
+        let g = self.lock();
+        let Store::File(f) = &g.store else {
+            return Ok(());
+        };
+        let Some(h) = f.cache.hot.as_deref() else {
+            return Ok(());
+        };
+        h.check(f.cache.frames.len())?;
+        if h.capacity() > f.cache.cap / 2 {
+            return Err(format!(
+                "room for {} hot pages in a {}-frame cache",
+                h.capacity(),
+                f.cache.cap
+            ));
+        }
+        let gone: std::collections::HashSet<u64> = g
+            .free
+            .iter()
+            .chain(&g.pending)
+            .chain(&g.held)
+            .chain(&g.chain)
+            .copied()
+            .collect();
+        for i in h.frames() {
+            let pno = f.cache.frames[i].pno;
+            if f.cache.map.get(&pno) != Some(&i) {
+                return Err(format!("hot page {pno} is not where the cache says"));
+            }
+            if pno < 2 || pno >= g.hw || gone.contains(&pno) {
+                return Err(format!("hot page {pno} is not a page of the database"));
+            }
+        }
+        Ok(())
     }
 
     /// Bytes of pages held for a `:memory:` database; its limit.
@@ -706,8 +856,8 @@ impl Pager {
         }
     }
 
-    /// Drop every clean page from the cache (file-backed): for tests and
-    /// benchmarks of cold reads. Dirty pages are written first.
+    /// Drop every clean page from the cache (file-backed), hot ones too: for
+    /// tests and benchmarks of cold reads. Dirty pages are written first.
     pub fn evict_all(&self) -> SResult<()> {
         let mut g = self.lock();
         g.flush_dirty()?;
@@ -842,11 +992,20 @@ impl Inner {
                     let fr = &mut f.cache.frames[i];
                     fr.usage = fr.usage.saturating_add(1).min(3);
                     self.stats.hits += 1;
-                    return Ok(fr.data.clone());
+                    let data = fr.data.clone();
+                    if let Some(h) = f.cache.hot.as_deref_mut() {
+                        h.touch(i);
+                    }
+                    return Ok(data);
                 }
                 self.stats.misses += 1;
                 let data: Page = self.read_page(pno)?.into();
-                self.install(pno, data.clone(), false)?;
+                let i = self.cache_insert(pno, data.clone(), false)?;
+                if let Store::File(f) = &mut self.store {
+                    if let Some(h) = f.cache.hot.as_deref_mut() {
+                        h.touch(i);
+                    }
+                }
                 Ok(data)
             }
         }
@@ -929,7 +1088,8 @@ impl Inner {
         }
     }
 
-    fn cache_insert(&mut self, pno: u64, data: Page, dirty: bool) -> SResult<()> {
+    /// Put `data` in the cache as page `pno`; returns its frame.
+    fn cache_insert(&mut self, pno: u64, data: Page, dirty: bool) -> SResult<usize> {
         let ps = self.ps;
         let Store::File(f) = &mut self.store else {
             unreachable!()
@@ -939,25 +1099,25 @@ impl Inner {
             fr.data = data;
             fr.dirty |= dirty;
             fr.usage = 3;
-            return Ok(());
+            // New contents: all they share with the old is the number.
+            if let Some(h) = f.cache.hot.as_deref_mut() {
+                h.forget(i);
+            }
+            return Ok(i);
         }
         if f.cache.frames.len() < f.cache.cap && f.cache.reserve_frame() {
-            f.cache.frames.push(Frame {
-                pno,
-                data,
-                dirty,
-                usage: 1,
-            });
-            let i = f.cache.frames.len() - 1;
-            f.cache.map.insert(pno, i);
-            return Ok(());
+            return Ok(f.cache.push(pno, data, dirty));
         }
-        // CLOCK: find a victim that nobody holds.
+        // CLOCK: find a victim that nobody holds. Hot frames are not the
+        // sweep's to take.
         let n = f.cache.frames.len();
         let mut victim = None;
         for _ in 0..(n * 4) {
             let h = f.cache.hand;
             f.cache.hand = (h + 1) % n;
+            if f.cache.hot.as_deref().is_some_and(|hot| hot.is_hot(h)) {
+                continue;
+            }
             let fr = &mut f.cache.frames[h];
             if Arc::strong_count(&fr.data) > 1 {
                 continue;
@@ -968,6 +1128,26 @@ impl Inner {
             }
             victim = Some(h);
             break;
+        }
+        // Every frame nobody holds is hot: the coolest goes, as any frame
+        // would have before there was a hot set, rather than nothing.
+        if victim.is_none() {
+            let frames = &f.cache.frames;
+            victim = f.cache.hot.as_deref().and_then(|h| {
+                h.coolest(|i| {
+                    frames
+                        .get(i)
+                        .is_some_and(|fr| Arc::strong_count(&fr.data) == 1)
+                })
+            });
+        }
+        // Nothing of its own to give: room from other databases' hot frames,
+        // their cold ones having gone already.
+        if victim.is_none()
+            && f.cache.frames.len() < f.cache.cap
+            && f.cache.reserve_frame_from_hot()
+        {
+            return Ok(f.cache.push(pno, data, dirty));
         }
         let Some(v) = victim else {
             return Err(SError::Full(
@@ -990,8 +1170,11 @@ impl Inner {
             usage: 1,
         };
         f.cache.map.insert(pno, v);
+        if let Some(h) = f.cache.hot.as_deref_mut() {
+            h.forget(v);
+        }
         self.stats.evictions += 1;
-        Ok(())
+        Ok(v)
     }
 
     fn modify<R>(&mut self, pno: u64, f: impl FnOnce(&mut [u8]) -> R) -> SResult<R> {
@@ -1042,9 +1225,15 @@ impl Inner {
                 self.free.push(pno);
             }
             Store::File(f) => {
+                let at = f.cache.map.get(&pno).copied();
+                if let (Some(i), Some(h)) = (at, f.cache.hot.as_deref_mut()) {
+                    // Its heat goes with it: the number may come back as
+                    // other data.
+                    h.forget(i);
+                }
                 if now {
                     // Its cached content (if any) is garbage now.
-                    if let Some(i) = f.cache.map.get(&pno).copied() {
+                    if let Some(i) = at {
                         f.cache.frames[i].dirty = false;
                     }
                     self.free.push(pno);
@@ -1211,15 +1400,8 @@ impl Inner {
             let (file, off) = f.locate(*pno, ps, true)?;
             file.write_all_at(&b, off)?;
             // Never serve a stale cached copy of a page now in the chain.
-            if let Some(i) = f.cache.map.remove(pno) {
-                let last = f.cache.frames.len() - 1;
-                f.cache.frames.swap(i, last);
-                f.cache.frames.pop();
-                f.cache.release_frame();
-                if i < f.cache.frames.len() {
-                    let moved = f.cache.frames[i].pno;
-                    f.cache.map.insert(moved, i);
-                }
+            if let Some(&i) = f.cache.map.get(pno) {
+                f.cache.remove(i);
                 f.cache.hand = 0;
             }
             self.stats.writes += 1;
@@ -1296,15 +1478,27 @@ impl Cache {
             pool: crate::budget::process().map(|b| b.cache.clone()),
             // Payload plus conservative Arc/Vec/hash-table bookkeeping.
             charge: ps as u64 + 512,
+            hot: None,
         }
     }
 
+    /// A frame's worth of the process's pool, if it has one: free, or from
+    /// other databases' cold frames.
     fn reserve_frame(&self) -> bool {
         let Some(pool) = &self.pool else { return true };
         if pool.reserve(self.charge) {
             return true;
         }
-        reclaim_caches(pool, self.charge);
+        reclaim_caches(pool, self.charge, Take::Cold);
+        pool.reserve(self.charge)
+    }
+    /// The last resort, for a cache with nothing of its own to evict: a
+    /// frame's worth from other databases' hot frames, their cold ones
+    /// having gone in [`Cache::reserve_frame`]. Where no database has a hot
+    /// set this takes nothing, as before there were any.
+    fn reserve_frame_from_hot(&self) -> bool {
+        let Some(pool) = &self.pool else { return false };
+        reclaim_caches(pool, self.charge, Take::Hot);
         pool.reserve(self.charge)
     }
     fn release_frame(&self) {
@@ -1319,6 +1513,86 @@ impl Cache {
         self.frames = Vec::new();
         self.map = HashMap::default();
         self.hand = 0;
+        if let Some(h) = self.hot.as_deref_mut() {
+            h.clear();
+        }
+    }
+    /// A new frame for `pno`, already paid for.
+    fn push(&mut self, pno: u64, data: Page, dirty: bool) -> usize {
+        self.frames.push(Frame {
+            pno,
+            data,
+            dirty,
+            usage: 1,
+        });
+        let i = self.frames.len() - 1;
+        self.map.insert(pno, i);
+        if let Some(h) = self.hot.as_deref_mut() {
+            h.push();
+        }
+        i
+    }
+    /// Drop frame `i`, which must be clean and unheld, and give its memory
+    /// back. The last frame takes its place.
+    fn remove(&mut self, i: usize) {
+        if i >= self.frames.len() {
+            return;
+        }
+        if let Some(h) = self.hot.as_deref_mut() {
+            h.swap_remove(i);
+        }
+        let gone = self.frames.swap_remove(i);
+        self.map.remove(&gone.pno);
+        if let Some(moved) = self.frames.get(i) {
+            self.map.insert(moved.pno, i);
+        }
+        if self.hand >= self.frames.len() {
+            self.hand = 0;
+        }
+        self.release_frame();
+    }
+}
+
+impl Inner {
+    /// Reclaim, from an idle database: write what is dirty, then give up
+    /// every cold frame. Without a hot set that is the whole cache, as it
+    /// was before there was one.
+    fn shed_cold(&mut self) {
+        if self.flush_dirty().is_err() {
+            return;
+        }
+        let Store::File(f) = &mut self.store else {
+            return;
+        };
+        if f.cache.hot.is_none() {
+            f.cache.clear();
+            return;
+        }
+        let mut i = 0;
+        while i < f.cache.frames.len() {
+            if f.cache.hot.as_deref().is_some_and(|h| h.is_hot(i)) {
+                i += 1;
+            } else {
+                f.cache.remove(i);
+            }
+        }
+    }
+
+    /// Reclaim, from an idle database, when cold frames were not enough:
+    /// hot frames, coolest first, until the pool has room for `needed`.
+    fn shed_hot(&mut self, pool: &crate::budget::Pool, needed: u64) {
+        if pool.used().saturating_add(needed) <= pool.limit() || self.flush_dirty().is_err() {
+            return;
+        }
+        let Store::File(f) = &mut self.store else {
+            return;
+        };
+        while pool.used().saturating_add(needed) > pool.limit() {
+            let Some(i) = f.cache.hot.as_deref().and_then(|h| h.coolest(|_| true)) else {
+                return;
+            };
+            f.cache.remove(i);
+        }
     }
 }
 
@@ -1328,6 +1602,17 @@ impl Drop for Cache {
             pool.release(self.frames.len() as u64 * self.charge);
         }
     }
+}
+
+/// What [`reclaim_caches`] may take from idle databases.
+#[derive(Clone, Copy)]
+enum Take {
+    /// Cold frames: every frame of a database without a hot set.
+    Cold,
+    /// Hot frames, coolest first.
+    Hot,
+    /// Cold frames, then hot ones if those were not enough.
+    Both,
 }
 
 static CACHES: OnceLock<Mutex<Vec<Weak<Mutex<Inner>>>>> = OnceLock::new();
@@ -1345,41 +1630,60 @@ fn register_cache(pager: &Pager) {
 
 // Never wait for another pager while holding one: concurrent opens and queries
 // may reclaim each other's idle frames without a lock-order cycle.
-fn reclaim_caches(pool: &crate::budget::Pool, needed: u64) {
+//
+// Cold frames go first, from every idle database; hot frames only when those
+// were not enough and `take` says to look further. A database that wants room
+// to grow does not take another's hot frames: it evicts its own cold ones.
+fn reclaim_caches(pool: &crate::budget::Pool, needed: u64, take: Take) {
     let Some(registry) = CACHES.get() else { return };
     let caches = registry.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    for cache in caches {
-        if pool.used().saturating_add(needed) <= pool.limit() {
-            break;
-        }
-        let Some(inner) = cache.upgrade() else {
-            continue;
-        };
-        let Ok(mut inner) = inner.try_lock() else {
-            continue;
-        };
-        let evictable = match &inner.store {
-            Store::File(f) => f
-                .cache
-                .frames
-                .iter()
-                .all(|f| Arc::strong_count(&f.data) == 1),
-            _ => false,
-        };
-        if evictable && inner.flush_dirty().is_ok() {
-            if let Store::File(f) = &mut inner.store {
-                f.cache.clear();
+    let passes: &[bool] = match take {
+        Take::Cold => &[false],
+        Take::Hot => &[true],
+        Take::Both => &[false, true],
+    };
+    for &take_hot in passes {
+        for cache in &caches {
+            if pool.used().saturating_add(needed) <= pool.limit() {
+                return;
+            }
+            let Some(inner) = cache.upgrade() else {
+                continue;
+            };
+            let Ok(mut inner) = inner.try_lock() else {
+                continue;
+            };
+            let evictable = match &inner.store {
+                Store::File(f) => f
+                    .cache
+                    .frames
+                    .iter()
+                    .all(|f| Arc::strong_count(&f.data) == 1),
+                _ => false,
+            };
+            let has_hot = matches!(&inner.store, Store::File(f) if f.cache.hot.is_some());
+            if !evictable || (take_hot && !has_hot) {
+                continue;
+            }
+            if take_hot {
+                // Its cold frames first, in case it was busy when the cold
+                // pass came by.
+                inner.shed_cold();
+                inner.shed_hot(pool, needed);
+            } else {
+                inner.shed_cold();
             }
         }
     }
 }
 
 /// Governor hook. Busy/pinned frames are reclaimed on the next admission;
-/// the returned usage makes a pending shrink observable.
+/// the returned usage makes a pending shrink observable. A limit below what
+/// the hot sets hold takes hot frames too, the coolest first.
 pub fn resize_shared_cache(bytes: u64) -> Option<u64> {
     let budget = crate::budget::process()?;
     budget.cache.resize(bytes.min(budget.config.cache));
-    reclaim_caches(&budget.cache, 0);
+    reclaim_caches(&budget.cache, 0, Take::Both);
     Some(budget.cache.used())
 }
 
