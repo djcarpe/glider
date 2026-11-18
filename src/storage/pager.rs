@@ -1010,9 +1010,16 @@ impl Pager {
         self.lock().durable
     }
 
-    /// The epoch the next checkpoint will write: the committed state's.
+    /// The epoch the next checkpoint will write: the committed state's, or,
+    /// with nothing committed since the last checkpoint, one past it (a
+    /// checkpoint always supersedes the last; see `Inner::checkpoint`).
     pub fn committed_epoch(&self) -> u64 {
-        self.lock().epoch - 1
+        let g = self.lock();
+        if g.epoch == g.durable + 1 {
+            g.epoch
+        } else {
+            g.epoch - 1
+        }
     }
 
     /// The hot set as a list to keep beside the database (see

@@ -246,6 +246,7 @@ impl Db {
             keep_from: None,
             hold_at_checkpoint: (false, 0),
             pin_checked: None,
+            opened_epoch: 0,
             _lock: None,
         };
         Ok((db, rec))
