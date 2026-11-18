@@ -222,12 +222,14 @@ pub fn query_json(g: &mut Graph, src: &str) -> Result<String, String> {
 }
 
 /// Parameters for a statement from a JSON object, `{"name": value, ...}`.
-/// Nested objects become their JSON text, as properties do.
+/// Nested objects become their JSON text, as properties do; a list nested
+/// deeper than a value may be is refused.
 pub fn params_from_json(json: &str) -> Result<Vec<(String, Value)>, String> {
     match crate::value::parse_json(json)? {
-        crate::value::Json::Object(fields) => {
-            Ok(fields.into_iter().map(|(k, v)| (k, v.to_value())).collect())
-        }
+        crate::value::Json::Object(fields) => fields
+            .into_iter()
+            .map(|(k, v)| Ok((k, v.try_value()?)))
+            .collect(),
         crate::value::Json::Null => Ok(Vec::new()),
         _ => Err("parameters must be a JSON object".into()),
     }
