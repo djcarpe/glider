@@ -317,8 +317,7 @@ fn an_idle_writer_gives_a_base_and_then_a_forced_one() {
     let first = sync_while_idle(&mut g, &db, &root, &remote, false);
     assert_eq!(first.bases_uploaded, 1, "a base for the new replica");
     restore_and_compare(&g, remote.as_ref(), &root.join("restored"));
-    // The writer releases the hold at its next look at the pin.
-    std::thread::sleep(Duration::from_millis(1100));
+    // The writer releases the hold when it is next polled.
     g.poll_replication().unwrap();
     let forced = sync_while_idle(&mut g, &db, &root, &remote, true);
     assert_eq!(forced.bases_uploaded, 1, "a forced base");
