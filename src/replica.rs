@@ -44,7 +44,8 @@ fn sio(e: crate::storage::SError) -> io::Error {
     }
 }
 
-fn hex(g: &[u8; 16]) -> String {
+/// A generation, spelled as replica directories and keys name it.
+pub fn generation_name(g: &[u8; 16]) -> String {
     g.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -56,8 +57,25 @@ pub fn is_paged(db: &Path) -> bool {
 /// A paged database's generation, spelled as replica directories name it.
 pub fn generation_hex(db: &Path) -> io::Result<String> {
     pager::read_superblock(db)
-        .map(|sb| hex(&sb.generation))
+        .map(|sb| generation_name(&sb.generation))
         .map_err(sio)
+}
+
+/// A base's `base.json`: what a restore needs to know of the base before it
+/// reads a page, and the file whose presence makes the base whole. One
+/// spelling for a base copied from a file and one written from memory.
+pub fn base_json(
+    lsn: u64,
+    epoch: u64,
+    ts: u64,
+    bytes: u64,
+    page_size: u64,
+    pages: u64,
+    segment_pages: u64,
+) -> String {
+    format!(
+        "{{\"lsn\":{lsn},\"epoch\":{epoch},\"ts\":{ts},\"bytes\":{bytes},\"page_size\":{page_size},\"pages\":{pages},\"segment_pages\":{segment_pages}}}\n"
+    )
 }
 
 /// One base snapshot in a replica.
@@ -263,10 +281,17 @@ impl Tailer<'_> {
         }
         let ts = wal::now_unix();
         let mut meta = File::create(tmp.join("base.json"))?;
-        writeln!(
-            meta,
-            r#"{{"lsn":{},"epoch":{},"ts":{},"bytes":{},"page_size":{},"pages":{},"segment_pages":{}}}"#,
-            sb.wal_lsn, sb.epoch, ts, bytes, ps, sb.high_water, sb.seg_pages
+        meta.write_all(
+            base_json(
+                sb.wal_lsn,
+                sb.epoch,
+                ts,
+                bytes,
+                ps,
+                sb.high_water,
+                sb.seg_pages,
+            )
+            .as_bytes(),
         )?;
         meta.sync_all()?;
         // Windows refuses to rename a directory that holds an open file.
@@ -398,7 +423,7 @@ pub fn tail_with(
                 continue;
             }
         };
-        let gen = hex(&sb.generation);
+        let gen = generation_name(&sb.generation);
         let mut need_base = false;
         if gen != t.gen {
             t.gen = gen.clone();

@@ -9,6 +9,7 @@ pub mod backend;
 pub mod config;
 pub mod hash;
 pub mod http;
+pub mod memory;
 pub mod paged;
 pub mod replicator;
 pub mod s3;

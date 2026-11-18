@@ -37,6 +37,31 @@
 //! after it into a scratch directory laid out like a spool, then run the same
 //! restore `glider wal restore` runs. The result is opened by the caller,
 //! which replays the log and checks every tree.
+//!
+//! ## Carrying on after a restore
+//!
+//! A database restored from a replica keeps its generation, and its log
+//! carries on from where the replica's ended. Its spool is new, so the
+//! tailer would take a base; instead, a pass that finds the spool without a
+//! base of the database's generation looks at the backend first, and when
+//! the backend holds a base of it, with whole log up to a position in the
+//! database's own history and nothing past that, it writes the backend's
+//! state into the spool as if this spool had shipped it: the base's
+//! `base.json`, and the log after it, marked uploaded. The tailer then
+//! ships only what was written since. Anything less certain and the tailer
+//! takes a base, as it always has.
+//!
+//! A position is in the database's history when it is the last checkpoint,
+//! a commit the log on disk still holds, or the pin's: [`restore`] leaves a
+//! pin at the end of the log the restored file replays on open, so its
+//! writer keeps the log from there through checkpoints until a replicator
+//! takes the pin over. A pin lapses, as any pin does, after
+//! `storage::db::PIN_TTL`; a replicator started later than that takes a
+//! base.
+//!
+//! The same keys, the same `base.json` and the same retention serve a
+//! `:memory:` database's replica ([`super::memory`]), which is the same
+//! objects shipped from memory instead of from a spool.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -51,6 +76,7 @@ use super::config::ReplicaConfig;
 use super::replicator::Metrics;
 use crate::replica::{self, Base, RestoreReport};
 use crate::storage::log::{self, Committed};
+use crate::storage::{db, pager};
 use crate::wal::{self, fmt_unix, now_unix, Segment, TailOptions};
 
 fn other(msg: impl Into<String>) -> io::Error {
@@ -61,7 +87,42 @@ fn is_gen(name: &str) -> bool {
     name.len() == 32 && name.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-fn field(text: &str, key: &str) -> Option<u64> {
+// ---------------------------------------------------------------------- keys
+
+/// Where the files of the base at log `lsn` live: `<gen>/base/<lsn:016x>/`.
+pub fn base_prefix(gen: &str, lsn: u64) -> String {
+    format!("{gen}/base/{lsn:016x}/")
+}
+
+/// A base's segment file `n` under its prefix: `db` for the database file,
+/// `data/<n:08>.seg` for the segment files beside it.
+pub fn base_file(n: usize) -> String {
+    if n == 0 {
+        "db".into()
+    } else {
+        format!("data/{n:08}.seg")
+    }
+}
+
+/// Which segment file of a base `rel` (a key under its prefix) is, if any.
+pub fn base_file_number(rel: &str) -> Option<usize> {
+    if rel == "db" {
+        return Some(0);
+    }
+    let digits = rel.strip_prefix("data/")?.strip_suffix(".seg")?;
+    if digits.len() != 8 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok().filter(|n| *n > 0)
+}
+
+/// The key of the segment of log from `offset`, shipped at `ts`.
+pub fn segment_key(gen: &str, offset: u64, ts: u64) -> String {
+    format!("{gen}/segments/{offset:016x}-{ts}.seg")
+}
+
+/// A number field of a `base.json`.
+pub(crate) fn field(text: &str, key: &str) -> Option<u64> {
     let at = text.find(&format!("\"{key}\""))? + key.len() + 2;
     let digits: String = text[at..]
         .chars()
@@ -119,6 +180,18 @@ impl Listing {
         let from = self.bases.last().map(|b| b.lsn).unwrap_or(0);
         let segs: Vec<Segment> = self.segments.iter().map(|s| s.seg).collect();
         replica::reach(&segs, from)
+    }
+
+    /// The furthest log position anything of the generation reaches — a
+    /// segment's end, or a base — across gaps too; None when the backend
+    /// holds nothing of it. A replicator appends to a replica only where
+    /// this is also how far the log is whole ([`Listing::complete_to`]).
+    pub fn furthest(&self) -> Option<u64> {
+        self.segments
+            .iter()
+            .map(|s| s.seg.end())
+            .chain(self.bases.iter().map(|b| b.lsn))
+            .max()
     }
 
     pub fn last_ts(&self) -> u64 {
@@ -249,6 +322,13 @@ impl PagedReplicator {
     /// the configured retention afterwards.
     pub fn sync(&self, force_base: bool, retention: bool) -> io::Result<SyncReport> {
         fs::create_dir_all(&self.spool)?;
+        // Failing to look only costs a base, which is what the tailer would
+        // take anyway.
+        if let Err(e) = self.adopt() {
+            self.note(&format!(
+                "could not look at the backend before tailing: {e}"
+            ));
+        }
         let opts = TailOptions {
             poll: Duration::from_millis(100),
             min_bytes: self.cfg.min_bytes,
@@ -301,7 +381,7 @@ impl PagedReplicator {
                 if !dir.join("db").exists() {
                     continue;
                 }
-                let key = format!("{gen}/base/{:016x}", b.lsn);
+                let key = base_prefix(&gen, b.lsn);
                 let mut files = vec![("db".to_string(), dir.join("db"))];
                 if let Ok(rd) = fs::read_dir(dir.join("data")) {
                     let mut data: Vec<_> = rd
@@ -316,13 +396,11 @@ impl PagedReplicator {
                 for (rel, path) in &files {
                     let body = fs::read(path)?;
                     report.bytes += body.len() as u64;
-                    self.backend.put(&format!("{key}/{rel}"), body)?;
+                    self.backend.put(&format!("{key}{rel}"), body)?;
                 }
                 // Last: from now on the base is whole in the backend too.
-                self.backend.put(
-                    &format!("{key}/base.json"),
-                    fs::read(dir.join("base.json"))?,
-                )?;
+                self.backend
+                    .put(&format!("{key}base.json"), fs::read(dir.join("base.json"))?)?;
                 // The tailer reads only base.json; the pages can go.
                 let _ = fs::remove_file(dir.join("db"));
                 let _ = fs::remove_dir_all(dir.join("data"));
@@ -351,10 +429,7 @@ impl PagedReplicator {
                     .join(format!("{:016x}.seg", s.offset));
                 let body = fs::read(&local)?;
                 let len = body.len() as u64;
-                self.backend.put(
-                    &format!("{gen}/segments/{:016x}-{}.seg", s.offset, s.ts),
-                    body,
-                )?;
+                self.backend.put(&segment_key(&gen, s.offset, s.ts), body)?;
                 let mut f = fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -401,51 +476,89 @@ impl PagedReplicator {
     /// segments wholly below the oldest base kept, and generations that have
     /// been idle longer than the retention period (never the current one).
     pub fn enforce_retention(&self) -> io::Result<usize> {
-        let keep_after = now_unix().saturating_sub(self.cfg.retention.as_secs());
         let current = replica::generation_hex(&self.db).unwrap_or_default();
-        let mut deleted = 0;
-        for gen in generations(self.backend.as_ref())? {
-            let l = listing(self.backend.as_ref(), &gen)?;
-            if gen != current && l.last_ts() < keep_after {
-                for e in self.backend.list(&format!("{gen}/"))? {
-                    self.backend.delete(&e.key)?;
-                    deleted += 1;
-                }
-                continue;
-            }
-            let Some(newest) = l.bases.last() else {
-                continue;
-            };
-            let kept: Vec<&Base> = l
-                .bases
-                .iter()
-                .filter(|b| b.ts >= keep_after || b.lsn == newest.lsn)
-                .collect();
-            let floor = kept.iter().map(|b| b.lsn).min().unwrap_or(newest.lsn);
-            for b in &l.bases {
-                if kept.iter().any(|k| k.lsn == b.lsn) {
-                    continue;
-                }
-                // base.json first: from then on the base is not whole, so a
-                // restore never picks it half deleted.
-                let prefix = format!("{gen}/base/{:016x}/", b.lsn);
-                self.backend.delete(&format!("{prefix}base.json"))?;
-                for e in self.backend.list(&prefix)? {
-                    self.backend.delete(&e.key)?;
-                }
-                deleted += 1;
-            }
-            for s in &l.segments {
-                if s.seg.end() <= floor {
-                    self.backend.delete(&s.key)?;
-                    deleted += 1;
-                }
-            }
-        }
+        let deleted = expire(self.backend.as_ref(), &current, self.cfg.retention)?;
         self.metrics
             .deletions
             .fetch_add(deleted as u64, Ordering::Relaxed);
         Ok(deleted)
+    }
+
+    /// When the spool holds no base of the database's generation but the
+    /// backend does, write the backend's state into the spool, so the
+    /// tailer carries on shipping where the replica ends instead of taking
+    /// a base (see "Carrying on after a restore" above). Only when that is
+    /// certain: a whole base, whole log after it to a position nothing in
+    /// the backend reaches past, and that position the database's last
+    /// checkpoint, a commit its log still holds, or where a restore left it
+    /// (its pin). Says whether it did.
+    fn adopt(&self) -> io::Result<bool> {
+        let Ok(sb) = pager::read_superblock(&self.db) else {
+            return Ok(false);
+        };
+        let gen = replica::generation_name(&sb.generation);
+        if !replica::bases(&self.spool, &gen)?.is_empty() {
+            return Ok(false);
+        }
+        let l = listing(self.backend.as_ref(), &gen)?;
+        let Some(base) = l.bases.last().cloned() else {
+            return Ok(false);
+        };
+        let to = l.complete_to();
+        let restored_to = db::read_pin(&self.db).map(|p| p.shipped) == Some(to);
+        if l.furthest() != Some(to)
+            || (to != sb.wal_lsn && !restored_to && !log::commit_at(&self.db, to)?)
+        {
+            return Ok(false);
+        }
+        let dir = self.spool.join(&gen);
+        let segs = dir.join("segments");
+        fs::create_dir_all(&segs)?;
+        // The log first: a spool's base counts once its base.json is there,
+        // and a pass cut short here adopts again from the start.
+        let mut manifest = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("manifest.jsonl"))?;
+        let mut done = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("uploaded"))?;
+        let mut at = base.lsn;
+        for s in &l.segments {
+            if s.seg.end() <= at {
+                continue;
+            }
+            if s.seg.offset > at {
+                break;
+            }
+            let path = segs.join(format!("{:016x}.seg", s.seg.offset));
+            let tmp = path.with_extension("partial");
+            fs::write(&tmp, self.backend.get(&s.key)?)?;
+            fs::rename(&tmp, &path)?;
+            writeln!(
+                manifest,
+                r#"{{"offset":{},"len":{},"ts":{}}}"#,
+                s.seg.offset, s.seg.len, s.seg.ts
+            )?;
+            writeln!(done, "{:016x}", s.seg.offset)?;
+            at = s.seg.end();
+        }
+        manifest.sync_data()?;
+        done.sync_data()?;
+        let meta = self
+            .backend
+            .get(&format!("{}base.json", base_prefix(&gen, base.lsn)))?;
+        let bdir = dir.join("base").join(format!("{:016x}", base.lsn));
+        fs::create_dir_all(&bdir)?;
+        fs::write(bdir.join("base.json.partial"), meta)?;
+        fs::rename(bdir.join("base.json.partial"), bdir.join("base.json"))?;
+        self.note(&format!(
+            "{gen} carries on the replica in {}: its base at log {} and log to {to}",
+            self.backend.describe(),
+            base.lsn
+        ));
+        Ok(true)
     }
 
     /// Replicate until `stop`: a pass every sync interval, retention hourly.
@@ -476,17 +589,69 @@ impl PagedReplicator {
     }
 }
 
+// ----------------------------------------------------------------- retention
+
+/// Retention for one replica, whatever kind of database it is of: delete
+/// bases older than `retention` (never the newest), the segments wholly
+/// below the oldest base kept, and generations idle longer than `retention`
+/// — never `current`, the generation the database is on. A base loses its
+/// `base.json` first, so a restore never picks one half deleted. Returns
+/// how many objects went, a base counting as one.
+pub fn expire(backend: &dyn Backend, current: &str, retention: Duration) -> io::Result<usize> {
+    let keep_after = now_unix().saturating_sub(retention.as_secs());
+    let mut deleted = 0;
+    for gen in generations(backend)? {
+        let l = listing(backend, &gen)?;
+        if gen != current && l.last_ts() < keep_after {
+            for e in backend.list(&format!("{gen}/"))? {
+                backend.delete(&e.key)?;
+                deleted += 1;
+            }
+            continue;
+        }
+        let Some(newest) = l.bases.last() else {
+            continue;
+        };
+        let kept: Vec<&Base> = l
+            .bases
+            .iter()
+            .filter(|b| b.ts >= keep_after || b.lsn == newest.lsn)
+            .collect();
+        let floor = kept.iter().map(|b| b.lsn).min().unwrap_or(newest.lsn);
+        for b in &l.bases {
+            if kept.iter().any(|k| k.lsn == b.lsn) {
+                continue;
+            }
+            // base.json first: from then on the base is not whole, so a
+            // restore never picks it half deleted.
+            let prefix = base_prefix(&gen, b.lsn);
+            backend.delete(&format!("{prefix}base.json"))?;
+            for e in backend.list(&prefix)? {
+                backend.delete(&e.key)?;
+            }
+            deleted += 1;
+        }
+        for s in &l.segments {
+            if s.seg.end() <= floor {
+                backend.delete(&s.key)?;
+                deleted += 1;
+            }
+        }
+    }
+    Ok(deleted)
+}
+
 // ------------------------------------------------------------------- restore
 
-/// Rebuild a paged database at `out` from the backend: the newest base at or
-/// before `as_of` and the log shipped after it, up to `as_of`. Open the
-/// result to finish (opening replays the log).
-pub fn restore(
+/// What a restore reads, to a file or into memory alike: the generation
+/// (`generation`, or the most recently active), its newest whole base taken
+/// at or before `as_of`, and the segments shipped after that base, in
+/// order, up to the first gap or the first shipped after `as_of`.
+pub fn restore_plan(
     backend: &dyn Backend,
     generation: Option<&str>,
     as_of: Option<u64>,
-    out: &Path,
-) -> io::Result<RestoreReport> {
+) -> io::Result<(String, Base, Vec<RemoteSegment>)> {
     let gen = match generation {
         Some(g) => g.to_string(),
         None => generations(backend)?.pop().ok_or_else(|| {
@@ -508,6 +673,31 @@ pub fn restore(
                 "generation {gen} has no base at or before that time"
             ))
         })?;
+    let mut segments = Vec::new();
+    let mut at = base.lsn;
+    for s in &l.segments {
+        if s.seg.end() <= at {
+            continue;
+        }
+        if s.seg.offset > at || as_of.map(|t| s.seg.ts > t).unwrap_or(false) {
+            break;
+        }
+        segments.push(s.clone());
+        at = s.seg.end();
+    }
+    Ok((gen, base, segments))
+}
+
+/// Rebuild a paged database at `out` from the backend: the newest base at or
+/// before `as_of` and the log shipped after it, up to `as_of`. Open the
+/// result to finish (opening replays the log).
+pub fn restore(
+    backend: &dyn Backend,
+    generation: Option<&str>,
+    as_of: Option<u64>,
+    out: &Path,
+) -> io::Result<RestoreReport> {
+    let (gen, base, shipped) = restore_plan(backend, generation, as_of)?;
 
     let mut scratch = out.as_os_str().to_owned();
     scratch.push(".restoring");
@@ -515,7 +705,7 @@ pub fn restore(
     let _ = fs::remove_dir_all(&scratch);
     let result = (|| {
         // The base.
-        let prefix = format!("{gen}/base/{:016x}/", base.lsn);
+        let prefix = base_prefix(&gen, base.lsn);
         let local = scratch
             .join(&gen)
             .join("base")
@@ -541,14 +731,7 @@ pub fn restore(
         let segs = scratch.join(&gen).join("segments");
         fs::create_dir_all(&segs)?;
         let mut manifest = fs::File::create(scratch.join(&gen).join("manifest.jsonl"))?;
-        let mut at = base.lsn;
-        for s in &l.segments {
-            if s.seg.end() <= at {
-                continue;
-            }
-            if s.seg.offset > at || as_of.map(|t| s.seg.ts > t).unwrap_or(false) {
-                break;
-            }
+        for s in &shipped {
             fs::write(
                 segs.join(format!("{:016x}.seg", s.seg.offset)),
                 backend.get(&s.key)?,
@@ -558,10 +741,25 @@ pub fn restore(
                 r#"{{"offset":{},"len":{},"ts":{}}}"#,
                 s.seg.offset, s.seg.len, s.seg.ts
             )?;
-            at = s.seg.end();
         }
         manifest.sync_all()?;
-        replica::restore(&scratch, Some(&gen), as_of, out)
+        let report = replica::restore(&scratch, Some(&gen), as_of, out)?;
+        // Where opening it will have replayed to, as a pin: the writer
+        // keeps its log from there, so a replicator pointed back at this
+        // replica can see the database's history carries the replica's on
+        // (see "Carrying on after a restore" above), even after checkpoints.
+        // The pin lapses as any pin does; then it takes a base.
+        if let Committed::To(end) = log::committed_end(out, report.base.lsn)? {
+            db::write_pin(
+                out,
+                db::Pin {
+                    nonce: 0,
+                    hold: false,
+                    shipped: end,
+                },
+            )?;
+        }
+        Ok(report)
     })();
     let _ = fs::remove_dir_all(&scratch);
     result
