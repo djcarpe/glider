@@ -59,6 +59,9 @@ impl Cursor {
         if limits.max_rows == 0 || limits.max_bytes < 128 || limits.max_bytes > g.query_memory() {
             return Err(budget_error());
         }
+        // the statement's own budget: matching stops (and the caller's lock
+        // on the graph is released) once it is spent
+        let _meter = meter(&limits);
         let (temp, file) = TempFile::new(&g.temp_dir())?;
         let mut writer = BufWriter::new(file);
         let mut remaining = 0;

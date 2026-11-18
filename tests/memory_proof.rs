@@ -213,6 +213,7 @@ fn peak_rss_stays_under_the_cap_on_a_graph_larger_than_memory() {
     let limits = QueryLimits {
         max_rows: 1000,
         max_bytes: MIB,
+        ..Default::default()
     };
     let mut cursor = Cursor::open(&mut g, "MATCH (n) RETURN n", &[], limits).unwrap();
     let (mut rows, mut batches) = (0u64, 0u64);

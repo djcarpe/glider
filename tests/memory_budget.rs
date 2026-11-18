@@ -60,6 +60,7 @@ fn result_sort_collect_and_distinct_stop_at_work_mem() {
     let caps = QueryLimits {
         max_rows: 2,
         max_bytes: 4096,
+        ..Default::default()
     };
     assert!(query::execute_capped(&mut disk, "MATCH (n) RETURN n.i", &[], caps).is_err());
     assert!(query::execute_capped(
@@ -68,7 +69,8 @@ fn result_sort_collect_and_distinct_stop_at_work_mem() {
         &[],
         QueryLimits {
             max_rows: 10,
-            max_bytes: 100
+            max_bytes: 100,
+            ..Default::default()
         }
     )
     .is_err());
@@ -101,6 +103,7 @@ fn cursor_batches_are_capped_complete_and_removed_on_drop() {
         QueryLimits {
             max_rows: 17,
             max_bytes: 1000,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -126,7 +129,8 @@ fn cursor_batches_are_capped_complete_and_removed_on_drop() {
         &[],
         QueryLimits {
             max_rows: 100,
-            max_bytes: 128
+            max_bytes: 128,
+            ..Default::default()
         }
     )
     .is_err());
