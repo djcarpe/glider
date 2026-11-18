@@ -136,6 +136,32 @@ fn sync_while_writing(
     })
 }
 
+/// One pass while the writer does nothing but poll for the replicator,
+/// every 100 ms, as `Glider.Replication.sync` does. A base that never comes
+/// fails at the deadline instead of hanging the suite, so the pass runs in a
+/// thread of its own: a scoped one would be waited for, for ever, by a
+/// failing test still holding the writer.
+fn sync_while_idle(
+    g: &mut Graph,
+    db: &Path,
+    root: &Path,
+    remote: &Arc<FileBackend>,
+    force: bool,
+) -> paged::SyncReport {
+    let (db, root, remote) = (db.to_path_buf(), root.to_path_buf(), remote.clone());
+    let h = std::thread::spawn(move || replicator(&db, &root, remote).sync(force, false));
+    let start = Instant::now();
+    while !h.is_finished() {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "no base from an idle writer"
+        );
+        g.poll_replication().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    h.join().unwrap().unwrap()
+}
+
 fn restore_and_compare(g: &Graph, backend: &dyn Backend, out: &Path) {
     let _ = std::fs::remove_file(out);
     paged::restore(backend, None, None, out).unwrap();
@@ -262,6 +288,41 @@ fn forced_bases_and_retention_keep_the_replica_restorable() {
     }
     r.sync(false, false).unwrap();
     restore_and_compare(&g, remote.as_ref(), &root.join("restored"));
+}
+
+#[test]
+fn an_idle_writer_gives_a_base_and_then_a_forced_one() {
+    // Written, never checkpointed, then idle: a base for a new replica, its
+    // hold released, then a forced snapshot with nothing committed between.
+    let root = temp("idle");
+    let db = root.join("db");
+    let remote = Arc::new(FileBackend {
+        root: root.join("remote"),
+    });
+    let mut g = Graph::open_opts(
+        &db,
+        OpenOptions {
+            page_size: 1024,
+            cache_size: 64 << 10,
+            checkpoint_bytes: u64::MAX,
+            wal_segment: 4 << 10,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap();
+    let mut w = Writer { n: 0 };
+    for _ in 0..200 {
+        w.step(&mut g);
+    }
+    let first = sync_while_idle(&mut g, &db, &root, &remote, false);
+    assert_eq!(first.bases_uploaded, 1, "a base for the new replica");
+    restore_and_compare(&g, remote.as_ref(), &root.join("restored"));
+    // The writer releases the hold at its next look at the pin.
+    std::thread::sleep(Duration::from_millis(1100));
+    g.poll_replication().unwrap();
+    let forced = sync_while_idle(&mut g, &db, &root, &remote, true);
+    assert_eq!(forced.bases_uploaded, 1, "a forced base");
+    restore_and_compare(&g, remote.as_ref(), &root.join("restored2"));
 }
 
 #[test]

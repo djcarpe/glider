@@ -35,7 +35,9 @@
 //! superblock records the hold and the nonce of the request it honours.
 //!
 //! Pages 0 and 1 are the two superblocks, written alternately so a torn
-//! superblock write always leaves the previous one intact.
+//! superblock write always leaves the previous one intact. Readers take the
+//! valid one with the greater epoch, so each checkpoint carries a greater
+//! epoch than the last, even when nothing was committed in between.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1125,6 +1127,18 @@ impl Inner {
 
     fn checkpoint(&mut self, wal_lsn: u64) -> SResult<()> {
         let ps = self.ps;
+        // 0. A checkpoint supersedes the last one even with nothing
+        //    committed in between, as when a hold starts or ends on an idle
+        //    writer. Readers take the superblock with the greater epoch, and
+        //    slot 0 on a tie, so two of one epoch would leave the older in
+        //    force whenever the newer went to slot 1: a hold the replicator
+        //    never sees, and after a crash a free list the newer one had
+        //    already released for reuse. Advancing the epoch is an empty
+        //    commit; between transactions no page carries the current epoch,
+        //    so nothing else notices.
+        if self.epoch == self.durable + 1 {
+            self.epoch += 1;
+        }
         // 1. Everything dirty goes to disk. All of it is newer than the
         //    durable state, so none of it overwrites anything that state uses.
         self.flush_dirty()?;
@@ -1510,6 +1524,143 @@ mod tests {
             got.push(p.alloc(page::KIND_LEAF, 1).unwrap());
         }
         assert!(got.contains(&a), "{a} not reused; got {got:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Readers (`Pager::open`, `read_superblock`) take the valid superblock
+    /// with the greater epoch. A checkpoint with nothing committed since the
+    /// last one, which is what a hold starting or ending on an idle writer
+    /// is, must still be the one they take.
+    #[test]
+    fn every_checkpoint_supersedes_the_last_even_with_nothing_committed() {
+        let path = tmp("supersede");
+        let cfg = Config {
+            page_size: 512,
+            cache_bytes: 512 * 16,
+            max_memory: u64::MAX,
+            segment_bytes: 1 << 30,
+        };
+        let p = Pager::create(&path, &cfg, [5; 16]).unwrap();
+        let a = p.alloc(page::KIND_LEAF, 1).unwrap();
+        p.set_root(0, a);
+        p.commit();
+        let slots = || {
+            let b = std::fs::read(&path).unwrap();
+            [b[..512].to_vec(), b[512..1024].to_vec()]
+        };
+        for round in 0..6u64 {
+            match round % 3 {
+                1 => p.set_hold(true, 100 + round),
+                2 => p.set_hold(false, 0),
+                _ => {}
+            }
+            let before = slots();
+            p.checkpoint(0).unwrap();
+            let after = slots();
+            let written = (0..2)
+                .find(|&s| before[s] != after[s])
+                .expect("a superblock was written");
+            assert!(
+                sb_epoch(&after[written]) > sb_epoch(&after[1 - written]),
+                "checkpoint {round} is newer than the one before it"
+            );
+            let sb = read_superblock(&path).unwrap();
+            assert_eq!(sb.slot, written as u64, "checkpoint {round} is read");
+            assert_eq!((sb.hold, sb.pin_seen), p.hold());
+            let q = Pager::open(&path, 512 * 16).unwrap();
+            assert_eq!(q.hold(), p.hold(), "checkpoint {round} is opened");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Two superblocks of equal epoch name the same trees but not the same
+    /// free list, and the newer one releases the older one's free-list pages
+    /// for reuse. Reopening the older one after a crash reads a free list
+    /// that is no longer there: a page written over it since makes the
+    /// database fail to open, and a later checkpoint's free list written
+    /// over it is loaded as the older one's, so pages the reopened trees
+    /// still use are handed out as free. Every checkpoint superseding the
+    /// last means a crash reopens the newest, whose free list is intact.
+    #[test]
+    fn a_crash_never_reopens_a_free_list_a_later_checkpoint_released() {
+        let cfg = Config {
+            page_size: 512,
+            cache_bytes: 512 * 64,
+            max_memory: u64::MAX,
+            segment_bytes: 1 << 30,
+        };
+        // Eight one-page trees, a few replaced between checkpoints so pages
+        // are free and pending, then a hold checkpoint in slot 0 with pages
+        // free and held, then its release with nothing committed since.
+        let build = |name: &str| {
+            let path = tmp(name);
+            let p = Pager::create(&path, &cfg, [4; 16]).unwrap();
+            for i in 0..8 {
+                let a = p.alloc(page::KIND_LEAF, 1).unwrap();
+                fill(&p, a, i as u8 + 1);
+                p.set_root(i, a);
+            }
+            p.commit();
+            p.checkpoint(0).unwrap();
+            for (n, batch) in [0..4, 4..5, 5..6].into_iter().enumerate() {
+                for i in batch {
+                    let b = p.writable(p.root(i)).unwrap();
+                    p.set_root(i, b);
+                }
+                p.commit();
+                if n == 2 {
+                    p.set_hold(true, 5);
+                }
+                p.checkpoint(0).unwrap();
+            }
+            let sb = read_superblock(&path).unwrap();
+            assert!(sb.slot == 0 && sb.hold, "the hold checkpoint is in slot 0");
+            let hold_sb = sb.bytes;
+            p.set_hold(false, 0);
+            p.checkpoint(0).unwrap();
+            (path, p, hold_sb)
+        };
+        // The reopened state must use its own pages and hand out only
+        // pages it does not use.
+        let reopened = |path: &Path| {
+            let q = Pager::open(path, 512 * 64).expect("opens after the crash");
+            let live: Vec<u64> = (0..8).map(|i| q.root(i)).collect();
+            for (i, r) in live.iter().enumerate() {
+                assert_eq!(q.get(*r).unwrap()[HEADER], i as u8 + 1, "tree {i}");
+            }
+            let hw = q.high_water();
+            loop {
+                let x = q.alloc(page::KIND_LEAF, 1).unwrap();
+                assert!(!live.contains(&x), "page {x} is in use, and handed out");
+                if x >= hw {
+                    break;
+                }
+            }
+        };
+
+        // Pages written over the hold's free list since, then a crash.
+        let (path, p, _) = build("released-overwritten");
+        for _ in 0..2 {
+            let x = p.alloc(page::KIND_LEAF, 1).unwrap();
+            fill(&p, x, 0xEE);
+        }
+        p.evict_all().unwrap();
+        drop(p);
+        reopened(&path);
+        let _ = std::fs::remove_file(&path);
+
+        // The next checkpoint's free list written over it, and a crash
+        // before that checkpoint's superblock lands where the hold's is.
+        let (path, p, hold_sb) = build("released-relisted");
+        let b = p.writable(p.root(6)).unwrap();
+        p.set_root(6, b);
+        p.commit();
+        p.checkpoint(0).unwrap();
+        drop(p);
+        let mut img = std::fs::read(&path).unwrap();
+        img[..512].copy_from_slice(&hold_sb);
+        std::fs::write(&path, &img).unwrap();
+        reopened(&path);
         let _ = std::fs::remove_file(&path);
     }
 }

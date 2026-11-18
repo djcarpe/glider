@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 use glider::graph::{Graph, OpenOptions};
 use glider::query;
+use glider::storage::db::{remove_pin, write_pin, Pin};
+use glider::storage::pager::read_superblock;
 use glider::value::Value;
 use glider::wal::TailOptions;
 
@@ -155,7 +157,7 @@ fn base_and_log_restore_the_source_exactly() {
 }
 
 fn gen(db: &Path) -> String {
-    let sb = glider::storage::pager::read_superblock(db).unwrap();
+    let sb = read_superblock(db).unwrap();
     sb.generation.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -234,6 +236,446 @@ fn restore_as_of_stops_at_the_log_shipped_by_then() {
     glider::replica::restore(&dir, None, Some(cut), &out).unwrap();
     let r = Graph::open(&out, glider::store::Sync::Normal).unwrap();
     assert_eq!(query::export_jsonl(&r), snapshot);
+    drop(g);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ------------------------------------------------- a base from an idle writer
+//
+// A writer that has the database open and does nothing but poll for the
+// replicator, as `Glider.Replication.sync` does every 100 ms, gives a base
+// whatever it did before it went idle. Every wait has a deadline: a base that
+// never comes fails the test instead of stalling the suite.
+
+/// The writer looks at the pin at most once a second, so a base takes a
+/// second or two; past this it is never coming.
+const IDLE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Checkpoints only where a test asks for one, so a test says exactly what
+/// the writer did before it went idle.
+fn open_idle(path: &Path) -> Graph {
+    Graph::open_opts(
+        path,
+        OpenOptions {
+            page_size: 1024,
+            cache_size: 64 << 10,
+            checkpoint_bytes: u64::MAX,
+            wal_segment: 4 << 10,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap()
+}
+
+/// Take a base into `dir` (a new one even if `dir` has one, if `force`, as
+/// glider-stream's forced snapshot asks) while the writer only polls for
+/// the replicator, every 100 ms.
+fn base_from_idle_writer(g: &mut Graph, db: &Path, dir: &Path, force: bool) {
+    let (db2, dir2) = (db.to_path_buf(), dir.to_path_buf());
+    let tailer = std::thread::spawn(move || {
+        let first = std::cell::Cell::new(force);
+        glider::replica::tail_with(&db2, &dir2, &once(), &|_| first.replace(false))
+    });
+    let start = Instant::now();
+    while !tailer.is_finished() {
+        assert!(
+            start.elapsed() < IDLE_DEADLINE,
+            "no base of {} into {} from an idle writer polled for {IDLE_DEADLINE:?}",
+            db.display(),
+            dir.display()
+        );
+        g.poll_replication().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    tailer.join().unwrap().unwrap();
+}
+
+/// Give the writer its next look at the pin, which it takes at most once a
+/// second.
+fn writer_looks_at_the_pin(g: &mut Graph) {
+    std::thread::sleep(Duration::from_millis(1100));
+    g.poll_replication().unwrap();
+}
+
+#[test]
+fn an_idle_writer_gives_a_base_before_its_first_checkpoint() {
+    let root = temp("idle-new");
+    let db = root.join("db");
+    let mut g = open_idle(&db);
+    let mut w = Writer { n: 0 };
+    for _ in 0..200 {
+        w.step(&mut g);
+    }
+    base_from_idle_writer(&mut g, &db, &root.join("replica"), false);
+    restore_and_compare(&g, &root.join("replica"), &root.join("restored"));
+    drop(g);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_idle_writer_gives_a_base_after_explicit_checkpoints() {
+    // Checkpoints alternate between the two superblock slots: one, two and
+    // three of them leave either slot in force.
+    for checkpoints in 1..=3 {
+        let root = temp(&format!("idle-checkpointed-{checkpoints}"));
+        let db = root.join("db");
+        let mut g = open_idle(&db);
+        let mut w = Writer { n: 0 };
+        for _ in 0..200 {
+            w.step(&mut g);
+        }
+        for _ in 0..checkpoints {
+            g.checkpoint().unwrap();
+        }
+        base_from_idle_writer(&mut g, &db, &root.join("replica"), false);
+        restore_and_compare(&g, &root.join("replica"), &root.join("restored"));
+        drop(g);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[test]
+fn an_idle_writer_gives_a_base_after_a_clean_reopen() {
+    // Closed cleanly (a checkpoint) once or twice, then reopened and idle.
+    for sessions in 1..=2 {
+        let root = temp(&format!("idle-reopened-{sessions}"));
+        let db = root.join("db");
+        let mut w = Writer { n: 0 };
+        for _ in 0..sessions {
+            let mut g = open_idle(&db);
+            for _ in 0..100 {
+                w.step(&mut g);
+            }
+        }
+        let mut g = open_idle(&db);
+        base_from_idle_writer(&mut g, &db, &root.join("replica"), false);
+        restore_and_compare(&g, &root.join("replica"), &root.join("restored"));
+        drop(g);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[test]
+fn an_idle_writer_gives_a_base_of_a_database_restored_from_a_replica() {
+    // A restored database starts from a base taken under a hold. Opening it
+    // releases that hold and, when log was shipped after the base, replays
+    // and folds it in: one checkpoint or two, with nothing committed between.
+    for replayed in [true, false] {
+        let root = temp(&format!("idle-restored-{replayed}"));
+        let src = root.join("src");
+        let replica = root.join("replica");
+        let mut g = open(&src);
+        let mut w = Writer { n: 0 };
+        for _ in 0..200 {
+            w.step(&mut g);
+        }
+        tail_while_writing(&mut g, &mut w, &src, &replica);
+        for _ in 0..100 {
+            w.step(&mut g);
+        }
+        glider::replica::tail(&src, &replica, &once()).unwrap();
+        let db = root.join("restored");
+        glider::replica::restore(&replica, None, None, &db).unwrap();
+        if !replayed {
+            // Restored as of the base itself: no log after it.
+            let wal = glider::storage::log::wal_dir(&db);
+            for e in std::fs::read_dir(wal).unwrap().flatten() {
+                std::fs::remove_file(e.path()).unwrap();
+            }
+        }
+        let mut r = open_idle(&db);
+        if replayed {
+            assert_eq!(query::export_jsonl(&r), query::export_jsonl(&g));
+        }
+        drop(g);
+        base_from_idle_writer(&mut r, &db, &root.join("replica2"), false);
+        restore_and_compare(&r, &root.join("replica2"), &root.join("again"));
+        drop(r);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[test]
+fn an_idle_writer_gives_base_after_base_with_nothing_committed_between() {
+    // A base, its hold released, then another with no commit in between:
+    // for a second replica, then a forced one (a snapshot) for the first.
+    for checkpoints in 0..=1 {
+        let root = temp(&format!("idle-again-{checkpoints}"));
+        let db = root.join("db");
+        let (first, second) = (root.join("replica"), root.join("replica2"));
+        let mut g = open_idle(&db);
+        let mut w = Writer { n: 0 };
+        for _ in 0..200 {
+            w.step(&mut g);
+        }
+        for _ in 0..checkpoints {
+            g.checkpoint().unwrap();
+        }
+        base_from_idle_writer(&mut g, &db, &first, false);
+        restore_and_compare(&g, &first, &root.join("restored"));
+        writer_looks_at_the_pin(&mut g);
+        base_from_idle_writer(&mut g, &db, &second, false);
+        restore_and_compare(&g, &second, &root.join("restored2"));
+        writer_looks_at_the_pin(&mut g);
+        base_from_idle_writer(&mut g, &db, &first, true);
+        restore_and_compare(&g, &first, &root.join("restored3"));
+        drop(g);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[test]
+fn an_idle_writer_gives_a_base_after_its_replicator_died_holding() {
+    // A replicator asked for a hold and died. Its pin is removed, and the
+    // writer lets the hold go at its next look (a pin older than PIN_TTL
+    // reads as no pin at all, so a lapsed one is the same to the writer);
+    // or a new replicator asks first, over the dead one's pin.
+    for checkpoints in 0..=1 {
+        for released in [true, false] {
+            let root = temp(&format!("idle-orphaned-{checkpoints}-{released}"));
+            let db = root.join("db");
+            let mut g = open_idle(&db);
+            let mut w = Writer { n: 0 };
+            for _ in 0..200 {
+                w.step(&mut g);
+            }
+            for _ in 0..checkpoints {
+                g.checkpoint().unwrap();
+            }
+            let dead = Pin {
+                nonce: 42,
+                hold: true,
+                shipped: 0,
+            };
+            write_pin(&db, dead).unwrap();
+            writer_looks_at_the_pin(&mut g);
+            let sb = read_superblock(&db).unwrap();
+            assert!(sb.hold && sb.pin_seen == 42, "the writer holds for it");
+            if released {
+                remove_pin(&db);
+                writer_looks_at_the_pin(&mut g);
+                assert!(!read_superblock(&db).unwrap().hold, "and lets go");
+            }
+            base_from_idle_writer(&mut g, &db, &root.join("replica"), false);
+            restore_and_compare(&g, &root.join("replica"), &root.join("restored"));
+            drop(g);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+}
+
+// ------------------------------------------- a crash around idle checkpoints
+
+/// The two superblock pages, as they are on disk now.
+fn superblocks(db: &Path) -> [Vec<u8>; 2] {
+    let ps = read_superblock(db).unwrap().page_size;
+    let b = std::fs::read(db).unwrap();
+    [b[..ps].to_vec(), b[ps..2 * ps].to_vec()]
+}
+
+/// What a crash now would leave: the database file, its segment files and
+/// its log with the replicator's pin, but no lock.
+fn crash_copy(db: &Path, to: &Path) {
+    std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+    std::fs::copy(db, to).unwrap();
+    let dirs = |db: &Path| {
+        let data = glider::storage::pager::segment_path(db, 1);
+        [
+            glider::storage::log::wal_dir(db),
+            data.parent().unwrap().to_path_buf(),
+        ]
+    };
+    for (from, to) in dirs(db).into_iter().zip(dirs(to)) {
+        let Ok(rd) = std::fs::read_dir(&from) else {
+            continue;
+        };
+        std::fs::create_dir_all(&to).unwrap();
+        for e in rd.flatten() {
+            std::fs::copy(e.path(), to.join(e.file_name())).unwrap();
+        }
+    }
+}
+
+/// Pages below the high water of the checkpoint `db` opens at that are in
+/// no tree, not in the free-list chain and not listed free or held: lost
+/// to reuse for good. (A page both used and listed free counts twice and
+/// drives this negative.)
+fn unaccounted_pages(db: &Path) -> i64 {
+    use glider::storage::btree::Tree;
+    use glider::storage::page;
+    use glider::storage::pager::{Pager, ROOTS};
+    let p = Pager::open(db, 1 << 20).unwrap();
+    let mut used = 0u64;
+    for slot in 0..ROOTS {
+        let root = p.root(slot);
+        if root == 0 {
+            continue;
+        }
+        // Every page of a tree carries the tree's id.
+        let id = page::tree(&p.get(root).unwrap());
+        let st = Tree { slot, id }.check(&p).unwrap();
+        used += st.leaves + st.interiors + st.overflow_pages;
+    }
+    // The chain the superblock in force points to: its head is at byte 88
+    // of the superblock, and each chain page links the next at byte 32.
+    let sb = read_superblock(db).unwrap();
+    let mut chain = 0u64;
+    let mut next = page::get_u64(&sb.bytes, 88);
+    while next != 0 {
+        let pg = p.get(next).unwrap();
+        assert_eq!(page::kind(&pg), page::KIND_FREELIST, "chain page {next}");
+        chain += 1;
+        next = page::get_u64(&pg, 32);
+    }
+    (p.high_water() - 2) as i64 - (used + chain + p.free_pages()) as i64
+}
+
+/// Crash copies of a database taken after each thing its writer does, each
+/// reopened and checked against the writer as it was at that moment.
+struct Crashes {
+    db: PathBuf,
+    dir: PathBuf,
+    last: [Vec<u8>; 2],
+    newest: u64,
+    n: usize,
+}
+
+impl Crashes {
+    fn new(db: &Path, dir: &Path) -> Crashes {
+        Crashes {
+            db: db.to_path_buf(),
+            dir: dir.to_path_buf(),
+            last: superblocks(db),
+            newest: read_superblock(db).unwrap().slot,
+            n: 0,
+        }
+    }
+
+    /// A crash now. If the writer has just checkpointed with nothing
+    /// committed since its last checkpoint (`idle`), also a crash before
+    /// that checkpoint's superblock landed, and one that tore it: both
+    /// leave the checkpoint before in force, with the same contents.
+    fn now(&mut self, g: &Graph, what: &str, idle: bool) {
+        let now = superblocks(&self.db);
+        let written: Vec<usize> = (0..2).filter(|&s| now[s] != self.last[s]).collect();
+        assert!(written.len() <= 1, "{what}: one checkpoint at a time");
+        assert!(!idle || written.len() == 1, "{what}: a checkpoint");
+        if let Some(&slot) = written.first() {
+            self.newest = slot as u64;
+        }
+        let want = query::export_jsonl(g);
+        self.check(&format!("{what}, then a crash"), None, &want);
+        if let Some(&slot) = written.first() {
+            if idle {
+                let old = self.last[slot].clone();
+                self.check(
+                    &format!("{what}, a crash before its superblock landed"),
+                    Some((slot, old.clone())),
+                    &want,
+                );
+                // Written up to the last byte it changes, and no further.
+                let new = &now[slot];
+                let cut = (0..new.len()).rev().find(|&i| new[i] != old[i]).unwrap();
+                let mut torn = new.clone();
+                torn[cut..].copy_from_slice(&old[cut..]);
+                self.check(
+                    &format!("{what}, a crash that tore its superblock"),
+                    Some((slot, torn)),
+                    &want,
+                );
+            }
+        }
+        self.last = now;
+    }
+
+    /// Reopen a crash copy, with `patch` over one superblock slot: the
+    /// superblock in force is the newest whole one, every page is
+    /// accounted for, every tree checks, and it holds what the source held.
+    fn check(&mut self, what: &str, patch: Option<(usize, Vec<u8>)>, want: &str) {
+        self.n += 1;
+        let copy = self.dir.join(format!("crash-{}", self.n)).join("db");
+        crash_copy(&self.db, &copy);
+        let mut newest = self.newest;
+        if let Some((slot, bytes)) = patch {
+            let mut img = std::fs::read(&copy).unwrap();
+            img[slot * bytes.len()..(slot + 1) * bytes.len()].copy_from_slice(&bytes);
+            std::fs::write(&copy, &img).unwrap();
+            newest = 1 - slot as u64;
+        }
+        assert_eq!(
+            read_superblock(&copy).unwrap().slot,
+            newest,
+            "{what}: the newest superblock is in force"
+        );
+        assert_eq!(unaccounted_pages(&copy), 0, "{what}: pages leaked");
+        let r = open_idle(&copy);
+        r.verify_trees().unwrap();
+        assert_eq!(
+            query::export_jsonl(&r),
+            want,
+            "{what}: what the source held"
+        );
+        drop(r);
+        let _ = std::fs::remove_dir_all(copy.parent().unwrap());
+    }
+}
+
+#[test]
+fn a_crash_around_idle_checkpoints_reopens_the_newest_and_loses_nothing() {
+    let root = temp("idle-crash");
+    let db = root.join("db");
+    let mut g = open_idle(&db);
+    let mut w = Writer { n: 0 };
+    for _ in 0..300 {
+        w.step(&mut g);
+    }
+    g.checkpoint().unwrap();
+    // Pages freed since the checkpoint wait for the next one.
+    for _ in 0..100 {
+        w.step(&mut g);
+    }
+    let mut crash = Crashes::new(&db, &root);
+    crash.now(&g, "writes", false);
+    g.checkpoint().unwrap();
+    crash.now(&g, "a checkpoint", false);
+    g.checkpoint().unwrap();
+    crash.now(&g, "a checkpoint with nothing committed", true);
+
+    let pin = |nonce, hold| Pin {
+        nonce,
+        hold,
+        shipped: 0,
+    };
+    write_pin(&db, pin(7, true)).unwrap();
+    writer_looks_at_the_pin(&mut g);
+    crash.now(&g, "a hold", true);
+    write_pin(&db, pin(7, false)).unwrap();
+    writer_looks_at_the_pin(&mut g);
+    crash.now(&g, "its release", true);
+    // Writes reuse what the release freed, through a cache that evicts.
+    for _ in 0..50 {
+        w.step(&mut g);
+    }
+    crash.now(&g, "writes after the release", false);
+
+    write_pin(&db, pin(8, true)).unwrap();
+    writer_looks_at_the_pin(&mut g);
+    crash.now(&g, "a hold after writes", false);
+    remove_pin(&db);
+    writer_looks_at_the_pin(&mut g);
+    crash.now(&g, "its pin removed", true);
+    write_pin(&db, pin(9, true)).unwrap();
+    writer_looks_at_the_pin(&mut g);
+    crash.now(&g, "another hold", true);
+    g.checkpoint().unwrap();
+    crash.now(&g, "a checkpoint under the hold", true);
+    for _ in 0..50 {
+        w.step(&mut g);
+    }
+    crash.now(&g, "writes under the hold", false);
+    remove_pin(&db);
+    writer_looks_at_the_pin(&mut g);
+    crash.now(&g, "its pin removed after writes", false);
     drop(g);
     let _ = std::fs::remove_dir_all(&root);
 }
