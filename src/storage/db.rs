@@ -21,14 +21,23 @@
 //!   copied. A pin not refreshed for [`PIN_TTL`] is ignored: a dead
 //!   replicator cannot make the log or the file grow forever.
 //!
+//! * **A memory database** keeps no log and pays nothing for one, until it
+//!   is replicated. Then it is given a [`MemLog`] ([`Db::enable_log`]):
+//!   every record a file would log goes there, at the positions a file
+//!   would give it, and a replicator ships it, taking bases from
+//!   [`Db::snapshot`]. A memory database is restored from what it shipped
+//!   by [`Db::from_replica`]: a base's pages, the log after them replayed,
+//!   and a log that carries on where the replay ended.
+//!
 //! What a log record means is up to the layer above; this layer only moves
 //! bytes and keeps them transactional.
 
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-use super::log::{Replay, SyncMode, Wal};
-use super::pager::{self, Pager};
+use super::log::{self, MemLog, Recovery, Replay, SyncMode, Wal};
+use super::pager::{self, Pager, Snapshot};
 use super::{SError, SResult};
 use crate::store::{new_generation, Lock};
 
@@ -111,9 +120,27 @@ pub fn remove_pin(db: &Path) {
     let _ = std::fs::remove_file(pin_path(db));
 }
 
+fn unsupported(msg: &str) -> SError {
+    SError::Io(io::Error::new(io::ErrorKind::Unsupported, msg))
+}
+
+/// A new lineage. One is made from the clock and the process id, which a
+/// wasm host has neither of (std panics when asked): there a memory
+/// database's log has to come with a replica's lineage.
+fn mint_generation() -> SResult<[u8; 16]> {
+    if cfg!(target_family = "wasm") {
+        return Err(unsupported(
+            "a new generation needs a clock and a process id, which this platform lacks",
+        ));
+    }
+    Ok(new_generation())
+}
+
 pub struct Db {
     pager: Pager,
     wal: Option<Wal>,
+    /// A memory database's log, once it is given one.
+    mem_log: Option<MemLog>,
     path: Option<PathBuf>,
     checkpoint_bytes: u64,
     ckpt_lsn: u64,
@@ -141,6 +168,7 @@ impl Db {
         Db {
             pager: Pager::memory(page_size, max_memory),
             wal: None,
+            mem_log: None,
             path: None,
             checkpoint_bytes: u64::MAX,
             ckpt_lsn: 0,
@@ -157,6 +185,7 @@ impl Db {
         Ok(Db {
             pager: Pager::from_image(bytes, max_memory)?,
             wal: None,
+            mem_log: None,
             path: None,
             checkpoint_bytes: u64::MAX,
             ckpt_lsn: 0,
@@ -165,6 +194,50 @@ impl Db {
             pin_checked: None,
             _lock: None,
         })
+    }
+
+    /// A memory database restored from a replica: the pages of a base, from
+    /// its segment files' bytes in order ([`Pager::from_parts`], keeping
+    /// its lineage), then the log shipped after it, each segment with the
+    /// position it starts at, replayed through `apply` as [`Db::open`]
+    /// replays a file's log ([`log::replay_shipped`]: whole committed
+    /// transactions, in order, stopping at a gap or a torn or damaged
+    /// frame). The database keeps a log from where the replay ended, with
+    /// at most `log_cap` bytes of committed log nobody has let go of, so
+    /// its positions carry the replica's on. Nothing is left behind by a
+    /// restore that fails: a base or a replay that does not fit in
+    /// `max_memory` is [`SError::Full`].
+    pub fn from_replica(
+        parts: &[&[u8]],
+        segments: &[(u64, &[u8])],
+        max_memory: u64,
+        log_cap: u64,
+        apply: &mut dyn FnMut(&Pager, &[u8]) -> SResult<()>,
+    ) -> SResult<(Db, Recovery)> {
+        let pager = Pager::from_parts(parts, max_memory, true)?;
+        if pager.generation() == [0; 16] {
+            pager.set_generation(mint_generation()?);
+        }
+        let rec = log::replay_shipped(pager.wal_lsn(), segments, &mut |e| match e {
+            Replay::Record(b) => apply(&pager, b),
+            Replay::Commit => {
+                pager.commit();
+                Ok(())
+            }
+        })?;
+        let db = Db {
+            pager,
+            wal: None,
+            mem_log: Some(MemLog::new(rec.end, log_cap)),
+            path: None,
+            checkpoint_bytes: u64::MAX,
+            ckpt_lsn: 0,
+            keep_from: None,
+            hold_at_checkpoint: (false, 0),
+            pin_checked: None,
+            _lock: None,
+        };
+        Ok((db, rec))
     }
 
     /// Open (creating if absent) the database at `path`. Committed
@@ -227,6 +300,7 @@ impl Db {
         let mut db = Db {
             pager,
             wal: Some(wal),
+            mem_log: None,
             path: Some(path.to_path_buf()),
             checkpoint_bytes: cfg.checkpoint_bytes,
             ckpt_lsn: from,
@@ -256,10 +330,61 @@ impl Db {
         self.wal.is_none()
     }
 
-    /// Log a record of the open transaction (no-op in memory).
+    /// Give a memory database a log from now on, keeping at most `cap`
+    /// bytes of committed log nobody has let go of. It starts where the
+    /// pages are (their `wal_lsn`: 0 for a new database, the image's for
+    /// one loaded keeping its lineage), and the database gets a generation
+    /// if it has none. Only between transactions: a log that began inside
+    /// one would hold half of it. A database that has a log already keeps
+    /// it as it is; a file database has its own, on disk.
+    pub fn enable_log(&mut self, cap: u64) -> SResult<()> {
+        if self.wal.is_some() {
+            return Err(unsupported("a file database keeps its log on disk"));
+        }
+        if self.mem_log.is_some() {
+            return Ok(());
+        }
+        if self.pager.in_txn() {
+            return Err(unsupported("a log can only start between transactions"));
+        }
+        if self.pager.generation() == [0; 16] {
+            self.pager.set_generation(mint_generation()?);
+        }
+        self.mem_log = Some(MemLog::new(self.pager.wal_lsn(), cap));
+        Ok(())
+    }
+
+    /// A memory database's log, if it has one.
+    pub fn mem_log(&self) -> Option<&MemLog> {
+        self.mem_log.as_ref()
+    }
+
+    /// Everything below `below` is shipped: a memory database's log lets
+    /// go of it ([`MemLog::release`]).
+    pub fn release_log(&mut self, below: u64) {
+        if let Some(m) = &mut self.mem_log {
+            m.release(below);
+        }
+    }
+
+    /// The committed state of a memory database with a log, at its last
+    /// commit: what a base is made from ([`Pager::snapshot`]).
+    pub fn snapshot(&self) -> SResult<Snapshot> {
+        let Some(m) = &self.mem_log else {
+            return Err(unsupported(
+                "only a memory database with a log is snapshotted for a base",
+            ));
+        };
+        self.pager.snapshot(m.committed_lsn())
+    }
+
+    /// Log a record of the open transaction: to the file's log, or a memory
+    /// database's if it has one (a no-op otherwise).
     pub fn log(&mut self, payload: &[u8]) -> SResult<()> {
         if let Some(w) = &mut self.wal {
             w.append(payload)?;
+        } else if let Some(m) = &mut self.mem_log {
+            m.append(payload);
         }
         Ok(())
     }
@@ -269,6 +394,9 @@ impl Db {
     pub fn commit(&mut self) -> SResult<()> {
         if let Some(w) = &mut self.wal {
             w.commit()?;
+        }
+        if let Some(m) = &mut self.mem_log {
+            m.commit();
         }
         self.pager.commit();
         if let Some(w) = &self.wal {
@@ -324,6 +452,9 @@ impl Db {
     pub fn rollback(&mut self) -> SResult<()> {
         if let Some(w) = &mut self.wal {
             w.rollback()?;
+        }
+        if let Some(m) = &mut self.mem_log {
+            m.rollback();
         }
         self.pager.rollback();
         Ok(())

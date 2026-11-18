@@ -34,10 +34,20 @@
 //! copy stays consistent however many checkpoints happen meanwhile. The
 //! superblock records the hold and the nonce of the request it honours.
 //!
+//! **Snapshots.** Pages are shared by reference and the committed state is
+//! never written in place, so the committed state of a `:memory:` database
+//! is captured by copying its page table — numbers and references, no
+//! page's bytes — while the writer carries on ([`Snapshot`]). A snapshot
+//! writes the image a file holds at a checkpoint, and
+//! [`Pager::from_parts`] reads such an image, or a file's own segment
+//! files, back into memory: that is how a memory database is based and
+//! restored by replication.
+//!
 //! Pages 0 and 1 are the two superblocks, written alternately so a torn
 //! superblock write always leaves the previous one intact.
 
 use std::collections::HashMap;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
@@ -542,6 +552,195 @@ impl Pager {
         })
     }
 
+    /// A `:memory:` pager holding an image cut into segments: `parts` are
+    /// the segment files' bytes in order, the database file first — a file
+    /// database's own files after a checkpoint, a base as a replica holds
+    /// it, or what [`Snapshot::write_image`] wrote.
+    ///
+    /// Where [`Pager::from_image`] is lenient, for the browser, this is
+    /// strict, because what it loads must be whole: every page number below
+    /// the high-water mark is either covered by the free list or must be in
+    /// the parts, intact and no newer than the superblock. A part cut short,
+    /// a damaged page, a superblock naming pages the parts do not hold,
+    /// parts out of order: each is an error, never a pager that lacks a
+    /// page. Pages the free list covers are not read at all (a file's
+    /// writer may have reused them since its checkpoint), and whatever lies
+    /// past the high-water mark is ignored. An image larger than
+    /// `max_memory`, with the slack a full graph may hold, is
+    /// [`SError::Full`], found before a page is copied.
+    ///
+    /// With `keep_lineage` the pager keeps the image's generation and log
+    /// position, so log shipped after the image replays onto it and a log
+    /// started on it carries the replica's positions on. Without, it is a
+    /// new database, as `from_image` makes.
+    pub fn from_parts(parts: &[&[u8]], max_memory: u64, keep_lineage: bool) -> SResult<Pager> {
+        let first = parts.first().copied().unwrap_or(&[]);
+        if first.len() < page::MIN_PAGE || &first[32..40] != MAGIC {
+            return corrupt("not a paged glider database");
+        }
+        let ps = page::get_u32(first, 44) as usize;
+        if !page::valid_page_size(ps) {
+            return corrupt(format!("bad page size {ps}"));
+        }
+        let mut best: Option<&[u8]> = None;
+        for slot in 0..2usize {
+            let Some(b) = first.get(slot * ps..(slot + 1) * ps) else {
+                continue;
+            };
+            if page::check(b, slot as u64).unwrap_or(false)
+                && page::kind(b) == page::KIND_SUPER
+                && &b[32..40] == MAGIC
+                && best.map(|x| sb_epoch(b) > sb_epoch(x)).unwrap_or(true)
+            {
+                best = Some(b);
+            }
+        }
+        let Some(sb) = best else {
+            return corrupt("no valid superblock");
+        };
+        if page::get_u32(sb, 40) != FORMAT {
+            return corrupt(format!("unsupported format {}", page::get_u32(sb, 40)));
+        }
+        let s = Super::decode(sb);
+        if s.seg_pages == 0 || s.hw < 2 || s.hw >= HELD {
+            return corrupt(format!(
+                "bad superblock: {} pages in segments of {}",
+                s.hw, s.seg_pages
+            ));
+        }
+        let Some(epoch) = s.epoch.checked_add(1) else {
+            return corrupt("bad superblock: its epoch has run out");
+        };
+        // The pages the parts hold, superblocks and all: every page number
+        // the free list does not cover is one of them.
+        let present: u64 = parts.iter().map(|p| (p.len() / ps) as u64).sum();
+
+        // The free list: the pages of its chain, and the pages it lists.
+        let mut chain: Vec<u64> = Vec::new();
+        let mut free: Vec<u64> = Vec::new();
+        let mut next = s.free_head;
+        while next != 0 {
+            if next < 2 || next >= s.hw || chain.len() as u64 >= present {
+                return corrupt("bad free-list chain");
+            }
+            let Some(pg) = part_page(parts, s.seg_pages, ps, next) else {
+                return corrupt(format!("free-list page {next} is missing"));
+            };
+            match page::check(pg, next) {
+                Ok(true) if page::kind(pg) == page::KIND_FREELIST => {}
+                Ok(true) => return corrupt(format!("page {next} is not a free-list page")),
+                Ok(false) => return corrupt(format!("free-list page {next} was never written")),
+                Err(e) => return corrupt(e),
+            }
+            let n = page::get_u32(pg, 40) as usize;
+            if n > (ps - 48) / 8 {
+                return corrupt("free-list page overflows");
+            }
+            chain.push(next);
+            for i in 0..n {
+                // Held pages are simply free in a copy.
+                let pno = page::get_u64(pg, 48 + 8 * i) & !HELD;
+                if pno < 2 || pno >= s.hw {
+                    return corrupt(format!("free list names page {pno}"));
+                }
+                free.push(pno);
+            }
+            next = page::get_u64(pg, 32);
+        }
+        let covers = (chain.len() + free.len()) as u64;
+        if s.hw - 2 > present.saturating_add(covers) {
+            return corrupt(format!(
+                "the superblock names {} pages; the parts hold {present}",
+                s.hw
+            ));
+        }
+        let Ok(hw) = usize::try_from(s.hw) else {
+            return corrupt("the image is larger than this machine can address");
+        };
+        let mut covered = vec![false; hw];
+        for &pno in chain.iter().chain(free.iter()) {
+            let c = &mut covered[pno as usize];
+            if *c {
+                return corrupt(format!("the free list covers page {pno} twice"));
+            }
+            *c = true;
+        }
+        if let Some(r) = s
+            .roots
+            .iter()
+            .find(|r| **r != 0 && (**r < 2 || **r >= s.hw || covered[**r as usize]))
+        {
+            return corrupt(format!("a root names page {r}, which holds nothing"));
+        }
+        let used = (s.hw - 2 - covers).saturating_mul(ps as u64);
+        if used > max_memory.saturating_add(SLACK_PAGES * ps as u64) {
+            return Err(SError::Full(format!(
+                "the image needs {:.1} MiB, max_memory is {:.1} MiB",
+                used as f64 / 1048576.0,
+                max_memory as f64 / 1048576.0
+            )));
+        }
+        let mut pages: Vec<Option<Page>> = vec![None; hw];
+        for pno in 2..s.hw {
+            if covered[pno as usize] {
+                continue;
+            }
+            let Some(b) = part_page(parts, s.seg_pages, ps, pno) else {
+                return corrupt(format!("page {pno} is missing: the parts end before it"));
+            };
+            match page::check(b, pno) {
+                Ok(true) => {}
+                Ok(false) => return corrupt(format!("page {pno} was never written")),
+                Err(e) => return corrupt(e),
+            }
+            // Copy-on-write takes a page of the current epoch for the open
+            // transaction's own: none of the committed state may look like
+            // one.
+            if page::epoch(b) > s.epoch {
+                return corrupt(format!("page {pno} is newer than its superblock"));
+            }
+            pages[pno as usize] = Some(Arc::from(b));
+        }
+        // In memory nothing durable refers to the chain: its pages are free.
+        free.extend(chain);
+        let (generation, wal_lsn) = if keep_lineage {
+            (s.generation, s.wal_lsn)
+        } else {
+            ([0; 16], 0)
+        };
+        let inner = Inner {
+            ps,
+            store: Store::Mem(Mem {
+                pages,
+                used,
+                max: max_memory,
+            }),
+            epoch,
+            durable: 0,
+            hw: s.hw,
+            free,
+            pending: Vec::new(),
+            chain: Vec::new(),
+            held: Vec::new(),
+            hold: false,
+            pin_seen: 0,
+            txn_alloc: Vec::new(),
+            txn_free: Vec::new(),
+            roots: s.roots,
+            committed_roots: s.roots,
+            meta: s.meta,
+            committed_meta: s.meta,
+            generation,
+            wal_lsn,
+            sb_slot: 0,
+            stats: Stats::default(),
+        };
+        Ok(Pager {
+            ps,
+            inner: Arc::new(Mutex::new(inner)),
+        })
+    }
+
     fn lock(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -748,6 +947,188 @@ impl Pager {
     pub fn held_pages(&self) -> u64 {
         self.lock().held.len() as u64
     }
+
+    /// Give the database a lineage: a memory database gets one when it
+    /// starts keeping a log.
+    pub(crate) fn set_generation(&self, generation: [u8; 16]) {
+        self.lock().generation = generation;
+    }
+
+    /// The committed state of a `:memory:` database, now, at log position
+    /// `lsn`. Under the lock it copies the page table — each page number
+    /// and a reference to its bytes, never the bytes — leaving out whatever
+    /// the open transaction has allocated, so it may be taken mid-
+    /// transaction. A transaction never writes a page the committed state
+    /// uses (it copies it first), so the snapshot stays exactly this state
+    /// however the writer carries on: a page it replaces or frees
+    /// afterwards lives on in the snapshot until the snapshot is dropped.
+    /// Nothing the pager counts changes, taking it or dropping it: what it
+    /// keeps alive meanwhile is outside `max_memory`.
+    pub fn snapshot(&self, lsn: u64) -> SResult<Snapshot> {
+        let g = self.lock();
+        let Store::Mem(m) = &g.store else {
+            return Err(SError::Io(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "only a memory database is snapshotted; a file's base is copied under a hold",
+            )));
+        };
+        let hw = usize::try_from(g.hw)
+            .unwrap_or(usize::MAX)
+            .min(m.pages.len());
+        let mut pages = m.pages[..hw].to_vec();
+        for &pno in &g.txn_alloc {
+            if let Some(slot) = pages.get_mut(pno as usize) {
+                *slot = None;
+            }
+        }
+        let (roots, meta, generation) = (g.committed_roots, g.committed_meta, g.generation);
+        // Every page of the committed state is from an earlier epoch than
+        // the open transaction's.
+        let epoch = g.epoch - 1;
+        drop(g);
+        // The image ends at the last page that holds something.
+        let len = pages
+            .iter()
+            .rposition(Option::is_some)
+            .map_or(2, |i| (i + 1).max(2));
+        pages.resize(len, None);
+        Ok(Snapshot {
+            ps: self.ps,
+            pages,
+            roots,
+            meta,
+            generation,
+            epoch,
+            lsn,
+        })
+    }
+}
+
+/// The committed state of a `:memory:` database at one moment
+/// ([`Pager::snapshot`]), and the image a file of it would hold.
+///
+/// It owns references to the pages it names, so it outlives the lock it
+/// was taken under and may be written out on another thread while the
+/// database carries on.
+pub struct Snapshot {
+    ps: usize,
+    /// Page `n` is `pages[n]`, up to the last page that holds something.
+    pages: Vec<Option<Page>>,
+    roots: [u64; ROOTS],
+    meta: [u64; METAS],
+    generation: [u8; 16],
+    /// The committed state's epoch: no page in it is newer.
+    epoch: u64,
+    lsn: u64,
+}
+
+impl Snapshot {
+    pub fn page_size(&self) -> usize {
+        self.ps
+    }
+
+    pub fn generation(&self) -> [u8; 16] {
+        self.generation
+    }
+
+    /// The log position the snapshot was taken at: log from here replays
+    /// onto its image.
+    pub fn lsn(&self) -> u64 {
+        self.lsn
+    }
+
+    /// The epoch of the committed state, as a file's superblock records it.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Pages in the image, free ones included: its extent.
+    pub fn high_water(&self) -> u64 {
+        self.pages.len() as u64
+    }
+
+    /// Write the image a file holds at a checkpoint, cut into segments of
+    /// `seg_pages` pages (at least 4, as a file's are): the superblock in
+    /// slot 0 — committed roots and counters, generation, log position,
+    /// page and segment size — and slot 1 empty; every page, checksummed as
+    /// it leaves memory; and a free list covering every page number below
+    /// the high-water mark that holds nothing, its chain on the highest of
+    /// them and listing the rest, so a database opened from the image
+    /// reuses them before it grows. Segment 0 is the database file, segment
+    /// `n` is `<db>-data/<n:08>.seg` beside it ([`segment_path`]) or
+    /// `data/<n:08>.seg` in a base.
+    ///
+    /// Each segment is handed to `sink` as soon as it is made, and only one
+    /// is held at a time. Returns the bytes written.
+    pub fn write_image(
+        &self,
+        seg_pages: u64,
+        sink: &mut dyn FnMut(usize, Vec<u8>) -> io::Result<()>,
+    ) -> io::Result<u64> {
+        if seg_pages < 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("a segment of {seg_pages} pages cannot hold both superblocks"),
+            ));
+        }
+        let ps = self.ps;
+        let hw = self.high_water();
+        // The free list, built as a checkpoint builds one: chain pages are
+        // taken from the free pages themselves, highest first, until there
+        // are enough of them to list the rest.
+        let mut free: Vec<u64> = (2..hw)
+            .filter(|p| self.pages[*p as usize].is_none())
+            .collect();
+        let cap = (ps - 48) / 8;
+        let mut chain: Vec<u64> = Vec::new();
+        while chain.len() < free.len().div_ceil(cap) {
+            match free.pop() {
+                Some(p) => chain.push(p),
+                None => break,
+            }
+        }
+        chain.sort_unstable();
+        let sb = Super {
+            epoch: self.epoch,
+            generation: self.generation,
+            wal_lsn: self.lsn,
+            hw,
+            free_head: chain.first().copied().unwrap_or(0),
+            pin_seen: 0,
+            hold: false,
+            seg_pages,
+            roots: self.roots,
+            meta: self.meta,
+        }
+        .encode(ps, 0);
+        let mut written = 0u64;
+        for seg in 0..hw.div_ceil(seg_pages) {
+            let first = seg * seg_pages;
+            let n = (hw - first).min(seg_pages);
+            let mut buf = vec![0u8; n as usize * ps];
+            for (pno, out) in (first..).zip(buf.chunks_exact_mut(ps)) {
+                if pno == 0 {
+                    out.copy_from_slice(&sb);
+                } else if let Some(pg) = &self.pages[pno as usize] {
+                    out.copy_from_slice(pg);
+                    page::seal(out);
+                } else if let Ok(i) = chain.binary_search(&pno) {
+                    let list = free.get(i * cap..free.len().min((i + 1) * cap));
+                    let list = list.unwrap_or(&[]);
+                    page::init(out, page::KIND_FREELIST, pno, self.epoch, 0);
+                    page::put_u64(out, 32, chain.get(i + 1).copied().unwrap_or(0));
+                    page::put_u32(out, 40, list.len() as u32);
+                    for (k, p) in list.iter().enumerate() {
+                        page::put_u64(out, 48 + 8 * k, *p);
+                    }
+                    page::seal(out);
+                }
+            }
+            written += buf.len() as u64;
+            sink(seg as usize, buf)?;
+        }
+        Ok(written)
+    }
 }
 
 /// The superblock in force in a database file, read without opening it
@@ -825,6 +1206,81 @@ const SB_HOLD: usize = 112 + 8 * (ROOTS + METAS);
 
 fn sb_epoch(b: &[u8]) -> u64 {
     page::get_u64(b, 48)
+}
+
+/// What a superblock says. One layout for the superblocks a checkpoint
+/// writes and those an image is written with.
+struct Super {
+    epoch: u64,
+    generation: [u8; 16],
+    wal_lsn: u64,
+    hw: u64,
+    free_head: u64,
+    pin_seen: u64,
+    hold: bool,
+    seg_pages: u64,
+    roots: [u64; ROOTS],
+    meta: [u64; METAS],
+}
+
+impl Super {
+    /// The superblock page for `slot`, sealed.
+    fn encode(&self, ps: usize, slot: u64) -> Vec<u8> {
+        let mut b = new_page(ps);
+        page::init(&mut b, page::KIND_SUPER, slot, 0, 0);
+        b[32..40].copy_from_slice(MAGIC);
+        page::put_u32(&mut b, 40, FORMAT);
+        page::put_u32(&mut b, 44, ps as u32);
+        page::put_u64(&mut b, 48, self.epoch);
+        b[56..72].copy_from_slice(&self.generation);
+        page::put_u64(&mut b, 72, self.wal_lsn);
+        page::put_u64(&mut b, 80, self.hw);
+        page::put_u64(&mut b, 88, self.free_head);
+        page::put_u64(&mut b, SB_PIN, self.pin_seen);
+        page::put_u64(&mut b, SB_HOLD, self.hold as u64);
+        page::put_u64(&mut b, 104, self.seg_pages);
+        for (i, r) in self.roots.iter().enumerate() {
+            page::put_u64(&mut b, 112 + 8 * i, *r);
+        }
+        for (i, m) in self.meta.iter().enumerate() {
+            page::put_u64(&mut b, 112 + 8 * ROOTS + 8 * i, *m);
+        }
+        page::seal(&mut b);
+        b
+    }
+
+    fn decode(b: &[u8]) -> Super {
+        let mut generation = [0u8; 16];
+        generation.copy_from_slice(&b[56..72]);
+        let mut roots = [0u64; ROOTS];
+        let mut meta = [0u64; METAS];
+        for (i, r) in roots.iter_mut().enumerate() {
+            *r = page::get_u64(b, 112 + 8 * i);
+        }
+        for (i, m) in meta.iter_mut().enumerate() {
+            *m = page::get_u64(b, 112 + 8 * ROOTS + 8 * i);
+        }
+        Super {
+            epoch: sb_epoch(b),
+            generation,
+            wal_lsn: page::get_u64(b, 72),
+            hw: page::get_u64(b, 80),
+            free_head: page::get_u64(b, 88),
+            pin_seen: page::get_u64(b, SB_PIN),
+            hold: page::get_u64(b, SB_HOLD) != 0,
+            seg_pages: page::get_u64(b, 104),
+            roots,
+            meta,
+        }
+    }
+}
+
+/// Page `pno` of an image cut into `parts` of `seg_pages` pages, if the
+/// parts hold all of it.
+fn part_page<'a>(parts: &[&'a [u8]], seg_pages: u64, ps: usize, pno: u64) -> Option<&'a [u8]> {
+    let part = parts.get(usize::try_from(pno / seg_pages).ok()?)?;
+    let at = usize::try_from(pno % seg_pages).ok()?.checked_mul(ps)?;
+    part.get(at..at.checked_add(ps)?)
 }
 
 impl Inner {
@@ -1094,29 +1550,22 @@ impl Inner {
 
     fn write_superblock(&mut self, slot: u64) -> SResult<()> {
         let ps = self.ps;
-        let mut b = new_page(ps);
-        page::init(&mut b, page::KIND_SUPER, slot, 0, 0);
-        b[32..40].copy_from_slice(MAGIC);
-        page::put_u32(&mut b, 40, FORMAT);
-        page::put_u32(&mut b, 44, ps as u32);
-        page::put_u64(&mut b, 48, self.durable);
-        b[56..72].copy_from_slice(&self.generation);
-        page::put_u64(&mut b, 72, self.wal_lsn);
-        page::put_u64(&mut b, 80, self.hw);
-        page::put_u64(&mut b, 88, self.chain.first().copied().unwrap_or(0));
-        page::put_u64(&mut b, SB_PIN, self.pin_seen);
-        page::put_u64(&mut b, SB_HOLD, self.hold as u64);
         let Store::File(f) = &mut self.store else {
             return Ok(());
         };
-        page::put_u64(&mut b, 104, f.seg_pages);
-        for (i, r) in self.committed_roots.iter().enumerate() {
-            page::put_u64(&mut b, 112 + 8 * i, *r);
+        let b = Super {
+            epoch: self.durable,
+            generation: self.generation,
+            wal_lsn: self.wal_lsn,
+            hw: self.hw,
+            free_head: self.chain.first().copied().unwrap_or(0),
+            pin_seen: self.pin_seen,
+            hold: self.hold,
+            seg_pages: f.seg_pages,
+            roots: self.committed_roots,
+            meta: self.committed_meta,
         }
-        for (i, m) in self.committed_meta.iter().enumerate() {
-            page::put_u64(&mut b, 112 + 8 * ROOTS + 8 * i, *m);
-        }
-        page::seal(&mut b);
+        .encode(ps, slot);
         let (file, off) = f.locate(slot, ps, true)?;
         file.write_all_at(&b, off)?;
         self.stats.writes += 1;
@@ -1511,5 +1960,347 @@ mod tests {
         }
         assert!(got.contains(&a), "{a} not reused; got {got:?}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    use crate::storage::btree::Tree;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const T: Tree = Tree { slot: 0, id: 1 };
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+    }
+
+    /// A value: mostly small, sometimes long enough for an overflow chain.
+    fn val(r: &mut Rng) -> Vec<u8> {
+        let n = match r.below(20) {
+            0 => 700 + r.below(3000) as usize,
+            _ => r.below(40) as usize,
+        };
+        (0..n).map(|i| (i as u64 ^ r.next()) as u8).collect()
+    }
+
+    fn contents(p: &Pager) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut c = T.scan(p).unwrap();
+        let mut out = Vec::new();
+        while let Some((k, v)) = c.next().unwrap() {
+            out.push((k.to_vec(), v.load(p).unwrap().into_owned()));
+        }
+        out
+    }
+
+    fn listed(m: &BTreeMap<Vec<u8>, Vec<u8>>) -> Vec<(Vec<u8>, Vec<u8>)> {
+        m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    }
+
+    /// A snapshot's image, its segments in order.
+    fn image(s: &Snapshot, seg_pages: u64) -> Vec<Vec<u8>> {
+        let mut parts: Vec<Vec<u8>> = Vec::new();
+        let bytes = s
+            .write_image(seg_pages, &mut |n, b| {
+                assert_eq!(n, parts.len(), "segments arrive in order");
+                parts.push(b);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(bytes, s.high_water() * s.page_size() as u64);
+        parts
+    }
+
+    fn refs(parts: &[Vec<u8>]) -> Vec<&[u8]> {
+        parts.iter().map(|p| p.as_slice()).collect()
+    }
+
+    /// A memory pager whose tree has seen many puts and deletes, committed:
+    /// plenty of pages in use and plenty free.
+    fn worn(seed: u64) -> (Pager, BTreeMap<Vec<u8>, Vec<u8>>) {
+        let p = Pager::memory(512, u64::MAX);
+        let mut r = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let mut m = BTreeMap::new();
+        for _ in 0..3000 {
+            let k = r.below(900).to_be_bytes().to_vec();
+            let v = val(&mut r);
+            T.put(&p, &k, &v).unwrap();
+            m.insert(k, v);
+        }
+        p.commit();
+        for _ in 0..2000 {
+            let k = r.below(900).to_be_bytes().to_vec();
+            T.delete(&p, &k).unwrap();
+            m.remove(&k);
+        }
+        p.commit();
+        (p, m)
+    }
+
+    #[test]
+    fn a_snapshot_shares_its_pages_until_something_writes() {
+        let p = Pager::memory(512, u64::MAX);
+        let mut pnos = Vec::new();
+        for i in 0..40u8 {
+            let a = p.alloc(page::KIND_LEAF, 1).unwrap();
+            fill(&p, a, i);
+            pnos.push(a);
+        }
+        p.set_root(0, pnos[0]);
+        p.commit();
+        // An open transaction that has copied a page, made one and freed one.
+        let copy = p.writable(pnos[1]).unwrap();
+        fill(&p, copy, 200);
+        let made = p.alloc(page::KIND_LEAF, 1).unwrap();
+        p.free(pnos[2]).unwrap();
+        p.set_root(0, copy);
+        let snap = p.snapshot(77).unwrap();
+        assert_eq!((snap.roots[0], snap.lsn()), (pnos[0], 77));
+        let same = |pno: u64| -> bool {
+            let g = p.lock();
+            let Store::Mem(m) = &g.store else {
+                unreachable!()
+            };
+            match (&snap.pages[pno as usize], &m.pages[pno as usize]) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            }
+        };
+        // Every committed page is the pager's own allocation, not a copy;
+        // the open transaction's pages are not in it at all.
+        assert!(pnos.iter().all(|a| same(*a)));
+        for pno in [copy, made] {
+            assert!(snap.pages.get(pno as usize).map_or(true, |s| s.is_none()));
+        }
+        // The transaction commits: the page it replaced and the one it
+        // freed leave the pager and live on, unchanged, in the snapshot.
+        p.commit();
+        for (pno, byte) in [(pnos[1], 1u8), (pnos[2], 2)] {
+            assert!(p.get(pno).is_err());
+            assert_eq!(snap.pages[pno as usize].as_ref().unwrap()[HEADER], byte);
+        }
+        // A later write copies its page; the snapshot's stays as it was,
+        // and the pages nobody touched are still shared.
+        let w = p.writable(pnos[5]).unwrap();
+        fill(&p, w, 99);
+        p.commit();
+        assert!(!same(pnos[5]));
+        assert_eq!(snap.pages[pnos[5] as usize].as_ref().unwrap()[HEADER], 5);
+        assert!(pnos[6..].iter().all(|a| same(*a)));
+    }
+
+    #[test]
+    fn snapshots_are_isolated_and_the_pager_counts_as_if_none_were_taken() {
+        for seed in 1..=3u64 {
+            // Twins fed the same operations; only `a` is snapshotted.
+            let a = Pager::memory(512, u64::MAX);
+            let b = Pager::memory(512, u64::MAX);
+            let mut r = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let mut committed: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+            let mut cur = committed.clone();
+            // Snapshots outstanding: the state each must hold, and its image
+            // as first written.
+            type Held = (Snapshot, Vec<(Vec<u8>, Vec<u8>)>, Vec<Vec<u8>>);
+            let mut held: Vec<Held> = Vec::new();
+            let check = |(s, want, img): Held, ctx: &str| {
+                assert_eq!(image(&s, 16), img, "{ctx}: the snapshot changed");
+                let back = Pager::from_parts(&refs(&img), u64::MAX, true).unwrap();
+                assert_eq!(contents(&back), want, "{ctx}");
+                T.check(&back).unwrap();
+            };
+            for step in 0..3000u64 {
+                let k = r.below(800).to_be_bytes().to_vec();
+                match r.below(12) {
+                    0..=5 => {
+                        let v = val(&mut r);
+                        T.put(&a, &k, &v).unwrap();
+                        T.put(&b, &k, &v).unwrap();
+                        cur.insert(k, v);
+                    }
+                    6..=7 => {
+                        T.delete(&a, &k).unwrap();
+                        T.delete(&b, &k).unwrap();
+                        cur.remove(&k);
+                    }
+                    8 => {
+                        a.commit();
+                        b.commit();
+                        committed = cur.clone();
+                    }
+                    9 => {
+                        a.rollback();
+                        b.rollback();
+                        cur = committed.clone();
+                    }
+                    10 => {
+                        // Inside a transaction or not, it is the committed state.
+                        let s = a.snapshot(step).unwrap();
+                        let img = image(&s, 16);
+                        held.push((s, listed(&committed), img));
+                    }
+                    _ if !held.is_empty() => {
+                        let i = r.below(held.len() as u64) as usize;
+                        check(held.swap_remove(i), &format!("seed {seed} step {step}"));
+                    }
+                    _ => {}
+                }
+                assert_eq!(
+                    a.memory_usage(),
+                    b.memory_usage(),
+                    "seed {seed} step {step}"
+                );
+                assert_eq!(a.stats().allocated_pages, b.stats().allocated_pages);
+            }
+            for h in held.drain(..) {
+                check(h, &format!("seed {seed} end"));
+            }
+            assert_eq!(a.memory_usage(), b.memory_usage());
+        }
+    }
+
+    #[test]
+    fn an_image_opens_as_a_file_and_in_memory_and_reuses_its_free_pages_first() {
+        let (p, model) = worn(1);
+        let want = listed(&model);
+        let snap = p.snapshot(1234).unwrap();
+        let hw = snap.high_water();
+        let free: BTreeSet<u64> = (2..hw)
+            .filter(|n| snap.pages[*n as usize].is_none())
+            .collect();
+        assert!(free.len() > 200, "deletes left pages free: {}", free.len());
+
+        // Cut small: an image of many segments, laid out as a database.
+        let parts = image(&snap, 16);
+        assert!(parts.len() > 4);
+        let path = tmp("image");
+        for (n, b) in parts.iter().enumerate() {
+            let f = segment_path(&path, n);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(&f, b).unwrap();
+        }
+        {
+            let f = Pager::open(&path, 512 * 16).unwrap();
+            assert_eq!(contents(&f), want);
+            T.check(&f).unwrap();
+            assert_eq!((f.wal_lsn(), f.generation()), (1234, snap.generation()));
+            // Every free page is listed but those holding the list itself
+            // (no more of them than it takes), and they are handed out
+            // before the file grows.
+            let chain = free.len() as u64 - f.free_pages();
+            let per_page = (512 - 48) / 8;
+            assert!(chain >= 1 && chain <= (free.len() as u64).div_ceil(per_page));
+            assert_eq!(f.high_water(), hw);
+            let mut got = BTreeSet::new();
+            for _ in 0..f.free_pages() {
+                got.insert(f.alloc(page::KIND_LEAF, 1).unwrap());
+            }
+            assert_eq!(f.high_water(), hw, "the file grew while pages were free");
+            assert!(got.is_subset(&free));
+            assert_eq!(got.len() as u64 + chain, free.len() as u64);
+            assert_eq!(f.alloc(page::KIND_LEAF, 1).unwrap(), hw);
+            f.rollback();
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(segment_path(&path, 1).parent().unwrap());
+
+        // In memory: every free page, the chain's too, is free.
+        let m = Pager::from_parts(&refs(&parts), u64::MAX, true).unwrap();
+        assert_eq!(contents(&m), want);
+        T.check(&m).unwrap();
+        assert_eq!(m.free_pages(), free.len() as u64);
+        assert_eq!(m.memory_usage().unwrap().0, p.memory_usage().unwrap().0);
+        assert_eq!((m.wal_lsn(), m.generation()), (1234, snap.generation()));
+        let fresh = Pager::from_parts(&refs(&parts), u64::MAX, false).unwrap();
+        assert_eq!((fresh.wal_lsn(), fresh.generation()), (0, [0; 16]));
+
+        // One segment: the browser's reader takes it too.
+        let one = image(&snap, 1 << 20);
+        assert_eq!(one.len(), 1);
+        let w = Pager::from_image(&one[0], u64::MAX).unwrap();
+        assert_eq!(contents(&w), want);
+        assert_eq!(w.free_pages(), free.len() as u64);
+    }
+
+    #[test]
+    fn from_parts_refuses_an_image_it_cannot_load_whole() {
+        let (p, model) = worn(2);
+        let snap = p.snapshot(0).unwrap();
+        let parts = image(&snap, 32);
+        assert!(parts.len() >= 4);
+        let live: Vec<u64> = (2..snap.high_water())
+            .filter(|n| snap.pages[*n as usize].is_some())
+            .collect();
+        let load = |parts: &[Vec<u8>]| Pager::from_parts(&refs(parts), u64::MAX, true);
+        let damaged = |parts: &[Vec<u8>]| {
+            assert!(matches!(load(parts), Err(SError::Corrupt(_))));
+        };
+        assert_eq!(contents(&load(&parts).unwrap()), listed(&model));
+
+        // The image ends at its last live page, so the last part ends in one.
+        let last = parts.len() - 1;
+        assert_eq!(*live.last().unwrap(), snap.high_water() - 1);
+        // A part cut short, by a page or by part of one.
+        for cut in [512, 100] {
+            let mut short = parts.clone();
+            let n = short[last].len() - cut;
+            short[last].truncate(n);
+            damaged(&short);
+        }
+        // A damaged page, anywhere.
+        for &pno in [live[0], live[live.len() / 2], live[live.len() - 1]].iter() {
+            let mut bad = parts.clone();
+            let (seg, at) = ((pno / 32) as usize, (pno % 32) as usize * 512);
+            bad[seg][at + 100] ^= 1;
+            damaged(&bad);
+        }
+        // A superblock naming pages the parts do not hold.
+        damaged(&parts[..last]);
+        // Parts out of order, or one repeated.
+        let mut swapped = parts.clone();
+        swapped.swap(1, last);
+        damaged(&swapped);
+        swapped = parts.clone();
+        swapped.swap(0, 1);
+        damaged(&swapped);
+        let mut repeated = parts.clone();
+        repeated[last] = parts[0].clone();
+        damaged(&repeated);
+        // Not a database, or nothing at all.
+        damaged(&[vec![7u8; 4096]]);
+        damaged(&[]);
+        // Too big for the memory it may have: past max_memory and the slack
+        // a full graph's committed state may hold beyond it.
+        let big = Pager::memory(512, u64::MAX);
+        for k in 0..900u64 {
+            T.put(&big, &k.to_be_bytes(), &[k as u8; 200]).unwrap();
+        }
+        big.commit();
+        let (used, _) = big.memory_usage().unwrap();
+        assert!(used > 4 * SLACK_PAGES * 512);
+        let img = image(&big.snapshot(0).unwrap(), 64);
+        assert!(matches!(
+            Pager::from_parts(&refs(&img), used / 2, true),
+            Err(SError::Full(_))
+        ));
+        let fits = Pager::from_parts(&refs(&img), used, true).unwrap();
+        assert_eq!(fits.memory_usage(), Some((used, used)));
+
+        // What is not read cannot do harm: the bytes of a page the free list
+        // lists (the lowest free pages are listed; its chain is on the
+        // highest), or bytes past the end.
+        let free = (32..snap.high_water())
+            .find(|n| snap.pages[*n as usize].is_none())
+            .unwrap();
+        let mut odd = parts.clone();
+        let (seg, at) = ((free / 32) as usize, (free % 32) as usize * 512);
+        odd[seg][at..at + 512].fill(0x5a);
+        odd.last_mut().unwrap().extend_from_slice(&[9u8; 700]);
+        assert_eq!(contents(&load(&odd).unwrap()), listed(&model));
     }
 }

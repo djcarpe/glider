@@ -35,8 +35,8 @@ use crate::codec;
 use crate::storage::btree::Tree;
 use crate::storage::db::{Db, DbConfig};
 use crate::storage::keys;
-use crate::storage::log::SyncMode;
-use crate::storage::pager::{self, Pager};
+use crate::storage::log::{Committed, MemLog, Recovery, SyncMode};
+use crate::storage::pager::{self, Pager, Snapshot};
 use crate::storage::{SError, SResult};
 use crate::store::{Op, Sync};
 use crate::value::Value;
@@ -2577,6 +2577,109 @@ impl Graph {
             return Ok(());
         }
         Ok(self.db.poll_pin(false)?)
+    }
+
+    // ------------------------------------------------- memory replication
+
+    /// Give a `:memory:` graph a log, so it can be replicated: from now on
+    /// everything it commits is logged as a file logs it ([`MemLog`]), and
+    /// kept until a replicator lets go of it ([`Graph::release_log`]) — up
+    /// to `cap` bytes of committed log (`storage::log::DEFAULT_LOG_CAP` is
+    /// the usual), past which it is dropped and the replicator takes a new
+    /// base instead. The graph gets a generation if it has none. Only
+    /// between transactions; a graph that already has a log keeps it as it
+    /// is.
+    pub fn enable_log(&mut self, cap: u64) -> Result<()> {
+        if self.is_persistent() {
+            return Err(Error::Msg(
+                "a file database keeps its log on disk; replicate it with glider-stream".into(),
+            ));
+        }
+        if self.uncommitted > 0 || self.pager().in_txn() {
+            return Err(Error::Msg(
+                "the log can only be enabled between transactions".into(),
+            ));
+        }
+        Ok(self.db.enable_log(cap)?)
+    }
+
+    /// The graph's lineage: the generation its replicas are filed under. A
+    /// memory graph has one once it has a log; until then it is zeros.
+    pub fn generation(&self) -> [u8; 16] {
+        self.pager().generation()
+    }
+
+    /// Where a memory graph's log starts — below it, log has been let go of
+    /// or dropped — and how far it is committed. None without a log in
+    /// memory.
+    pub fn log_span(&self) -> Option<(u64, u64)> {
+        self.db.mem_log().map(|m| (m.start(), m.committed_lsn()))
+    }
+
+    /// How far committed log reaches from `from`, or [`Committed::Gone`]
+    /// when the memory log does not hold `from` as a commit — the answer
+    /// that calls for a new base, as `storage::log::committed_end` gives it
+    /// for a file.
+    pub fn log_committed_end(&self, from: u64) -> Result<Committed> {
+        Ok(self.mem_log()?.committed_end(from))
+    }
+
+    /// The memory log's bytes `[from, to)`. Both ends must be commits it
+    /// holds, so the bytes are whole transactions: a segment, as shipped.
+    pub fn log_range(&self, from: u64, to: u64) -> Result<Vec<u8>> {
+        let m = self.mem_log()?;
+        let held = m.committed_lsn() - m.start();
+        let mut out = Vec::with_capacity(to.saturating_sub(from).min(held) as usize);
+        m.copy_range(from, to, &mut out)?;
+        Ok(out)
+    }
+
+    /// Everything below `below` is shipped: the memory log lets go of it,
+    /// up to the last commit at or before it.
+    pub fn release_log(&mut self, below: u64) {
+        self.db.release_log(below);
+    }
+
+    /// The committed state of a memory graph with a log, for a base: taken
+    /// in the time it takes to copy the page table, leaving out whatever
+    /// the open transaction has done, and written out
+    /// ([`Snapshot::write_image`]) once the caller has let go of the graph.
+    pub fn snapshot(&self) -> Result<Snapshot> {
+        if self.is_persistent() {
+            return Err(Error::Msg(
+                "a file database's base is copied under a hold; replicate it with glider-stream"
+                    .into(),
+            ));
+        }
+        Ok(self.db.snapshot()?)
+    }
+
+    fn mem_log(&self) -> Result<&MemLog> {
+        self.db.mem_log().ok_or_else(|| {
+            Error::Msg("this graph keeps no log in memory (see Graph::enable_log)".into())
+        })
+    }
+
+    /// A memory graph restored from a replica: the pages of a base, from
+    /// its segment files' bytes in order (the database file first), then
+    /// the log shipped after it — each segment with the position it starts
+    /// at — replayed as opening a file replays its log, and stopping at a
+    /// gap. The graph is on the replica's lineage, with a log that carries
+    /// on from where the replay ended (`Recovery::end`), keeping at most
+    /// `log_cap` bytes, so a replicator resumed against that replica ships
+    /// only what is written from then on. A restore that does not fit in
+    /// `max_memory` is [`Error::Full`] and leaves nothing behind.
+    pub fn from_replica(
+        base: &[&[u8]],
+        log: &[(u64, &[u8])],
+        max_memory: u64,
+        log_cap: u64,
+    ) -> Result<(Graph, Recovery)> {
+        let mut sch: Option<(Interner, Indexes)> = None;
+        let (db, rec) = Db::from_replica(base, log, max_memory, log_cap, &mut |p, r| {
+            replay(p, &mut sch, r)
+        })?;
+        Ok((Graph::init(db)?, rec))
     }
 
     /// The workspace one query may hold for its result rows, sort buffer,
