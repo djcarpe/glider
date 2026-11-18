@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use glider::graph::{Graph, OpenOptions};
 use glider::query;
-use glider::storage::db::{remove_pin, write_pin, Pin};
+use glider::storage::db::{read_pin, remove_pin, write_pin, Pin};
 use glider::storage::pager::read_superblock;
 use glider::value::Value;
 use glider::wal::TailOptions;
@@ -247,8 +247,8 @@ fn restore_as_of_stops_at_the_log_shipped_by_then() {
 // whatever it did before it went idle. Every wait has a deadline: a base that
 // never comes fails the test instead of stalling the suite.
 
-/// The writer looks at the pin at most once a second, so a base takes a
-/// second or two; past this it is never coming.
+/// A polled writer acts on the pin at the poll, so a base takes about the
+/// tailer's own tenth of a second; past this it is never coming.
 const IDLE_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Checkpoints only where a test asks for one, so a test says exactly what
@@ -290,10 +290,8 @@ fn base_from_idle_writer(g: &mut Graph, db: &Path, dir: &Path, force: bool) {
     tailer.join().unwrap().unwrap();
 }
 
-/// Give the writer its next look at the pin, which it takes at most once a
-/// second.
+/// Let the writer act on the pin as it stands: a poll looks at once.
 fn writer_looks_at_the_pin(g: &mut Graph) {
-    std::thread::sleep(Duration::from_millis(1100));
     g.poll_replication().unwrap();
 }
 
@@ -462,6 +460,103 @@ fn an_idle_writer_gives_a_base_after_its_replicator_died_holding() {
             let _ = std::fs::remove_dir_all(&root);
         }
     }
+}
+
+/// Open `db`, and ask the writer, idle but for a poll every `poll`, for a
+/// base into `dir`: the first poll after the request must take the hold,
+/// the first after the base must let it go, and the base restores to the
+/// source. Returns how long after that first poll the tailer began to copy.
+fn base_from_a_writer_just_opened(db: &Path, dir: &Path, out: &Path, poll: Duration) -> Duration {
+    let mut g = open_idle(db);
+    let (db2, dir2) = (db.to_path_buf(), dir.to_path_buf());
+    let tailer = std::thread::spawn(move || glider::replica::tail(&db2, &dir2, &once()));
+    // Not polled until the replicator has asked, so the next poll is the
+    // first after the request.
+    let start = Instant::now();
+    let nonce = loop {
+        if let Some(p) = read_pin(db).filter(|p| p.hold) {
+            break p.nonce;
+        }
+        assert!(start.elapsed() < IDLE_DEADLINE, "the replicator asked");
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    g.poll_replication().unwrap();
+    let held = Instant::now();
+    let sb = read_superblock(db).unwrap();
+    assert!(
+        sb.hold && sb.pin_seen == nonce,
+        "the first poll takes the hold"
+    );
+    // The tailer's copy starts by making the base's directory.
+    let bases = dir
+        .join(glider::replica::generation_hex(db).unwrap())
+        .join("base");
+    let mut copying = None;
+    let mut polled = Instant::now();
+    while !tailer.is_finished() {
+        assert!(held.elapsed() < IDLE_DEADLINE, "no base");
+        let begun = std::fs::read_dir(&bases).map(|mut d| d.next().is_some());
+        if copying.is_none() && begun.unwrap_or(false) {
+            copying = Some(Instant::now());
+        }
+        if polled.elapsed() >= poll {
+            g.poll_replication().unwrap();
+            polled = Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let copying = copying.unwrap_or_else(Instant::now);
+    tailer.join().unwrap().unwrap();
+    g.poll_replication().unwrap();
+    assert!(
+        !read_superblock(db).unwrap().hold,
+        "the next poll lets it go"
+    );
+    restore_and_compare(&g, dir, out);
+    copying - held
+}
+
+#[test]
+fn an_idle_writer_polled_often_gives_a_base_within_a_few_polls() {
+    // An explicit poll acts on the pin then and there; only a commit looks
+    // at most once a second. A writer just opened has just looked, so a
+    // hold left for the next once-a-second look would come a second late
+    // however often the writer is polled.
+    let root = temp("idle-polled");
+    let db = root.join("db");
+    {
+        let mut g = open_idle(&db);
+        let mut w = Writer { n: 0 };
+        for _ in 0..200 {
+            w.step(&mut g);
+        }
+    }
+    // From the poll that takes the hold until the tailer, which looks for
+    // its hold every 100 ms, begins to copy: twenty polls of 25 ms, five of
+    // its looks. The copy itself is the disk's to time, and a busy disk can
+    // stall anything for a moment, so the writer gets three tries.
+    let within = Duration::from_millis(500);
+    let mut took = Vec::new();
+    for n in 0..3 {
+        let (dir, out) = (
+            root.join(format!("replica{n}")),
+            root.join(format!("out{n}")),
+        );
+        took.push(base_from_a_writer_just_opened(
+            &db,
+            &dir,
+            &out,
+            Duration::from_millis(25),
+        ));
+        if took[n] < within {
+            break;
+        }
+    }
+    assert!(
+        took.iter().any(|t| *t < within),
+        "bases under way {took:?} after the first poll"
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 // ------------------------------------------- a crash around idle checkpoints

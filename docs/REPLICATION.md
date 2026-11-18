@@ -63,7 +63,9 @@ database's lock instead and copies directly.
 `glider serve` looks at the pin every second even when idle. An embedding
 application that may sit idle for long periods calls
 `Graph::poll_replication()` from time to time, or a base waits for its next
-commit.
+commit. Each call reads the pin there and then (a commit looks at most once a
+second), so a base asked of a writer polled every 50 ms is under way within
+about a tenth of a second.
 
 ## Shipping to S3, MinIO, or anything else
 

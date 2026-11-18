@@ -14,12 +14,13 @@
 //!
 //! * **Replication** is cooperative. A replicator (a separate process) leaves
 //!   a pin file in the log directory saying how far it has shipped the log,
-//!   and whether it is copying a base snapshot. The writer looks at it at
-//!   most once a second, on commit: it keeps the log the replicator has not
-//!   shipped yet, and for a snapshot it checkpoints at once under a *hold*
-//!   (see the pager), so the checkpoint's pages stay put while they are
-//!   copied. A pin not refreshed for [`PIN_TTL`] is ignored: a dead
-//!   replicator cannot make the log or the file grow forever.
+//!   and whether it is copying a base snapshot. The writer looks at it on
+//!   commit, at most once a second, and whenever it is polled: it keeps the
+//!   log the replicator has not shipped yet, and for a snapshot it
+//!   checkpoints at once under a *hold* (see the pager), so the
+//!   checkpoint's pages stay put while they are copied. A pin not refreshed
+//!   for [`PIN_TTL`] is ignored: a dead replicator cannot make the log or
+//!   the file grow forever.
 //!
 //! What a log record means is up to the layer above; this layer only moves
 //! bytes and keeps them transactional.

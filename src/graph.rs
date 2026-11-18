@@ -2572,11 +2572,16 @@ impl Graph {
     /// Act on a replicator's pin now (keep unshipped log, start or end a
     /// hold for a base snapshot) instead of at the next commit. For a
     /// writer that may sit idle; does nothing inside a transaction.
+    ///
+    /// Every call reads the pin; a commit looks at most once a second, so
+    /// that a busy writer does not read a file per transaction. A base asked
+    /// of an idle writer is taken at the first call after the request: call
+    /// this as often as a base should be quick to come.
     pub fn poll_replication(&mut self) -> Result<()> {
         if self.uncommitted > 0 {
             return Ok(());
         }
-        Ok(self.db.poll_pin(false)?)
+        Ok(self.db.poll_pin(true)?)
     }
 
     /// The workspace one query may hold for its result rows, sort buffer,
