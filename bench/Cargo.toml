@@ -45,3 +45,7 @@ path = "src/bin/ctxbench.rs"
 [[bin]]
 name = "hotbench"
 path = "src/bin/hotbench.rs"
+
+[[bin]]
+name = "memprobe"
+path = "src/bin/memprobe.rs"

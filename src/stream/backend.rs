@@ -21,6 +21,18 @@ pub struct Entry {
 pub trait Backend: Send + Sync {
     fn put(&self, key: &str, body: Vec<u8>) -> io::Result<()>;
     fn get(&self, key: &str) -> io::Result<Vec<u8>>;
+    /// Store the file at `path` under `key`. A base's page file is as large as
+    /// the database, so a backend that can should stream it rather than hold
+    /// it: `file://` and `exec:` copy it file to file. The default (S3) reads
+    /// it into memory for one PUT.
+    fn put_file(&self, key: &str, path: &Path) -> io::Result<()> {
+        self.put(key, std::fs::read(path)?)
+    }
+    /// Write the object `key` to the file at `path` (the reverse of
+    /// [`Backend::put_file`]), replacing it.
+    fn get_file(&self, key: &str, path: &Path) -> io::Result<()> {
+        std::fs::write(path, self.get(key)?)
+    }
     fn delete(&self, key: &str) -> io::Result<()>;
     fn list(&self, prefix: &str) -> io::Result<Vec<Entry>>;
     fn describe(&self) -> String;
@@ -46,6 +58,22 @@ impl Backend for FileBackend {
 
     fn get(&self, key: &str) -> io::Result<Vec<u8>> {
         std::fs::read(self.root.join(key))
+    }
+
+    // File to file in the kernel (copy_file_range where it can), never
+    // through a buffer the size of the file.
+    fn put_file(&self, key: &str, from: &Path) -> io::Result<()> {
+        let path = self.root.join(key);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("partial");
+        std::fs::copy(from, &tmp)?;
+        std::fs::rename(&tmp, &path)
+    }
+
+    fn get_file(&self, key: &str, to: &Path) -> io::Result<()> {
+        std::fs::copy(self.root.join(key), to).map(|_| ())
     }
 
     fn delete(&self, key: &str) -> io::Result<()> {
@@ -218,6 +246,16 @@ impl Backend for ExecBackend {
         let r = self.run(&self.put, key, &tmp).map(|_| ());
         let _ = std::fs::remove_file(&tmp);
         r
+    }
+
+    // The command reads the file itself.
+    fn put_file(&self, key: &str, path: &Path) -> io::Result<()> {
+        self.run(&self.put, key, path).map(|_| ())
+    }
+
+    fn get_file(&self, key: &str, path: &Path) -> io::Result<()> {
+        let _ = std::fs::remove_file(path);
+        self.run(&self.get, key, path).map(|_| ())
     }
 
     fn get(&self, key: &str) -> io::Result<Vec<u8>> {

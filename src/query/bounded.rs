@@ -62,6 +62,7 @@ impl Cursor {
         // the statement's own budget: matching stops (and the caller's lock
         // on the graph is released) once it is spent
         let _meter = meter(&limits);
+        let _release = super::Release;
         let (temp, file) = TempFile::new(&g.temp_dir())?;
         let mut writer = BufWriter::new(file);
         let mut remaining = 0;
@@ -228,6 +229,7 @@ pub fn execute_batch(
     if bytes.saturating_mul(4) > g.query_memory() {
         return Err(budget_error());
     }
+    let _release = super::Release;
     let mut parsed = Vec::new();
     for (src, params) in statements {
         let (stmt, funcs) = parse_checked(src, params)?;
