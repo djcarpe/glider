@@ -1726,6 +1726,15 @@ impl Drop for LimitsGuard {
     }
 }
 
+/// On drop, [`crate::budget::after_operation`]: freed memory goes back to the
+/// OS when the allocator holds a lot of it, however the operation ended.
+pub(crate) struct Release;
+impl Drop for Release {
+    fn drop(&mut self) {
+        crate::budget::after_operation(false);
+    }
+}
+
 pub fn row_bytes(row: &[Value]) -> u64 {
     64 + row.iter().map(Value::memory_bytes).sum::<u64>() * 2
 }
@@ -1744,6 +1753,9 @@ pub fn execute_capped(
     }
     let _guard = LimitsGuard(LIMITS.with(|l| l.replace(Some(limits))));
     let _meter = meter(&limits);
+    // whatever the statement freed (a scan that cycled the cache, a sort),
+    // the allocator gives back once it has returned
+    let _release = Release;
     let result = execute_with(g, src, params)?;
     if result.rows.len() > limits.max_rows
         || result.rows.iter().map(|r| row_bytes(r)).sum::<u64>()

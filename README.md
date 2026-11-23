@@ -358,6 +358,33 @@ transaction back) instead of growing past it.
 `Graph` is `Send`; wrap it in a `Mutex` for shared access, which is what the
 server does.
 
+### A process memory budget
+
+An embedder with a memory limit (a container) calls `budget::configure`
+(or `budget::ensure`, which reads the cgroup's `memory.max`) before opening
+databases: every database in the process then shares one page cache pool and
+one query workspace pool cut from that budget. Native memory outside the
+pools stays a fixed few MiB per operation, whatever the graph's size:
+whole-graph counts and aggregates hold one group per key, cursors spool to
+disk, and a replication base is copied file to file (a 4 MiB buffer), never
+read whole.
+
+The page cache holds its memory once, whichever thread reads: a page read
+in evicts its victim into the victim's own buffer, so a scan on one thread
+that cycles frames another thread read does not grow a second cache in its
+own malloc arena. What the operations free goes back to the OS. A configured
+process tunes
+glibc's allocator (a fixed 128 KiB mmap and trim threshold, two arenas;
+`GLIDER_MALLOC_TUNE=0` leaves it alone), and after a statement, a write
+batch, a cursor, a base copy, a cache shrink or a close, the allocator's
+free memory is trimmed once it passes an eighth of the workspace
+(`budget::after_operation`). `budget::native()` reports what the allocator
+has handed out (`used`, for a governor to count beside the pools' limits),
+keeps free and holds in all, and
+`tests/native_memory.rs` proves both: the catch-up reads and a base copy at
+200,000 nodes cost what they cost at 20,000, and a shrunk cache gives its
+memory back to the OS.
+
 ## HTTP
 
 ```

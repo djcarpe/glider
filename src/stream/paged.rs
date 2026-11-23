@@ -358,6 +358,7 @@ impl PagedReplicator {
         if let Ok(lag) = self.lag(&report.generation) {
             self.metrics.lag_bytes.store(lag, Ordering::Relaxed);
         }
+        crate::budget::after_operation(true);
         Ok(report)
     }
 
@@ -397,10 +398,11 @@ impl PagedReplicator {
                         files.push((format!("data/{name}"), dir.join("data").join(&name)));
                     }
                 }
+                // File by file, never read whole: the page file is as large
+                // as the database.
                 for (rel, path) in &files {
-                    let body = fs::read(path)?;
-                    report.bytes += body.len() as u64;
-                    self.backend.put(&format!("{key}{rel}"), body)?;
+                    report.bytes += fs::metadata(path)?.len();
+                    self.backend.put_file(&format!("{key}{rel}"), path)?;
                 }
                 // Last: from now on the base is whole in the backend too.
                 self.backend
@@ -432,9 +434,9 @@ impl PagedReplicator {
                     .join(&gen)
                     .join("segments")
                     .join(format!("{:016x}.seg", s.offset));
-                let body = fs::read(&local)?;
-                let len = body.len() as u64;
-                self.backend.put(&segment_key(&gen, s.offset, s.ts), body)?;
+                let len = fs::metadata(&local)?.len();
+                self.backend
+                    .put_file(&segment_key(&gen, s.offset, s.ts), &local)?;
                 let mut f = fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -539,7 +541,7 @@ impl PagedReplicator {
             }
             let path = segs.join(format!("{:016x}.seg", s.seg.offset));
             let tmp = path.with_extension("partial");
-            fs::write(&tmp, self.backend.get(&s.key)?)?;
+            self.backend.get_file(&s.key, &tmp)?;
             fs::rename(&tmp, &path)?;
             writeln!(
                 manifest,
@@ -730,17 +732,14 @@ pub fn restore(
             }
             let path = local.join(rel);
             fs::create_dir_all(path.parent().unwrap())?;
-            fs::write(&path, backend.get(&e.key)?)?;
+            backend.get_file(&e.key, &path)?;
         }
         // The log after it, up to the first gap or the target time.
         let segs = scratch.join(&gen).join("segments");
         fs::create_dir_all(&segs)?;
         let mut manifest = fs::File::create(scratch.join(&gen).join("manifest.jsonl"))?;
         for s in &shipped {
-            fs::write(
-                segs.join(format!("{:016x}.seg", s.seg.offset)),
-                backend.get(&s.key)?,
-            )?;
+            backend.get_file(&s.key, &segs.join(format!("{:016x}.seg", s.seg.offset)))?;
             writeln!(
                 manifest,
                 r#"{{"offset":{},"len":{},"ts":{}}}"#,

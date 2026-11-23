@@ -1644,13 +1644,16 @@ impl Inner {
                 }
                 self.stats.misses += 1;
                 let data: Page = self.read_page(pno)?.into();
-                let i = self.cache_insert(pno, data.clone(), false)?;
-                if let Store::File(f) = &mut self.store {
-                    if let Some(h) = f.cache.hot.as_deref_mut() {
-                        h.touch(i);
-                    }
+                let i = self.cache_insert(pno, data, false)?;
+                let Store::File(f) = &mut self.store else {
+                    unreachable!()
+                };
+                if let Some(h) = f.cache.hot.as_deref_mut() {
+                    h.touch(i);
                 }
-                Ok(data)
+                // The frame's own bytes, shared, as a hit returns them: the
+                // frame stays held while the caller has them.
+                Ok(f.cache.frames[i].data.clone())
             }
         }
     }
@@ -1807,12 +1810,20 @@ impl Inner {
             self.stats.writes += 1;
         }
         f.cache.map.remove(&old_pno);
-        f.cache.frames[v] = Frame {
-            pno,
-            data,
-            dirty,
-            usage: 1,
-        };
+        let fr = &mut f.cache.frames[v];
+        // The new page goes into the victim's memory, not the other way
+        // round: the victim was allocated by whichever thread first read it,
+        // and freeing it here would put it in that thread's malloc arena
+        // while this one grows its own. Over a scan that cycles the cache
+        // from another thread, the process would come to hold the cache
+        // twice. `data` is this thread's, freed (and reused) here.
+        match Arc::get_mut(&mut fr.data) {
+            Some(buf) if buf.len() == data.len() => buf.copy_from_slice(&data),
+            _ => fr.data = data,
+        }
+        fr.pno = pno;
+        fr.dirty = dirty;
+        fr.usage = 1;
         f.cache.map.insert(pno, v);
         if let Some(h) = f.cache.hot.as_deref_mut() {
             h.forget(v);
@@ -2333,6 +2344,8 @@ pub fn resize_shared_cache(bytes: u64) -> Option<u64> {
     let budget = crate::budget::process()?;
     budget.cache.resize(bytes.min(budget.config.cache));
     reclaim_caches(&budget.cache, 0, Take::Both);
+    // The frames given up are free in the allocator, not yet in the OS.
+    crate::budget::after_operation(true);
     Some(budget.cache.used())
 }
 
