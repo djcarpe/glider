@@ -249,10 +249,9 @@ a block opened with `BEGIN` or `Graph::begin()` is spent, so the error says
 the transaction was rolled back, later statements and writes are refused,
 `COMMIT` says nothing was committed, and the next block starts clean; a
 transaction opened by assigning `autocommit` goes on in a new one. Only the
-outermost statement does this: a statement a procedure runs, stopped by its
-own budget, leaves the decision to the procedure; stopped by the outer
-budget, it stops the outer statement, which then rolls back. A stopped
-statement that had written nothing leaves the transaction open. A
+outermost statement does this, and it does it for the statements it runs
+too (below). A stopped statement that had written nothing leaves the
+transaction open. A
 stopped algorithm returns early with partial state that nothing uses; a
 stopped projection build returns an empty projection; a stopped local walk
 ends as if finished, so no whole-graph fallback starts. The memory and spill
@@ -272,7 +271,30 @@ well as by any of its own: the tighter step count and the earlier deadline
 hold. When it returns, the outer meter carries on with the inner steps
 counted; an inner statement stopped by the outer budget stops the outer one
 too. The transaction belongs to the outermost statement: an inner one never
-commits or rolls back on its own.
+commits or rolls back on its own, and so a statement is all or nothing
+however deep it runs. An inner statement that fails after it has written
+anything (an error, its own budget, the outer budget, a panic) records what
+failed in a thread-local slot as it returns or unwinds; the outermost
+statement reads the slot when the procedure returns and, whatever the
+procedure did with the error, fails as a whole ("statement failed as a
+whole: a statement it ran, `<its text>` failed after writing: <why>") and is
+rolled back under the rule of its kind of transaction: in autocommit nothing
+remains, a block is spent, a transaction opened by assigning `autocommit`
+goes on in a new one. An inner statement that fails before writing anything
+leaves nothing to undo, and the procedure may handle its error. A panic is a
+failure of the statement it unwinds through, in every kind of transaction:
+if the statement had written, it is rolled back (and a block spent) before
+the panic goes on, so a caller that catches it cannot commit part of it
+(`tests/statement_atomic.rs`). Before this, on the base too, a procedure
+that swallowed an inner failure, or a caller that caught a panic inside a
+transaction, could commit half a statement.
+
+**What `max_steps` does not bound.** Building the in-memory projection
+counts only its nodes, so that both tiers count the same steps: a
+`max_steps` budget does not limit how many edges that build reads (a test
+read all of 3,000,000 edges under `max_steps: 200`). Where `max_steps` is
+the only budget, as on wasm32, the build is bounded only by the graph; a
+time budget stops it within 4,096 edges.
 
 **Without a budget** nothing changes: no result differs (every existing test
 passes untouched, and every algorithm on every tier answers byte for byte the

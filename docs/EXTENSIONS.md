@@ -186,7 +186,11 @@ Built-in algorithms and walks called from a procedure (`glider::algo::pagerank`
 over `g.projection(...)`, `glider::traverse::bfs`) count their own steps, every
 one of them, however many calls the work is cut into. A statement a procedure
 runs with `query::execute_capped` is bounded by the outer statement's budget
-too, and its steps count against it. A procedure that panics leaves the
+too, and its steps count against it. A statement is all or nothing however
+deep it runs: if one a procedure runs fails after it has written anything,
+the outermost statement fails as a whole and is rolled back, whatever the
+procedure does with the error; one that fails before writing may be
+handled. A procedure that panics leaves the
 thread's budgets as they were. A procedure that carries on after
 a stop, or returns normally from one, still fails: the statement ends with
 the budget's error whatever the procedure returned, and rolls back, so a
@@ -202,7 +206,9 @@ panic through a procedure and a hook together leaves the thread's budgets,
 the meter, autocommit and the hook state as they were.
 
 `max_millis` needs a clock, so it is not kept on wasm32, for procedures as for
-queries; `max_steps` is kept everywhere.
+queries; `max_steps` is kept everywhere, except that building an algorithm's
+in-memory projection counts its nodes only, so under `max_steps` alone that
+build reads every edge of the graph.
 
 ## `context`: graph retrieval for language models
 
