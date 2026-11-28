@@ -55,13 +55,14 @@ fn all_instances(g: &mut Graph, args: &str) -> BTreeMap<String, BTreeSet<u64>> {
     loop {
         let r = run(
             g,
-            &format!("CALL structure.templates({args}, instances: '*', after: {after})"),
+            &format!(
+                "CALL structure.templates({args}, instances: '*', grouped: true, after: {after})"
+            ),
         );
         if r.rows.is_empty() {
             return sets;
         }
-        after += r.rows.len();
-        instance_sets(&r.rows, &mut sets);
+        after += instance_sets(&r.rows, &mut sets);
     }
 }
 

@@ -138,7 +138,7 @@ const PROCEDURES: &[Spec] = &[
     },
     Spec {
         name: "templates",
-        args: "(types, dir, labels, min_nodes, min_count, max_nodes, identity, instances, dictionary, fresh, after, limit)",
+        args: "(types, dir, labels, min_nodes, min_count, max_nodes, identity, instances, grouped, dictionary, fresh, after, limit)",
         doc: "Shapes that repeat along a hierarchy: id, root label, nodes, edges, slots, instances, estimated saving and definition; instances: <id> (or '*') lists instances and their slot values; dictionary: a kept dictionary's templates instead",
     },
     Spec {

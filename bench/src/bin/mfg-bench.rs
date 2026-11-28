@@ -830,7 +830,9 @@ fn all_instances(
     let mut calls = 0;
     loop {
         let (r, t) = run.run(
-            &format!("CALL structure.templates({args}, instances: '*', after: {after})"),
+            &format!(
+                "CALL structure.templates({args}, instances: '*', grouped: true, after: {after})"
+            ),
             &[],
         )?;
         ms += t;
@@ -838,8 +840,7 @@ fn all_instances(
         if r.rows.is_empty() {
             return Ok((sets, ms, calls));
         }
-        after += r.rows.len();
-        shapes::instance_sets(&r.rows, &mut sets);
+        after += shapes::instance_sets(&r.rows, &mut sets);
     }
 }
 

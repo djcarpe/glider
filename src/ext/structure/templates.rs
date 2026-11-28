@@ -1863,6 +1863,9 @@ pub fn templates(g: &mut Graph, a: &Args) -> Result<QueryResult> {
         }
     };
     if let Some(of) = a.str("instances") {
+        if of == "*" && a.bool("grouped", false) {
+            return grouped_instances(&h, g, &mut found, a);
+        }
         if of == "*" {
             return all_instances(g, &h, &mut found, a, limit);
         }
@@ -2005,6 +2008,68 @@ fn instances(
         msg.push_str(&format!(
             "; more: CALL structure.templates again with instances: '{}', after: {last}",
             t.id
+        ));
+    }
+    r.message = Some(msg);
+    Ok(r)
+}
+
+/// Roots one `grouped: true` call lists at most.
+pub const MAX_GROUPED: usize = 100_000;
+
+/// `instances: "*", grouped: true`: one row per template, `template,
+/// instances, roots`, its roots in member order, at most [`MAX_GROUPED`]
+/// roots a call; `after:` is the number of roots already read. For a
+/// caller that wants every instance of many templates in few calls.
+fn grouped_instances(h: &Hier, g: &Graph, found: &mut Found, a: &Args) -> Result<QueryResult> {
+    let after = a.usize("after", 0);
+    let order = template_order(found);
+    let total: usize = found.templates.iter().map(|t| t.count).sum();
+    let mut rows = Vec::new();
+    let (mut seen, mut shown) = (0usize, 0usize);
+    for (i, _) in order {
+        if shown == MAX_GROUPED {
+            break;
+        }
+        let t = &found.templates[i];
+        if seen + t.count <= after {
+            seen += t.count;
+            continue;
+        }
+        let mut members: Vec<(Vec<u8>, u64)> = (t.start..t.start + t.count)
+            .map(|r| {
+                let id = found.roots.get(r);
+                (order_key(g, &h.names, id), id)
+            })
+            .collect();
+        members.sort();
+        step(members.len() as u64)?;
+        let skip = after.saturating_sub(seen);
+        let take = (MAX_GROUPED - shown).min(members.len() - skip);
+        let roots: Vec<Value> = members[skip..skip + take]
+            .iter()
+            .map(|(_, id)| Value::Int(*id as i64))
+            .collect();
+        seen += skip + take;
+        shown += take;
+        rows.push(vec![
+            Value::Text(t.id.clone()),
+            Value::Int(t.count as i64),
+            Value::List(roots),
+        ]);
+    }
+    let mut r = QueryResult::table(
+        ["template", "instances", "roots"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        rows,
+    );
+    let mut msg = format!("{total} instances of {} templates", found.templates.len());
+    if after + shown < total {
+        msg.push_str(&format!(
+            "; more: CALL structure.templates again with instances: '*', grouped: true, after: {} and the same arguments",
+            after + shown
         ));
     }
     r.message = Some(msg);
@@ -2225,4 +2290,51 @@ pub fn nest(
     }
     t2.slots = definition(g, names, &t2, all, "T", &|_| "T".into()).1;
     t2
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forest_state_spills_past_its_budget_with_the_same_hashes() {
+        let mut g = Graph::memory();
+        let mut parents = Vec::new();
+        for i in 0..4_000u64 {
+            let id = g
+                .add_node(
+                    &[["A", "B"][(i % 2) as usize].to_string()],
+                    vec![("i".into(), Value::Int((i % 5) as i64))],
+                )
+                .unwrap();
+            if i > 0 {
+                let p: u64 = parents[(i as usize * 7 + 3) % parents.len()];
+                g.add_edge(p, id, "H", vec![]).unwrap();
+            }
+            parents.push(id);
+        }
+        let a = Args(vec![(
+            "types".into(),
+            Value::List(vec![Value::Text("H".into())]),
+        )]);
+        let h = Hier::from(&g, &a).unwrap();
+        let mut free = Forest::build(&g, &h).unwrap();
+        assert!(!free.ids.is_spilled() && !free.shape.is_spilled());
+        // 16 KiB for 4,000 nodes of 56 bytes: the per-node state spills.
+        let mut tight = crate::ooc::with_budget(16 << 10, g.temp_dir(), || {
+            let f = Forest::build(&g, &h).unwrap();
+            assert!(f.ids.is_spilled() && f.shape.is_spilled() && f.content.is_spilled());
+            f
+        });
+        for v in 0..free.len {
+            assert_eq!(free.shape.get(v), tight.shape.get(v));
+            assert_eq!(free.content.get(v), tight.content.get(v));
+            assert_eq!(free.size.get(v), tight.size.get(v));
+            assert_eq!(free.owner.get(v), tight.owner.get(v));
+        }
+        // The forest under one root alone is the same there.
+        let root = free.ids.get(0);
+        let mut local = Forest::local(&g, &h, root, 100_000).unwrap();
+        assert_eq!(local.shape_of(root), free.shape_of(root));
+    }
 }

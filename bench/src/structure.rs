@@ -307,13 +307,22 @@ pub fn template_recovery(
     r
 }
 
-/// `template -> roots` from `templates(instances: '*')` rows.
-pub fn instance_sets(rows: &[Vec<Value>], into: &mut BTreeMap<String, BTreeSet<u64>>) {
+/// `template -> roots` from `templates(instances: '*', grouped: true)`
+/// rows; returns how many roots they listed.
+pub fn instance_sets(rows: &[Vec<Value>], into: &mut BTreeMap<String, BTreeSet<u64>>) -> usize {
+    let mut n = 0;
     for row in rows {
-        if let (Value::Text(t), Value::Int(root)) = (&row[0], &row[1]) {
-            into.entry(t.clone()).or_default().insert(*root as u64);
+        if let (Value::Text(t), Some(Value::List(roots))) = (&row[0], row.get(2)) {
+            let e = into.entry(t.clone()).or_default();
+            for r in roots {
+                if let Value::Int(r) = r {
+                    e.insert(*r as u64);
+                    n += 1;
+                }
+            }
         }
     }
+    n
 }
 
 fn exact_value(v: &Value) -> String {
