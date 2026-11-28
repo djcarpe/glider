@@ -203,9 +203,13 @@ in `tests/review_g4.rs`.*
   degree: about 13 log bytes per edge (2.6 MB for a 200,000-edge node,
   where one `NodeDel` is 20 bytes) plus whatever the hooks write per edge,
   and the copy-on-write pages it touches. What bounds it is the database's
-  ordinary limits: a memory graph's `max_memory` (past it the delete is
-  `Error::Full`, rolled back, the graph as it was; tested) and a file's
-  disk. A file database cannot checkpoint inside the transaction, so its
+  ordinary limits: a memory graph's `max_memory` and a file's disk.
+  Deleting frees about as many pages as it copies, so what grows is the
+  log (in memory only for a memory graph with a log) and what the hooks
+  write: a follower that writes a few bytes per edge deletes a
+  225,000-edge hub inside 24 MiB, one that writes a kilobyte per edge runs
+  out, and the test asserts that this ends in `Error::Full`, rolled back,
+  with the graph, the revision and the hook's keyspace as they were. A file database cannot checkpoint inside the transaction, so its
   log holds the whole delete until it commits. Detach memory itself stays
   at one batch of 4,096 edge ids.
 - `on_bulk_write(g, BulkWrite::Clear)`, for an extension that follows node
@@ -223,15 +227,29 @@ in `tests/review_g4.rs`.*
   back. With autocommit off (the API, or a statement inside `BEGIN`) the
   whole open transaction rolls back and the error says so, whatever its
   kind (an I/O error keeps its kind, with the note added): the engine has
-  no savepoints, so undoing only the failed write is not possible. The
-  block is then *spent* (`Graph::spent()`): every further write and
-  statement in it is refused with the explanation, and `COMMIT` is an
+  no savepoints, so undoing only the failed write is not possible. A block
+  the engine can see start — the `BEGIN` statement, or `Graph::begin()`,
+  added beside `commit()` and `rollback()` as the way to open a
+  transaction — is then *spent* (`Graph::spent()`): every further write
+  and statement in it is refused with the explanation, and `COMMIT` is an
   error ("nothing was committed: ...") that ends the block, so the writes
   made after the failure can never commit as if they were the whole
-  transaction. The same rule now covers the engine's own rollback inside
-  an open transaction (`Error::Full` past `max_memory`, a storage error),
-  which before let the statements after it commit as a partial unit; no
-  existing test or document relied on that.
+  transaction. The same rule covers the engine's own rollback inside such
+  a block (`Error::Full` past `max_memory`, a storage error), which before
+  let the statements after it commit as a partial unit; no existing test
+  or document relied on that. A block opened with `begin()` ends only with
+  `commit()` or `rollback()` (or `COMMIT`/`ROLLBACK`), and a spent state
+  belongs to that block alone: what happens depends only on what the
+  caller did, never on whether some other call ran in between. A
+  transaction opened by assigning the public `autocommit` field cannot be
+  seen to start or end, so it keeps the behaviour it had before this
+  slice: the failing call's error says the transaction was rolled back,
+  and the caller carries on in a new one. The embedding binding opens its
+  transactions that way and tracks failure itself; it can move to
+  `begin()` later.
+- A hook that panics: the hook state, autocommit and the statement's
+  transaction are restored on the way out (the C interface catches panics
+  and keeps the handle, which then stays writable).
 - With the revision (D2): a write that changes nothing (the same value set
   again, an unset of an absent property, a delete of what is not there) is
   not logged, does not move the revision and is reported to no hook; every

@@ -1070,10 +1070,12 @@ pub struct Graph {
     /// How many write hooks are running: while any is, the graph itself
     /// may not be written, only extension keyspaces.
     in_hook: u32,
-    /// Set when the engine rolled back a transaction the caller had open
-    /// (autocommit off) because a write or a hook failed: the explanation
-    /// every further write, statement and COMMIT in it is refused with,
-    /// until the caller ends it.
+    /// A transaction block opened with [`Graph::begin`] (or `BEGIN`) is
+    /// open: one the engine can see start, and so can mark spent.
+    block: bool,
+    /// Set when the engine rolled back the open block because a write or a
+    /// hook failed: the explanation every further write, statement and
+    /// COMMIT in it is refused with, until the caller ends the block.
     spent: Option<String>,
 }
 
@@ -1140,6 +1142,7 @@ impl Graph {
             tel_id: crate::telemetry::next_db_id(),
             hooks: None,
             in_hook: 0,
+            block: false,
             spent: None,
         })
     }
@@ -1291,7 +1294,7 @@ impl Graph {
                 })?;
                 n += 1;
                 if n % 50_000 == 0 {
-                    self.commit()?;
+                    self.commit_txn()?;
                 }
             }
             for id in old.edge_ids() {
@@ -1305,7 +1308,7 @@ impl Graph {
                 })?;
                 n += 1;
                 if n % 50_000 == 0 {
-                    self.commit()?;
+                    self.commit_txn()?;
                 }
             }
             let (next_node, next_edge) = crate::legacy::image::ImageSource::next_ids(old);
@@ -1313,7 +1316,7 @@ impl Graph {
                 next_node,
                 next_edge,
             })?;
-            self.commit()
+            self.commit_txn()
         })();
         self.restore_autocommit(auto);
         r
@@ -2008,18 +2011,45 @@ impl Graph {
         self.uncommitted
     }
 
+    /// Open a transaction block: autocommit off until [`Graph::commit`] or
+    /// [`Graph::rollback`] ends it (as `BEGIN` does for statements). This
+    /// is the way to open a transaction: if the engine has to roll a block
+    /// back because a write or a write hook failed inside it, the block is
+    /// spent ([`Graph::spent`]) and nothing more can go into it or commit
+    /// from it. A transaction opened by assigning `autocommit = false`
+    /// keeps the older behaviour: the failing call's error says the
+    /// transaction was rolled back, and the caller carries on in a new one.
+    /// Assigning `autocommit` does not end a block opened here.
+    pub fn begin(&mut self) -> Result<()> {
+        if let Some(why) = self.spent() {
+            return Err(Error::Msg(why.to_string()));
+        }
+        self.block = true;
+        self.spent = None;
+        self.autocommit = false;
+        Ok(())
+    }
+
     /// Make the open transaction durable (per the sync mode) and visible as
-    /// the committed state.
-    ///
-    /// A transaction the engine already rolled back (see
-    /// [`Graph::spent`]) cannot be committed: this is an error that says
-    /// why, and the next write starts a new transaction.
+    /// the committed state. A block opened with [`Graph::begin`] ends here
+    /// (autocommit back on); if the engine rolled it back (see
+    /// [`Graph::spent`]) nothing is committed and this is an error that
+    /// says why.
     pub fn commit(&mut self) -> Result<()> {
-        if let Some(why) = self.spent.take() {
-            if !self.autocommit {
+        if self.block {
+            self.block = false;
+            self.autocommit = true;
+            if let Some(why) = self.spent.take() {
+                self.rollback_quietly();
                 return Err(Error::Msg(format!("nothing was committed: {why}")));
             }
         }
+        self.commit_txn()
+    }
+
+    /// Commit the open transaction without ending a block: for the engine's
+    /// own intermediate commits (imports in slices, autocommit).
+    pub(crate) fn commit_txn(&mut self) -> Result<()> {
         if let Err(e) = self.db.commit() {
             self.rollback_quietly();
             return Err(e.into());
@@ -2028,9 +2058,19 @@ impl Graph {
         Ok(())
     }
 
-    /// Abandon everything since the last commit.
+    /// Abandon everything since the last commit. A block opened with
+    /// [`Graph::begin`] ends here, spent or not.
     pub fn rollback(&mut self) -> Result<()> {
+        if self.block {
+            self.block = false;
+            self.autocommit = true;
+        }
         self.spent = None;
+        self.rollback_txn()
+    }
+
+    /// Roll back the open transaction without ending a block.
+    pub(crate) fn rollback_txn(&mut self) -> Result<()> {
         self.forget_reads();
         self.hooks = None;
         self.db.rollback()?;
@@ -2054,7 +2094,7 @@ impl Graph {
     /// Writes, statements and COMMIT are refused with this until the caller
     /// ends the transaction (ROLLBACK, or a COMMIT that reports the error).
     pub fn spent(&self) -> Option<&str> {
-        if self.autocommit {
+        if !self.block || self.autocommit {
             return None;
         }
         self.spent.as_deref()
@@ -2065,17 +2105,15 @@ impl Graph {
     /// so none can be spent.
     pub(crate) fn restore_autocommit(&mut self, auto: bool) {
         self.autocommit = auto;
-        if auto {
-            self.spent = None;
-        }
     }
 
-    /// Roll back after a failure, and if the caller had a transaction open,
-    /// mark it spent. The error says what happened, whatever its kind.
+    /// Roll back after a failure, and if the caller had a block open (see
+    /// [`Graph::begin`]), mark it spent. The error says what happened,
+    /// whatever its kind.
     fn abandon(&mut self, e: Error) -> Error {
         self.rollback_quietly();
         let e = rolled_back(e);
-        if !self.autocommit {
+        if self.block {
             self.spent = Some(format!(
                 "the open transaction was rolled back by an earlier error ({e}); \
                  end it with ROLLBACK and run its writes again"
@@ -2086,7 +2124,7 @@ impl Graph {
 
     fn maybe_commit(&mut self) -> Result<()> {
         if self.autocommit {
-            self.commit()
+            self.commit_txn()
         } else {
             Ok(())
         }
@@ -2103,10 +2141,8 @@ impl Graph {
     /// revision ([`Graph::revision`]); replaying the log without it gives
     /// the same state, since it did nothing.
     fn exec_changed(&mut self, op: Op) -> Result<bool> {
-        if self.autocommit {
-            self.spent = None;
-        } else if let Some(why) = &self.spent {
-            return Err(Error::Msg(why.clone()));
+        if let Some(why) = self.spent() {
+            return Err(Error::Msg(why.to_string()));
         }
         if self.in_hook > 0
             && !matches!(
@@ -2737,18 +2773,27 @@ impl Graph {
     /// without the hook writes that belong with it.
     fn unit(&mut self, f: impl FnOnce(&mut Graph) -> Result<()>) -> Result<()> {
         let auto = self.autocommit;
-        if auto {
-            self.spent = None;
-        }
         let start = self.uncommitted;
         self.autocommit = false;
-        let r = f(self);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
         self.autocommit = auto;
+        let r = match r {
+            Ok(r) => r,
+            // A hook panicked: take its unit back, as for an error, before
+            // the panic goes on to whoever catches it.
+            Err(panic) => {
+                if auto {
+                    self.rollback_quietly();
+                } else if self.uncommitted > start {
+                    let _ = self.abandon(Error::Msg("a write hook panicked".into()));
+                }
+                std::panic::resume_unwind(panic)
+            }
+        };
         match r {
             Ok(()) => self.maybe_commit(),
             Err(e) if auto => {
                 self.rollback_quietly();
-                self.spent = None;
                 Err(e)
             }
             Err(e) if self.uncommitted > start => Err(self.abandon(e)),
@@ -2886,18 +2931,23 @@ impl Graph {
 
     /// Run write hooks: while they run, only extension keyspaces may be
     /// written, so a hook can never set off hooks again.
+    /// The count is restored on every way out, a panic included, so a
+    /// handle whose embedder catches panics stays writable.
     fn in_hooks(&mut self, f: impl FnOnce(&mut Graph) -> Result<()>) -> Result<()> {
         self.in_hook += 1;
-        let r = f(self);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
         self.in_hook -= 1;
-        r
+        match r {
+            Ok(r) => r,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 
     /// Reclaim space: folds the log into the pages. (Pages freed by deletes
     /// are reused by later writes; the file does not shrink.)
     pub fn compact(&mut self) -> Result<u64> {
         let before = self.file_len();
-        self.commit()?;
+        self.commit_txn()?;
         self.db.checkpoint()?;
         Ok(before)
     }

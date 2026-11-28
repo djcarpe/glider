@@ -1892,18 +1892,29 @@ fn execute_stmt(g: &mut Graph, stmt: Stmt) -> Result<QueryResult> {
 fn atomically<R>(g: &mut Graph, f: impl FnOnce(&mut Graph) -> Result<R>) -> Result<R> {
     let auto = g.autocommit;
     g.autocommit = false;
-    let r = f(g);
+    // A panic (in an extension, say) must not leave the handle with
+    // autocommit off and the statement's writes pending.
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(g)));
     g.restore_autocommit(auto);
+    let r = match r {
+        Ok(r) => r,
+        Err(panic) => {
+            if auto {
+                let _ = g.rollback_txn();
+            }
+            std::panic::resume_unwind(panic)
+        }
+    };
     if !auto || g.uncommitted() == 0 {
         return r;
     }
     match r {
         Ok(v) => {
-            g.commit()?;
+            g.commit_txn()?;
             Ok(v)
         }
         Err(e) => {
-            let _ = g.rollback();
+            let _ = g.rollback_txn();
             Err(e)
         }
     }
@@ -2082,7 +2093,7 @@ fn run(g: &mut Graph, stmt: Stmt) -> Result<QueryResult> {
             Ok(QueryResult::message("graph cleared"))
         }
         Stmt::Begin => {
-            g.autocommit = false;
+            g.begin()?;
             Ok(QueryResult::message("transaction open (autocommit off)"))
         }
         Stmt::Commit => {
@@ -5095,10 +5106,10 @@ fn import_lines(g: &mut Graph, text: &str) -> Result<(usize, usize)> {
             }
         }
         if (nodes + edges) % 20_000 == 0 {
-            g.commit()?;
+            g.commit_txn()?;
         }
     }
-    g.commit()?;
+    g.commit_txn()?;
     Ok((nodes, edges))
 }
 

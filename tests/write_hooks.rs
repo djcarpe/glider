@@ -711,7 +711,7 @@ fn every_write_path_is_accounted_for_by_the_hooks() {
             },
         ];
         for fail in fails {
-            g.autocommit = false;
+            g.begin().unwrap();
             g.add_node(&["Earlier".into()], vec![]).unwrap();
             refused(fail(g).unwrap_err());
             // The transaction is spent: nothing more goes into it, and
@@ -722,8 +722,20 @@ fn every_write_path_is_accounted_for_by_the_hooks() {
             let e = g.commit().unwrap_err();
             assert!(e.to_string().starts_with("nothing was committed"), "{e}");
             assert!(g.spent().is_none());
-            g.autocommit = true;
+            assert!(g.autocommit, "COMMIT ended the block");
         }
+        // A transaction opened by assigning the field keeps the behaviour
+        // it had: the failing call says it was rolled back, and the caller
+        // carries on in a new transaction (rolled back here, so that this
+        // path leaves nothing).
+        g.autocommit = false;
+        g.add_node(&["Earlier".into()], vec![]).unwrap();
+        refused(g.add_node(&["Fail".into()], vec![]).unwrap_err());
+        assert!(g.spent().is_none());
+        g.add_node(&["Next".into()], vec![]).unwrap();
+        assert!(g.uncommitted() > 0, "the new transaction took the write");
+        g.rollback().unwrap();
+        g.autocommit = true;
     });
     rolled_back(&mut g, "statements inside BEGIN", |g| {
         for bad in [

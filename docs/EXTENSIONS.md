@@ -61,12 +61,22 @@ functions work in any expression as `<extension>.<function>(...)`.
   A hook that returns an error fails the write: with autocommit on the
   statement rolls back; with autocommit off the whole open transaction
   rolls back, and the error ends with "(the transaction was rolled back)"
-  whatever its kind. The transaction block is then spent: every further
-  write and statement in it is refused with that explanation, and `COMMIT`
-  answers "nothing was committed: ..." and ends the block, so nothing run
-  after the failure can commit as if it were the whole transaction. The
-  same holds when the engine itself rolls back an open transaction (a
-  memory graph past `max_memory`, a storage error).
+  whatever its kind. Open a transaction with `BEGIN` or `Graph::begin()`
+  and end it with `COMMIT`/`ROLLBACK` or `commit()`/`rollback()`: such a
+  block is then spent (`Graph::spent()`): every further write and
+  statement in it is refused with that explanation, and `COMMIT` answers
+  "nothing was committed: ..." and ends the block, so nothing run after the
+  failure can commit as if it were the whole transaction. The same holds
+  when the engine itself rolls back an open block (a memory graph past
+  `max_memory`, a storage error). A spent state never reaches the next
+  block. A transaction opened by assigning `autocommit = false` keeps the
+  older behaviour: the failing call's error says the transaction was
+  rolled back, and the caller carries on in a new one. Assigning
+  `autocommit` does not end a block opened with `begin()`.
+
+  A hook that panics leaves the handle as it was: its statement's writes
+  are rolled back and autocommit and the hook state restored before the
+  panic goes on, so an embedder that catches panics can keep the handle.
 
   An extension that does not ask is never called, and costs nothing. A
   write that changes nothing (a property set to the value it has, an unset
