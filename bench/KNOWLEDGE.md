@@ -443,17 +443,19 @@ as one hop pays: 1, 4 and 6 patterns.
 
 | dataset | part | plain | planned, dictionary inline | with the kept dictionary | dictionary |
 |---|---|---|---|---|---|
-| n10000-s1 | whole graph (10,055 nodes) | 2.59 MB, 950,841 tokens | 514 KB, 218,405 (23%) | | 49.8 KB, 18,162 |
+| n10000-s1 | whole graph (10,055 nodes) | 2.59 MB, 950,841 tokens | 514 KB, 218,539 (23%) | | 50.2 KB, 18,296 |
 | n10000-s1 | one station (40 nodes) | 10,514 B, 3,734 | not shorter: plain | 905 B, 441 (12%) | |
-| n10000-s1 | one line (345 nodes) | 90,056 B, 31,947 | 56,835 B, 20,979 (66%) | 13,896 B, 5,919 (19%) | |
-| n100000-s1 | whole graph (103,004) | 28.8 MB, 10,395,457 | 4.70 MB, 2,042,178 (20%) | | 310 KB, 113,170 |
+| n10000-s1 | one line (345 nodes) | 90,056 B, 31,947 | 21,113 tokens (66%) | 13,896 B, 5,919 (19%) | |
+| n100000-s1 | whole graph (103,004) | 28.8 MB, 10,395,457 | 4.70 MB, 2,042,312 (20%) | | 311 KB, 113,304 |
 | n100000-s1 | one station (18) | 4,893 B, 1,770 | plain | 480 B, 223 (13%) | |
-| n100000-s1 | one line (361) | 100,826 B, 35,821 | 56,082 B, 20,865 (58%) | 13,318 B, 5,827 (16%) | |
-| n1000000-s1 | whole graph (1,023,660) | 291 MB, 103,283,695 | 42.0 MB, 18,305,719 (18%) | | 1.66 MB, 610,774 |
+| n100000-s1 | one line (361) | 100,826 B, 35,821 | 20,999 tokens (59%) | 13,318 B, 5,827 (16%) | |
+| n1000000-s1 | whole graph (1,023,660) | 291 MB, 103,283,695 | 42.0 MB, 18,305,853 (18%) | | 1.67 MB, 610,908 |
 | n1000000-s1 | one station (8) | 1,889 B, 683 | plain | 263 B, 109 (16%) | |
-| n1000000-s1 | one line (447) | 126,292 B, 45,525 | 83,710 B, 31,305 (69%) | 10,310 B, 5,034 (11%) | |
+| n1000000-s1 | one line (447) | 126,292 B, 45,525 | 31,439 tokens (69%) | 10,310 B, 5,034 (11%) | |
 
-(Percentages are of the plain tokens; "one station" is the first station
+(After the review fixes the legend is longer, so dictionaries grew by
+0.4 KB; "planned, dictionary inline" for a line is in tokens. Percentages
+are of the plain tokens; "one station" is the first station
 without a deviation, a different design at each size.) The whole graph
 written with templates takes a fifth of the tokens, measured by writing
 both. A single station planned alone is not shorter: a dictionary for one
@@ -472,9 +474,9 @@ file, and the resident memory added in memory:
 
 | dataset | station templates | all shapes | patterns | plan, whole graph | one station planned alone (ms) / with the kept dictionary (ms) | expand, every instance | list every instance (calls) |
 |---|---|---|---|---|---|---|---|
-| n10000-s1 | 196 / 204 | 408 / 519 | 30 / 19 | 682 / 584, +1 MB | 364 / 3 | 286 / 361, 41 calls | 581 / 570 (2) |
-| n100000-s1 | 2,632 / 2,096 | 5,175 / 5,508 | 232 / 237 | 6,645 / 8,352, +12 MB | 5,042 / 2 | 4,337 / 3,899, 149 calls | 7,788 / 7,277 (2) |
-| n1000000-s1 | 23.6 / 24.2 s | 50.4 / 48.5 s | 2.5 / 2.6 s | 109 / 131 s, +115 MB | 48 s / 2.5 ms | 49 / 45 s, 570 calls | 121 / 114 s (3) |
+| n10000-s1 | 196 / 204 | 408 / 519 | 30 / 19 | 544 / 546, +1 MB | 364 / 2.6 | 286 / 361, 41 calls | 581 / 570 (2) |
+| n100000-s1 | 2,632 / 2,096 | 5,175 / 5,508 | 232 / 237 | 6,489 / 6,652, +12 MB | 5,042 / 2.2 | 4,337 / 3,899, 149 calls | 7,788 / 7,277 (2) |
+| n1000000-s1 | 23.6 / 24.2 s | 50.4 / 48.5 s | 2.5 / 2.6 s | 80 / 79 s, +115 MB | 48 s / 2.0 ms | 49 / 45 s, 570 calls | 121 / 114 s (3) |
 
 Finding templates is a whole-graph computation, about 50 µs a node at 1M
 with every node a root: the forest (56 bytes a node), then a walk of every
@@ -484,8 +486,8 @@ writing both texts in full (291 MB and 42 MB at 1M, counted, not kept). A
 plan of a few nodes without a kept dictionary costs what finding templates
 costs; with one, it reads only the selection (below). Expansion reads only
 the shape under each root (about 0.25 ms an instance). The whole-graph
-plan times are from two runs on a shared machine (78-87 s, then 109-131 s
-at 1M).
+plan times are from three runs on a shared machine (78-87 s, 109-131 s and
+79-80 s at 1M; the last after the review fixes).
 The memory is the per-node state and the sorts, inside half and a quarter
 of `algorithm_memory()`, spilling past them
 (`forest_state_spills_past_its_budget_with_the_same_hashes`,
@@ -501,15 +503,15 @@ in the last column, memory tier) writes for the same selection:
 
 | dataset | selection | nodes | plain tokens | kept tokens | uses | ms | same | whole-graph path |
 |---|---|---|---|---|---|---|---|---|
-| n10000-s1 | one station | 40 | 3,734 | 441 | 1 | 2.8 / 2.8 | yes | 320 ms |
-| n10000-s1 | one line | 345 | 31,947 | 5,919 | 17 | 18 / 27 | yes | 294 ms |
-| n10000-s1 | 300 scattered nodes | 300 | 27,975 | 27,809 | 1 | 7.7 / 7.5 | yes | 319 ms |
-| n100000-s1 | one station | 18 | 1,770 | 223 | 1 | 2.1 / 2.2 | yes | 3.5 s |
-| n100000-s1 | one line | 361 | 35,821 | 5,827 | 17 | 24 / 23 | yes | 3.6 s |
-| n100000-s1 | 300 scattered nodes | 300 | 30,636 | 30,636 | 0 | 15 / 13 | yes | 3.4 s |
-| n1000000-s1 | one station | 8 | 683 | 109 | 1 | 2.5 / 2.1 | yes | 39.5 s |
-| n1000000-s1 | one line | 447 | 45,525 | 5,034 | 13 | 39 / 71 (median 86) | yes | 37.1 s |
-| n1000000-s1 | 300 scattered nodes | 300 | 29,946 | 29,946 | 0 | 15 / 17 | yes | 38.2 s |
+| n10000-s1 | one station | 40 | 3,734 | 441 | 1 | 2.6 / 2.6 | yes | 282 ms |
+| n10000-s1 | one line | 345 | 31,947 | 5,919 | 17 | 17 / 17 | yes | 278 ms |
+| n10000-s1 | 300 scattered nodes | 300 | 27,975 | 27,809 | 1 | 6.9 / 7.5 | yes | 289 ms |
+| n100000-s1 | one station | 18 | 1,770 | 223 | 1 | 2.2 / 2.3 | yes | 3.4 s |
+| n100000-s1 | one line | 361 | 35,821 | 5,827 | 17 | 23 / 26 | yes | 3.4 s |
+| n100000-s1 | 300 scattered nodes | 300 | 30,636 | 30,636 | 0 | 13 / 12 | yes | 3.5 s |
+| n1000000-s1 | one station | 8 | 683 | 109 | 1 | 2.0 / 2.1 | yes | 35.8 s |
+| n1000000-s1 | one line | 447 | 45,525 | 5,034 | 13 | 47 / 42 | yes | 35.8 s |
+| n1000000-s1 | 300 scattered nodes | 300 | 29,946 | 29,946 | 0 | 15 / 19 | yes | 36.4 s |
 
 The time follows the selection (about 0.05 ms a selected node in memory,
 up to 0.2 ms on the file tier for the pages of a line not yet read), not
@@ -522,4 +524,11 @@ use is matched in full, so a node changed since the dictionary was made is
 written as it is now. What the dictionary keeps for this is an index of
 root shapes and ids, about 50 bytes a template (24 KB of the 7.0 MB that
 the kept dictionary `mfg` takes at 1M, all its records counted:
-`stored_bytes`; 211 KB at 10k, 1.36 MB at 100k).
+`stored_bytes`; 214 KB at 10k, 1.37 MB at 100k, 7.1 MB at 1M).
+
+**Read back from the text alone.** The compact text of the whole graph,
+by id and by identity (`["code", "number"]`, which names every node there
+uniquely), decoded with the decoder written from the documented notation
+(`tests/structure_notation.rs`), is exactly the graph at 10k, 100k and 1M
+(1,023,660 nodes and 2,435,930 edges; the 1M check is run on demand with
+`GLIDER_NOTATION_SIZES=n1000000-s1`, 267 s).

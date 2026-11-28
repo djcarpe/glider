@@ -6,7 +6,11 @@
 //! test of the property it broke.
 
 // Written by the reviewer as an independent reading; kept as written.
-#![allow(clippy::needless_range_loop, clippy::too_many_arguments, clippy::manual_div_ceil)]
+#![allow(
+    clippy::needless_range_loop,
+    clippy::too_many_arguments,
+    clippy::manual_div_ceil
+)]
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -2031,7 +2035,11 @@ fn mfg(n: &str) -> Option<Graph> {
 
 #[test]
 fn manufacturing_graph_compact_text_reads_back_and_identity_handles_are_unique() {
-    for n in ["n10000-s1", "n100000-s1"] {
+    // GLIDER_NOTATION_SIZES lists other datasets (the 1M one is read back
+    // this way, on demand: its text is 291 MB).
+    let sizes =
+        std::env::var("GLIDER_NOTATION_SIZES").unwrap_or_else(|_| "n10000-s1,n100000-s1".into());
+    for n in sizes.split(',') {
         let Some(mut g) = mfg(n) else {
             println!("{n}: no data");
             continue;
@@ -2056,6 +2064,23 @@ fn manufacturing_graph_compact_text_reads_back_and_identity_handles_are_unique()
                 .collect::<Vec<_>>()
                 .join("\n")
         );
+        drop(c);
+        // And by identity, every node named by code or number.
+        let ida = format!("{args}, identity: ['code', 'number']");
+        let c = plan_text(&mut g, &ida, "compact");
+        let (want_id, _) = snap_id(&g, &["code", "number"], None);
+        let got = decode(&c, None);
+        println!("{n}: by identity, reads back exactly: {}", got == want_id);
+        assert!(
+            got == want_id,
+            "{}",
+            diff(&want_id, &got)
+                .lines()
+                .take(10)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        drop(c);
         // Handles under identity: ['code', 'number'].
         let mut by: HashMap<String, usize> = HashMap::new();
         let mut none = 0;
