@@ -388,17 +388,9 @@ fn pass2_hub_delete_past_the_memory_limit() {
     let hub = g.add_node(&["Hub".into()], vec![]).unwrap();
     let leaf = g.add_node(&["Leaf".into()], vec![]).unwrap();
     let mut n = 0u64;
-    loop {
-        match g.add_edge(hub, leaf, "E", vec![]) {
-            Ok(_) => n += 1,
-            Err(_) => break,
-        }
-        if n % 5000 == 0 {
-            if g.commit().is_err() {
-                break;
-            }
-        }
-        if n >= 400_000 {
+    while g.add_edge(hub, leaf, "E", vec![]).is_ok() {
+        n += 1;
+        if (n % 5000 == 0 && g.commit().is_err()) || n >= 400_000 {
             break;
         }
     }
