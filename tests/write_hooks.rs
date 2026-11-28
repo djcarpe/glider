@@ -714,7 +714,14 @@ fn every_write_path_is_accounted_for_by_the_hooks() {
             g.autocommit = false;
             g.add_node(&["Earlier".into()], vec![]).unwrap();
             refused(fail(g).unwrap_err());
-            g.commit().unwrap();
+            // The transaction is spent: nothing more goes into it, and
+            // COMMIT says that nothing was committed.
+            assert!(g.spent().is_some());
+            let e = g.add_node(&["After".into()], vec![]).unwrap_err();
+            assert!(e.to_string().contains("end it with ROLLBACK"), "{e}");
+            let e = g.commit().unwrap_err();
+            assert!(e.to_string().starts_with("nothing was committed"), "{e}");
+            assert!(g.spent().is_none());
             g.autocommit = true;
         }
     });
@@ -733,7 +740,17 @@ fn every_write_path_is_accounted_for_by_the_hooks() {
                     .unwrap();
             }
             refused(query::execute(g, bad).err().expect(bad));
-            q(g, "COMMIT");
+            for after in ["CREATE (:After)", "MATCH (n) RETURN count(n)"] {
+                let e = query::execute(g, after).err().expect(after).to_string();
+                assert!(e.contains("end it with ROLLBACK"), "{after}: {e}");
+            }
+            let e = query::execute(g, "COMMIT")
+                .err()
+                .expect("COMMIT")
+                .to_string();
+            assert!(e.starts_with("nothing was committed"), "{e}");
+            // The block is over: the next statement runs on its own.
+            assert!(g.autocommit);
         }
     });
     let switch = |g: &Graph| g.ext_get(NS, b"!failbulk").is_some();
@@ -748,15 +765,17 @@ fn every_write_path_is_accounted_for_by_the_hooks() {
         .unwrap();
 
     let total: usize = changed.iter().map(|(_, n)| n).sum();
-    // Clearing an empty graph changes nothing and tells no one.
+    // CLEAR always counts as a change, on an empty graph too (it resets
+    // the id counters and wipes derived data): it moves the revision and
+    // the bulk notification is heard. `path` checks heard == moved.
     let mut empty = Graph::memory();
     q(&mut empty, "CREATE EXTENSION recorder");
-    assert_eq!(
-        path(&mut empty, "CLEAR of an empty graph", |g| {
-            q(g, "CLEAR");
-        }),
-        0
-    );
+    let rev = empty.revision();
+    path(&mut empty, "CLEAR of an empty graph", |g| {
+        q(g, "CLEAR");
+    });
+    assert!(empty.revision() > rev, "an empty CLEAR moved the revision");
+    assert!(recorded(&empty).bulk, "an empty CLEAR was heard");
     for (name, n) in &changed {
         // Everything but the index definition changed something.
         assert!(
@@ -1035,4 +1054,223 @@ fn the_text_index_stays_right_through_replayed_operations_imports_and_clear() {
     q(&mut g, "CLEAR");
     q(&mut g, "CREATE (:P {name: \"willow cipher\"})");
     check(&mut g, "after CLEAR");
+}
+
+/// Writes the graph from inside its hooks: a :Grow node makes another, and
+/// with `swallow` the hook ignores the refusal and carries on.
+struct Writer {
+    swallow: bool,
+}
+
+impl Extension for Writer {
+    fn name(&self) -> &str {
+        if self.swallow {
+            "swallower"
+        } else {
+            "writer"
+        }
+    }
+    fn version(&self) -> &str {
+        "1"
+    }
+    fn summary(&self) -> &str {
+        "writes the graph from its hooks"
+    }
+    fn procedures(&self) -> &[Spec] {
+        &[]
+    }
+    fn call(&self, _: &mut Graph, _: &str, _: &Args) -> Result<QueryResult> {
+        unreachable!()
+    }
+    fn wants_writes(&self, _: &Graph) -> bool {
+        true
+    }
+    fn wants_edge_writes(&self, _: &Graph) -> bool {
+        true
+    }
+    fn on_node_write(
+        &self,
+        g: &mut Graph,
+        id: u64,
+        _: Option<&NodeImage>,
+        after: Option<&NodeImage>,
+    ) -> Result<()> {
+        if !after.is_some_and(|n| n.labels.iter().any(|l| l == "Grow")) {
+            return Ok(());
+        }
+        let attempts: [Result<()>; 4] = [
+            g.add_node(&["Grow".into()], vec![]).map(|_| ()),
+            g.set_node_prop(id, "x", Value::Int(1)),
+            g.add_label(id, "More"),
+            g.apply_op(Op::NodeAdd {
+                id: 9999,
+                labels: vec![],
+                props: vec![],
+            }),
+        ];
+        for r in attempts {
+            let e = r.expect_err("a graph write from a hook is refused");
+            assert!(
+                e.to_string().contains("may write only extension keyspaces"),
+                "{e}"
+            );
+            if !self.swallow {
+                return Err(e);
+            }
+        }
+        g.ext_write(
+            self.name(),
+            vec![(id.to_be_bytes().to_vec(), vec![])],
+            vec![],
+        )
+    }
+    fn on_edge_write(
+        &self,
+        g: &mut Graph,
+        _: u64,
+        _: Option<&EdgeImage>,
+        after: Option<&EdgeImage>,
+    ) -> Result<()> {
+        let Some(e) = after else { return Ok(()) };
+        let r = g.add_edge(e.from, e.to, "MORE", vec![]).map(|_| ());
+        let r = r.and_then(|_| g.delete_node(e.from).map(|_| ()));
+        if self.swallow {
+            Ok(())
+        } else {
+            r
+        }
+    }
+    fn on_bulk_write(&self, g: &mut Graph, _: BulkWrite) -> Result<()> {
+        let r = g.add_node(&["AfterClear".into()], vec![]).map(|_| ());
+        if self.swallow {
+            Ok(())
+        } else {
+            r
+        }
+    }
+}
+
+#[test]
+fn a_hook_may_not_write_the_graph_and_the_refused_write_leaves_nothing() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        ext::register(Arc::new(Writer { swallow: false }));
+        ext::register(Arc::new(Writer { swallow: true }));
+    });
+    // A hook that passes the refusal on fails the statement: nothing of it
+    // stays, and there is no nesting to run away with.
+    let mut g = Graph::memory();
+    q(&mut g, "CREATE EXTENSION writer");
+    q(&mut g, "CREATE (:Plain)");
+    let before = observe(&g);
+    let rev = g.revision();
+    for src in [
+        "CREATE (:Grow)",
+        "MATCH (p:Plain) CREATE (p)-[:E]->(p)",
+        "CLEAR",
+    ] {
+        let e = query::execute(&mut g, src).err().expect(src).to_string();
+        assert!(
+            e.contains("may write only extension keyspaces"),
+            "{src}: {e}"
+        );
+        assert_eq!(observe(&g), before, "{src}");
+        assert_eq!(g.revision(), rev, "{src}");
+    }
+    // A hook that swallows the refusal: its own write lands, the graph
+    // write it attempted does not.
+    let mut g = Graph::memory();
+    q(&mut g, "CREATE EXTENSION swallower");
+    q(&mut g, "CREATE (:Grow)");
+    q(&mut g, "MATCH (n:Grow) CREATE (n)-[:E]->(n)");
+    let obs = observe(&g);
+    assert_eq!(obs.nodes.len(), 1, "{obs:?}");
+    assert_eq!(obs.edges.len(), 1, "{obs:?}");
+    assert_eq!(g.node_labels(1), vec!["Grow".to_string()]);
+    assert_eq!(keyspace(&g, "swallower").len(), 1);
+    q(&mut g, "CLEAR");
+    assert_eq!(g.node_count(), 0);
+}
+
+/// Keeps a kilobyte of derived data per edge it is told about, as an
+/// extension keeping a vector per edge would.
+struct Heavy;
+
+impl Extension for Heavy {
+    fn name(&self) -> &str {
+        "heavy"
+    }
+    fn version(&self) -> &str {
+        "1"
+    }
+    fn summary(&self) -> &str {
+        "a kilobyte per edge write"
+    }
+    fn procedures(&self) -> &[Spec] {
+        &[]
+    }
+    fn call(&self, _: &mut Graph, _: &str, _: &Args) -> Result<QueryResult> {
+        unreachable!()
+    }
+    fn wants_edge_writes(&self, _: &Graph) -> bool {
+        true
+    }
+    fn on_edge_write(
+        &self,
+        g: &mut Graph,
+        id: u64,
+        _: Option<&EdgeImage>,
+        _: Option<&EdgeImage>,
+    ) -> Result<()> {
+        g.ext_write(
+            "heavy",
+            vec![(id.to_be_bytes().to_vec(), vec![7; 1024])],
+            vec![],
+        )
+    }
+}
+
+/// A node with many edges, deleted while an extension follows edges, in a
+/// memory graph too small for the transaction: the engine's ordinary
+/// out-of-memory error, and the graph as it was.
+#[test]
+fn deleting_a_huge_hub_past_the_memory_limit_is_full_and_leaves_the_graph_intact() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| ext::register(Arc::new(Heavy)));
+    let mut g = Graph::memory_with_limit(24 << 20);
+    g.autocommit = false;
+    let hub = g.add_node(&["Hub".into()], vec![]).unwrap();
+    let leaves: Vec<u64> = (0..64).map(|_| g.add_node(&[], vec![]).unwrap()).collect();
+    let mut edges = 0u64;
+    loop {
+        g.add_edge(hub, leaves[(edges % 64) as usize], "E", vec![])
+            .unwrap();
+        edges += 1;
+        if edges % 10_000 == 0 {
+            g.commit().unwrap();
+            let (used, max) = g.stats().memory.unwrap();
+            if used * 10 > max * 4 {
+                break;
+            }
+        }
+    }
+    g.autocommit = true;
+    q(&mut g, "CREATE EXTENSION heavy");
+    let before = observe(&g);
+    let rev = g.revision();
+    let e = g
+        .delete_node(hub)
+        .expect_err(&format!("{edges} edges: too big for the limit"));
+    assert!(matches!(e, Error::Full(_)), "{e}");
+    assert!(
+        e.to_string().contains("the transaction was rolled back"),
+        "{e}"
+    );
+    assert_eq!(observe(&g), before, "{edges} edges");
+    assert_eq!(g.revision(), rev);
+    assert!(keyspace(&g, "heavy").is_empty());
+    g.verify_trees().unwrap();
+    // Still usable.
+    let a = g.add_node(&[], vec![]).unwrap();
+    g.add_edge(a, hub, "AFTER", vec![]).unwrap();
 }

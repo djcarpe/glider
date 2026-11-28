@@ -1857,6 +1857,14 @@ pub fn execute_with(g: &mut Graph, src: &str, params: &[(String, Value)]) -> Res
 }
 
 fn execute_stmt(g: &mut Graph, stmt: Stmt) -> Result<QueryResult> {
+    // In a transaction the engine already rolled back, only ending it is
+    // allowed: nothing run after the failure may commit as if it were the
+    // whole transaction.
+    if !matches!(stmt, Stmt::Commit | Stmt::Rollback) {
+        if let Some(why) = g.spent() {
+            return Err(Error::Msg(why.to_string()));
+        }
+    }
     // STATS reports the damage itself; everything else must not return
     // results computed from an image that failed a checksum along the way.
     let reports_damage = matches!(stmt, Stmt::Stats);
@@ -1885,7 +1893,7 @@ fn atomically<R>(g: &mut Graph, f: impl FnOnce(&mut Graph) -> Result<R>) -> Resu
     let auto = g.autocommit;
     g.autocommit = false;
     let r = f(g);
-    g.autocommit = auto;
+    g.restore_autocommit(auto);
     if !auto || g.uncommitted() == 0 {
         return r;
     }
@@ -2078,8 +2086,11 @@ fn run(g: &mut Graph, stmt: Stmt) -> Result<QueryResult> {
             Ok(QueryResult::message("transaction open (autocommit off)"))
         }
         Stmt::Commit => {
-            g.commit()?;
+            // COMMIT ends the block whatever happens; a spent block reports
+            // that nothing was committed.
+            let r = g.commit();
             g.autocommit = true;
+            r?;
             Ok(QueryResult::message("committed"))
         }
         Stmt::Rollback => {
@@ -5026,7 +5037,7 @@ pub fn import_jsonl(g: &mut Graph, text: &str) -> Result<(usize, usize)> {
     if result.is_err() && was_auto {
         let _ = g.rollback();
     }
-    g.autocommit = was_auto;
+    g.restore_autocommit(was_auto);
     result
 }
 

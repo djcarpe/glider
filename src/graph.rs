@@ -1067,6 +1067,14 @@ pub struct Graph {
     /// Installed extensions that maintain state on writes; computed on
     /// first write, forgotten whenever installs or config may change.
     hooks: Option<Hooks>,
+    /// How many write hooks are running: while any is, the graph itself
+    /// may not be written, only extension keyspaces.
+    in_hook: u32,
+    /// Set when the engine rolled back a transaction the caller had open
+    /// (autocommit off) because a write or a hook failed: the explanation
+    /// every further write, statement and COMMIT in it is refused with,
+    /// until the caller ends it.
+    spent: Option<String>,
 }
 
 type Ext = std::sync::Arc<dyn crate::ext::Extension>;
@@ -1084,7 +1092,7 @@ fn rolled_back(e: Error) -> Error {
     match e {
         Error::Msg(m) => Error::Msg(add(m)),
         Error::Full(m) => Error::Full(add(m)),
-        other => other,
+        Error::Io(io) => Error::Io(std::io::Error::new(io.kind(), add(io.to_string()))),
     }
 }
 
@@ -1131,6 +1139,8 @@ impl Graph {
             last_edge: std::sync::Mutex::new(None),
             tel_id: crate::telemetry::next_db_id(),
             hooks: None,
+            in_hook: 0,
+            spent: None,
         })
     }
 
@@ -1305,7 +1315,7 @@ impl Graph {
             })?;
             self.commit()
         })();
-        self.autocommit = auto;
+        self.restore_autocommit(auto);
         r
     }
 
@@ -2000,7 +2010,16 @@ impl Graph {
 
     /// Make the open transaction durable (per the sync mode) and visible as
     /// the committed state.
+    ///
+    /// A transaction the engine already rolled back (see
+    /// [`Graph::spent`]) cannot be committed: this is an error that says
+    /// why, and the next write starts a new transaction.
     pub fn commit(&mut self) -> Result<()> {
+        if let Some(why) = self.spent.take() {
+            if !self.autocommit {
+                return Err(Error::Msg(format!("nothing was committed: {why}")));
+            }
+        }
         if let Err(e) = self.db.commit() {
             self.rollback_quietly();
             return Err(e.into());
@@ -2011,6 +2030,7 @@ impl Graph {
 
     /// Abandon everything since the last commit.
     pub fn rollback(&mut self) -> Result<()> {
+        self.spent = None;
         self.forget_reads();
         self.hooks = None;
         self.db.rollback()?;
@@ -2027,6 +2047,41 @@ impl Graph {
             (self.strings, self.indexes) = s;
         }
         self.uncommitted = 0;
+    }
+
+    /// Why the caller's open transaction can no longer be committed: the
+    /// engine rolled it back when a write or a write hook failed inside it.
+    /// Writes, statements and COMMIT are refused with this until the caller
+    /// ends the transaction (ROLLBACK, or a COMMIT that reports the error).
+    pub fn spent(&self) -> Option<&str> {
+        if self.autocommit {
+            return None;
+        }
+        self.spent.as_deref()
+    }
+
+    /// Put autocommit back after an internal transaction (a statement, an
+    /// import, a batch). Back to on, no transaction of the caller's is open,
+    /// so none can be spent.
+    pub(crate) fn restore_autocommit(&mut self, auto: bool) {
+        self.autocommit = auto;
+        if auto {
+            self.spent = None;
+        }
+    }
+
+    /// Roll back after a failure, and if the caller had a transaction open,
+    /// mark it spent. The error says what happened, whatever its kind.
+    fn abandon(&mut self, e: Error) -> Error {
+        self.rollback_quietly();
+        let e = rolled_back(e);
+        if !self.autocommit {
+            self.spent = Some(format!(
+                "the open transaction was rolled back by an earlier error ({e}); \
+                 end it with ROLLBACK and run its writes again"
+            ));
+        }
+        e
     }
 
     fn maybe_commit(&mut self) -> Result<()> {
@@ -2048,6 +2103,28 @@ impl Graph {
     /// revision ([`Graph::revision`]); replaying the log without it gives
     /// the same state, since it did nothing.
     fn exec_changed(&mut self, op: Op) -> Result<bool> {
+        if self.autocommit {
+            self.spent = None;
+        } else if let Some(why) = &self.spent {
+            return Err(Error::Msg(why.clone()));
+        }
+        if self.in_hook > 0
+            && !matches!(
+                op,
+                Op::ExtWrite { .. }
+                    | Op::ExtensionAdd { .. }
+                    | Op::ExtensionDel { .. }
+                    | Op::IndexAdd { .. }
+                    | Op::IndexDel { .. }
+                    | Op::Counters { .. }
+            )
+        {
+            return Err(Error::Msg(
+                "a write hook may write only extension keyspaces (Graph::ext_write); \
+                 it may not write a node, an edge, a label or a property, nor clear the graph"
+                    .into(),
+            ));
+        }
         // Checked before anything is logged, so a refused value leaves the
         // transaction exactly as it was. Every value written passes here
         // (statements, the API, imports; recovery replays only what once
@@ -2082,14 +2159,7 @@ impl Graph {
             });
         let changed = match r {
             Ok(c) => c,
-            Err(e) => {
-                self.rollback_quietly();
-                let e: Error = e.into();
-                return Err(match e {
-                    Error::Full(m) => Error::Full(format!("{m} (the transaction was rolled back)")),
-                    other => other,
-                });
-            }
+            Err(e) => return Err(self.abandon(e.into())),
         };
         self.uncommitted += 1;
         self.maybe_commit()?;
@@ -2645,6 +2715,9 @@ impl Graph {
     /// without the hook writes that belong with it.
     fn unit(&mut self, f: impl FnOnce(&mut Graph) -> Result<()>) -> Result<()> {
         let auto = self.autocommit;
+        if auto {
+            self.spent = None;
+        }
         let start = self.uncommitted;
         self.autocommit = false;
         let r = f(self);
@@ -2653,12 +2726,10 @@ impl Graph {
             Ok(()) => self.maybe_commit(),
             Err(e) if auto => {
                 self.rollback_quietly();
+                self.spent = None;
                 Err(e)
             }
-            Err(e) if self.uncommitted > start => {
-                self.rollback_quietly();
-                Err(rolled_back(e))
-            }
+            Err(e) if self.uncommitted > start => Err(self.abandon(e)),
             // Nothing was written (a refused value, or a failure that
             // already rolled the transaction back): the transaction is as
             // the caller left it.
@@ -2689,10 +2760,17 @@ impl Graph {
                 return Ok(());
             }
             let after = g.node_image(id);
-            for h in &hooks {
-                h.on_node_write(g, id, before.as_ref(), after.as_ref())?;
+            // A replayed op on a node that does not exist (it may still
+            // have logged a newly seen name) has nothing to report.
+            if before.is_none() && after.is_none() {
+                return Ok(());
             }
-            Ok(())
+            g.in_hooks(|g| {
+                for h in &hooks {
+                    h.on_node_write(g, id, before.as_ref(), after.as_ref())?;
+                }
+                Ok(())
+            })
         })
     }
 
@@ -2725,10 +2803,12 @@ impl Graph {
             if before.is_none() && after.is_none() {
                 return Ok(());
             }
-            for h in &hooks {
-                h.on_edge_write(g, id, before.as_ref(), after.as_ref())?;
-            }
-            Ok(())
+            g.in_hooks(|g| {
+                for h in &hooks {
+                    h.on_edge_write(g, id, before.as_ref(), after.as_ref())?;
+                }
+                Ok(())
+            })
         })
     }
 
@@ -2768,16 +2848,27 @@ impl Graph {
             return self.exec(Op::Clear);
         }
         let hooks = self.write_hooks().any.clone();
+        // CLEAR always counts as a change, on an empty graph too: it resets
+        // the id counters and wipes derived data. It is logged, moves the
+        // revision and is reported.
         self.unit(|g| {
-            // Clearing an empty graph changes nothing and tells no one.
-            if !g.exec_changed(Op::Clear)? {
-                return Ok(());
-            }
-            for h in &hooks {
-                h.on_bulk_write(g, crate::ext::BulkWrite::Clear)?;
-            }
-            Ok(())
+            g.exec(Op::Clear)?;
+            g.in_hooks(|g| {
+                for h in &hooks {
+                    h.on_bulk_write(g, crate::ext::BulkWrite::Clear)?;
+                }
+                Ok(())
+            })
         })
+    }
+
+    /// Run write hooks: while they run, only extension keyspaces may be
+    /// written, so a hook can never set off hooks again.
+    fn in_hooks(&mut self, f: impl FnOnce(&mut Graph) -> Result<()>) -> Result<()> {
+        self.in_hook += 1;
+        let r = f(self);
+        self.in_hook -= 1;
+        r
     }
 
     /// Reclaim space: folds the log into the pages. (Pages freed by deletes

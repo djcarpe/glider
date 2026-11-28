@@ -42,24 +42,39 @@ functions work in any expression as `<extension>.<function>(...)`.
     edge add, delete, property set and unset (endpoints, type and
     properties before and after). Deleting a node reports each of its edges
     first, then the node;
-  - either → `on_bulk_write(BulkWrite::Clear)` after `CLEAR`, which reports
-    no records of its own. Keys not starting with `!` are already wiped.
+  - either → `on_bulk_write(BulkWrite::Clear)` after every `CLEAR`, an
+    empty graph's too (it resets the id counters, so it always counts as a
+    change). Keys not starting with `!` are already wiped.
 
   Every path calls them: statements (including `CALL` procedures that
   write, `BEGIN` blocks and `execute_batch`), the graph API, JSON Lines
   imports, `Graph::apply_op` (replayed operations with explicit ids),
   `Graph::import_legacy` and `migrate`. They run inside the writing
   transaction. What a hook writes is logged, so crash recovery and replicas
-  replay the result without running the hook again. A hook that returns an
-  error fails the write: with autocommit on the statement rolls back; with
-  autocommit off the whole open transaction rolls back, and the error ends
-  with "(the transaction was rolled back)", so the write can never be
-  committed without what the hook would have written. An extension that
-  does not ask is never called, and costs nothing. A write that changes
-  nothing (a property set to the value it has, an unset of an absent
-  property, a label it already has, a delete of what is not there, a
-  `CLEAR` of an empty graph) is not logged, does not move the revision and
-  calls no hook.
+  replay the result without running the hook again.
+
+  A hook may write only extension keyspaces (`Graph::ext_write`). A node,
+  edge, label or property write, or a `CLEAR`, attempted from inside any
+  hook is refused with an error saying so, which fails the statement like
+  any hook failure; so a hook never sets off hooks again.
+
+  A hook that returns an error fails the write: with autocommit on the
+  statement rolls back; with autocommit off the whole open transaction
+  rolls back, and the error ends with "(the transaction was rolled back)"
+  whatever its kind. The transaction block is then spent: every further
+  write and statement in it is refused with that explanation, and `COMMIT`
+  answers "nothing was committed: ..." and ends the block, so nothing run
+  after the failure can commit as if it were the whole transaction. The
+  same holds when the engine itself rolls back an open transaction (a
+  memory graph past `max_memory`, a storage error).
+
+  An extension that does not ask is never called, and costs nothing. A
+  write that changes nothing (a property set to the value it has, an unset
+  of an absent property, a label it already has, a delete of what is not
+  there) is not logged, does not move the revision and calls no hook. A
+  hook is never called with nothing before and nothing after. The revision
+  moving does not mean a hook was called: a replayed operation on a record
+  that does not exist may still log a newly seen name.
 
   `Graph::bulk_load` only builds a new database, so no extension is
   installed in what it writes; one installed afterwards builds from a scan

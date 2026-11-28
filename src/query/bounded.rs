@@ -258,7 +258,7 @@ pub fn execute_batch(
     if result.is_err() {
         let _ = g.rollback();
     }
-    g.autocommit = true;
+    g.restore_autocommit(true);
     result
 }
 
@@ -369,7 +369,7 @@ pub fn import_jsonl_from(
     if result.is_err() {
         let _ = g.rollback();
     }
-    g.autocommit = true;
+    g.restore_autocommit(true);
     drop(map);
     result
 }

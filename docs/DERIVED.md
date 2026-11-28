@@ -182,7 +182,8 @@ After this slice:
 
 ## Write hooks for edges and bulk paths
 
-*Built (G4). Shown by `tests/write_hooks.rs`.*
+*Built (G4). Shown by `tests/write_hooks.rs` and the adopted review tests
+in `tests/review_g4.rs`.*
 
 `on_node_write` keeps its meaning. Beside it:
 
@@ -190,34 +191,63 @@ After this slice:
   `EdgeImage { from, to, etype, props }`: after every edge add, delete,
   property set and unset, inside the writing transaction. An extension that
   does not ask is not called, and a database where none asks pays one
-  check of a cached list per edge write (measured below).
+  check of a cached list per edge write (measured below). One that asks
+  pays for two edge images per write and the transaction wrapper: the
+  review measured a hook that does nothing at about 17% slower edge adds
+  and deletes (200,000 edges, memory graph).
 - Deleting a node, when an extension follows edge writes, deletes its edges
   first one by one through the hooked path (logged as `EdgeDel` records),
   a batch at a time, then the node. Without such an extension the node's
-  delete detaches its edges inside one `NodeDel` record, as before.
+  delete detaches its edges inside one `NodeDel` record, as before. The
+  whole delete is one transaction, so it grows linearly with the node's
+  degree: about 13 log bytes per edge (2.6 MB for a 200,000-edge node,
+  where one `NodeDel` is 20 bytes) plus whatever the hooks write per edge,
+  and the copy-on-write pages it touches. What bounds it is the database's
+  ordinary limits: a memory graph's `max_memory` (past it the delete is
+  `Error::Full`, rolled back, the graph as it was; tested) and a file's
+  disk. A file database cannot checkpoint inside the transaction, so its
+  log holds the whole delete until it commits. Detach memory itself stays
+  at one batch of 4,096 edge ids.
 - `on_bulk_write(g, BulkWrite::Clear)`, for an extension that follows node
   or edge writes, after `CLEAR`. `BulkWrite` is `#[non_exhaustive]`: an
   extension treats a kind it does not know as "everything may have
   changed".
+- A hook may write only extension keyspaces. A node, edge, label or
+  property write, or a `CLEAR`, from inside any hook (node, edge or bulk)
+  is refused with an error that says so, before anything is written; a
+  hook that passes it on fails the statement, one that swallows it has
+  written nothing to the graph. Hooks therefore never nest, and there is
+  nothing to bound (before, a hook that wrote the graph ran the hooks again
+  on the stack until the process aborted).
 - A failing hook fails the write. With autocommit on, the statement rolls
   back. With autocommit off (the API, or a statement inside `BEGIN`) the
-  whole open transaction rolls back and the error says so: the engine has
-  no savepoints, so undoing only the failed write is not possible, and
-  leaving it in a transaction that can still be committed would let it
-  become durable without the hook's writes. This now holds for node hooks
-  too, which before left the write in the caller's transaction.
+  whole open transaction rolls back and the error says so, whatever its
+  kind (an I/O error keeps its kind, with the note added): the engine has
+  no savepoints, so undoing only the failed write is not possible. The
+  block is then *spent* (`Graph::spent()`): every further write and
+  statement in it is refused with the explanation, and `COMMIT` is an
+  error ("nothing was committed: ...") that ends the block, so the writes
+  made after the failure can never commit as if they were the whole
+  transaction. The same rule now covers the engine's own rollback inside
+  an open transaction (`Error::Full` past `max_memory`, a storage error),
+  which before let the statements after it commit as a partial unit; no
+  existing test or document relied on that.
 - With the revision (D2): a write that changes nothing (the same value set
-  again, an unset of an absent property, a delete of what is not there, a
-  `CLEAR` of an empty graph) is not logged, does not move the revision and
-  is reported to no hook; every write a hook is told about was logged, so
-  it has moved the revision by the time its transaction commits. The test
-  checks, for every write path, that the hooks heard something exactly when
-  the revision moved. The one write that moves the revision with nothing to
-  report is an index definition, which is not a node or an edge. A
-  replayed operation that would only intern a new string (`apply_op` of a
-  property set on a node or edge that does not exist) is logged and moves
-  the revision; a node hook is then called with nothing before and after,
-  an edge hook is not called at all.
+  again, an unset of an absent property, a delete of what is not there) is
+  not logged, does not move the revision and is reported to no hook; every
+  write a hook is told about was logged, so it has moved the revision by
+  the time its transaction commits. `CLEAR` always counts as a change, on
+  an empty graph too (it resets the id counters and wipes derived data, as
+  the revision slice decided): it moves the revision and the bulk
+  notification is sent. The test checks, for every write path, that the
+  hooks heard something exactly when the revision moved. The writes that
+  move the revision with nothing to report are an index definition (not a
+  node or an edge) and a replayed operation on a record that does not
+  exist that logs a newly seen key or label (`apply_op` of `NodeSet`,
+  `EdgeSet` or `LabelAdd` on a missing id). No hook is ever called with
+  nothing before and nothing after. **The revision moving does not imply
+  that any hook was called**: a journal must not count on one entry per
+  revision step.
 - Recovery and replicas replay what the hooks wrote and never run them
   (shown by counting hook calls during `from_replica` and crash recovery,
   and by comparing the replayed keyspace with one made by running the
