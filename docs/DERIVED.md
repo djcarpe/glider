@@ -444,7 +444,25 @@ What is true now, and what this slice decided where the plan was open:
   revision asked about is (it belongs to another line of history). The
   next write then starts it again: it records nothing and forgets 64
   entries a write (`SWEEP`), answering nothing meanwhile, and once empty
-  takes the floor where it is (`why: reset`). A kept colouring whose
+  takes the floor where it is (`why: reset`). Only that end makes it
+  answer again: every writer of the state (a write, `release`, `cap`)
+  starts from the same check and keeps a restart under way, so `cap` sets
+  the cap and `release` the floor without ending it, and every question is
+  refused meanwhile (`no_procedure_ends_a_restart_before_it_is_over`; the
+  review's `a_cap_call_does_not_end_a_restart_whose_floor_is_not_past_the_database`
+  failed before). `CLEAR`, and `DROP` with `CREATE EXTENSION`, make an
+  empty journal at the current position, which is what the end of a
+  restart is. An entry past the position, with a state that is not, begins
+  a restart when a write or call meets it: a sweep, the adjacency entry a
+  node delete or creation reads, `release` and `cap` (which walk the
+  journal); every question that reads one is refused. Until one of those
+  meets it, `changed` answers for ids whose own entries are not past. That
+  is safe as far as positions can tell: positions alone cannot tell two
+  histories apart (an entry from another database at or below this one's
+  position looks like one of its own), and the guarantee against that
+  rests on the engine, where a journal is written only by its own
+  database's hooks and an image keeps its positions; such a state arises
+  only by copying a journal between databases by hand. A kept colouring whose
   position is past the database's is stale. With images keeping their
   revision (D2) this needs a path that moves positions back, which the
   engine no longer has; it is shown by copying a journal and a colouring

@@ -1380,3 +1380,138 @@ fn a_journal_holding_positions_past_the_databases_refuses_and_starts_again() {
         derived_findings(&mut g)
     );
 }
+
+/// Copy the journal of a graph further along into `b`, as positions going
+/// back would leave it.
+fn plant_journal_from(a: &Graph, b: &mut Graph) {
+    // Over what `b` holds, so the restart has more than one slice to do.
+    b.ext_write(changes::NS, keyspace(a, changes::NS), Vec::new())
+        .unwrap();
+}
+
+/// While a restart is under way nothing but its own end makes the journal
+/// answer: `cap`, `release` and `status` leave it restarting, and every
+/// question is refused; a change made during it is never answered "not
+/// changed". (CLEAR, and dropping and installing again, make a new,
+/// empty journal at the current position, which is the restart's end.)
+#[test]
+fn no_procedure_ends_a_restart_before_it_is_over() {
+    use changes::Mode;
+    let mut a = Graph::memory();
+    q(&mut a, "CREATE EXTENSION changes");
+    q(&mut a, "CALL changes.cap(entries: 64)");
+    q(&mut a, "CREATE (:A)");
+    for i in 0..3000 {
+        q(&mut a, &format!("MATCH (n:A) SET n.i = {i}"));
+    }
+    for call in ["cap", "release", "status", "since"] {
+        let mut b = Graph::memory();
+        q(&mut b, "CREATE EXTENSION changes");
+        for i in 0..400 {
+            q(&mut b, &format!("CREATE (:B {{i: {i}}})"));
+        }
+        plant_journal_from(&a, &mut b);
+        let r = b.revision();
+        b.set_node_prop(300, "w", Value::Int(1)).unwrap();
+        assert_eq!(changes::state_of(&b).unwrap().mode, Mode::Purging);
+        let src = match call {
+            "cap" => "CALL changes.cap(entries: 1000)".to_string(),
+            "release" => format!("CALL changes.release(below: {r})"),
+            "status" => "CALL changes.status()".into(),
+            _ => format!("CALL changes.since(revision: {r})"),
+        };
+        let _ = query::execute(&mut b, &src);
+        assert_eq!(
+            changes::state_of(&b).unwrap().mode,
+            Mode::Purging,
+            "{call} ended it"
+        );
+        assert_ne!(
+            changes::changed(&b, r, Kind::Node, &[300]),
+            Some(vec![false]),
+            "{call}"
+        );
+        assert!(changes::since(&b, r, &[], None, 10).is_err(), "{call}");
+        if call == "cap" {
+            assert_eq!(
+                changes::state_of(&b).unwrap().cap,
+                1000,
+                "the cap took effect"
+            );
+        }
+        // Writes finish it; then it answers only from where it ended.
+        for i in 0..200 {
+            b.set_node_prop(1 + i % 50, "z", Value::Int(i as i64))
+                .unwrap();
+        }
+        assert_eq!(changes::state_of(&b).unwrap().mode, Mode::Idle, "{call}");
+        assert!(
+            !changes::answers(&b, r),
+            "{call}: answers across the restart"
+        );
+    }
+}
+
+/// Entries past the database's position with a state that is not (a
+/// journal that never rewrote its state, from a database further along):
+/// every question that reads such an entry is refused, and the first write
+/// or call that meets one (a sweep, the adjacency entry a node delete
+/// reads, `release`, `cap`) begins a restart.
+#[test]
+fn an_entry_past_the_databases_position_begins_a_restart_when_met() {
+    use changes::Mode;
+    let mut a = Graph::memory();
+    q(&mut a, "CREATE EXTENSION changes");
+    for i in 0..300 {
+        q(&mut a, &format!("CREATE (:A {{i: {i}}})-[:K]->(:A)"));
+    }
+    for how in ["release", "cap", "delete", "sweep"] {
+        let mut b = Graph::memory();
+        q(&mut b, "CREATE EXTENSION changes");
+        for i in 0..40 {
+            q(&mut b, &format!("CREATE (:B {{i: {i}}})-[:K]->(:B)"));
+        }
+        plant_journal_from(&a, &mut b);
+        let st = changes::state_of(&b).unwrap();
+        assert!(st.at <= b.log_end() && st.floor <= b.log_end());
+        let r = b.revision();
+        assert!(
+            changes::since(&b, r, &[], None, 10).is_err(),
+            "an entry past is refused"
+        );
+        match how {
+            "release" => {
+                q(&mut b, &format!("CALL changes.release(below: {r})"));
+            }
+            "cap" => {
+                q(&mut b, "CALL changes.cap(entries: 5000)");
+            }
+            "delete" => {
+                // An adjacency entry past this position for a node without
+                // edges (an edge write would overwrite it), which deleting
+                // the node reads.
+                let lone = b.add_node(&["Lone".into()], vec![]).unwrap();
+                let (k, v) = changes::encode_entry(&changes::Entry {
+                    revision: b.log_end() + 1_000_000,
+                    kind: Kind::Adjacency,
+                    id: lone,
+                    change: Change::Put,
+                });
+                b.ext_write(changes::NS, vec![(k, v)], Vec::new()).unwrap();
+                b.delete_node(lone).unwrap();
+            }
+            _ => {
+                q(&mut b, "CALL changes.cap(entries: 64)");
+                for i in 0..100 {
+                    b.set_node_prop(2 + i % 30, "s", Value::Int(i as i64))
+                        .unwrap();
+                    if changes::state_of(&b).unwrap().mode == Mode::Purging {
+                        break;
+                    }
+                }
+            }
+        }
+        assert_eq!(changes::state_of(&b).unwrap().mode, Mode::Purging, "{how}");
+        assert!(!changes::answers(&b, b.revision()), "{how}");
+    }
+}

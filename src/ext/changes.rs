@@ -766,21 +766,48 @@ pub fn since(
 /// entries looked at and forgotten, and the state rewritten, only while it
 /// sweeps or purges.
 fn note(g: &mut Graph, entries: &[(Kind, u64, Change)]) -> Result<()> {
+    note_seen(g, entries, false)
+}
+
+/// The state as every writer of it must start from: when it is missing or
+/// does not decode, or holds a position past the database's (positions
+/// went back), a restart ([`Mode::Purging`]) begins, and whoever writes the
+/// state next writes it purging, so the evidence is never lost. Returns
+/// whether the restart begins here.
+fn load(g: &Graph) -> (State, bool) {
+    let now = g.log_end();
+    match state(g) {
+        None => {
+            let mut s = fresh(g, Floor::Reset);
+            s.mode = Mode::Purging;
+            (s, true)
+        }
+        Some(mut s) if s.mode != Mode::Purging && (s.at > now || s.floor > now) => {
+            begin_restart(&mut s);
+            (s, true)
+        }
+        Some(s) => (s, false),
+    }
+}
+
+/// Forget it all, a slice per write, answering nothing meanwhile. Only the
+/// restart's own end (an empty journal) sets the floor and records again.
+fn begin_restart(s: &mut State) {
+    s.idle();
+    s.mode = Mode::Purging;
+    s.why = Floor::Reset;
+}
+
+/// [`note`], told whether the write has already met an entry past the
+/// database's position (the evidence that begins a restart).
+fn note_seen(g: &mut Graph, entries: &[(Kind, u64, Change)], seen_past: bool) -> Result<()> {
     let rev = g.log_end();
-    let mut s = state(g).unwrap_or_else(|| {
-        let mut s = fresh(g, Floor::Reset);
-        // Unreadable or missing: start again, answering nothing before.
-        s.mode = Mode::Purging;
-        s
-    });
+    let (mut s, began) = load(g);
     let mut dels: Vec<Vec<u8>> = Vec::new();
     let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(entries.len() + 1);
-    let mut rewrite = false;
-    if s.mode != Mode::Purging && (s.at > rev || s.floor > rev) {
-        // Positions went back below what the journal holds: forget it all,
-        // a slice per write, and answer nothing meanwhile.
-        s.idle();
-        s.mode = Mode::Purging;
+    let mut rewrite = began;
+    if seen_past && s.mode != Mode::Purging {
+        begin_restart(&mut s);
         rewrite = true;
     }
     match s.mode {
@@ -817,6 +844,14 @@ fn note(g: &mut Graph, entries: &[(Kind, u64, Change)]) -> Result<()> {
         }
         Mode::Idle => {}
     }
+    if s.mode == Mode::Purging {
+        // Evidence met in this write (a sweep, or the entry a node delete
+        // reads): record nothing; the restart takes its slices from the
+        // next write on.
+        dels.clear();
+        puts.push(state_put(g, &mut s));
+        return g.ext_write(NS, puts, dels);
+    }
     step(entries.len() as u64)?;
     for &(kind, id, change) in entries {
         puts.push((entry_key(kind, id), entry_value(rev, change)));
@@ -825,6 +860,21 @@ fn note(g: &mut Graph, entries: &[(Kind, u64, Change)]) -> Result<()> {
         puts.push(state_put(g, &mut s));
     }
     g.ext_write(NS, puts, dels)
+}
+
+/// Whether any entry lies past the database's position: the evidence of a
+/// journal from another history. One walk of the journal, for the calls
+/// that walk it anyway (`release`, `cap`).
+fn any_past(g: &Graph) -> bool {
+    let now = g.log_end();
+    let (mut past, mut looked) = (false, 0u64);
+    walk(g, &[], None, &mut |_, e| {
+        looked += 1;
+        past = e.is_some_and(|e| e.revision > now);
+        !past
+    });
+    let _ = step(looked);
+    past
 }
 
 fn set_cursor(s: &mut State, key: Option<&[u8]>) {
@@ -871,6 +921,11 @@ fn sweep_step(g: &Graph, s: &mut State, rev: u64, dels: &mut Vec<Vec<u8>>) {
     let width = (s.sweep_start.saturating_sub(lo) / SWEEP_BUCKETS as u64) + 1;
     for (k, e) in &keys {
         match e {
+            // An entry past the database's position: positions went back.
+            Some(e) if e.revision > rev => {
+                begin_restart(s);
+                return;
+            }
             Some(e) if e.revision <= s.floor => dels.push(k.clone()),
             Some(e) => {
                 s.sweep_live += 1;
@@ -1137,12 +1192,6 @@ fn status_proc(g: &mut Graph) -> Result<QueryResult> {
     Ok(out)
 }
 
-fn state_or_err(g: &Graph) -> Result<State> {
-    state(g).ok_or_else(|| {
-        Error::Msg("the change journal's state does not decode; DROP EXTENSION changes and CREATE EXTENSION changes start it again".into())
-    })
-}
-
 fn release_proc(g: &mut Graph, a: &Args) -> Result<QueryResult> {
     let below = revision_arg(a, "below", "release")?.min(g.log_end());
     let limit = match a.get("limit") {
@@ -1156,10 +1205,19 @@ fn release_proc(g: &mut Graph, a: &Args) -> Result<QueryResult> {
     };
     // The floor goes up first: from then on nothing at or below it is
     // consulted, so forgetting it can be done in slices.
-    let mut s = state_or_err(g)?;
-    if below > s.floor {
+    // A restart under way stays one: the floor may rise, nothing more.
+    let (mut s, _) = load(g);
+    if s.mode != Mode::Purging && any_past(g) {
+        begin_restart(&mut s);
+    }
+    let raise = below > s.floor;
+    if raise {
         s.floor = below;
-        s.why = Floor::Released;
+        if s.mode != Mode::Purging {
+            s.why = Floor::Released;
+        }
+    }
+    if raise || s.mode == Mode::Purging {
         let put = state_put(g, &mut s);
         g.ext_write(NS, vec![put], Vec::new())?;
     }
@@ -1210,8 +1268,22 @@ fn cap_proc(g: &mut Graph, a: &Args) -> Result<QueryResult> {
         vec![(CAP_KEY.to_vec(), cap.to_be_bytes().to_vec())],
         Vec::new(),
     )?;
-    let mut s = state_or_err(g)?;
+    let (mut s, _) = load(g);
     s.cap = cap;
+    if s.mode != Mode::Purging && any_past(g) {
+        begin_restart(&mut s);
+    }
+    if s.mode == Mode::Purging {
+        // A restart under way: the cap takes effect, and the restart goes
+        // on; only its own end makes the journal answer again.
+        let put = state_put(g, &mut s);
+        g.ext_write(NS, vec![put], Vec::new())?;
+        let mut out = QueryResult::message(format!(
+            "the journal holds at most {cap} entries; it is starting again (positions here went back, or its state was lost) and answers nothing until the writes that follow have emptied it"
+        ));
+        out.touched = 1;
+        return Ok(out);
+    }
     let gone = trim_now(g, &mut s, cap)?;
     let mut out = QueryResult::message(format!(
         "the journal holds at most {cap} entries; {gone} forgotten, it answers for revision {} and later",
@@ -1268,11 +1340,15 @@ impl Extension for Changes {
         };
         // A node that goes or comes back: its adjacency entry, if it has
         // one, follows, so a `put` never names a node that is gone.
-        if before.is_some() != after.is_some() && entry(g, Kind::Adjacency, id).is_some() {
-            return note(
-                g,
-                &[(Kind::Node, id, change), (Kind::Adjacency, id, change)],
-            );
+        if before.is_some() != after.is_some() {
+            if let Some(e) = entry(g, Kind::Adjacency, id) {
+                let past = e.revision > g.log_end();
+                return note_seen(
+                    g,
+                    &[(Kind::Node, id, change), (Kind::Adjacency, id, change)],
+                    past,
+                );
+            }
         }
         note(g, &[(Kind::Node, id, change)])
     }
