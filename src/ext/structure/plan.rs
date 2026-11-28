@@ -500,8 +500,10 @@ impl<'a> Planner<'a> {
                 if !ok {
                     break;
                 }
-                let p = self.pos(x);
-                ok = self.in_part(x) && !self.covered.get(p);
+                ok = self.in_part(x) && {
+                    let p = self.pos(x);
+                    !self.covered.get(p)
+                };
             }
             if !ok {
                 continue;
@@ -818,6 +820,16 @@ pub fn plan(g: &mut Graph, a: &Args) -> Result<QueryResult> {
         None | Some(Value::Null) => None,
         Some(_) => Some(a.ids("nodes")?.into_iter().collect()),
     };
+    // With a kept dictionary and a selection, the plan reads the selection
+    // and the templates it can use, never the whole graph; `find: "graph"`
+    // finds the selection's instances over the whole graph instead (the
+    // same text, for checking). Without a selection, or without a kept
+    // dictionary, it is a whole-graph computation.
+    let whole = a
+        .str("find")
+        .is_some_and(|f| f.eq_ignore_ascii_case("graph"));
+    let want_text = text.as_deref() == Some("dictionary");
+    let mut local: Option<Forest> = None;
     let kept = match store_name(a, "dictionary")? {
         Some(name) => {
             if store.is_some() {
@@ -825,7 +837,32 @@ pub fn plan(g: &mut Graph, a: &Args) -> Result<QueryResult> {
                     "store: and dictionary: together would keep a dictionary that was given; plan without dictionary: to keep a new one".into(),
                 ));
             }
-            Some((name.clone(), load(g, &name, fresh_arg(a)?)?))
+            let (meta, ok) = open_dict(g, &name, fresh_arg(a)?)?;
+            let k = match &part {
+                Some(p) if !whole => {
+                    let h = meta.hier.rebind(g);
+                    let mut sel: Vec<u64> = p
+                        .iter()
+                        .copied()
+                        .filter(|&id| g.node_shared(id).is_some())
+                        .collect();
+                    sel.sort_unstable();
+                    let mut f = Forest::part(g, &h, &sel)?;
+                    let mut shapes = HashSet::new();
+                    for v in 0..f.len {
+                        let size = f.size.get(v) as usize;
+                        if size >= h.min_nodes && size <= h.max_nodes {
+                            let id = f.ids.get(v);
+                            shapes.insert(f.shape_of(id).unwrap_or_default());
+                        }
+                    }
+                    let k = load_with(g, &name, meta, ok, Some(&shapes), want_text)?;
+                    local = Some(f);
+                    k
+                }
+                _ => load_with(g, &name, meta, ok, None, want_text)?,
+            };
+            Some((name.clone(), k))
         }
         None => None,
     };
@@ -833,7 +870,10 @@ pub fn plan(g: &mut Graph, a: &Args) -> Result<QueryResult> {
     let (h, found, cached) = match &kept {
         Some((_, k)) => {
             let h = k.hier(g);
-            let found = find_kept(g, &h, &k.dict)?;
+            let found = match local.take() {
+                Some(f) => find_kept_in(g, &h, &k.dict, f)?,
+                None => find_kept(g, &h, &k.dict)?,
+            };
             (h, found, true)
         }
         None => {
@@ -1530,8 +1570,21 @@ fn keep(g: &mut Graph, name: &str, meta: &DictMeta, d: &Dict, text: &str) -> Res
     }
     n += puts.len();
     g.ext_write(NS, puts, Vec::new())?;
-    seal(g, from, vec![(key(b'd', name), meta.encode())], Vec::new())?;
-    Ok(n + 1)
+    // The index a selection is planned by: each template's root shape and
+    // id, so only the templates a selection can use are read.
+    let mut index = Vec::new();
+    codec::put_varint(&mut index, d.templates.len() as u64);
+    for t in &d.templates {
+        index.extend_from_slice(&t.shape.to_be_bytes());
+        codec::put_str(&mut index, &t.id);
+    }
+    seal(
+        g,
+        from,
+        vec![(key(b's', name), index), (key(b'd', name), meta.encode())],
+        Vec::new(),
+    )?;
+    Ok(n + 2)
 }
 
 pub fn find_meta(g: &Graph, name: &str) -> Result<DictMeta> {
@@ -1548,6 +1601,13 @@ pub fn find_meta(g: &Graph, name: &str) -> Result<DictMeta> {
 }
 
 pub fn load(g: &Graph, name: &str, fresh: Fresh) -> Result<Kept> {
+    let (meta, ok) = open_dict(g, name, fresh)?;
+    load_with(g, name, meta, ok, None, true)
+}
+
+/// A kept dictionary's metadata, refusing it when stale and `fresh:
+/// "require"` was asked for.
+pub fn open_dict(g: &Graph, name: &str, fresh: Fresh) -> Result<(DictMeta, bool)> {
     let meta = find_meta(g, name)?;
     let ok = is_fresh(g, meta.at);
     if !ok && fresh == Fresh::Require {
@@ -1556,21 +1616,83 @@ pub fn load(g: &Graph, name: &str, fresh: Fresh) -> Result<Kept> {
             meta.at
         )));
     }
+    Ok((meta, ok))
+}
+
+fn decode_index(v: &[u8]) -> Option<Vec<(u128, String)>> {
+    let mut r = Reader::new(v);
+    let n = r.varint().ok()? as usize;
+    let mut out = Vec::with_capacity(n.min(1 << 16));
+    for _ in 0..n {
+        if r.remaining() < 16 {
+            return None;
+        }
+        let shape = u128::from_be_bytes(r.buf[r.pos..r.pos + 16].try_into().ok()?);
+        r.pos += 16;
+        out.push((shape, r.string().ok()?));
+    }
+    (r.remaining() == 0).then_some(out)
+}
+
+/// A kept dictionary read for use. With `only`, just the templates whose
+/// root shape is in it are read and decoded (the others stand in by id,
+/// with no instances), so planning a selection reads what the selection
+/// can use, not the whole dictionary; the text is read (and checked
+/// against its hash) only when `text` asks for it.
+pub fn load_with(
+    g: &Graph,
+    name: &str,
+    meta: DictMeta,
+    fresh: bool,
+    only: Option<&HashSet<u128>>,
+    text: bool,
+) -> Result<Kept> {
     let bad = || {
         Error::Msg(format!(
             "the dictionary kept as '{name}' does not decode; drop it and plan again"
         ))
     };
     let mut dict = Dict::default();
-    let mut prefix = key(b't', name);
-    prefix.push(0);
-    let mut raw: Vec<Vec<u8>> = Vec::new();
-    g.ext_scan(NS, &prefix, &mut |_, v| {
-        raw.push(v.to_vec());
-        true
-    });
-    for v in raw {
-        dict.templates.push(decode_template(&v).ok_or_else(bad)?);
+    let index = g.ext_get(NS, &key(b's', name)).map(|v| decode_index(&v));
+    match (only, index) {
+        (Some(only), Some(Some(index))) => {
+            for (i, (shape, id)) in index.into_iter().enumerate() {
+                step(1)?;
+                if only.contains(&shape) {
+                    let v = g
+                        .ext_get(NS, &item_key(b't', name, i as u32))
+                        .ok_or_else(bad)?;
+                    dict.templates.push(decode_template(&v).ok_or_else(bad)?);
+                } else {
+                    dict.templates.push(Template {
+                        id,
+                        group: 0,
+                        shape,
+                        structure: Vec::new(),
+                        parent: Vec::new(),
+                        labels: Vec::new(),
+                        props: Vec::new(),
+                        edges: Vec::new(),
+                        nested: Vec::new(),
+                        slots: Vec::new(),
+                        start: 0,
+                        count: 0,
+                    });
+                }
+            }
+        }
+        _ => {
+            let mut prefix = key(b't', name);
+            prefix.push(0);
+            let mut raw: Vec<Vec<u8>> = Vec::new();
+            g.ext_scan(NS, &prefix, &mut |_, v| {
+                raw.push(v.to_vec());
+                true
+            });
+            for v in raw {
+                dict.templates.push(decode_template(&v).ok_or_else(bad)?);
+            }
+        }
     }
     let mut prefix = key(b'p', name);
     prefix.push(0);
@@ -1585,37 +1707,72 @@ pub fn load(g: &Graph, name: &str, fresh: Fresh) -> Result<Kept> {
         let t = r.string().map_err(|_| bad())?;
         dict.patterns.push((id, t));
     }
-    let mut prefix = key(b'x', name);
-    prefix.push(0);
-    let mut text = Vec::new();
-    g.ext_scan(NS, &prefix, &mut |_, v| {
-        text.extend_from_slice(v);
-        true
-    });
-    let text = String::from_utf8(text).map_err(|_| bad())?;
-    if hash_hex(&text) != meta.hash {
-        return Err(bad());
+    let mut body = String::new();
+    if text {
+        let mut prefix = key(b'x', name);
+        prefix.push(0);
+        let mut raw = Vec::new();
+        g.ext_scan(NS, &prefix, &mut |_, v| {
+            raw.extend_from_slice(v);
+            true
+        });
+        body = String::from_utf8(raw).map_err(|_| bad())?;
+        if hash_hex(&body) != meta.hash {
+            return Err(bad());
+        }
     }
     Ok(Kept {
         meta,
         dict,
-        text,
-        fresh: ok,
+        text: body,
+        fresh,
     })
+}
+
+/// Bytes a kept dictionary takes in the keyspace, every record counted:
+/// definitions, patterns, text, the shape index and the metadata.
+fn stored_bytes(g: &Graph, name: &str) -> u64 {
+    let mut n = 0u64;
+    for p in *b"tpx" {
+        let mut prefix = key(p, name);
+        prefix.push(0);
+        g.ext_scan(NS, &prefix, &mut |k, v| {
+            n += (k.len() + v.len()) as u64;
+            true
+        });
+    }
+    for p in *b"sd" {
+        let k = key(p, name);
+        if let Some(v) = g.ext_get(NS, &k) {
+            n += (k.len() + v.len()) as u64;
+        }
+    }
+    n
 }
 
 /// A kept dictionary's templates as found in the graph now: each
 /// candidate root whose shape is a kept template's and that matches it in
 /// full.
 pub fn find_kept(g: &Graph, h: &Hier, d: &Dict) -> Result<Found> {
-    let mut forest = Forest::build(g, h)?;
+    find_kept_in(g, h, d, Forest::build(g, h)?)
+}
+
+/// [`find_kept`] over a forest: the whole graph's, or a selection's
+/// ([`Forest::part`]), whose instances are then those wholly inside it.
+pub fn find_kept_in(g: &Graph, h: &Hier, d: &Dict, mut forest: Forest) -> Result<Found> {
     let by_group: HashMap<u128, usize> = d
         .templates
         .iter()
         .enumerate()
+        .filter(|(_, t)| !t.structure.is_empty())
         .map(|(i, t)| (t.group, i))
         .collect();
-    let shapes: HashSet<u128> = d.templates.iter().map(|t| t.shape).collect();
+    let shapes: HashSet<u128> = d
+        .templates
+        .iter()
+        .filter(|t| !t.structure.is_empty())
+        .map(|t| t.shape)
+        .collect();
     let label_ids: Vec<u32> = h
         .labels
         .iter()
@@ -1696,9 +1853,11 @@ pub fn dictionaries(g: &mut Graph) -> Result<QueryResult> {
                 Value::Null,
                 Value::Null,
                 Value::Null,
+                Value::Null,
             ]);
             continue;
         };
+        let stored = stored_bytes(g, &name);
         rows.push(vec![
             Value::Text(name),
             Value::Int(m.at as i64),
@@ -1710,6 +1869,7 @@ pub fn dictionaries(g: &mut Graph) -> Result<QueryResult> {
             Value::Int(m.tokens as i64),
             Value::Text(m.code),
             Value::Text(m.args),
+            Value::Int(stored as i64),
         ]);
     }
     let n = rows.len();
@@ -1725,13 +1885,16 @@ pub fn dictionaries(g: &mut Graph) -> Result<QueryResult> {
             "tokens",
             "code",
             "args",
+            "stored_bytes",
         ]
         .iter()
         .map(|s| s.to_string())
         .collect(),
         rows,
     );
-    r.message = Some(format!("{n} kept dictionaries"));
+    r.message = Some(format!(
+        "{n} kept dictionaries; bytes and tokens are the dictionary's text, stored_bytes every record kept for it"
+    ));
     Ok(r)
 }
 
@@ -1739,7 +1902,7 @@ pub fn drop_dictionary(g: &mut Graph, name: &str) -> Result<QueryResult> {
     find_meta(g, name)?;
     let (_, from) = begin(g);
     let gone = forget(g, name)?;
-    seal(g, from, Vec::new(), vec![key(b'd', name)])?;
+    seal(g, from, Vec::new(), vec![key(b's', name), key(b'd', name)])?;
     let mut r = QueryResult::message(format!("dropped the dictionary '{name}' ({gone} records)"));
     r.touched = 1;
     Ok(r)
@@ -1755,6 +1918,7 @@ pub fn sound(k: &[u8], v: &[u8]) -> bool {
             k.len() > 6 && r.string().is_ok() && r.string().is_ok() && r.remaining() == 0
         }
         Some(b'x') => k.len() > 6,
+        Some(b's') => decode_index(v).is_some(),
         _ => false,
     }
 }

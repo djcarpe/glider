@@ -53,6 +53,10 @@ pub const MAX_TEMPLATES: usize = 100_000;
 pub struct Hier {
     pub types: Vec<String>,
     follow: Vec<Option<u128>>,
+    /// The followed types' ids when `types:` names them (empty: every
+    /// type), so a node's followed edges are read by type, not by scanning
+    /// all of them.
+    type_ids: Vec<u32>,
     pub dir: Dir,
     /// Roots are nodes of these labels; empty: every node.
     pub labels: Vec<String>,
@@ -90,6 +94,7 @@ impl Hier {
         };
         let types = sorted_names(a, "types");
         Ok(Hier {
+            type_ids: type_ids(g, &types),
             follow: followed_types(g, &types),
             types,
             dir,
@@ -118,6 +123,7 @@ impl Hier {
         Hier {
             types,
             follow: Vec::new(),
+            type_ids: Vec::new(),
             dir,
             labels,
             min_nodes,
@@ -131,6 +137,7 @@ impl Hier {
     pub fn rebind(&self, g: &Graph) -> Hier {
         let mut h = self.clone();
         h.follow = followed_types(g, &h.types);
+        h.type_ids = type_ids(g, &h.types);
         h
     }
 
@@ -160,6 +167,27 @@ impl Hier {
             .unwrap_or_default()
     }
 
+    /// Visit `v`'s followed edges in `dir`, stopping when `f` says so:
+    /// by type when `types:` names them, so the cost is the followed edges,
+    /// not every edge of the node.
+    pub fn each_followed(
+        &self,
+        g: &Graph,
+        v: u64,
+        dir: Dir,
+        f: &mut dyn FnMut(crate::types::Adj) -> bool,
+    ) {
+        if self.types.is_empty() {
+            g.for_each_adj_while(v, dir, None, &mut *f);
+            return;
+        }
+        for &t in &self.type_ids {
+            if !g.for_each_adj_while(v, dir, Some(t), &mut *f) {
+                return;
+            }
+        }
+    }
+
     /// The direction edges reach a child from: against the one followed.
     fn back(&self) -> Dir {
         match self.dir {
@@ -167,6 +195,13 @@ impl Hier {
             _ => Dir::Out,
         }
     }
+}
+
+/// The interned ids of the types named (those the graph has).
+fn type_ids(g: &Graph, types: &[String]) -> Vec<u32> {
+    let mut v: Vec<u32> = types.iter().filter_map(|t| g.strings.lookup(t)).collect();
+    v.sort_unstable();
+    v
 }
 
 // ------------------------------------------------------------ the forest
@@ -254,6 +289,9 @@ fn join(c: Colour) -> u128 {
     ((c.0 as u128) << 64) | c.1 as u128
 }
 
+/// A child before it is hashed: (node, edge, edge type).
+type Kid0 = (u64, u64, u32);
+
 /// A child as its parent's hashes see it: (edge, edge type, the child's
 /// shape hash, its content hash, its size).
 type Kid = (u64, u32, Colour, Colour, u64);
@@ -306,7 +344,7 @@ fn hashes(g: &Graph, h: &Hier, id: u64, kids: &[Kid]) -> (Colour, Colour, u64) {
 /// The one node a followed edge reaches `v` from, when exactly one does.
 fn sole_owner(g: &Graph, h: &Hier, v: u64) -> u64 {
     let (mut count, mut other) = (0u32, NONE);
-    g.for_each_adj_while(v, h.back(), None, |a| {
+    h.each_followed(g, v, h.back(), &mut |a| {
         if h.followed(a.etype) {
             count += 1;
             other = a.other;
@@ -539,6 +577,137 @@ impl Forest {
             size: StateVec::from_vec(rows.iter().map(|r| hashed[&r.0].2).collect()),
             shape: StateVec::from_vec(rows.iter().map(|r| hashed[&r.0].0).collect()),
             content: StateVec::from_vec(rows.iter().map(|r| hashed[&r.0].1).collect()),
+        })
+    }
+
+    /// The forest over a selection of nodes alone: for each selected node
+    /// whose whole shape is selected, its owner, size and hashes, the same
+    /// as [`Forest::build`] makes them for the whole graph; a node with an
+    /// owned node outside the selection gets size `u64::MAX`, so it is never
+    /// a root here. Reads the selection, its edges and the owners above it,
+    /// never the rest of the graph.
+    pub fn part(g: &Graph, h: &Hier, part: &[u64]) -> Result<Forest> {
+        let mut ids: Vec<u64> = part.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        let inside: std::collections::HashSet<u64> = ids.iter().copied().collect();
+        // Owners, and which nodes are on a circle of owners, following each
+        // node's owners upwards once.
+        let mut owner: HashMap<u64, u64> = HashMap::new();
+        let mut circle: HashMap<u64, bool> = HashMap::new();
+        for &v in &ids {
+            let mut path: Vec<u64> = Vec::new();
+            let mut at: HashMap<u64, usize> = HashMap::new();
+            let mut x = v;
+            loop {
+                step(1)?;
+                if circle.contains_key(&x) {
+                    break;
+                }
+                if let Some(&i) = at.get(&x) {
+                    for &y in &path[i..] {
+                        circle.insert(y, true);
+                    }
+                    break;
+                }
+                at.insert(x, path.len());
+                path.push(x);
+                let o = *owner.entry(x).or_insert_with(|| sole_owner(g, h, x));
+                if o == NONE {
+                    break;
+                }
+                x = o;
+            }
+            for y in path {
+                circle.entry(y).or_insert(false);
+            }
+        }
+        let eff = |x: u64, owner: &HashMap<u64, u64>, circle: &HashMap<u64, bool>| -> u64 {
+            if circle.get(&x).copied().unwrap_or(false) {
+                NONE
+            } else {
+                owner.get(&x).copied().unwrap_or(NONE)
+            }
+        };
+        // Each selected node's owned children; a child outside the
+        // selection leaves its owner (and everything above it) incomplete.
+        let mut kids: HashMap<u64, Vec<Kid0>> = HashMap::new();
+        let mut incomplete: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for &v in &ids {
+            let mut found: Vec<(u64, u64, u32)> = Vec::new();
+            h.each_followed(g, v, h.dir, &mut |a| {
+                if h.followed(a.etype) && a.other != v {
+                    found.push((a.other, a.edge, a.etype));
+                }
+                true
+            });
+            step(1 + found.len() as u64)?;
+            for (c, e, t) in found {
+                let owned = if inside.contains(&c) {
+                    eff(c, &owner, &circle) == v
+                } else {
+                    !circle.get(&c).copied().unwrap_or(false) && sole_owner(g, h, c) == v
+                };
+                if !owned {
+                    continue;
+                }
+                if inside.contains(&c) {
+                    kids.entry(v).or_default().push((c, e, t));
+                } else {
+                    incomplete.insert(v);
+                }
+            }
+        }
+        // Incomplete reaches up through owners in the selection.
+        let mut up: Vec<u64> = incomplete.iter().copied().collect();
+        while let Some(x) = up.pop() {
+            let o = eff(x, &owner, &circle);
+            if o != NONE && inside.contains(&o) && incomplete.insert(o) {
+                up.push(o);
+            }
+        }
+        // Bottom-up over the complete ones.
+        let mut pending: HashMap<u64, usize> = HashMap::new();
+        let mut ready: Vec<u64> = Vec::new();
+        for &v in &ids {
+            if incomplete.contains(&v) {
+                continue;
+            }
+            let n = kids.get(&v).map_or(0, |k| k.len());
+            if n == 0 {
+                ready.push(v);
+            } else {
+                pending.insert(v, n);
+            }
+        }
+        let mut hashed: HashMap<u64, (Colour, Colour, u64)> = HashMap::new();
+        while let Some(v) = ready.pop() {
+            let mut ks: Vec<Kid> = Vec::new();
+            for &(c, e, t) in kids.get(&v).map(|k| k.as_slice()).unwrap_or(&[]) {
+                let hc = hashed[&c];
+                ks.push((e, t, hc.0, hc.1, hc.2));
+            }
+            hashed.insert(v, hashes(g, h, v, &ks));
+            let o = eff(v, &owner, &circle);
+            if o != NONE {
+                if let Some(n) = pending.get_mut(&o) {
+                    *n -= 1;
+                    if *n == 0 {
+                        pending.remove(&o);
+                        ready.push(o);
+                    }
+                }
+            }
+        }
+        let len = ids.len();
+        let row = |v: &u64| hashed.get(v).copied().unwrap_or(((0, 0), (0, 0), u64::MAX));
+        Ok(Forest {
+            owner: StateVec::from_vec(ids.iter().map(|&v| eff(v, &owner, &circle)).collect()),
+            size: StateVec::from_vec(ids.iter().map(|v| row(v).2).collect()),
+            shape: StateVec::from_vec(ids.iter().map(|v| row(v).0).collect()),
+            content: StateVec::from_vec(ids.iter().map(|v| row(v).1).collect()),
+            ids: StateVec::from_vec(ids),
+            len,
         })
     }
 

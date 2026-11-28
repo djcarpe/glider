@@ -677,7 +677,8 @@ the user-facing description is in `docs/EXTENSIONS.md`, "Templates".
   here leaves anything out.
 - **Kept dictionaries (D3, D4).** Keyspace `structure`, beside the
   colourings: `d<name>` (revision, code `structure-templates/1`, arguments,
-  the hash of the dictionary's text, counts, the hierarchy), `t<name>\0<i>`
+  the hash of the dictionary's text, counts, the hierarchy), `s<name>`
+  (each template's root shape and id), `t<name>\0<i>`
   (each definition), `p<name>\0<i>` (each chain pattern), `x<name>\0<i>`
   (the text, in chunks). Freshness is the colourings' stretch of the
   extension's own writes, so keeping or dropping a dictionary or a
@@ -685,6 +686,26 @@ the user-facing description is in `docs/EXTENSIONS.md`, "Templates".
   names it by hash and does not repeat it; every use is matched against
   the graph in full, so a stale dictionary still writes the graph exactly.
   `check.run` reports kept records that do not decode.
+- **A selection with a kept dictionary is local.** `plan(dictionary:,
+  nodes:)` builds the forest over the selection alone (`Forest::part`:
+  each node's owner from its own edges, followed upwards once to cut
+  circles, hashes bottom-up over the nodes whose whole shape is selected),
+  reads the dictionary's shape index (`s<name>`: root shape and id per
+  template, ~50 bytes each, 23 KB at 1M), decodes only the definitions
+  whose shapes occur, matches each candidate root in full, and writes. Its
+  cost is the selection, its edges and the owners above it; the text and
+  rows are byte for byte those of the whole-graph path (`find: "graph"`;
+  `a_selection_written_with_a_kept_dictionary_is_the_text_the_whole_graph_path_writes`).
+  Membership is derived, never kept: a node changed since is written from
+  the graph as it is now (plainly, unless it still matches exactly), the
+  call says the dictionary is stale, and `fresh: "require"` refuses it.
+  Whole-graph calls: `templates`, `paths`, `plan` without a kept
+  dictionary or without `nodes:`, `expand` without `dictionary:`,
+  `templates(dictionary:)`. Local: `plan(dictionary:, nodes:)`,
+  `expand(dictionary:)` (the shapes under its roots), `dictionaries()`,
+  `drop(dictionary:)`. A dictionary kept inside a `begin()` block goes
+  with its rollback and stays with its commit
+  (`a_dictionary_kept_inside_a_transaction_block_goes_with_a_rollback_and_stays_with_a_commit`).
 - **The same answer (D7).** Template ids are content-only always. With
   `identity:` naming a property every node has (or a list: the first a node
   has wins, `["code", "number"]` on the manufacturing graph), the

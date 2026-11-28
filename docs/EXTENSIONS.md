@@ -595,8 +595,17 @@ the graph in full, so a stale dictionary still writes the graph exactly,
 only less of it by reference. `structure.dictionaries()` lists them (`name,
 revision, fresh, hash, templates, patterns, bytes, tokens, code, args`);
 `fresh: "require"` refuses a stale one; `structure.drop(dictionary:)`
-forgets one. Freshness works as for colourings, and keeping or dropping
+forgets one; `stored_bytes` counts every record kept for one. Freshness works as for colourings, and keeping or dropping
 either leaves the other fresh.
+
+Which nodes are instances is never kept: a selection works it out from the
+graph as it is now (ownership from each node's own edges, each candidate
+root's shape hashed and matched in full against the kept definition), so a
+node changed since the dictionary was made is written plainly unless it
+still matches exactly, and nothing is written from a membership that may
+no longer hold. Beside the definitions a dictionary keeps an index of each
+template's root shape and id (about 50 bytes a template), so a selection
+reads only the definitions its shapes can use.
 
 **Bounds.** The hierarchy's state is 56 bytes a node, within half of
 `algorithm_memory()` and spilling past it; candidates are grouped by
@@ -607,9 +616,15 @@ continued with `after:`.
 
 ### Limits of templates
 
-- Finding templates reads the whole graph: a plan of a few `nodes:` costs
-  what finding templates costs, because a template's constants are what is
-  the same across all its instances. Use a kept dictionary for many answers.
+- Finding templates reads the whole graph (a template's constants are what
+  is the same across all its instances), so `templates`, `plan` without a
+  kept dictionary, `plan(dictionary:)` without `nodes:`, `expand` without
+  `dictionary:` and `templates(dictionary:)` are whole-graph calls. A
+  selection written with a kept dictionary, `plan(dictionary:, nodes:)`,
+  reads only the selection, the owners above it and the definitions it can
+  use: milliseconds at a million nodes. `expand(dictionary:)` reads only the
+  shapes under its roots. `find: "graph"` makes a selection's plan find its
+  instances over the whole graph instead (the same text, for checking).
 - A deviating station is written plainly with its parts' templates; a
   template plus a list of differences is not built.
 - Sibling nodes are numbered by content, not by id, so a use's id list

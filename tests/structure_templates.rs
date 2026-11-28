@@ -2031,3 +2031,116 @@ fn bad_arguments_are_refused_with_what_to_do() {
         assert!(e.contains(want), "{args}: {e}");
     }
 }
+
+#[test]
+fn a_selection_written_with_a_kept_dictionary_is_the_text_the_whole_graph_path_writes() {
+    let (mut g, truth) = plant(19, 60, 4);
+    let h = list(HIER);
+    plan(&mut g, &format!("types: {h}, store: 'k'"));
+    let dict = text(&total(&plan(&mut g, "dictionary: 'k', text: 'dictionary'"))[14]);
+    let n = g.node_count() as u64;
+    let mut r = Rng(5);
+    let stations: Vec<u64> = truth.stations.keys().copied().collect();
+    let mut selections: Vec<Vec<u64>> = Vec::new();
+    // Whole stations, a line's worth, scattered nodes, and a mix.
+    for s in stations.iter().take(3) {
+        let mut v = vec![*s];
+        let mut stack = vec![*s];
+        while let Some(x) = stack.pop() {
+            for e in g.edge_ids() {
+                let er = g.edge(e).unwrap();
+                if er.from == x && HIER[2..].contains(&g.strings.name(er.etype)) {
+                    v.push(er.to);
+                    stack.push(er.to);
+                }
+            }
+        }
+        selections.push(v);
+    }
+    selections.push((0..80).map(|_| 1 + r.below(n)).collect());
+    let mut mix = selections[0].clone();
+    mix.extend(selections[3].iter().copied());
+    mix.extend(selections[1].iter().skip(3).copied());
+    selections.push(mix);
+    selections.push((1..=n).collect());
+    for (i, sel) in selections.iter().enumerate() {
+        let ids: Vec<String> = sel.iter().map(|x| x.to_string()).collect();
+        let args = format!(
+            "dictionary: 'k', nodes: [{}], text: 'compact'",
+            ids.join(", ")
+        );
+        let local = plan(&mut g, &args);
+        let whole = plan(&mut g, &format!("{args}, find: 'graph'"));
+        assert_eq!(total(&local), total(&whole), "selection {i}");
+        let t = text(&total(&local)[14]);
+        assert!(
+            t.starts_with(&format!(
+                "# glider-compact/1 dictionary {}",
+                text(&total(&local)[1])
+            )) || total(&local)[3] == Value::Bool(false)
+        );
+        let got = decode(&t, Some(&dict), None);
+        let all = snapshot(&g, None);
+        for (k, v) in &got.nodes {
+            assert_eq!(all.nodes.get(k), Some(v), "selection {i}: {k}");
+        }
+        for (k, c) in &got.edges {
+            assert_eq!(all.edges.get(k), Some(c), "selection {i}: {k:?}");
+        }
+    }
+    // After a change, the selection is still written from the graph as it
+    // is now: the changed station is no longer an instance and is written
+    // plainly, the same both ways; require refuses.
+    let st = selections[0][0];
+    q(
+        &mut g,
+        &format!(
+            "MATCH (s) WHERE id(s) = {} SET s.takt_seconds = 'changed'",
+            selections[0][1]
+        ),
+    );
+    let ids: Vec<String> = selections[0].iter().map(|x| x.to_string()).collect();
+    let args = format!(
+        "dictionary: 'k', nodes: [{}], text: 'compact'",
+        ids.join(", ")
+    );
+    let local = plan(&mut g, &args);
+    assert_eq!(
+        total(&local),
+        total(&plan(&mut g, &format!("{args}, find: 'graph'")))
+    );
+    assert!(local.message.as_ref().unwrap().contains("stale"));
+    let got = decode(&text(&total(&local)[14]), Some(&dict), None);
+    assert_eq!(
+        got.nodes[&format!("n{}", selections[0][1])],
+        snapshot(&g, None).nodes[&format!("n{}", selections[0][1])]
+    );
+    let e = err(
+        &mut g,
+        &format!("CALL structure.plan({args}, fresh: 'require')"),
+    );
+    assert!(e.contains("has changed since"), "{e} {st}");
+}
+
+#[test]
+fn a_dictionary_kept_inside_a_transaction_block_goes_with_a_rollback_and_stays_with_a_commit() {
+    let (mut g, _) = plant(20, 20, 3);
+    let h = list(HIER);
+    g.begin().unwrap();
+    plan(&mut g, &format!("types: {h}, store: 'gone'"));
+    assert_eq!(
+        q(&mut g, "CALL structure.dictionaries()").rows[0][2],
+        Value::Bool(true)
+    );
+    g.rollback().unwrap();
+    assert!(q(&mut g, "CALL structure.dictionaries()").rows.is_empty());
+    let e = err(&mut g, "CALL structure.plan(dictionary: 'gone')");
+    assert!(e.contains("no dictionary is kept as 'gone'"), "{e}");
+    g.begin().unwrap();
+    plan(&mut g, &format!("types: {h}, store: 'kept'"));
+    g.commit().unwrap();
+    let d = q(&mut g, "CALL structure.dictionaries()");
+    assert_eq!(d.rows.len(), 1);
+    assert_eq!(d.rows[0][2], Value::Bool(true));
+    plan(&mut g, "dictionary: 'kept', fresh: 'require'");
+}

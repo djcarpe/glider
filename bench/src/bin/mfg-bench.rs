@@ -955,10 +955,13 @@ fn templates(run: &mut Run) -> Result<(), String> {
         .filter(|&&i| num(&cell(&r, i, "nested_in")) > 0)
         .map(|&i| num(&cell(&r, i, "uses")))
         .sum();
+    let (kept, _) = run.run("CALL structure.dictionaries()", &[])?;
+    let stored = num(&cell(&kept, 0, "stored_bytes"));
     run.emit(
         "structure.plan",
         Obj::new()
             .s("what", "whole graph")
+            .i("kept_stored_bytes", stored)
             .i("ms", ms as i64)
             .u("rss_before_mb", before)
             .u("rss_added_mb", added)
@@ -993,9 +996,25 @@ fn templates(run: &mut Run) -> Result<(), String> {
     let below = &shapes::TEMPLATE_TYPES[4..];
     let mut line_types = vec!["HAS_STATION"];
     line_types.extend_from_slice(below);
+    // A few hundred nodes scattered over the graph: ids from a fixed
+    // stream, spread over the whole id range.
+    let top = run.g.node_ids().last().copied().unwrap_or(1);
+    let mut z = 0x9e37_79b9_7f4a_7c15u64;
+    let mut scattered: Vec<u64> = Vec::new();
+    while scattered.len() < 300 {
+        z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut x = z;
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        let id = 1 + (x ^ (x >> 31)) % top;
+        if run.g.node_shared(id).is_some() {
+            scattered.push(id);
+        }
+    }
     for (what, nodes) in [
         ("one station", shapes::subtree(&run.g, station, below)),
         ("one line", shapes::subtree(&run.g, line, &line_types)),
+        ("300 scattered nodes", scattered),
     ] {
         let ids = Value::List(nodes.iter().map(|&n| Value::Int(n as i64)).collect());
         let params = vec![("nodes".to_string(), ids)];
@@ -1004,11 +1023,28 @@ fn templates(run: &mut Run) -> Result<(), String> {
             &format!("CALL structure.plan({hier}, nodes: $nodes, limit: 1)"),
             &params,
         )?;
-        let (kept, ms_kept, _, _) = measured_with(
+        // With the kept dictionary, from the selection alone: five runs.
+        let mut times = Vec::new();
+        let (mut kept, mut added) = (None, 0);
+        for _ in 0..5 {
+            let (r, ms, _, add) = measured_with(
+                run,
+                "CALL structure.plan(dictionary: 'mfg', nodes: $nodes, text: 'compact', limit: 1)",
+                &params,
+            )?;
+            times.push(ms);
+            added = added.max(add);
+            kept = Some(r);
+        }
+        let kept = kept.unwrap();
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        // The same selection found over the whole graph: the same text.
+        let (whole, ms_whole, _, _) = measured_with(
             run,
-            "CALL structure.plan(dictionary: 'mfg', nodes: $nodes, limit: 1)",
+            "CALL structure.plan(dictionary: 'mfg', nodes: $nodes, text: 'compact', limit: 1, find: 'graph')",
             &params,
         )?;
+        let same = cell(&kept, 0, "text") == cell(&whole, 0, "text");
         run.emit(
             "structure.plan",
             Obj::new()
@@ -1024,8 +1060,13 @@ fn templates(run: &mut Run) -> Result<(), String> {
                 )
                 .i("kept_bytes", num(&cell(&kept, 0, "use_bytes")))
                 .i("kept_tokens", num(&cell(&kept, 0, "use_tokens")))
+                .i("kept_uses", num(&cell(&kept, 0, "uses")))
                 .i("ms_alone", ms_alone as i64)
-                .i("ms_kept", ms_kept as i64),
+                .raw("ms_kept_min", &format!("{:.2}", times[0]))
+                .raw("ms_kept_median", &format!("{:.2}", times[2]))
+                .u("kept_rss_added_mb", added)
+                .i("ms_whole_graph_path", ms_whole as i64)
+                .b("same_text_as_whole_graph_path", same),
         );
     }
     // Every instance of the kept dictionary, expanded and compared.
