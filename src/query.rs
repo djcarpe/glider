@@ -1629,7 +1629,10 @@ pub fn edge_value(g: &Graph, id: u64) -> Value {
 /// walk, an extension procedure) a node taken up or an edge followed; an
 /// extension function evaluated for a row. The same count bounds all of
 /// them ([`crate::meter`]). `max_millis` needs a clock and is ignored on
-/// wasm32; `max_steps` works everywhere.
+/// wasm32; `max_steps` works everywhere, with one gap: building the
+/// in-memory projection of an algorithm counts its nodes only (so that both
+/// tiers count the same steps), so under `max_steps` alone that build reads
+/// every edge of the graph before anything stops it.
 #[derive(Clone, Copy, Debug)]
 pub struct QueryLimits {
     pub max_rows: usize,
@@ -1757,6 +1760,7 @@ pub fn execute_with(g: &mut Graph, src: &str, params: &[(String, Value)]) -> Res
     if input > g.query_memory() {
         return Err(budget_error());
     }
+    let _text = StatementText::push(src);
     let watch = telemetry::Stopwatch::start();
     let before = g.pager_stats();
     let mut report = telemetry::OpReport {
@@ -1837,19 +1841,34 @@ fn execute_stmt(g: &mut Graph, stmt: Stmt) -> Result<QueryResult> {
 /// committed: a block is spent, a transaction opened by assigning
 /// `autocommit` goes on in a new one.
 fn atomically<R>(g: &mut Graph, f: impl FnOnce(&mut Graph) -> Result<R>) -> Result<R> {
-    thread_local! { static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
+    thread_local! {
+        static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        /// Set by a statement run inside another (by a procedure) that
+        /// failed, or panicked, after it had written: what failed and why.
+        /// The outermost statement then fails as a whole, whatever the
+        /// procedure did with the error.
+        static INNER_FAILED: std::cell::RefCell<Option<String>> =
+            const { std::cell::RefCell::new(None) };
+    }
     struct Nested;
     impl Drop for Nested {
         fn drop(&mut self) {
-            DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+            let left = DEPTH.with(|d| {
+                d.set(d.get().saturating_sub(1));
+                d.get()
+            });
+            if left == 0 {
+                INNER_FAILED.with(|f| f.borrow_mut().take());
+            }
         }
     }
-    // a statement run by a procedure inside another statement leaves the
-    // transaction to the outer one
     let outermost = DEPTH.with(|d| {
         d.set(d.get() + 1);
         d.get() == 1
     });
+    if outermost {
+        INNER_FAILED.with(|f| f.borrow_mut().take());
+    }
     let _nested = Nested;
     let auto = g.autocommit;
     let before = g.uncommitted();
@@ -1858,24 +1877,61 @@ fn atomically<R>(g: &mut Graph, f: impl FnOnce(&mut Graph) -> Result<R>) -> Resu
     // autocommit off and the statement's writes pending.
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(g)));
     g.restore_autocommit(auto);
+    let wrote = g.uncommitted() != before;
     let r = match r {
         Ok(r) => r,
         Err(panic) => {
-            if auto {
+            // A panic is a failure of the statement it unwinds through:
+            // what it wrote goes, before the panic goes on.
+            if !outermost {
+                if wrote {
+                    let what = statement_text();
+                    INNER_FAILED.with(|f| {
+                        f.borrow_mut()
+                            .get_or_insert_with(|| format!("{what} panicked after writing"));
+                    });
+                }
+            } else if auto {
                 let _ = g.rollback_txn();
+            } else if wrote {
+                let _ = g.abandon(Error::Msg("a statement panicked".into()));
             }
             std::panic::resume_unwind(panic)
         }
     };
     // the budget's error, rather than whatever a stopped procedure said
     let r = crate::meter::check().and(r);
-    // Stopped after writing inside the caller's transaction: the engine
-    // rolls it back, as for any failure there (Graph::abandon). A block
-    // (BEGIN, Graph::begin) is then spent; a transaction opened by
-    // assigning `autocommit` carries on in a new one.
-    if outermost && !auto && g.uncommitted() != before && crate::meter::stopped() {
+    if !outermost {
+        // A failure after writing cannot be undone here (there are no
+        // savepoints): the outermost statement fails as a whole.
+        if let (Err(e), true) = (&r, wrote) {
+            let what = statement_text();
+            INNER_FAILED.with(|f| {
+                f.borrow_mut()
+                    .get_or_insert_with(|| format!("{what} failed after writing: {e}"));
+            });
+        }
+        return r;
+    }
+    let inner = INNER_FAILED.with(|f| f.borrow_mut().take());
+    let failed_inside = inner.is_some();
+    let r = match inner {
+        Some(why) => Err(Error::Msg(format!(
+            "statement failed as a whole: a statement it ran, {why}"
+        ))),
+        None => r,
+    };
+    // Failed after writing inside the caller's transaction, by its budget
+    // or by a statement it ran: the engine rolls the transaction back, as
+    // for any failure there (Graph::abandon). A block (BEGIN, Graph::begin)
+    // is then spent; a transaction opened by assigning `autocommit`
+    // carries on in a new one.
+    if !auto && g.uncommitted() != before {
         if let Err(e) = r {
-            return Err(g.abandon(e));
+            if crate::meter::stopped() || failed_inside {
+                return Err(g.abandon(e));
+            }
+            return Err(e);
         }
     }
     if !auto || g.uncommitted() == 0 {
@@ -1891,6 +1947,36 @@ fn atomically<R>(g: &mut Graph, f: impl FnOnce(&mut Graph) -> Result<R>) -> Resu
             Err(e)
         }
     }
+}
+
+thread_local! {
+    /// The text of the statement running on this thread, innermost last,
+    /// for saying which inner statement failed.
+    static STATEMENT: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+struct StatementText;
+impl StatementText {
+    fn push(src: &str) -> StatementText {
+        let mut s: String = src.trim().chars().take(120).collect();
+        if s.len() < src.trim().len() {
+            s.push('…');
+        }
+        STATEMENT.with(|st| st.borrow_mut().push(s));
+        StatementText
+    }
+}
+impl Drop for StatementText {
+    fn drop(&mut self) {
+        STATEMENT.with(|st| st.borrow_mut().pop());
+    }
+}
+
+fn statement_text() -> String {
+    STATEMENT.with(|st| match st.borrow().last() {
+        Some(s) => format!("`{s}`"),
+        None => "a statement".into(),
+    })
 }
 
 fn run(g: &mut Graph, stmt: Stmt) -> Result<QueryResult> {
