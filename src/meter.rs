@@ -34,6 +34,8 @@ pub const CHUNK: u64 = 256;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stop {
     Steps,
+    // never on wasm32, which has no clock
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     Time,
 }
 
@@ -210,7 +212,7 @@ pub fn check() -> Result<()> {
 
 /// Whether the running statement has been stopped by its budget.
 pub fn stopped() -> bool {
-    METER.with(|cell| cell.get().map_or(false, |m| m.stopped.is_some()))
+    METER.with(|cell| cell.get().is_some_and(|m| m.stopped.is_some()))
 }
 
 #[cold]

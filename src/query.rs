@@ -4514,6 +4514,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                 if let Some(found) =
                     crate::traverse::shortest_path(g, from, to, dir, etype, walk_cap(g))
                 {
+                    crate::meter::check()?;
                     return Ok(match found {
                         None => QueryResult::message("no path"),
                         Some(path) => {
@@ -4553,6 +4554,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
             } else {
                 algo::bfs_paths(&p, s)
             };
+            crate::meter::check()?;
             match paths.path_to(t) {
                 None => Ok(QueryResult::message("no path")),
                 Some(path) => {
@@ -4657,6 +4659,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                     algo::dfs_each(&p, s, depth, &mut keep);
                 }
             }
+            crate::meter::check()?;
             let rows = visits
                 .into_iter()
                 .map(|v| {
@@ -4680,8 +4683,9 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
             let from = a
                 .u64("from")
                 .ok_or_else(|| Error::Msg("neighbors needs from:".into()))?;
-            let rows: Vec<Vec<Value>> = g
-                .neighbors(from, dir, etype)
+            let list = g.neighbors(from, dir, etype);
+            crate::meter::steps(1 + list.len() as u64)?;
+            let rows: Vec<Vec<Value>> = list
                 .into_iter()
                 .take(a.top())
                 .map(|adj| {
@@ -4722,6 +4726,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                 }
                 true
             });
+            crate::meter::check()?;
             if done.is_some() {
                 return Ok(QueryResult::table(
                     vec!["id".into(), "node".into(), "depth".into()],
@@ -4733,6 +4738,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                 .index_of(from)
                 .ok_or_else(|| Error::Msg("from: must be an existing node id".into()))?;
             let reach = algo::k_hop(&p, s, a.u32("depth", 2));
+            crate::meter::check()?;
             let rows = reach
                 .into_iter()
                 .take(a.top())
@@ -4748,7 +4754,9 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
         }
         "toposort" | "topo" => {
             let p = proj!(dir, weight.as_deref());
-            match algo::topological_sort(&p) {
+            let order = algo::topological_sort(&p);
+            crate::meter::check()?;
+            match order {
                 None => Err(Error::Msg("graph has a cycle: no topological order".into())),
                 Some(mut order) => {
                     let rows = (0..order.len())
@@ -4810,7 +4818,9 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
         }
         "reduce" | "reduction" => {
             let p = proj!(dir, weight.as_deref());
-            let Some(edges) = algo::transitive_reduction(&p) else {
+            let reduced = algo::transitive_reduction(&p);
+            crate::meter::check()?;
+            let Some(edges) = reduced else {
                 return Err(Error::Msg(
                     "graph has a cycle: no transitive reduction".into(),
                 ));
@@ -4838,7 +4848,9 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
         }
         "cycle" | "cycles" => {
             let p = proj!(dir, weight.as_deref());
-            match algo::find_cycle(&p) {
+            let cycle = algo::find_cycle(&p);
+            crate::meter::check()?;
+            match cycle {
                 None => Ok(QueryResult::message("no cycle found")),
                 Some(cycle) => {
                     let rows = cycle
@@ -4859,6 +4871,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
         "mst" => {
             let p = proj!(Dir::Both, weight.as_deref());
             let (edges, total) = algo::minimum_spanning_forest(&p);
+            crate::meter::check()?;
             drop(p);
             let rows: Vec<Vec<Value>> = edges
                 .iter()
@@ -4924,6 +4937,7 @@ fn local_walk(
             return Ok(None);
         }
     }
+    crate::meter::check()?;
     let rows = visits
         .into_iter()
         .map(|v| {
