@@ -73,6 +73,14 @@
 //! Every loop over nodes or edges passes through [`step`], the one place
 //! the statement budget (slice G2) is to be counted.
 
+mod notation;
+mod paths;
+mod plan;
+mod templates;
+
+pub use notation::NOTATION;
+pub use plan::{CODE as TEMPLATES_CODE, LEGEND};
+
 use super::{Args, Extension, Spec};
 use crate::graph::{Dir, Error, Graph, Result};
 use crate::ooc::{self, SpillQueue, StateVec};
@@ -125,8 +133,33 @@ const PROCEDURES: &[Spec] = &[
     },
     Spec {
         name: "drop",
-        args: "(name)",
-        doc: "Forget a kept colouring",
+        args: "(name, dictionary)",
+        doc: "Forget a kept colouring (name:) or a kept dictionary (dictionary:)",
+    },
+    Spec {
+        name: "templates",
+        args: "(types, dir, labels, min_nodes, min_count, max_nodes, identity, instances, after, limit)",
+        doc: "Shapes that repeat along a hierarchy: id, root label, nodes, edges, slots, instances, estimated saving and definition; instances: <id> lists one template's instances and their slot values",
+    },
+    Spec {
+        name: "expand",
+        args: "(of, root, dictionary, fresh, types, dir, labels, min_nodes, min_count, max_nodes, identity)",
+        doc: "Exactly the nodes, edges and values of a template's instance (of: template id, root: its root) or of a chain's interior (of: 'chain:<id>'), rebuilt from the definition",
+    },
+    Spec {
+        name: "paths",
+        args: "(kind, types, dir, labels, min_count, max_hops, after, limit)",
+        doc: "Label and edge-type sequences many paths follow, with counts (kind: 'patterns'), or runs of nodes with one way in and one way out (kind: 'chains')",
+    },
+    Spec {
+        name: "plan",
+        args: "(types, dir, labels, nodes, min_nodes, min_count, max_nodes, identity, by, lambda, store, dictionary, fresh, text, after, limit)",
+        doc: "Which templates and chain patterns make the text of the graph (or of nodes:) shorter, measured by writing it both ways; store: keeps the chosen dictionary, dictionary: uses a kept one",
+    },
+    Spec {
+        name: "dictionaries",
+        args: "()",
+        doc: "The kept dictionaries: name, revision, fresh, hash, templates, patterns, bytes, tokens, code, args",
     },
 ];
 
@@ -151,7 +184,15 @@ impl Extension for Structure {
             "classes" => classes(g, a),
             "read" => read(g, a),
             "stored" => stored(g),
-            "drop" => drop_colouring(g, a),
+            "drop" => match store_name(a, "dictionary")? {
+                Some(d) => plan::drop_dictionary(g, &d),
+                None => drop_colouring(g, a),
+            },
+            "templates" => templates::templates(g, a),
+            "expand" => expand(g, a),
+            "paths" => paths::paths(g, a),
+            "plan" => plan::plan(g, a),
+            "dictionaries" => plan::dictionaries(g),
             _ => unreachable!("dispatch checks the procedure list"),
         })
     }
@@ -180,10 +221,10 @@ impl Extension for Structure {
                     Some(b'n') => k.len() > 9 && v.len() == 16,
                     Some(b'm') => Meta::decode(&v).is_some(),
                     Some(b'w') => k == CHAIN && v.len() == 16,
-                    _ => false,
+                    _ => plan::sound(&k, &v),
                 };
                 if !sound {
-                    probe.found("bad_record", hex(&k), "a kept colouring's record that does not decode; drop the colouring and compute it again");
+                    probe.found("bad_record", hex(&k), "a kept colouring's or dictionary's record that does not decode; drop it and compute it again");
                 }
                 after = Some(k);
             }
@@ -1234,6 +1275,41 @@ fn drop_colouring(g: &mut Graph, a: &Args) -> Result<QueryResult> {
     let mut r = QueryResult::message(format!("dropped the colouring '{name}' ({gone} colours)"));
     r.touched = 1;
     Ok(r)
+}
+
+// ---------------------------------------------------------------- expand
+
+fn expand(g: &mut Graph, a: &Args) -> Result<QueryResult> {
+    let of = a.str("of").ok_or_else(|| {
+        Error::Msg("expand needs of: a template id (with root:) or 'chain:<id>'".into())
+    })?;
+    if let Some(head) = of.strip_prefix("chain:") {
+        let head: u64 = head.trim().trim_start_matches('n').parse().map_err(|_| {
+            Error::Msg(format!(
+                "of: '{of}' does not name a chain; chains are 'chain:<first interior id>'"
+            ))
+        })?;
+        let h = templates::Hier::from(g, a)?;
+        return paths::expand_chain(g, &h, head);
+    }
+    let roots = a.ids("root")?;
+    if roots.is_empty() {
+        return Err(Error::Msg(format!(
+            "expand of a template needs root: the id of the instance's root (or a list of them); CALL structure.templates(instances: '{of}', ...) lists them"
+        )));
+    }
+    if let Some(d) = store_name(a, "dictionary")? {
+        return plan::expand_kept(g, &d, &of, &roots, fresh_arg(a)?);
+    }
+    let h = templates::Hier::from(g, a)?;
+    let mut found = templates::find(g, &h)?;
+    let i = templates::named(&found, &of).ok_or_else(|| {
+        Error::Msg(format!(
+            "no template '{of}' among those these arguments find; CALL structure.templates with the same arguments lists them, or give dictionary: a kept one"
+        ))
+    })?;
+    let t = found.templates[i].clone();
+    templates::expand_template(g, &h, &mut found.forest, &t, &roots)
 }
 
 // ---------------------------------------------------------------- classes
