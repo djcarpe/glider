@@ -88,6 +88,10 @@ fn list_segments(dir: &Path) -> io::Result<Vec<u64>> {
     Ok(v)
 }
 
+/// What a frame adds around its payload: the kind, the length and the
+/// checksum. A commit marker is a frame with no payload.
+pub const FRAME_BYTES: u64 = 9;
+
 fn frame(out: &mut Vec<u8>, kind: u8, payload: &[u8]) {
     let start = out.len();
     out.push(kind);

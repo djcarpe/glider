@@ -38,11 +38,18 @@ tests cite them.
   one thing. A procedure writes a node property only when the caller names
   it with `write:`, as the built-in algorithms already do.
 - **D2. A database has a revision.** `revision` is a 64-bit number that grows
-  with every committed transaction that changed something, and with nothing
-  else: not with an empty commit, a checkpoint, a reopen or a restore. It is
-  durable. A replica that has replayed the same transactions reports the same
-  revision. With `generation` (the lineage) it names one state of one
-  database. A build that predates revisions must not be able to leave it
+  with every committed transaction that changed something: it never stays
+  still across a change. It does not grow with an empty commit, a write that
+  changes nothing, a checkpoint, a reopen or a restore; it may also grow when
+  a transaction's operations cancel each other out. It is durable. A replica
+  that has replayed the same transactions reports the same revision. With
+  `generation` (the lineage) it names one state along one line of history:
+  the engine has one writer per lineage, but a copy that is restored and then
+  written to is a second line, and can share a pair with its source or with
+  another copy. Derived data kept inside the database is restored with its
+  copy and carries on with it, so it stays right; a consumer outside the
+  database that keys what it keeps by the pair must treat a restore as a new
+  source. A build that predates revisions must not be able to leave it
   behind: either that build advances it too, or it refuses the file.
 - **D3. Derived data says what it was derived from.** Every derived record
   carries the revision it was computed at, and every named set of them (an
@@ -79,16 +86,83 @@ tests cite them.
   as before, with two exceptions that are improvements: `STATS` reports the
   revision, and `CALL` honours the statement budget.
 
-## Revision
+## Revision (*built*)
 
-`STATS` gains `revision` and `generation`. `Graph::revision()` is the same
-number for a library caller.
+`STATS` reports `revision` (an integer) and `generation` (32 hex digits, all
+zeros for a memory graph that has no log). `Graph::revision()` is the same
+number for a library caller; it reads a field and costs nothing.
 
-The write-ahead log's committed position already has most of the properties
-D2 asks for on a file: it only moves when a transaction wrote records, it is
-durable, and older builds move it as well. An in-memory graph without a log
-has no such position. The slice that builds this decides the mechanism; D2 is
-the test.
+**The revision is the committed position of the write-ahead log**: the byte
+offset just past the last committed transaction's marker. No new field is
+stored and the file format is unchanged.
+
+- *Grows with every change.* Every change goes through one logged operation,
+  and a transaction that logged anything writes a commit marker, so the
+  position moves forward. Positions are bytes, so the number is not dense.
+  The test is per operation, not per transaction: a statement that sets a
+  value and sets it back, or `CALL context.index()` over an index that is
+  already current, moves the revision although nothing ends up different.
+  The guarantee runs one way: if the state changed, the revision moved.
+- *Holds for everything else.* An operation that would change nothing (a
+  property set to the value it has, compared exactly, so `1` and `1.0`
+  differ; an absent property or label removed; a label or an index that is
+  already there; an extension writing what it holds) is no longer written to
+  the log, and a node write that changed nothing calls no extension hooks.
+  (A property set to its own value still rewrites the record, so the page
+  cache sees the same accesses it always did; only the log is spared.)
+  A commit that logged nothing writes no marker. A rollback or a failed
+  statement cuts the log back to the last commit. Checkpoints, `COMPACT`,
+  closing and reopening and reads do not write to the log. `CLEAR` always
+  counts as a change.
+- *Durable.* A checkpoint records the position in the superblock and reopen
+  resumes there, whether or not any log segment is left; recovery after a
+  crash ends at the last commit marker.
+- *The same on a replica.* Replicas, file or memory, are made of a base taken
+  at a log position and the log shipped after it, at the same positions, so
+  a restore reports the position it replayed to: the source's revision at
+  that point, and an earlier one for an earlier point.
+- *Memory graphs.* With a log (`enable_log`), the revision is that log's
+  position. Without one, the graph counts the bytes a log would have written
+  for the same transactions, so it reports the same revision a logged graph
+  or a file reports for the same history, and a log enabled later starts
+  there instead of at 0, so enabling a log does not move the revision back. That number lives and dies with the graph object: it is as durable
+  as the graph is, which is not at all. A graph loaded from a file's image
+  (`Graph::from_bytes`) has no lineage and starts at 0.
+- *Bulk load* builds a new file without the log. It checkpoints the loaded
+  pages, then logs one record (the id counters it set) and checkpoints
+  again, so a loaded database is past 0. A crash between the two reopens the
+  loaded data at revision 0, as a load did before revisions (and an
+  interrupted load is to be deleted and run again); a crash never leaves the
+  empty file past 0.
+- *Older builds cannot leave it behind.* They log every operation they
+  apply, including the ones that change nothing, commit with a marker, keep
+  the position in the superblock across checkpoints, and carry it through
+  segment deletion and `CLEAR` exactly as this build does. Their revision
+  may grow where this build's would not, which D2 allows. Their migration
+  and bulk load create new files with new generations. So no format bump
+  was needed.
+
+With `generation`, `(generation, revision)` names one committed state along
+one line of history. A restore keeps the source's generation and its log
+positions, so a copy restored to a point and then written to carries on at
+the source's positions: once it is written to, it is a second line, and it
+can reach a pair the source (or another copy) also reaches with different
+data. What is guaranteed around a restore:
+
+- the restored copy reports the revision of the point restored to, and its
+  first change takes it past that point;
+- derived data kept inside the database (an extension's keyspace, anything a
+  later slice stores beside the graph) is restored with the copy and follows
+  the copy's own writes, so inside one database it agrees with that
+  database's graph whatever happens to the source;
+- a consumer outside the database that keys what it keeps by the pair must
+  treat a restored database as a new source, and must not assume a pair it
+  has seen on one copy means the same state on another.
+
+Left open: a restored database could take a new generation at its first
+change, which would make the pair unique across copies. That changes what
+replication does after a restore and is a decision for the owner, not for
+this slice.
 
 ## Budgets for procedures
 

@@ -158,6 +158,11 @@ pub struct Db {
     /// The epoch of the checkpoint the database opened from, before any
     /// replay: a hot list taken after it is not this file's.
     opened_epoch: u64,
+    /// A memory database without a log: where its log would be had it one
+    /// (the bytes [`MemLog`] would have framed for the same commits), and
+    /// what the open transaction would add to it. This is its revision.
+    unlogged: u64,
+    unlogged_pending: u64,
     /// Declared last so it is dropped last.
     _lock: Option<Lock>,
 }
@@ -185,6 +190,8 @@ impl Db {
             hold_at_checkpoint: (false, 0),
             pin_checked: None,
             opened_epoch: 0,
+            unlogged: 0,
+            unlogged_pending: 0,
             _lock: None,
         }
     }
@@ -192,8 +199,10 @@ impl Db {
     /// An in-memory database loaded from a database file's bytes (its state
     /// as of its last checkpoint).
     pub fn from_image(bytes: &[u8], max_memory: u64) -> SResult<Db> {
+        let pager = Pager::from_image(bytes, max_memory)?;
+        let unlogged = pager.wal_lsn();
         Ok(Db {
-            pager: Pager::from_image(bytes, max_memory)?,
+            pager,
             wal: None,
             mem_log: None,
             path: None,
@@ -203,6 +212,8 @@ impl Db {
             hold_at_checkpoint: (false, 0),
             pin_checked: None,
             opened_epoch: 0,
+            unlogged,
+            unlogged_pending: 0,
             _lock: None,
         })
     }
@@ -247,6 +258,8 @@ impl Db {
             hold_at_checkpoint: (false, 0),
             pin_checked: None,
             opened_epoch: 0,
+            unlogged: 0,
+            unlogged_pending: 0,
             _lock: None,
         };
         Ok((db, rec))
@@ -321,6 +334,8 @@ impl Db {
             hold_at_checkpoint,
             pin_checked: None,
             opened_epoch,
+            unlogged: 0,
+            unlogged_pending: 0,
             _lock: Some(lock),
         };
         db.poll_pin(true)?;
@@ -347,7 +362,9 @@ impl Db {
     /// Give a memory database a log from now on, keeping at most `cap`
     /// bytes of committed log nobody has let go of. It starts where the
     /// pages are (their `wal_lsn`: 0 for a new database, the image's for
-    /// one loaded keeping its lineage), and the database gets a generation
+    /// one loaded keeping its lineage), carried on by what was committed
+    /// since without a log, so the revision does not go back
+    /// ([`Db::revision`]), and the database gets a generation
     /// if it has none. Only between transactions: a log that began inside
     /// one would hold half of it. A database that has a log already keeps
     /// it as it is; a file database has its own, on disk.
@@ -364,7 +381,9 @@ impl Db {
         if self.pager.generation() == [0; 16] {
             self.pager.set_generation(mint_generation()?);
         }
-        self.mem_log = Some(MemLog::new(self.pager.wal_lsn(), cap));
+        // Where the pages are, carried on by whatever was committed without
+        // a log, so the revision never goes back.
+        self.mem_log = Some(MemLog::new(self.unlogged.max(self.pager.wal_lsn()), cap));
         Ok(())
     }
 
@@ -416,6 +435,8 @@ impl Db {
             w.append(payload)?;
         } else if let Some(m) = &mut self.mem_log {
             m.append(payload);
+        } else {
+            self.unlogged_pending += log::FRAME_BYTES + payload.len() as u64;
         }
         Ok(())
     }
@@ -428,6 +449,11 @@ impl Db {
         }
         if let Some(m) = &mut self.mem_log {
             m.commit();
+        }
+        if self.unlogged_pending > 0 {
+            // The records, and the commit marker after them.
+            self.unlogged += self.unlogged_pending + log::FRAME_BYTES;
+            self.unlogged_pending = 0;
         }
         self.pager.commit();
         if let Some(w) = &self.wal {
@@ -487,6 +513,7 @@ impl Db {
         if let Some(m) = &mut self.mem_log {
             m.rollback();
         }
+        self.unlogged_pending = 0;
         self.pager.rollback();
         Ok(())
     }
@@ -570,6 +597,19 @@ impl Db {
     pub fn set_sync(&mut self, s: SyncMode) {
         if let Some(w) = &mut self.wal {
             w.set_sync(s);
+        }
+    }
+
+    /// The committed position of the log: the file's, a memory log's, or
+    /// for a memory database without one, where its log would be. The
+    /// database's revision (`Graph::revision`).
+    pub fn revision(&self) -> u64 {
+        if let Some(w) = &self.wal {
+            w.committed_lsn()
+        } else if let Some(m) = &self.mem_log {
+            m.committed_lsn()
+        } else {
+            self.unlogged
         }
     }
 
