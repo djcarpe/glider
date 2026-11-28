@@ -284,3 +284,109 @@ does cover, walks the postings again to name those nodes.
 - Staleness of derived data is found by comparison with the graph, not by
   revisions: the text index records none yet (D3 is a later slice).
 - Measured on the manufacturing graph: `bench/KNOWLEDGE.md`, "Integrity".
+
+## `structure`: which nodes are the same shape
+
+Graphs made by people repeat themselves: forty stations built to one
+design, each with the same sides, locations, work elements and tools.
+`structure` says which nodes have the same surroundings. It reports and
+never merges: two stations of one design are two stations, and nothing
+here adds, deletes, connects or relabels a node.
+
+```
+CREATE EXTENSION structure
+CALL structure.colors(depth: 4, types: ["HAS_SIDE", "HAS_LOCATION", "HAS_ELEMENT", "USES_TOOL"], dir: "out")
+CALL structure.colors(depth: "stable", labels: ["Station"], summary: true)
+CALL structure.colors(depth: 4, labels: ["Station"], store: "designs")
+CALL structure.read(name: "designs", fresh: "require", after: 0, limit: 1000)
+CALL structure.classes(by: "neighbours", labels: ["Tool"], keys: ["kind", "maker", "model", "spec"], types: ["SUPPLIED_BY"])
+CALL structure.classes(by: "colors", colors: "designs")
+CALL structure.stored()
+CALL structure.drop(name: "designs")
+```
+
+**Colours.** `structure.colors` gives every node (of `labels:`, when given)
+a colour, Weisfeiler-Lehman style: two nodes have the same colour at
+`depth: d` exactly when their surroundings out to `d` hops cannot be told
+apart by their labels, the values of the properties named in `props:`
+(none by default, so names and codes do not make every node unique), and
+the types, directions and number of their edges of `types:` (every type
+by default) in `dir:` (`out` by default, `in`, or `both`, which counts the
+two directions apart). `depth: 0` is labels and properties alone; the
+default is 3. `depth: "stable"` refines until the partition stops
+changing, at most `max_depth:` rounds (32 by default), and says where it
+stopped or that it hit the cap. Rows are `id, color` (and `identity` with
+`identity: "<key>"`), in id order; `summary: true` gives instead one row
+per depth: `depth, colors` (over every node) `, selected` (over the nodes
+asked about).
+
+A colour depends on content only: labels, types and property keys count by
+name and values by content (`1` equals `1.0`), never by id, so the same data
+loaded under other ids gets the same colours, matched through `identity:`.
+Colours are 128-bit hashes (SipHash-2-4 under a fixed key) written as 32 hex
+digits. Equal surroundings always have equal colours. Different ones share
+a colour only by a hash collision: under 1.5e-21 for any two of a billion
+nodes at one depth (below 1e-9 if some node has a single neighbour repeated
+about 2^40 times).
+
+**Classes.** `structure.classes` groups interchangeable nodes, largest
+class first. `by: "neighbours"` (the default) groups nodes with the same
+labels, the same values on `keys:` (an absent key counts as a value) and
+exactly the same neighbours: the same multiset of (direction, edge type,
+node) over `types:` in `dir:`. It is exact: candidates found by hashing are
+compared in full. `by: "colors"` groups by colour, from a kept colouring
+(`colors: "<name>"`) or one computed in the call from the colour arguments.
+Rows are `class, size, first, members` (and `identities` with
+`identity:`), members by id or by identity value, at most `members:` (1,000)
+listed per class; ties between classes of one size go to the smallest first
+member (`neighbours`) or the smaller colour (`colors`). Only classes of
+`min_size:` (2) or more are listed; `summary: true` gives the size
+distribution instead (`size, classes`). The message says it plainly: the
+members are distinct nodes that the structure cannot tell apart, not one
+thing.
+
+What `keys:` and `types:` to give decides what "the same" means. On the
+manufacturing benchmark a planted duplicate tool hangs off the same supplier
+as its original but no work element uses it, so the edges that come in from
+users are left out (`types: ["SUPPLIED_BY"], dir: "out"`); a work
+element's own instruction is told apart from the same text at another
+station of the design by the element it belongs to
+(`types: ["APPLIES_TO", "ISSUED_BY", "HAS_INSTRUCTION"], dir: "both"`).
+
+**Kept colourings.** `store: "<name>"` keeps a colouring in the extension's
+keyspace with the revision it was computed at, its arguments and the
+version of the code that computed it (`CODE`, `structure-colors/1`).
+`structure.read(name:)` reads it back in slices and says whether the
+database has moved since; with `fresh: "require"` a moved database is an
+error (`classes(by: "colors", colors:)` takes `fresh:` too).
+`structure.stored()` lists them (`name, revision, fresh, depth, stable,
+nodes, colors, code, args`), `structure.drop(name:)` forgets one. Only the
+extension's own writes do not count as a move, so keeping or dropping one
+colouring leaves the others fresh; a write to any node, edge, index or other
+extension makes them all stale, whether or not it touched what they
+describe. `write: "<key>"` also sets the colour as a text property on each
+node (refused for a key in `props:`, which would change what it records).
+Without `store:` or `write:` nothing is written and the revision does not
+move. A kept colouring is derived data: `CLEAR` and `DROP EXTENSION` remove
+it, and `check.run` reports only records of it that do not decode (going
+stale is expected, and reported by `read`).
+
+**Slices and memory.** At most 10,000 rows a call (`limit:` lowers it);
+continue with `after:` (the last id for colours, the last class number for
+classes), as the message says. Colours are a whole-graph computation, so a
+slice of a colouring computed in the call bounds what it returns, not the
+work; read a kept colouring to slice the work too. Per-node state (41 bytes
+a node) is held within half of `algorithm_memory()` and spills to temporary
+files past it; distinct colours are counted and classes formed by external
+sorts in a quarter of it. The same database and arguments give the same
+rows, byte for byte, in memory and from a file.
+
+### Limits
+
+- Colours are computed for every node, also when `labels:` asks about a
+  few; `labels:` chooses what is reported and kept.
+- Staleness is by revision, not by comparison: any change makes a kept
+  colouring stale, including one it does not depend on.
+- The edges of one node are read once per round; a colouring at depth `d`
+  reads the adjacency `d` times.
+- Measured on the manufacturing graph: `bench/KNOWLEDGE.md`, "Structure".

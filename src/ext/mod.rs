@@ -26,6 +26,7 @@
 
 pub mod check;
 pub mod context;
+pub mod structure;
 pub mod text;
 
 use std::sync::{Arc, OnceLock, RwLock};
@@ -130,6 +131,7 @@ fn registry() -> &'static RwLock<Vec<Arc<dyn Extension>>> {
         RwLock::new(vec![
             Arc::new(check::Check) as Arc<dyn Extension>,
             Arc::new(context::Context),
+            Arc::new(structure::Structure),
         ])
     })
 }

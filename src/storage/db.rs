@@ -613,6 +613,18 @@ impl Db {
         }
     }
 
+    /// Where the log ends with the open transaction's records in it (they
+    /// are not committed yet): [`Db::revision`] when nothing is pending.
+    pub fn log_end(&self) -> u64 {
+        if let Some(w) = &self.wal {
+            w.end_lsn()
+        } else if let Some(m) = &self.mem_log {
+            m.end_lsn()
+        } else {
+            self.unlogged + self.unlogged_pending
+        }
+    }
+
     /// Log bytes a crash right now would replay.
     pub fn log_since_checkpoint(&self) -> u64 {
         self.wal
