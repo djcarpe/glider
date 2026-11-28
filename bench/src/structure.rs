@@ -213,3 +213,217 @@ pub fn closure(pairs: &BTreeSet<Pair>) -> BTreeSet<Pair> {
     }
     out
 }
+
+// ---------------------------------------------------------------- templates
+
+/// The hierarchy templates follow: plant down to the work instructions.
+/// What a work element uses (tools, parts, standards) and what it depends
+/// on are not hierarchy: they are written as references and internal
+/// edges of the shapes.
+pub const TEMPLATE_TYPES: &[&str] = &[
+    "HAS_PLANT",
+    "HAS_SHOP",
+    "HAS_LINE",
+    "HAS_STATION",
+    "HAS_SIDE",
+    "HAS_LOCATION",
+    "HAS_ELEMENT",
+    "HAS_INSTRUCTION",
+];
+
+/// How well station templates recover the designs.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TemplateRecovery {
+    pub designs: usize,
+    /// Designs with at least two stations without a deviation: the ones a
+    /// template (of two or more instances) can say.
+    pub eligible: usize,
+    /// Eligible designs whose stations without a deviation are exactly one
+    /// template's instances.
+    pub recovered: usize,
+    pub deviated: usize,
+    /// Deviated stations that are instances of their design's template:
+    /// must be none.
+    pub deviated_in_design: usize,
+    /// Templates of stations that are not a design's: stations that
+    /// deviate the same way.
+    pub other_templates: usize,
+    pub templates: usize,
+}
+
+impl TemplateRecovery {
+    pub fn exact(&self) -> bool {
+        self.recovered == self.eligible && self.deviated_in_design == 0
+    }
+}
+
+/// Score `template -> station instances` against the designs.
+pub fn template_recovery(
+    instances: &BTreeMap<String, BTreeSet<u64>>,
+    stations: &[Station],
+) -> TemplateRecovery {
+    let mut clean: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+    let mut designs = BTreeSet::new();
+    for s in stations {
+        designs.insert(s.design);
+        if !s.deviated {
+            clean.entry(s.design).or_default().insert(s.id);
+        }
+    }
+    let mut r = TemplateRecovery {
+        designs: designs.len(),
+        deviated: stations.iter().filter(|s| s.deviated).count(),
+        templates: instances.len(),
+        ..TemplateRecovery::default()
+    };
+    let sets: BTreeSet<&BTreeSet<u64>> = instances.values().collect();
+    let mut design_sets: BTreeSet<&BTreeSet<u64>> = BTreeSet::new();
+    for members in clean.values() {
+        if members.len() >= 2 {
+            r.eligible += 1;
+            if sets.contains(members) {
+                r.recovered += 1;
+                design_sets.insert(members);
+            }
+        }
+    }
+    let design_of: BTreeMap<u64, (u64, bool)> = stations
+        .iter()
+        .map(|s| (s.id, (s.design, s.deviated)))
+        .collect();
+    for members in instances.values() {
+        let has_clean = members
+            .iter()
+            .any(|m| design_of.get(m).is_some_and(|d| !d.1));
+        if has_clean {
+            r.deviated_in_design += members
+                .iter()
+                .filter(|m| design_of.get(m).is_some_and(|d| d.1))
+                .count();
+        } else {
+            r.other_templates += 1;
+        }
+    }
+    r
+}
+
+/// `template -> roots` from `templates(instances: '*')` rows.
+pub fn instance_sets(rows: &[Vec<Value>], into: &mut BTreeMap<String, BTreeSet<u64>>) {
+    for row in rows {
+        if let (Value::Text(t), Value::Int(root)) = (&row[0], &row[1]) {
+            into.entry(t.clone()).or_default().insert(*root as u64);
+        }
+    }
+}
+
+fn exact_value(v: &Value) -> String {
+    match v {
+        Value::Int(i) => format!("i{i}"),
+        Value::Float(f) => format!("f{}", f.to_bits()),
+        Value::List(items) => format!(
+            "[{}]",
+            items.iter().map(exact_value).collect::<Vec<_>>().join(",")
+        ),
+        v => format!("{:?}", v),
+    }
+}
+
+fn props_key(props: &[(String, Value)]) -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = props
+        .iter()
+        .map(|(k, v)| (k.clone(), exact_value(v)))
+        .collect();
+    v.sort();
+    v
+}
+
+/// Whether `expand` rows (several roots, with a `root` column) are exactly
+/// the instances in the graph: per root, its nodes with their labels and
+/// values, and the edges going out of them. Returns (roots, roots exact).
+pub fn expansion_exact(g: &glider::graph::Graph, r: &QueryResult) -> (usize, usize) {
+    type Edge = (u64, String, u64, Vec<(String, String)>);
+    let at = r.columns.iter().position(|c| c == "root").unwrap_or(7);
+    let pairs = |v: &Value| -> Vec<(String, Value)> {
+        match v {
+            Value::List(ps) => ps
+                .iter()
+                .filter_map(|p| match p {
+                    Value::List(kv) if kv.len() == 2 => Some((kv[0].to_string(), kv[1].clone())),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    let mut per: BTreeMap<
+        u64,
+        (
+            BTreeMap<u64, (Vec<String>, Vec<(String, String)>)>,
+            Vec<Edge>,
+        ),
+    > = BTreeMap::new();
+    for row in &r.rows {
+        let root = row[at].as_i64().unwrap_or(0) as u64;
+        let e = per.entry(root).or_default();
+        if row[0] == Value::Text("node".into()) {
+            let mut labels: Vec<String> = match &row[2] {
+                Value::List(l) => l.iter().map(|x| x.to_string()).collect(),
+                _ => Vec::new(),
+            };
+            labels.sort();
+            e.0.insert(
+                row[1].as_i64().unwrap_or(0) as u64,
+                (labels, props_key(&pairs(&row[6]))),
+            );
+        } else {
+            e.1.push((
+                row[4].as_i64().unwrap_or(0) as u64,
+                row[3].to_string(),
+                row[5].as_i64().unwrap_or(0) as u64,
+                props_key(&pairs(&row[6])),
+            ));
+        }
+    }
+    let mut exact = 0;
+    let roots = per.len();
+    for (_, (nodes, mut edges)) in per {
+        let mut ok = true;
+        let mut want: Vec<Edge> = Vec::new();
+        for (&id, (labels, props)) in &nodes {
+            let mut gl = g.node_labels(id);
+            gl.sort();
+            if &gl != labels || &props_key(&g.node_props(id)) != props {
+                ok = false;
+            }
+            g.for_each_adj(id, glider::graph::Dir::Out, None, |a| {
+                want.push((
+                    id,
+                    g.strings.name(a.etype).to_string(),
+                    a.other,
+                    props_key(&g.edge_props(a.edge)),
+                ));
+            });
+        }
+        want.sort();
+        edges.sort();
+        if ok && want == edges {
+            exact += 1;
+        }
+    }
+    (roots, exact)
+}
+
+/// The nodes under `root` along `types`, outwards, root first.
+pub fn subtree(g: &glider::graph::Graph, root: u64, types: &[&str]) -> Vec<u64> {
+    let mut out = Vec::new();
+    let mut stack = vec![root];
+    while let Some(v) = stack.pop() {
+        out.push(v);
+        g.for_each_adj(v, glider::graph::Dir::Out, None, |a| {
+            if types.contains(&g.strings.name(a.etype)) {
+                stack.push(a.other);
+            }
+        });
+    }
+    out
+}

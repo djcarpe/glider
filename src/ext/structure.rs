@@ -138,8 +138,8 @@ const PROCEDURES: &[Spec] = &[
     },
     Spec {
         name: "templates",
-        args: "(types, dir, labels, min_nodes, min_count, max_nodes, identity, instances, after, limit)",
-        doc: "Shapes that repeat along a hierarchy: id, root label, nodes, edges, slots, instances, estimated saving and definition; instances: <id> lists one template's instances and their slot values",
+        args: "(types, dir, labels, min_nodes, min_count, max_nodes, identity, instances, dictionary, fresh, after, limit)",
+        doc: "Shapes that repeat along a hierarchy: id, root label, nodes, edges, slots, instances, estimated saving and definition; instances: <id> (or '*') lists instances and their slot values; dictionary: a kept dictionary's templates instead",
     },
     Spec {
         name: "expand",
@@ -1302,14 +1302,14 @@ fn expand(g: &mut Graph, a: &Args) -> Result<QueryResult> {
         return plan::expand_kept(g, &d, &of, &roots, fresh_arg(a)?);
     }
     let h = templates::Hier::from(g, a)?;
-    let mut found = templates::find(g, &h)?;
+    let found = templates::find(g, &h)?;
     let i = templates::named(&found, &of).ok_or_else(|| {
         Error::Msg(format!(
             "no template '{of}' among those these arguments find; CALL structure.templates with the same arguments lists them, or give dictionary: a kept one"
         ))
     })?;
     let t = found.templates[i].clone();
-    templates::expand_template(g, &h, &mut found.forest, &t, &roots)
+    templates::expand_template(g, &h, &t, &roots)
 }
 
 // ---------------------------------------------------------------- classes

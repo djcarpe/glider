@@ -290,6 +290,17 @@ impl<'a> Planner<'a> {
         );
         let mut delta = self.by(def2) - self.by(self.found.def_cost[t]);
         let mut costs = Vec::new();
+        // A use is its name, its ids and one value per slot, apart: when
+        // the slots are the same ones, every use costs what it did.
+        let key = |x: &SlotRef| (x.pos, x.edge, x.key);
+        let mut before: Vec<(u32, u32, u32)> =
+            self.found.templates[t].slots.iter().map(key).collect();
+        let mut after: Vec<(u32, u32, u32)> = t2.slots.iter().map(key).collect();
+        before.sort_unstable();
+        after.sort_unstable();
+        if before == after {
+            return Ok((delta, t2, def2, costs));
+        }
         for (r, root) in self.used_roots(t) {
             step(1)?;
             let inst = tp::walk(g, &mut self.found.forest, &self.h, root)?;
@@ -308,41 +319,49 @@ impl<'a> Planner<'a> {
             let (x, y) = (&self.found.templates[a], &self.found.templates[b]);
             (x.nodes(), &x.id).cmp(&(y.nodes(), &y.id))
         });
+        // Where each template could go: in a chosen one, at a position
+        // where every use of the chosen one has an instance of it.
+        let mut places: HashMap<usize, Vec<(usize, u32)>> = HashMap::new();
+        for t in 0..self.found.templates.len() {
+            if !self.in_dict[t] {
+                continue;
+            }
+            let roots = self.used_roots(t);
+            if roots.is_empty() {
+                continue;
+            }
+            let tn = self.found.templates[t].nodes();
+            let ids0 = self.members(roots[0].1)?;
+            let mut cands: Vec<(u32, usize)> = (1..ids0.len())
+                .filter_map(|p| by_root.get(&ids0[p]).map(|&u| (p as u32, u)))
+                .filter(|&(_, u)| self.found.templates[u].nodes() < tn)
+                .collect();
+            for &(_, root) in &roots[1..] {
+                if cands.is_empty() {
+                    break;
+                }
+                step(1)?;
+                let ids = self.members(root)?;
+                cands.retain(|&(p, u)| by_root.get(&ids[p as usize]) == Some(&u));
+            }
+            for (p, u) in cands {
+                places.entry(u).or_default().push((t, p));
+            }
+        }
         for &u in &order {
             let un = self.found.templates[u].nodes();
             let mut opps: Vec<(usize, u32)> = Vec::new();
-            for t in 0..self.found.templates.len() {
-                if !self.in_dict[t] || t == u || self.found.templates[t].nodes() <= un {
-                    continue;
-                }
-                let roots = self.used_roots(t);
-                if roots.is_empty() {
-                    continue;
-                }
+            let mut last: Option<(usize, u32)> = None;
+            for &(t, p) in places.get(&u).map(|v| v.as_slice()).unwrap_or(&[]) {
                 let ranges = tp::nested_ranges(&self.found.templates[t], &self.found.templates);
-                let ids0 = self.members(roots[0].1)?;
-                let mut cands: Vec<u32> = (1..ids0.len() as u32)
-                    .filter(|&p| by_root.get(&ids0[p as usize]) == Some(&u))
-                    .filter(|&p| {
-                        !ranges.iter().any(|&(a, b, v)| {
-                            (p > a && p < b) || (p == a && self.found.templates[v].nodes() >= un)
-                        })
-                    })
-                    .collect();
-                for &(_, root) in &roots[1..] {
-                    if cands.is_empty() {
-                        break;
-                    }
-                    let ids = self.members(root)?;
-                    cands.retain(|&p| by_root.get(&ids[p as usize]) == Some(&u));
-                }
+                let blocked = ranges.iter().any(|&(a, b, v)| {
+                    (p > a && p < b) || (p == a && self.found.templates[v].nodes() >= un)
+                });
                 // Nested parts may not overlap: keep the first of any two.
-                let mut last_end = 0u32;
-                for p in cands {
-                    if p >= last_end {
-                        opps.push((t, p));
-                        last_end = p + un as u32;
-                    }
+                let overlaps = matches!(last, Some((lt, end)) if lt == t && p < end);
+                if !blocked && !overlaps {
+                    opps.push((t, p));
+                    last = Some((t, p + un as u32));
                 }
             }
             if opps.is_empty() {
@@ -1290,6 +1309,7 @@ pub fn encode_template(t: &Template) -> Vec<u8> {
     let mut b = vec![1u8];
     codec::put_str(&mut b, &t.id);
     b.extend_from_slice(&t.group.to_be_bytes());
+    b.extend_from_slice(&t.shape.to_be_bytes());
     codec::put_bytes(&mut b, &t.structure);
     codec::put_u32(&mut b, t.nodes() as u32);
     for p in 0..t.nodes() {
@@ -1382,8 +1402,12 @@ pub fn decode_template(b: &[u8]) -> Option<Template> {
         if r.remaining() < 16 {
             return Err("short".into());
         }
+        if r.remaining() < 32 {
+            return Err("short".into());
+        }
         let group = u128::from_be_bytes(r.buf[r.pos..r.pos + 16].try_into().unwrap());
-        r.pos += 16;
+        let shape = u128::from_be_bytes(r.buf[r.pos + 16..r.pos + 32].try_into().unwrap());
+        r.pos += 32;
         let structure = r.bytes()?;
         let n = r.u32()? as usize;
         let (mut parent, mut labels, mut props) = (Vec::new(), Vec::new(), Vec::new());
@@ -1439,6 +1463,7 @@ pub fn decode_template(b: &[u8]) -> Option<Template> {
         Ok(Template {
             id,
             group,
+            shape,
             structure,
             parent,
             labels,
@@ -1590,6 +1615,7 @@ pub fn find_kept(g: &Graph, h: &Hier, d: &Dict) -> Result<Found> {
         .enumerate()
         .map(|(i, t)| (t.group, i))
         .collect();
+    let shapes: HashSet<u128> = d.templates.iter().map(|t| t.shape).collect();
     let label_ids: Vec<u32> = h
         .labels
         .iter()
@@ -1608,6 +1634,9 @@ pub fn find_kept(g: &Graph, h: &Hier, d: &Dict) -> Result<Found> {
             continue;
         }
         candidates += 1;
+        if !shapes.contains(&forest.shape_of(id).unwrap_or_default()) {
+            continue;
+        }
         let inst = tp::walk(g, &mut forest, h, id)?;
         let st = tp::structure(&inst);
         if let Some(&i) = by_group.get(&sip128(&st)) {
@@ -1757,6 +1786,5 @@ pub fn expand_kept(
                 "the dictionary '{name}' has no template '{of}'; give its id, the 16 digits its definition shows, or its name (T1, T2, ...)"
             ))
         })?;
-    let mut f = Forest::build(g, &h)?;
-    tp::expand_template(g, &h, &mut f, &k.dict.templates[i], roots)
+    tp::expand_template(g, &h, &k.dict.templates[i], roots)
 }

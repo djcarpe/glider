@@ -254,6 +254,72 @@ fn join(c: Colour) -> u128 {
     ((c.0 as u128) << 64) | c.1 as u128
 }
 
+/// A child as its parent's hashes see it: (edge, edge type, the child's
+/// shape hash, its content hash, its size).
+type Kid = (u64, u32, Colour, Colour, u64);
+
+/// A node's shape hash (labels, keys, and its children's types, edge keys
+/// and shapes, as a multiset), content hash (the same with every value)
+/// and size, from its children's.
+fn hashes(g: &Graph, h: &Hier, id: u64, kids: &[Kid]) -> (Colour, Colour, u64) {
+    let mut own_s = vec![b'S'];
+    let mut own_c = vec![b'C'];
+    if let Some(n) = node_text(g, id) {
+        for b in [&mut own_s, &mut own_c] {
+            b.extend_from_slice(&(n.labels.len() as u32).to_be_bytes());
+            for l in &n.labels {
+                super::put_str(b, l);
+            }
+        }
+        for (k, val) in &n.props {
+            super::put_str(&mut own_s, k);
+            super::put_str(&mut own_c, k);
+            exact(&mut own_c, val);
+        }
+    }
+    let (mut sum_s, mut sum_c, mut size) = (0u128, 0u128, 1u64);
+    for &(edge, t, shape, content, csize) in kids {
+        let mut es = vec![b'E'];
+        put_hash(&mut es, h.type_hash(t));
+        let mut ec = es.clone();
+        let mut props = g.edge_props(edge);
+        notation::sort_props(&mut props);
+        for (k, val) in &props {
+            super::put_str(&mut es, k);
+            super::put_str(&mut ec, k);
+            exact(&mut ec, val);
+        }
+        put_hash(&mut es, join(shape));
+        put_hash(&mut ec, join(content));
+        sum_s = sum_s.wrapping_add(sip128(&es));
+        sum_c = sum_c.wrapping_add(sip128(&ec));
+        size = size.saturating_add(csize);
+    }
+    let count = kids.len() as u64;
+    for (b, sum) in [(&mut own_s, sum_s), (&mut own_c, sum_c)] {
+        b.extend_from_slice(&count.to_be_bytes());
+        put_hash(b, sum);
+    }
+    (split(sip128(&own_s)), split(sip128(&own_c)), size)
+}
+
+/// The one node a followed edge reaches `v` from, when exactly one does.
+fn sole_owner(g: &Graph, h: &Hier, v: u64) -> u64 {
+    let (mut count, mut other) = (0u32, NONE);
+    g.for_each_adj_while(v, h.back(), None, |a| {
+        if h.followed(a.etype) {
+            count += 1;
+            other = a.other;
+        }
+        count < 2
+    });
+    if count == 1 && other != v {
+        other
+    } else {
+        NONE
+    }
+}
+
 impl Forest {
     pub fn build(g: &Graph, h: &Hier) -> Result<Forest> {
         let n = g.node_count();
@@ -345,28 +411,9 @@ impl Forest {
             shape: StateVec::new(len, (0u64, 0u64)),
             content: StateVec::new(len, (0u64, 0u64)),
         };
-        let mut own_s = Vec::new();
-        let mut own_c = Vec::new();
         while let Some(v) = ready.pop_front() {
             let v = v as usize;
             let id = f.ids.get(v);
-            own_s.clear();
-            own_c.clear();
-            own_s.push(b'S');
-            own_c.push(b'C');
-            if let Some(n) = node_text(g, id) {
-                for b in [&mut own_s, &mut own_c] {
-                    b.extend_from_slice(&(n.labels.len() as u32).to_be_bytes());
-                    for l in &n.labels {
-                        super::put_str(b, l);
-                    }
-                }
-                for (k, val) in &n.props {
-                    super::put_str(&mut own_s, k);
-                    super::put_str(&mut own_c, k);
-                    exact(&mut own_c, val);
-                }
-            }
             let mut kids: Vec<(u64, u64, u32)> = Vec::new();
             g.for_each_adj(id, h.dir, None, |a| {
                 if h.followed(a.etype) && a.other != id {
@@ -374,35 +421,17 @@ impl Forest {
                 }
             });
             step(1 + kids.len() as u64)?;
-            let (mut sum_s, mut sum_c, mut size, mut count) = (0u128, 0u128, 1u64, 0u64);
+            let mut done: Vec<Kid> = Vec::with_capacity(kids.len());
             for (c, edge, t) in kids {
                 let Some(p) = f.pos(c) else { continue };
                 if f.owner.get(p) != id {
                     continue;
                 }
-                let mut es = vec![b'E'];
-                put_hash(&mut es, h.type_hash(t));
-                let mut ec = es.clone();
-                let mut props = g.edge_props(edge);
-                notation::sort_props(&mut props);
-                for (k, val) in &props {
-                    super::put_str(&mut es, k);
-                    super::put_str(&mut ec, k);
-                    exact(&mut ec, val);
-                }
-                put_hash(&mut es, join(f.shape.get(p)));
-                put_hash(&mut ec, join(f.content.get(p)));
-                sum_s = sum_s.wrapping_add(sip128(&es));
-                sum_c = sum_c.wrapping_add(sip128(&ec));
-                size = size.saturating_add(f.size.get(p));
-                count += 1;
+                done.push((edge, t, f.shape.get(p), f.content.get(p), f.size.get(p)));
             }
-            for (b, sum) in [(&mut own_s, sum_s), (&mut own_c, sum_c)] {
-                b.extend_from_slice(&count.to_be_bytes());
-                put_hash(b, sum);
-            }
-            f.shape.set(v, split(sip128(&own_s)));
-            f.content.set(v, split(sip128(&own_c)));
+            let (sh, co, size) = hashes(g, h, id, &done);
+            f.shape.set(v, sh);
+            f.content.set(v, co);
             f.size.set(v, size);
             let o = f.owner.get(v);
             if o != NONE {
@@ -415,6 +444,107 @@ impl Forest {
             }
         }
         Ok(f)
+    }
+
+    /// The forest under one root alone, the same there as [`Forest::build`]
+    /// makes it for the whole graph: what `expand` needs, without reading
+    /// the rest of the graph. Ownership is decided by each node's own edges;
+    /// an owner that goes round in a circle is cut, as the whole forest cuts
+    /// it, when the root is on that circle (no node below a root that is not
+    /// on a circle can be).
+    pub fn local(g: &Graph, h: &Hier, root: u64, cap: usize) -> Result<Forest> {
+        // Is the root on a circle of owners?
+        let mut circle: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut x = root;
+        let root_owner = sole_owner(g, h, root);
+        loop {
+            step(1)?;
+            let o = sole_owner(g, h, x);
+            if o == NONE || !seen.insert(x) {
+                break;
+            }
+            if o == root {
+                // Back at the root: everything on the way is the circle.
+                let mut y = root;
+                loop {
+                    circle.insert(y);
+                    y = sole_owner(g, h, y);
+                    if y == root {
+                        break;
+                    }
+                }
+                break;
+            }
+            x = o;
+        }
+        // The nodes under it, with parents.
+        let mut order: Vec<(u64, u64, u64, u32)> = Vec::new(); // (node, parent, edge, type)
+        let mut stack: Vec<(u64, u64, u64, u32)> = vec![(root, NONE, 0, 0)];
+        while let Some((v, par, e, t)) = stack.pop() {
+            order.push((v, par, e, t));
+            if order.len() > cap {
+                return Err(Error::Msg(format!(
+                    "the shape under node {root} has more than {cap} nodes; give a smaller max_nodes: or other types:"
+                )));
+            }
+            let mut kids = Vec::new();
+            g.for_each_adj(v, h.dir, None, |a| {
+                if h.followed(a.etype) && a.other != v && a.other != root {
+                    kids.push((a.other, a.edge, a.etype));
+                }
+            });
+            step(1 + kids.len() as u64)?;
+            for (c, e, t) in kids {
+                if !circle.contains(&c) && sole_owner(g, h, c) == v {
+                    stack.push((c, v, e, t));
+                }
+            }
+        }
+        // Bottom-up, children before parents: reverse preorder.
+        let mut hashed: HashMap<u64, (Colour, Colour, u64)> = HashMap::with_capacity(order.len());
+        let mut kids_of: HashMap<u64, Vec<Kid>> = HashMap::new();
+        for &(v, par, e, t) in order.iter().rev() {
+            let kids = kids_of.remove(&v).unwrap_or_default();
+            let hv = hashes(g, h, v, &kids);
+            hashed.insert(v, hv);
+            if par != NONE {
+                kids_of
+                    .entry(par)
+                    .or_default()
+                    .push((e, t, hv.0, hv.1, hv.2));
+            }
+        }
+        let mut rows: Vec<(u64, u64)> = order.iter().map(|&(v, par, _, _)| (v, par)).collect();
+        rows.sort_unstable();
+        let len = rows.len();
+        let owner: Vec<u64> = rows
+            .iter()
+            .map(|&(v, par)| {
+                if v == root {
+                    if circle.is_empty() {
+                        root_owner
+                    } else {
+                        NONE
+                    }
+                } else {
+                    par
+                }
+            })
+            .collect();
+        Ok(Forest {
+            ids: StateVec::from_vec(rows.iter().map(|r| r.0).collect()),
+            len,
+            owner: StateVec::from_vec(owner),
+            size: StateVec::from_vec(rows.iter().map(|r| hashed[&r.0].2).collect()),
+            shape: StateVec::from_vec(rows.iter().map(|r| hashed[&r.0].0).collect()),
+            content: StateVec::from_vec(rows.iter().map(|r| hashed[&r.0].1).collect()),
+        })
+    }
+
+    pub fn shape_of(&mut self, id: u64) -> Option<u128> {
+        let p = self.pos(id)?;
+        Some(join(self.shape.get(p)))
     }
 
     pub fn pos(&mut self, id: u64) -> Option<usize> {
@@ -487,13 +617,28 @@ fn edge_key(e: &IEdge) -> Vec<u8> {
 /// shape, then by their own values, then by a hash of everything under
 /// them, then by id (only fully alike siblings get that far).
 pub fn order(g: &Graph, f: &mut Forest, h: &Hier, root: u64) -> Result<(Vec<u64>, Vec<u32>)> {
+    let (ids, parent, _) = ordered(g, f, h, root)?;
+    Ok((ids, parent))
+}
+
+/// [`order`], with each node as read for it.
+fn ordered(
+    g: &Graph,
+    f: &mut Forest,
+    h: &Hier,
+    root: u64,
+) -> Result<(Vec<u64>, Vec<u32>, Vec<NodeText>)> {
+    let gone = |v: u64| Error::Msg(format!("node {v} is gone; nothing can be written for it"));
     let mut ids: Vec<u64> = Vec::new();
     let mut parent: Vec<u32> = Vec::new();
-    let mut stack: Vec<(u64, u32)> = vec![(root, NO_POS)];
-    while let Some((v, par)) = stack.pop() {
+    let mut texts: Vec<NodeText> = Vec::new();
+    let first = node_text(g, root).ok_or_else(|| gone(root))?;
+    let mut stack: Vec<(u64, u32, NodeText)> = vec![(root, NO_POS, first)];
+    while let Some((v, par, text)) = stack.pop() {
         let p = ids.len() as u32;
         ids.push(v);
         parent.push(par);
+        texts.push(text);
         if ids.len() > h.max_nodes.max(1) * 4 + 1024 {
             return Err(Error::Msg(format!(
                 "the shape under node {root} has more than {} nodes; give a smaller max_nodes: or other types:",
@@ -507,7 +652,7 @@ pub fn order(g: &Graph, f: &mut Forest, h: &Hier, root: u64) -> Result<(Vec<u64>
             }
         });
         step(1 + found.len() as u64)?;
-        let mut kids: Vec<(&str, u128, Vec<u8>, u128, u64)> = Vec::new();
+        let mut kids: Vec<(&str, u128, Vec<u8>, u128, u64, NodeText)> = Vec::new();
         for (c, t) in found {
             let Some(cp) = f.pos(c) else { continue };
             if f.owner.get(cp) != v {
@@ -516,12 +661,11 @@ pub fn order(g: &Graph, f: &mut Forest, h: &Hier, root: u64) -> Result<(Vec<u64>
             // The child's own values in the order cards write them, so
             // that siblings line up the same way in every instance (the
             // element named "Fasten" before the one named "Inspect").
+            let n = node_text(g, c).ok_or_else(|| gone(c))?;
             let mut own = Vec::new();
-            if let Some(n) = node_text(g, c) {
-                for (k, val) in &n.props {
-                    super::put_str(&mut own, k);
-                    exact(&mut own, val);
-                }
+            for (k, val) in &n.props {
+                super::put_str(&mut own, k);
+                exact(&mut own, val);
             }
             kids.push((
                 g.strings.name(t),
@@ -529,26 +673,22 @@ pub fn order(g: &Graph, f: &mut Forest, h: &Hier, root: u64) -> Result<(Vec<u64>
                 own,
                 join(f.content.get(cp)),
                 c,
+                n,
             ));
         }
-        kids.sort();
-        for (_, _, _, _, c) in kids.into_iter().rev() {
-            stack.push((c, p));
+        kids.sort_by(|a, b| (a.0, a.1, &a.2, a.3, a.4).cmp(&(b.0, b.1, &b.2, b.3, b.4)));
+        for (_, _, _, _, c, n) in kids.into_iter().rev() {
+            stack.push((c, p, n));
         }
     }
-    Ok((ids, parent))
+    Ok((ids, parent, texts))
 }
 
 /// The shape under `root`, in preorder.
 pub fn walk(g: &Graph, f: &mut Forest, h: &Hier, root: u64) -> Result<Inst> {
-    let (ids, parent) = order(g, f, h, root)?;
-    let mut nodes: Vec<NodeText> = Vec::with_capacity(ids.len());
+    let (ids, parent, nodes) = ordered(g, f, h, root)?;
     let mut pos: HashMap<u64, u32> = HashMap::with_capacity(ids.len());
     for (p, &v) in ids.iter().enumerate() {
-        let n = node_text(g, v).ok_or_else(|| {
-            Error::Msg(format!("node {v} is gone; nothing can be written for it"))
-        })?;
-        nodes.push(n);
         pos.insert(v, p as u32);
     }
     let mut edges: Vec<IEdge> = Vec::new();
@@ -680,6 +820,9 @@ pub struct Template {
     pub id: String,
     /// The hash of [`structure`], by which instances are found.
     pub group: u128,
+    /// The forest's shape hash of its root: what a root must have before
+    /// it is walked and compared.
+    pub shape: u128,
     pub structure: Vec<u8>,
     pub parent: Vec<u32>,
     pub labels: Vec<Vec<String>>,
@@ -943,7 +1086,14 @@ fn template_id(g: &Graph, names: &Names, t: &Template) -> String {
 
 /// The template a set of instances makes, from its first instance and the
 /// tracks of all of them.
-fn make(g: &Graph, names: &Names, first: &Inst, structure: Vec<u8>, tracks: Tracks) -> Template {
+fn make(
+    g: &Graph,
+    names: &Names,
+    first: &Inst,
+    structure: Vec<u8>,
+    tracks: Tracks,
+    shape: u128,
+) -> Template {
     let props = first
         .nodes
         .iter()
@@ -977,6 +1127,7 @@ fn make(g: &Graph, names: &Names, first: &Inst, structure: Vec<u8>, tracks: Trac
     let mut t = Template {
         id: String::new(),
         group: sip128(&structure),
+        shape,
         structure,
         parent: first.parent.clone(),
         labels: first.nodes.iter().map(|n| n.labels.clone()).collect(),
@@ -1207,12 +1358,29 @@ pub fn definition(
     let mut p = 0u32;
     while (p as usize) < t.nodes() {
         if let Some(&(a, b, u)) = ranges.iter().find(|r| r.0 == p) {
-            s.push_str(&format!(" .{}={}\n", a + 1, short(u)));
-            // The nested template's slots, at its positions here.
+            s.push_str(&format!(" .{}={}", a + 1, short(u)));
             let ut = &all[u];
+            // Values of the nested root that this template gives itself
+            // (derived from its own root, or constant here) where the nested
+            // template has a slot: written after it, `.3=T2 code=~"-L"`.
+            let given =
+                |i: usize| ut.props[0][i].1 == Prop::Slot && t.props[a as usize][i].1 != Prop::Slot;
+            for (i, (k, pr)) in t.props[a as usize].iter().enumerate() {
+                if given(i) {
+                    s.push(' ');
+                    notation::name(k, &mut s);
+                    s.push('=');
+                    prop_text(pr, &mut s);
+                }
+            }
+            s.push('\n');
+            // The nested template's slots, at its positions here.
             let first_here = edge_starts(t);
             let first_there = edge_starts(ut);
             for r in &ut.slots {
+                if r.pos == 0 && r.edge == NO_SLOT_EDGE && given(r.key as usize) {
+                    continue;
+                }
                 slots.push(SlotRef {
                     pos: r.pos + a,
                     edge: if r.edge == NO_SLOT_EDGE {
@@ -1474,8 +1642,10 @@ pub fn find(g: &Graph, h: &Hier) -> Result<Found> {
             candidates: 0,
         });
     }
-    let mut s = sorter(g, "structure-templates")?;
-    let mut candidates = 0u64;
+    // Roots whose forest shape is not repeated cannot be in a template:
+    // only the others are walked.
+    let mut by_shape = sorter(g, "structure-template-shapes")?;
+    let mut looked = 0u64;
     for v in 0..forest.len {
         step(1)?;
         let size = forest.size.get(v) as usize;
@@ -1486,11 +1656,36 @@ pub fn find(g: &Graph, h: &Hier) -> Result<Found> {
         if !may_root(g, &label_ids, id) {
             continue;
         }
-        let inst = walk(g, &mut forest, h, id)?;
-        let mut k = sip128(&structure(&inst)).to_be_bytes().to_vec();
-        k.extend_from_slice(&order_key(g, &h.names, id));
-        s.push(&k, &id.to_be_bytes()).map_err(Error::Io)?;
-        candidates += 1;
+        let mut k = join(forest.shape.get(v)).to_be_bytes().to_vec();
+        k.extend_from_slice(&id.to_be_bytes());
+        by_shape.push(&k, &[]).map_err(Error::Io)?;
+        looked += 1;
+    }
+    let mut s = sorter(g, "structure-templates")?;
+    let mut candidates = 0u64;
+    let mut shapes = by_shape.finish().map_err(Error::Io)?;
+    let mut run: SpillQueue<u64> = SpillQueue::new();
+    let mut at: Option<Vec<u8>> = None;
+    loop {
+        let next = shapes.next().map_err(Error::Io)?;
+        let head = next.as_ref().map(|(k, _)| k[..16].to_vec());
+        if head != at {
+            if run.len() >= h.min_count as u64 {
+                while let Some(id) = run.pop_front() {
+                    let inst = walk(g, &mut forest, h, id)?;
+                    let mut k = sip128(&structure(&inst)).to_be_bytes().to_vec();
+                    k.extend_from_slice(&order_key(g, &h.names, id));
+                    s.push(&k, &id.to_be_bytes()).map_err(Error::Io)?;
+                    candidates += 1;
+                }
+            }
+            run = SpillQueue::new();
+            at = head;
+        }
+        match next {
+            Some((k, _)) => run.push_back(u64::from_be_bytes(k[16..24].try_into().unwrap())),
+            None => break,
+        }
     }
     let mut roots = StateVec::new(candidates as usize, 0u64);
     let mut use_cost = StateVec::new(candidates as usize, (0u64, 0u64));
@@ -1564,7 +1759,7 @@ pub fn find(g: &Graph, h: &Hier) -> Result<Found> {
         use_cost,
         plain_cost,
         def_cost,
-        candidates,
+        candidates: looked,
     })
 }
 
@@ -1604,7 +1799,8 @@ fn group(
         return Ok(None);
     }
     let (inst0, st0, tracks) = first.unwrap();
-    let mut t = make(g, &h.names, &inst0, st0, tracks);
+    let shape = f.shape_of(inst0.ids[0]).unwrap_or_default();
+    let mut t = make(g, &h.names, &inst0, st0, tracks, shape);
     t.start = *filled;
     while let Some(id) = members.pop_front() {
         let inst = walk(g, f, h, id)?;
@@ -1651,10 +1847,25 @@ fn template_order(found: &mut Found) -> Vec<(usize, (i64, i64))> {
 }
 
 pub fn templates(g: &mut Graph, a: &Args) -> Result<QueryResult> {
-    let h = Hier::from(g, a)?;
     let limit = limit_arg(a)?;
-    let mut found = find(g, &h)?;
+    let (h, mut found) = match super::store_name(a, "dictionary")? {
+        // The kept dictionary's templates, as the graph has them now.
+        Some(d) => {
+            let k = super::plan::load(g, &d, super::fresh_arg(a)?)?;
+            let h = k.meta.hier.rebind(g);
+            let found = super::plan::find_kept(g, &h, &k.dict)?;
+            (h, found)
+        }
+        None => {
+            let h = Hier::from(g, a)?;
+            let found = find(g, &h)?;
+            (h, found)
+        }
+    };
     if let Some(of) = a.str("instances") {
+        if of == "*" {
+            return all_instances(g, &h, &mut found, a, limit);
+        }
         return instances(g, &h, &mut found, &of, a, limit);
     }
     let after = a.usize("after", 0);
@@ -1800,6 +2011,72 @@ fn instances(
     Ok(r)
 }
 
+/// `instances: "*"`: every template's instances, template by template in
+/// the order `templates` lists them, each in member order; `after:` is the
+/// number of rows already read.
+fn all_instances(
+    g: &Graph,
+    h: &Hier,
+    found: &mut Found,
+    a: &Args,
+    limit: usize,
+) -> Result<QueryResult> {
+    let after = a.usize("after", 0);
+    let order = template_order(found);
+    let mut rows = Vec::new();
+    let mut seen = 0usize;
+    let total: usize = found.templates.iter().map(|t| t.count).sum();
+    'out: for (i, _) in order {
+        let t = found.templates[i].clone();
+        if seen + t.count <= after {
+            seen += t.count;
+            continue;
+        }
+        let mut members: Vec<(Vec<u8>, u64)> = (t.start..t.start + t.count)
+            .map(|r| {
+                let id = found.roots.get(r);
+                (order_key(g, &h.names, id), id)
+            })
+            .collect();
+        members.sort();
+        for (_, id) in members {
+            if seen < after {
+                seen += 1;
+                continue;
+            }
+            if rows.len() == limit {
+                break 'out;
+            }
+            step(1)?;
+            let inst = walk(g, &mut found.forest, h, id)?;
+            rows.push(vec![
+                Value::Text(t.id.clone()),
+                Value::Int(id as i64),
+                Value::Text(h.names.handle(g, id)),
+                Value::List(slot_values(&t, &inst)),
+            ]);
+            seen += 1;
+        }
+    }
+    let shown = rows.len();
+    let mut r = QueryResult::table(
+        ["template", "root", "handle", "slots"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        rows,
+    );
+    let mut msg = format!("{total} instances of {} templates", found.templates.len());
+    if after + shown < total {
+        msg.push_str(&format!(
+            "; more: CALL structure.templates again with instances: '*', after: {} and the same arguments",
+            after + shown
+        ));
+    }
+    r.message = Some(msg);
+    Ok(r)
+}
+
 /// Rows for the parts [`rebuild`] gives back.
 pub fn part_rows(parts: Vec<Part>) -> Vec<Vec<Value>> {
     let pairs = |props: Vec<(String, Value)>| {
@@ -1854,13 +2131,7 @@ pub const MAX_EXPAND: usize = 1_000;
 /// the call (the same arguments as `templates`) or a kept dictionary: each
 /// instance rebuilt from the definition and its slot values alone, after
 /// checking in full that the root really is an instance.
-pub fn expand_template(
-    g: &Graph,
-    h: &Hier,
-    f: &mut Forest,
-    t: &Template,
-    roots: &[u64],
-) -> Result<QueryResult> {
+pub fn expand_template(g: &Graph, h: &Hier, t: &Template, roots: &[u64]) -> Result<QueryResult> {
     if roots.len() > MAX_EXPAND {
         return Err(Error::Msg(format!(
             "root: {} roots is more than one call expands; give at most {MAX_EXPAND} at a time",
@@ -1870,7 +2141,8 @@ pub fn expand_template(
     let mut rows = Vec::new();
     let (mut nodes, mut edges, mut slots) = (0usize, 0usize, 0usize);
     for &root in roots {
-        let inst = walk(g, f, h, root)?;
+        let mut f = Forest::local(g, h, root, h.max_nodes.max(1) * 4 + 1024)?;
+        let inst = walk(g, &mut f, h, root)?;
         if let Err(why) = matches(t, &inst, &structure(&inst)) {
             return Err(Error::Msg(format!(
                 "node {root} is not an instance of template {}: {why}; it is written plainly",
@@ -1917,9 +2189,16 @@ pub fn nest(
     t2.nested.push((p, ui));
     t2.nested.sort();
     for q in 0..u.nodes() {
+        let before = t.props[p as usize + q].clone();
         t2.props[p as usize + q] = u.props[q]
             .iter()
-            .map(|(k, pr)| {
+            .enumerate()
+            .map(|(i, (k, pr))| {
+                // The nested root keeps what this template already knows
+                // of it where the nested template has a slot.
+                if q == 0 && *pr == Prop::Slot && before[i].1 != Prop::Slot {
+                    return before[i].clone();
+                }
                 let pr = match pr {
                     Prop::Derived {
                         base,

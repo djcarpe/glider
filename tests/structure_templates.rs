@@ -400,6 +400,7 @@ struct TDef {
     /// Position (0-based) -> card or nested template name.
     cards: BTreeMap<usize, (Vec<String>, Vec<(String, PVal)>)>,
     nested: BTreeMap<usize, String>,
+    given: BTreeMap<usize, Vec<(String, PVal)>>,
     edges: Vec<(usize, String, Vec<(String, PVal)>, Target)>,
 }
 
@@ -438,7 +439,18 @@ fn flatten(defs: &HashMap<String, TDef>, name: &str) -> Flat {
                 };
                 f.edges.push((s + base_n, t, ps, to));
             }
+            let given = d.given.get(&p).cloned().unwrap_or_default();
+            for (key, pv) in given {
+                let props = &mut f.nodes[base_n].1;
+                let i = props.iter().position(|(k, _)| *k == key).unwrap();
+                props[i].1 = pv;
+                // Derived here means from this template's root.
+                f.nodes[base_n].2 = 0;
+            }
             for (edge, i, k) in sub.slots {
+                if !edge && i == 0 && !matches!(f.nodes[base_n].1[k].1, PVal::Slot) {
+                    continue;
+                }
                 f.slots
                     .push((edge, if edge { i + base_e } else { i + base_n }, k));
             }
@@ -503,6 +515,14 @@ fn decode(text: &str, dictionary: Option<&str>, identity: Option<&str>) -> Snaps
             let p: usize = x.name().parse::<usize>().unwrap() - 1;
             if x.eat("=") {
                 d.nested.insert(p, x.name());
+                // Values of the nested root this definition gives itself.
+                let mut given = Vec::new();
+                while x.eat(" ") {
+                    let k = x.name();
+                    assert!(x.eat("="));
+                    given.push((k, x.pval()));
+                }
+                d.given.insert(p, given);
             } else if x.eat(" -") {
                 let t = x.name();
                 let ps = x.props();
