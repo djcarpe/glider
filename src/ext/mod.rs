@@ -29,6 +29,7 @@ pub mod check;
 pub mod context;
 pub mod structure;
 pub mod text;
+pub mod vector;
 
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -180,6 +181,7 @@ fn registry() -> &'static RwLock<Vec<Arc<dyn Extension>>> {
             Arc::new(check::Check),
             Arc::new(context::Context),
             Arc::new(structure::Structure),
+            Arc::new(vector::Vector),
         ])
     })
 }

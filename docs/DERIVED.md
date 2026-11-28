@@ -785,12 +785,28 @@ Built-in algorithms gain three names beside the existing ones:
 already computes, on its own), and `CALL steiner(nodes: [...])` (a small
 tree that connects the given nodes, for showing how a set of things relate).
 
-## `vector`: vectors beside the graph
+## `vector`: vectors beside the graph (*built*)
+
+*Built (G10). Shown by `tests/vector.rs`; measured by `mfg-bench --only
+vector` (`bench/KNOWLEDGE.md`, "Vectors"); the user-facing description is
+in `docs/EXTENSIONS.md`.*
 
 A vector is not a good property. As a list of floats it costs nine bytes an
 element on disk and thirty-two in memory, cannot be searched, and says
 nothing about where it came from. `vector` stores vectors in the extension
 keyspace as packed 32-bit floats, in named *spaces*.
+
+```
+CALL vector.create(space: "text", dims: 384, metric: "cosine", of: "node",
+                   labels: ["WorkInstruction"], model: "...", model_version: "...", at: "...")
+CALL vector.put(space: "text", ids: [...], vectors: [[...], ...], hashes: [...])
+CALL vector.get(space: "text", ids: [...])       CALL vector.hashes(space: "text", ids: [...])
+CALL vector.delete(space: "text", ids: [...])
+CALL vector.search(space: "text", vector: [...], top: 10, labels: [...], min_score: 0.3, fresh: "require")
+CALL vector.similar(space: "text", id: 42, top: 10, in: "other")
+CALL vector.stale(space: "text", limit: 1000, after: "...")
+CALL vector.spaces()        CALL vector.drop(space: "text")
+```
 
 A space records, once, everything needed to know whether two vectors may be
 compared and where they came from:
@@ -798,37 +814,202 @@ compared and where they came from:
 | field | meaning |
 |---|---|
 | `dims`, `metric`, `normalized` | the shape; `metric` is `cosine`, `dot` or `l2` |
-| `of` | what its vectors are about: `node`, `edge` or `set` (a named group of nodes) |
+| `of` | what its vectors are about: `node`, `edge` or `key` (a group of nodes or a whole graph, named by the caller with a string) |
+| `follows` | what makes them stale: `self` (the node or edge itself, the default) or, for node spaces, `edges` (the node and the edges at it) |
+| `labels` | for a node space, the labels whose nodes are expected to have a vector (optional) |
 | `algorithm`, `config` | what computed them and with which settings |
 | `model`, `model_version` | for supplied vectors, the model the application used |
-| `code` | the version of the engine code or of the application that wrote them |
-| `revision`, `at` | the revision when the space was last complete; a caller-supplied time |
+| `code` | the version of the application that wrote them (`vector/1`, this extension's format, when not given) |
+| `at` | a time the caller supplies; the engine records no clock |
+| `created` | the log position the space was made at |
 
-Each vector records the revision it was derived at and, for supplied
-vectors, a hash of its source text that the application passes in.
+What is true now, and what this slice decided where the plan was open:
 
-```
-CALL vector.create(space: "text", dims: 384, metric: "cosine", of: "node", model: "...", ...)
-CALL vector.put(space: "text", ids: [...], vectors: [[...], ...], hashes: [...])
-CALL vector.search(space: "text", vector: [...], top: 10, labels: [...])
-CALL vector.similar(space: "text", id: 42, top: 10)
-CALL vector.stale(space: "text", limit: 1000)
-CALL vector.spaces()        CALL vector.drop(space: "text")
-```
+- **A definition is never altered.** `create` with a name that exists and
+  the same definition does nothing; with any other definition it is
+  refused ("... would make its vectors incomparable; CALL vector.drop(...)
+  and create it again"). Decided: no field may change, not even `labels`
+  or `at`, so that a space's record is the record of every vector in it.
+  `vector.spaces()` lists every field with `vectors`, `bytes` and
+  `revision`, the position of the space's last change (a put, a delete,
+  `CLEAR`).
+- **Storage.** Keyspace `vector`: `!n` the next space number, `!d<name>`
+  the definition, `c<space>` count, bytes and last change, `v<space><id>`
+  the vector as `dims` little-endian 32-bit floats and nothing else,
+  `m<space><id>` the revision it was written at and the source hash. Ids
+  are 8 bytes big-endian, so vectors sort by id; a key space files its
+  vectors under the key's bytes. Vector and metadata are apart so that a
+  search reads nothing but floats and a put whose hash is unchanged
+  rewrites only 8 bytes and the hash. A vector costs **4 bytes a dimension
+  and 48 bytes beside**, plus its hash: 4.75 bytes a dimension at 64
+  dimensions, 4.13 at 384, 4.06 at 768, counted as keys with the namespace
+  and values (what `spaces()` reports); the database's growth is measured
+  in `bench/KNOWLEDGE.md`.
+- **Put.** In batches of up to 10,000, all or none: every item is checked
+  before anything is written. Refused: a vector of the wrong length, an
+  element that is not a finite 32-bit float (`1e39` is refused, not
+  stored as infinity), an id that does not exist (for node and edge
+  spaces), the same id twice, ids for a key space or keys for another,
+  and an all-zero vector in a cosine or a normalised space. *Decided: a
+  normalised space normalises* (in 64-bit floats, then stored as 32-bit),
+  it does not refuse. All vectors of one call carry the same revision,
+  `log_end()` before the call's single record (the journal's convention).
+  A hash given and equal to the stored one rewrites only the metadata:
+  the vector is recorded as current at the new revision, 90 log
+  bytes against 1,650 for a 384-dimension vector (the call's whole record); the vector may
+  then be `null` (an unchanged hash with no vector, or a vector with no
+  matching hash, is refused). The hash is trusted: a different vector
+  passed with the same hash is not stored.
+- **Search is exact.** Every candidate is scored, the best `top` (at most
+  10,000) kept in a bounded heap, ties to the lower id (key spaces: the
+  lower key, bytewise). Scores in 64-bit floats, element by element in
+  index order, with the query normalised when the metric is `cosine` or
+  the space is normalised: `cosine` is q·s/|s| (q·s in a normalised
+  space), `dot` q·s, `l2` −|q−s|, negated so that for every metric higher
+  is closer and `min_score:` means the same thing. The test compares every
+  metric, normalised or not, with ties, `top` from 1 to more than the
+  space, with `labels:` and `min_score:`, against a brute-force
+  computation of that definition, on both tiers, score for score.
+  `labels:` makes the label members the candidates (read from the label
+  index a batch at a time) instead of every vector; it applies to node
+  spaces only. A query of the wrong length, not finite, or all zeros
+  where it must be normalised is refused.
+- **Similar.** `similar` reads the stored vector of `id:` (or `key:`) and
+  searches its own space, or `in:` another one only when dimensions,
+  metric, algorithm, model and model version agree; otherwise it is
+  refused naming every field that differs. Decided: the vector searched
+  from is not listed when the two spaces are about the same kind of thing.
+- **Deletes.** A deleted node's vectors go with it in the same transaction,
+  in every node space, by every path G4 lists (`DELETE`, the API,
+  `apply_op`); a deleted edge's in every edge space, including the edges a
+  node delete takes with it. Rolled back, nothing moves. The hooks are
+  wanted only while a space exists (edge writes only while an edge space
+  does), so a database with the extension installed and no space pays
+  nothing on writes.
+- **`CLEAR`** wipes every vector, metadata and count record (they are not
+  configuration) and keeps the definitions; the bulk hook writes each
+  space's count as zero at the clear's position.
+- **Staleness (D4).** Each vector is `fresh`, `stale` or `unknown`:
+  - *stale*: the journal holds a change to what the space follows after
+    the position the vector was written at: for `follows: "self"` its node
+    (kind `node`: labels, properties, existence) or its edge (kind `edge`);
+    for `follows: "edges"` its node or an edge added, removed or changed at
+    it (kinds `node` and `adjacency`). A vector computed from farther
+    away (two hops, a community) can change when nothing at its own node
+    did: **this is where the engine's knowledge stops**. The journal says
+    which nodes' own edges changed and nothing about reach; a procedure
+    that computes such vectors works out its own reach from the changed
+    ids and puts what it recomputes; or that position, the space's creation or
+    its last change lies past the database's `log_end()` (never trusted,
+    whatever the journal says);
+  - *unknown*: `changes` is not installed or cannot answer (purging,
+    holding positions past the database's), the vector was written before
+    the journal's floor (before it was installed, released past, pushed
+    out by the cap, or before a `CLEAR`), or the journal holds an entry
+    past the database's position. For a key space, any node or edge change
+    after the vector makes it unknown: the engine cannot tell what a key's
+    vector was made from. Never fresh;
+  - *missing* is the fourth state, for nodes of the space's `labels` that
+    have no vector (a node with two of them is counted once).
 
-- A search refuses a query vector whose length is not the space's, and
-  `similar` across two spaces is refused unless their shape, algorithm, model
-  and model version agree. Vectors from different models are never compared.
-- A deleted node's vectors go with it, in the same transaction.
-- `stale` lists the ids whose source changed after their vector was made and
-  the ids that should have a vector and do not. It needs `changes`; without
-  it, it says that it cannot know (D4).
-- Search is exact: every candidate is scored, with a bounded heap for the
-  best. An approximate index is a later slice and is built only if the
-  benchmark shows exact search is too slow at sizes that matter, with its
-  recall against exact search stated beside its speed.
-- A vector never stands in for a node. A search returns ids and scores; what
-  the node is comes from the graph.
+  **Whether a space is current, cheaply.** Counting the states reads every
+  vector, and a search is asked on behalf of a waiting user, so a search
+  does not count by default. It reports `space current: yes` (established
+  complete at revision P, and nothing it follows has made a vector stale
+  or a node missing since), `no` (established at P, and since then a
+  named vector went stale or a node of its labels has none), or `unknown`
+  (not established, or the engine cannot tell), with P where there is one.
+  `yes` is never said without a count that found the space entirely
+  fresh. *Who records it and when*: only `CALL vector.complete(space:)`,
+  an explicit act a maintainer runs after bringing a space up to date. It
+  counts the space and, only when no vector is stale or unknown and no
+  node of its labels lacks one, writes one record, `k<space>`, holding
+  the position the count started at (P) and the end of that record itself
+  (its size is known before it is written, as `structure`'s chain is);
+  otherwise it reports the counts and writes nothing. **No question
+  writes**: `search` and `similar` (whatever `fresh:` and `counts:`),
+  `spaces()` (with or without counts), `stale`, `get` and `hashes` leave
+  the keyspace and the revision as they found them, in every state of the
+  space (`no_question_writes_whatever_state_the_space_is_in`). A question
+  that writes would move the revision (D2), make other derived data judged
+  by position look stale, join and fail with a caller's transaction, and
+  be impossible with read-only access. `put` and `delete` never record
+  completeness either, even when a batch would leave a space complete. *How it is read*: when
+  the log ends where that record ends (nothing at all was written since),
+  `yes` at once; otherwise the journal must answer for P (installed,
+  floor at or below P, not purging), and its entries of the kinds the
+  space follows changed after P are walked: one whose vector is older
+  than the change, or a node of the labels without a vector, makes it
+  `no`; none, `yes`. A put after P writes fresh vectors and keeps it; a
+  delete of a vector (`vector.delete`, or a node's or edge's delete)
+  removes the record; `CLEAR` wipes it. *Where it is not trusted*: P, the
+  record's end, the space's creation or last change past `log_end()`
+  (an image or a copy of a later state), a floor raised past P (release,
+  the cap, a `CLEAR`), the journal dropped and installed again (its floor
+  is the reinstall), and, for a key space, any node or edge change since
+  P (`unknown`). A put that fails takes its statement back, and a failed
+  block rolls back the record with it. Shown by
+  `a_search_says_cheaply_whether_its_space_is_current_and_never_claims_what_it_has_not_established`
+  and `the_record_that_a_space_is_current_is_not_trusted_where_it_must_not_be`.
+  The exact counts stay available: `counts: true` on `search`/`similar`
+  (in the message), `vector.spaces(counts: true)` (columns `stale`,
+  `missing`, `unknown`; `current` and `current_since` are always there),
+  and `vector.stale`. `fresh: "require"` uses the record when it is
+  valid ("established from the record, without a count" in the message)
+  and otherwise counts without recording, and says so, naming
+  `vector.complete`, so a caller who keeps taking the slow path knows to
+  record the space once it is up to date. It refuses unless the space is
+  fresh.
+
+  The journal is read through its Rust API: `oldest` and `answers` once a
+  call, then one `entry` lookup a vector; a key space reads the journal's
+  node and edge entries once a call (`since` in slices) for the newest
+  change. `vector.stale` lists the non-fresh vectors in id order with
+  `revision` and `why`, then the missing nodes label by label, in slices
+  (`limit:` at most 10,000 rows, at most 100,000 records looked at a
+  call, continued with `after:` as the message says); the slices together
+  are the whole list. `search` and `similar` report each returned row's
+  state and, in the message, whether the space is current, the revision,
+  and the counts (`stale S, missing M, unknown U`) when asked; with
+  `fresh: "require"` they are an error unless the space is current, or,
+  for `similar`, when the vector searched from is not fresh. Counting
+  reads every vector's metadata and journal entry and every member of the
+  space's labels, about as much again as a scan; reporting currency reads
+  one record, or the journal's entries since P (measured).
+- **Positions past the database's (the journal's review).** A vector or a
+  space whose position is past `log_end()` is stale; shown by copying a
+  space from a graph further along into one behind
+  (`a_vector_or_space_past_the_databases_position_is_stale`). An image
+  (a file's, a memory snapshot's), a replica (base and log) and crash
+  recovery hold the same keyspace, byte for byte, and give the same
+  search and `stale` answers as their source
+  (`an_image_a_replica_and_recovery_hold_the_same_vectors_and_answers`).
+- **Check.** `Extension::check` reports, under `check.run`'s `derived`:
+  records that do not decode or belong to no space (`bad_record`), a
+  vector for an id that does not exist (`orphan`), a vector of the wrong
+  length (`length`), an element that is not finite (`not_finite`), a
+  revision, creation or change past the log's end (`future`), a vector
+  without metadata or the reverse (`unpaired`), and, over a walk from the
+  start in one slice, a count or bytes that disagree with the space's
+  record (`count`). A search over a record of the wrong length is an
+  error that names `check.run`.
+- **Bounds (D6).** Search holds `top` candidates and a batch; `stale` and
+  the counts read 512 records or 4,096 label members at a time; a put,
+  get, delete or hashes call takes at most 10,000 ids; `drop` deletes
+  4,096 records a write (all in the statement's transaction). Every loop
+  over vectors or members passes through `step(n)` in `src/ext/vector.rs`,
+  one line per vector, the one place G2 is to count.
+- **For other extensions** (`glider::ext::vector`): `spaces`, `space`,
+  `stats`, `get`, `put` (with `Item`), `delete`, `prepare`, `score`,
+  `search` (with `Search`, returning ids and scores), `Judge` (a vector's
+  state and why) and `tally`.
+- Left out, as planned: an approximate index (G17, only if exact search
+  proves too slow), computing any vector (`embed`), seeding
+  `context.retrieve` from a search (G15). Also left out: `labels:` for
+  edge spaces (edge types expected to have a vector), and staleness
+  beyond a node's own edges (above).
+- A vector never stands in for a node. A search returns ids and scores;
+  what the node is comes from the graph.
 
 ## `embed`: vectors from structure
 
@@ -947,7 +1128,7 @@ tests, and adds its section to `docs/EXTENSIONS.md` and its numbers to
 | G7 | `structure`: colours, classes (*built*) | G2 |
 | G8 | `structure`: templates, path patterns, plan, expand | G7 |
 | G9 | `structure`: quotient; `louvain`, `ppr`, `steiner` | G2 |
-| G10 | `vector`: spaces, storage, exact search, staleness | G1, G5 |
+| G10 | `vector`: spaces, storage, exact search, staleness (*built*) | G1, G5 |
 | G11 | `embed`: fastrp, propagate, pool, edges | G10 |
 | G12 | `embed`: wl, for nodes, sets and graphs | G7, G10 |
 | G13 | `embed`: walks, ppr, graph2vec | G10 |

@@ -1,7 +1,8 @@
 //! mfg-bench: the baseline over a manufacturing graph from `mfg-gen`.
 //!
 //!   mfg-bench --data DIR [--tiers memory,file] [--budgets 250,1000,4000]
-//!             [--only stats,retrieve,check,structure,changes,...] [--out FILE] [--label NAME] [--detail]
+//!             [--only stats,retrieve,check,structure,changes,vector,...] [--dims 64,384,768]
+//!             [--out FILE] [--label NAME] [--detail]
 //!
 //! Loads DIR/graph.jsonl into glider (in memory, and as a file in DIR), then
 //! runs each measurement in [`MEASURES`] and appends one JSON object per
@@ -38,6 +39,7 @@ const MEASURES: &[(&str, Measure)] = &[
     ("check", check),
     ("structure", structure),
     ("changes", changes),
+    ("vector", vector),
 ];
 
 type Measure = fn(&mut Run) -> Result<(), String>;
@@ -60,6 +62,8 @@ pub struct Run<'a> {
     pub detail: bool,
     /// What the generator planted, from truth.jsonl.
     pub planted: &'a Planted,
+    /// Dimensions the `vector` measurement stores and searches.
+    pub dims: Vec<usize>,
     /// Every station's design and whether it deviates, from truth.jsonl.
     pub stations: &'a [Station],
     meta: &'a Meta,
@@ -981,12 +985,316 @@ fn changes(run: &mut Run) -> Result<(), String> {
     Ok(())
 }
 
+/// Seeded synthetic vector elements in [-1, 1).
+struct Floats(u64);
+
+impl Floats {
+    fn next(&mut self) -> f64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 >> 11) as f64 / (1u64 << 52) as f64 - 1.0
+    }
+    fn vector(&mut self, dims: usize) -> Vec<f64> {
+        (0..dims).map(|_| self.next()).collect()
+    }
+}
+
+fn float_list(v: &[f64]) -> Value {
+    Value::List(v.iter().map(|x| Value::Float(*x)).collect())
+}
+
+fn space_field(run: &mut Run, name: &str, col: &str) -> Result<i64, String> {
+    let (r, _) = run.run("CALL vector.spaces()", &[])?;
+    let at = r
+        .columns
+        .iter()
+        .position(|c| c == col)
+        .ok_or("no such column")?;
+    r.rows
+        .iter()
+        .find(|row| row[0] == Value::from(name))
+        .and_then(|row| row[at].as_i64())
+        .ok_or_else(|| format!("no space {name}"))
+}
+
+/// Vectors per `vector.put` call in the measurement.
+const PUT_BATCH: usize = 1_000;
+/// Nodes given the same vectors as list properties, for the comparison.
+const LIST_NODES: usize = 10_000;
+/// Nodes changed before `vector.stale` is measured.
+const STALE_CHANGES: usize = 100;
+
+/// `vector`: for each of `--dims`, one vector for every node of the graph
+/// (seeded synthetic values), with the change journal installed:
+///
+/// - `vector.bytes`: what the same vectors cost as list properties on the
+///   first 10,000 nodes (log bytes and growth of the database), set in
+///   1,000-node transactions and removed again before the space is made;
+/// - `vector.put`: put through statements, 1,000 vectors a call with a
+///   source hash each: `per_s`, log bytes, the space's bytes and the
+///   database's growth, per vector and per dimension;
+/// - `vector.search`: exact search from seeded queries, top 10, over every
+///   vector and over the `WorkInstruction` nodes: latency (`ms_p50`,
+///   `ms_max`), vectors scored a second, memory added during the call; and
+///   the scan alone through the Rust API (no staleness tally);
+/// - `vector.stale`: after changing 100 nodes, every stale row in slices
+///   of 1,000: time, rows and calls;
+///
+/// then drops the space.
+fn vector(run: &mut Run) -> Result<(), String> {
+    use glider::ext::vector as vx;
+    run.run("CREATE EXTENSION IF NOT EXISTS changes", &[])?;
+    run.run("CREATE EXTENSION IF NOT EXISTS vector", &[])?;
+    let ids = run.g.node_ids();
+    let n = ids.len();
+    let dims_list = run.dims.clone();
+    for dims in dims_list {
+        let mut rng = Floats(0x9e37_79b9_7f4a_7c15 ^ dims as u64);
+
+        // The same vectors as list properties, on a sample of nodes.
+        let k = LIST_NODES.min(n);
+        let (rev0, len0) = (run.g.revision(), run.g.file_len());
+        let t = Instant::now();
+        for chunk in ids[..k].chunks(PUT_BATCH) {
+            run.g.begin().map_err(|e| e.to_string())?;
+            for &id in chunk {
+                let v = rng.vector(dims);
+                run.g
+                    .set_node_prop(id, "embedding", float_list(&v))
+                    .map_err(|e| e.to_string())?;
+            }
+            run.g.commit().map_err(|e| e.to_string())?;
+        }
+        let list_ms = t.elapsed().as_secs_f64() * 1e3;
+        let list_log = (run.g.revision() - rev0) as f64 / k as f64;
+        let list_grow = run.g.file_len().saturating_sub(len0) as f64 / k as f64;
+        for chunk in ids[..k].chunks(PUT_BATCH) {
+            run.g.begin().map_err(|e| e.to_string())?;
+            for &id in chunk {
+                run.g
+                    .unset_node_prop(id, "embedding")
+                    .map_err(|e| e.to_string())?;
+            }
+            run.g.commit().map_err(|e| e.to_string())?;
+        }
+
+        // A space over every node, put in batches through statements.
+        let name = format!("bench{dims}");
+        run.run(
+            &format!(
+                "CALL vector.create(space: '{name}', dims: {dims}, metric: 'cosine', labels: ['WorkInstruction'], model: 'synthetic', model_version: '1')"
+            ),
+            &[],
+        )?;
+        let (rev0, len0) = (run.g.revision(), run.g.file_len());
+        let mut rng = Floats(0x9e37_79b9_7f4a_7c15 ^ dims as u64);
+        let mut put_ms = 0.0;
+        let src = format!("CALL vector.put(space: '{name}', ids: $ids, vectors: $vs, hashes: $hs)");
+        for chunk in ids.chunks(PUT_BATCH) {
+            let params = vec![
+                (
+                    "ids".to_string(),
+                    Value::List(chunk.iter().map(|&id| Value::Int(id as i64)).collect()),
+                ),
+                (
+                    "vs".to_string(),
+                    Value::List(
+                        chunk
+                            .iter()
+                            .map(|_| float_list(&rng.vector(dims)))
+                            .collect(),
+                    ),
+                ),
+                (
+                    "hs".to_string(),
+                    Value::List(
+                        chunk
+                            .iter()
+                            .map(|id| Value::Text(format!("{id:016x}")))
+                            .collect(),
+                    ),
+                ),
+            ];
+            let (_, ms) = run.run(&src, &params)?;
+            put_ms += ms;
+        }
+        if run.tier == "file" {
+            run.g.checkpoint().map_err(|e| e.to_string())?;
+        }
+        let log = (run.g.revision() - rev0) as f64 / n as f64;
+        let grow = run.g.file_len().saturating_sub(len0) as f64 / n as f64;
+        let bytes = space_field(run, &name, "bytes")? as f64 / n as f64;
+        run.emit(
+            "vector.bytes",
+            Obj::new()
+                .u("dims", dims as u64)
+                .u("list_nodes", k as u64)
+                .raw("list_log_per_vector", &format!("{list_log:.1}"))
+                .raw("list_db_growth_per_vector", &format!("{list_grow:.1}"))
+                .raw("list_per_s", &format!("{:.0}", k as f64 / list_ms * 1e3))
+                .raw("space_bytes_per_vector", &format!("{bytes:.1}"))
+                .raw(
+                    "space_bytes_per_dim",
+                    &format!("{:.3}", bytes / dims as f64),
+                )
+                .raw("put_log_per_vector", &format!("{log:.1}"))
+                .raw("put_db_growth_per_vector", &format!("{grow:.1}")),
+        );
+        run.emit(
+            "vector.put",
+            Obj::new()
+                .u("dims", dims as u64)
+                .u("vectors", n as u64)
+                .u("per_call", PUT_BATCH as u64)
+                .i("ms", put_ms as i64)
+                .raw("per_s", &format!("{:.0}", n as f64 / put_ms * 1e3)),
+        );
+
+        // Searches: every vector, then one label.
+        let queries = if n > 500_000 { 5 } else { 20 };
+        let space = vx::space(&run.g, &name).ok_or("space")?;
+        // `vector.complete` counts the space and records it complete; after
+        // it, a search reports that from one record.
+        let (r, establish_ms) = run.run(&format!("CALL vector.complete(space: '{name}')"), &[])?;
+        if r.rows.first().and_then(|row| row.get(1)) != Some(&Value::Bool(true)) {
+            return Err(format!("the space should be complete: {:?}", r.message));
+        }
+        for labels in [None, Some("WorkInstruction")] {
+            let mut counted = Vec::new();
+            let mut required = Vec::new();
+            let mut times = Vec::new();
+            let mut scan = Vec::new();
+            let mut scored = 0u64;
+            let (before, _) = rss_mb();
+            reset_peak();
+            for _ in 0..queries {
+                let qv = rng.vector(dims);
+                let src = match labels {
+                    None => format!("CALL vector.search(space: '{name}', vector: $q, top: 10)"),
+                    Some(l) => format!(
+                        "CALL vector.search(space: '{name}', vector: $q, top: 10, labels: ['{l}'])"
+                    ),
+                };
+                let qp = [("q".to_string(), float_list(&qv))];
+                let (r, ms) = run.run(&src, &qp)?;
+                if r.rows.len() != 10 {
+                    return Err(format!("search gave {} rows", r.rows.len()));
+                }
+                let msg = r.message.unwrap_or_default();
+                if !msg.contains("space current: yes") {
+                    return Err(format!("the space should be current: {msg}"));
+                }
+                times.push(ms);
+                let with = |extra: &str| src.replace("top: 10", &format!("top: 10, {extra}"));
+                let (_, ms) = run.run(&with("counts: true"), &qp)?;
+                counted.push(ms);
+                let (_, ms) = run.run(&with("fresh: 'require'"), &qp)?;
+                required.push(ms);
+                let opts = vx::Search {
+                    top: 10,
+                    labels: labels.map(|l| vec![l.to_string()]).unwrap_or_default(),
+                    ..Default::default()
+                };
+                let pq = vx::prepare(&space, &qv).map_err(|e| e.to_string())?;
+                let t = Instant::now();
+                let f = vx::search(&run.g, &space, &pq, &opts).map_err(|e| e.to_string())?;
+                scan.push(t.elapsed().as_secs_f64() * 1e3);
+                scored = f.scored;
+            }
+            let (_, peak) = rss_mb();
+            let p50 = pct(&mut times, 0.5);
+            let scan50 = pct(&mut scan, 0.5);
+            let counted50 = pct(&mut counted, 0.5);
+            let required50 = pct(&mut required, 0.5);
+            let max = times.iter().cloned().fold(0.0, f64::max);
+            run.emit(
+                "vector.search",
+                Obj::new()
+                    .u("dims", dims as u64)
+                    .s("candidates", labels.unwrap_or("all"))
+                    .u("scored", scored)
+                    .u("queries", queries as u64)
+                    .raw("ms_p50", &format!("{p50:.1}"))
+                    .raw("ms_max", &format!("{max:.1}"))
+                    .raw("scan_ms_p50", &format!("{scan50:.1}"))
+                    .raw("counts_ms_p50", &format!("{counted50:.1}"))
+                    .raw("require_ms_p50", &format!("{required50:.1}"))
+                    .raw("establish_ms", &format!("{establish_ms:.1}"))
+                    .raw("scored_per_s", &format!("{:.0}", scored as f64 / p50 * 1e3))
+                    .raw(
+                        "scan_scored_per_s",
+                        &format!("{:.0}", scored as f64 / scan50 * 1e3),
+                    )
+                    .u("rss_before_mb", before)
+                    .u("rss_added_mb", peak.saturating_sub(before)),
+            );
+        }
+
+        // A small change, then every stale row in slices.
+        let step = (n / STALE_CHANGES).max(1);
+        for i in 0..STALE_CHANGES.min(n) {
+            run.g
+                .set_node_prop(ids[i * step], "touched", Value::Int(dims as i64))
+                .map_err(|e| e.to_string())?;
+        }
+        // A search now finds the change from the journal, without counting.
+        let qv = rng.vector(dims);
+        let (r, changed_ms) = run.run(
+            &format!("CALL vector.search(space: '{name}', vector: $q, top: 10)"),
+            &[("q".to_string(), float_list(&qv))],
+        )?;
+        let msg = r.message.unwrap_or_default();
+        if !msg.contains("space current: no") {
+            return Err(format!("the space should not be current: {msg}"));
+        }
+        let t = Instant::now();
+        let mut after: Option<String> = None;
+        let (mut rows, mut calls) = (0usize, 0usize);
+        loop {
+            calls += 1;
+            let src = match &after {
+                None => format!("CALL vector.stale(space: '{name}', limit: 1000)"),
+                Some(a) => format!("CALL vector.stale(space: '{name}', limit: 1000, after: '{a}')"),
+            };
+            let (r, _) = run.run(&src, &[])?;
+            rows += r.rows.len();
+            let msg = r.message.unwrap_or_default();
+            match msg.split("after: \"").nth(1) {
+                Some(rest) => after = Some(rest.split('"').next().unwrap_or("").to_string()),
+                None => break,
+            }
+        }
+        let stale_ms = t.elapsed().as_secs_f64() * 1e3;
+        run.emit(
+            "vector.stale",
+            Obj::new()
+                .u("dims", dims as u64)
+                .u("vectors", n as u64)
+                .u("changed", STALE_CHANGES.min(n) as u64)
+                .u("rows", rows as u64)
+                .u("calls", calls as u64)
+                .i("ms", stale_ms as i64)
+                .raw("search_after_change_ms", &format!("{changed_ms:.1}")),
+        );
+        let (_, ms) = run.run(&format!("CALL vector.drop(space: '{name}')"), &[])?;
+        run.emit(
+            "vector.drop",
+            Obj::new().u("dims", dims as u64).i("ms", ms as i64),
+        );
+        if run.tier == "file" {
+            run.g.checkpoint().map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "-h" || a == "--help") || arg(&args, "--data").is_none() {
         eprintln!(
             "usage: mfg-bench --data DIR [--tiers memory,file] [--budgets 250,1000,4000] \
-             [--only {}] [--out FILE] [--label NAME] [--detail]",
+             [--only {}] [--dims 64,384,768] [--out FILE] [--label NAME] [--detail]",
             MEASURES.iter().map(|m| m.0).collect::<Vec<_>>().join(",")
         );
         std::process::exit(2);
@@ -1001,6 +1309,11 @@ fn main() {
         .unwrap_or_else(|| "250,1000,4000".into())
         .split(',')
         .map(|b| b.parse().expect("--budgets: a list of numbers"))
+        .collect();
+    let dims: Vec<usize> = arg(&args, "--dims")
+        .unwrap_or_else(|| "64,384,768".into())
+        .split(',')
+        .map(|d| d.parse().expect("--dims: a list of numbers"))
         .collect();
     let only: Option<Vec<String>> =
         arg(&args, "--only").map(|s| s.split(',').map(String::from).collect());
@@ -1031,6 +1344,7 @@ fn main() {
             budgets: budgets.clone(),
             detail,
             planted: &planted,
+            dims: dims.clone(),
             stations: &stations,
             meta: &meta,
             out: &mut buf,
