@@ -24,6 +24,7 @@
 //! `<name>.<function>(...)` in any expression, in every database that
 //! installs it.
 
+pub mod check;
 pub mod context;
 pub mod text;
 
@@ -113,11 +114,24 @@ pub trait Extension: Send + Sync {
     fn upgrade(&self, _g: &mut Graph, _from: &str) -> Result<()> {
         Ok(())
     }
+    /// Check what this extension derives from the graph against the graph,
+    /// for `CALL check.run()`: report through `probe` every record that
+    /// differs from what a rebuild would make, writing nothing. Returns
+    /// false when it does not know how (the default), which `check.run`
+    /// reports as unchecked. See [`check::Probe`] for working in slices.
+    fn check(&self, _g: &Graph, _probe: &mut check::Probe) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 fn registry() -> &'static RwLock<Vec<Arc<dyn Extension>>> {
     static REGISTRY: OnceLock<RwLock<Vec<Arc<dyn Extension>>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| RwLock::new(vec![Arc::new(context::Context) as Arc<dyn Extension>]))
+    REGISTRY.get_or_init(|| {
+        RwLock::new(vec![
+            Arc::new(check::Check) as Arc<dyn Extension>,
+            Arc::new(context::Context),
+        ])
+    })
 }
 
 /// Make an extension available to every graph in this process. One with the

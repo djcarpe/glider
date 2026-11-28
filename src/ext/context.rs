@@ -186,6 +186,14 @@ impl Extension for Context {
         text::config(g).is_some()
     }
 
+    /// The text index is all this extension keeps.
+    fn check(&self, g: &Graph, probe: &mut super::check::Probe) -> Result<bool> {
+        if let Some(c) = text::config(g) {
+            text::check(g, &c, probe)?;
+        }
+        Ok(true)
+    }
+
     fn on_node_write(
         &self,
         g: &mut Graph,
