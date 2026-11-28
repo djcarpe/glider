@@ -742,7 +742,9 @@ the user-facing description is in `docs/EXTENSIONS.md`, "Templates".
   of its plain tokens (103M to 18.3M at 1M, dictionary 0.6M), a station
   written with the kept dictionary 12-16%; every instance of the kept
   dictionary (192,865 at 1M) expands exactly. A plan of the 1M graph takes
-  78-87 s and 115 MB.
+  78-131 s and 115 MB; a station written with the kept dictionary takes
+  2-3 ms at every size, 300 scattered nodes 15-17 ms at 1M, the same text
+  as the whole-graph path.
 
 Built-in algorithms gain three names beside the existing ones:
 `CALL louvain()` (communities by modularity, deterministic, with levels),

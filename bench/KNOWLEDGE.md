@@ -185,7 +185,7 @@ every measurement in `MEASURES`, appending JSON lines to
 
 | `structure.templates` | over `HAS_PLANT` ... `HAS_INSTRUCTION` outwards: `what: "design recovery"` (roots of `Station`): `templates`, `designs`, `designs_eligible` (two or more stations without a deviation), `designs_recovered` (exactly one template's instances), `deviated`, `deviated_in_design` (deviated stations among a design's template's instances: must be 0), `deviation_templates`, `exact`, `instances_ms`/`instances_calls` to list every instance; `what: "all shapes"` (every root): `templates`, `by_root` as `[label, templates, instances, largest]` |
 | `structure.paths` | `what: "patterns"`: the first pattern (`top`, `top_hops`, `top_paths`, `top_maximal`); `what: "chains"`: chains in the first slice |
-| `structure.plan` | `what: "whole graph"`, kept as `mfg`: `plain_*`, `compact_*`, `dictionary_*` (bytes and tokens), `saving_tokens`, `uses`, `templates_chosen`, `templates_nested`, `nested_standalone_uses`, `patterns_chosen`, `candidates`; `what: "one station"` / `"one line"` (the first station without a deviation and its line, with everything below): `plain_*`, `alone_*` (planned with its dictionary inline), `kept_*` (written with the kept dictionary, not repeated), `ms_alone`, `ms_kept` |
+| `structure.plan` | `what: "whole graph"`, kept as `mfg`: `plain_*`, `compact_*`, `dictionary_*` (bytes and tokens), `saving_tokens`, `uses`, `templates_chosen`, `templates_nested`, `nested_standalone_uses`, `patterns_chosen`, `candidates`, `kept_stored_bytes`; `what: "one station"` / `"one line"` / `"300 scattered nodes"` (the first station without a deviation and its line, with everything below; ids from a fixed stream): `plain_*`, `alone_*` (planned with its dictionary inline), `kept_*` and `kept_uses` (written with the kept dictionary, not repeated), `ms_alone`, `ms_kept_min`, `ms_kept_median` (of five), `kept_rss_added_mb`, `ms_whole_graph_path` and `same_text_as_whole_graph_path` (`find: "graph"`) |
 | `structure.expand` | every instance of the kept dictionary, expanded 1,000 roots a call and compared with the graph: `templates`, `instances`, `exact`, `all_exact`, `ms`, `calls`, memory, `list_ms`/`list_calls` |
 
 A later slice adds a measurement by writing `fn(&mut Run) -> Result<(),
@@ -467,21 +467,56 @@ at every size, on both tiers.
 **Time and memory** of the calls (the graph already loaded), memory /
 file, and the resident memory added in memory:
 
-| dataset | station templates | all shapes | patterns | plan, whole graph | plan of a part, alone / kept | expand, every instance | list every instance (calls) |
+| dataset | station templates | all shapes | patterns | plan, whole graph | one station planned alone (ms) / with the kept dictionary (ms) | expand, every instance | list every instance (calls) |
 |---|---|---|---|---|---|---|---|
-| n10000-s1 | 196 / 204 | 408 / 519 | 30 / 19 | 975 / 593, +1 MB | 508 / 382 | 286 / 361, 41 calls | 581 / 570 (2) |
-| n100000-s1 | 2,632 / 2,096 | 5,175 / 5,508 | 232 / 237 | 6,867 / 7,051, +12 MB | 5,042 / 3,941 | 4,337 / 3,899, 149 calls | 7,788 / 7,277 (2) |
-| n1000000-s1 | 23.6 / 24.2 s | 50.4 / 48.5 s | 2.5 / 2.6 s | 78 / 87 s, +115 MB | 48 / 40 s | 49 / 45 s, 570 calls | 121 / 114 s (3) |
+| n10000-s1 | 196 / 204 | 408 / 519 | 30 / 19 | 682 / 584, +1 MB | 364 / 3 | 286 / 361, 41 calls | 581 / 570 (2) |
+| n100000-s1 | 2,632 / 2,096 | 5,175 / 5,508 | 232 / 237 | 6,645 / 8,352, +12 MB | 5,042 / 2 | 4,337 / 3,899, 149 calls | 7,788 / 7,277 (2) |
+| n1000000-s1 | 23.6 / 24.2 s | 50.4 / 48.5 s | 2.5 / 2.6 s | 109 / 131 s, +115 MB | 48 s / 2.5 ms | 49 / 45 s, 570 calls | 121 / 114 s (3) |
 
 Finding templates is a whole-graph computation, about 50 µs a node at 1M
 with every node a root: the forest (56 bytes a node), then a walk of every
 root whose forest shape repeats, twice more for each group's members, with
 their plain and compact text priced. A plan adds nesting, the chains and
 writing both texts in full (291 MB and 42 MB at 1M, counted, not kept). A
-plan of a few nodes costs what finding templates costs, with or without a
-kept dictionary (its instances are found and checked again each call);
-expansion reads only the shape under each root (about 0.25 ms an instance).
+plan of a few nodes without a kept dictionary costs what finding templates
+costs; with one, it reads only the selection (below). Expansion reads only
+the shape under each root (about 0.25 ms an instance). The whole-graph
+plan times are from two runs on a shared machine (78-87 s, then 109-131 s
+at 1M).
 The memory is the per-node state and the sorts, inside half and a quarter
 of `algorithm_memory()`, spilling past them
 (`forest_state_spills_past_its_budget_with_the_same_hashes`,
 `state_spills_past_the_memory_budget_and_nothing_changes`).
+
+**A selection written with the kept dictionary** (`plan(dictionary:
+"mfg", nodes: [...], text: "compact")`), the call an agent waits on: it
+reads the selection, the owners above it, the dictionary's shape index and
+the definitions the selection can use, never the rest of the graph. Best
+and median of five calls in ms, memory / file; "same" is whether the text
+equals, byte for byte, what the whole-graph path (`find: "graph"`, its time
+in the last column, memory tier) writes for the same selection:
+
+| dataset | selection | nodes | plain tokens | kept tokens | uses | ms | same | whole-graph path |
+|---|---|---|---|---|---|---|---|---|
+| n10000-s1 | one station | 40 | 3,734 | 441 | 1 | 2.8 / 2.8 | yes | 320 ms |
+| n10000-s1 | one line | 345 | 31,947 | 5,919 | 17 | 18 / 27 | yes | 294 ms |
+| n10000-s1 | 300 scattered nodes | 300 | 27,975 | 27,809 | 1 | 7.7 / 7.5 | yes | 319 ms |
+| n100000-s1 | one station | 18 | 1,770 | 223 | 1 | 2.1 / 2.2 | yes | 3.5 s |
+| n100000-s1 | one line | 361 | 35,821 | 5,827 | 17 | 24 / 23 | yes | 3.6 s |
+| n100000-s1 | 300 scattered nodes | 300 | 30,636 | 30,636 | 0 | 15 / 13 | yes | 3.4 s |
+| n1000000-s1 | one station | 8 | 683 | 109 | 1 | 2.5 / 2.1 | yes | 39.5 s |
+| n1000000-s1 | one line | 447 | 45,525 | 5,034 | 13 | 39 / 71 (median 86) | yes | 37.1 s |
+| n1000000-s1 | 300 scattered nodes | 300 | 29,946 | 29,946 | 0 | 15 / 17 | yes | 38.2 s |
+
+The time follows the selection (about 0.05 ms a selected node in memory,
+up to 0.2 ms on the file tier for the pages of a line not yet read), not
+the graph: a station takes 2-3 ms at 10k and at 1M. No memory is added
+that the resident size shows. Scattered nodes are mostly not whole
+instances (a node without the rest of its shape is written plainly), so
+their text is the plain text. Nothing about which node is in which
+instance is kept: it is worked out from the selection each call and every
+use is matched in full, so a node changed since the dictionary was made is
+written as it is now. What the dictionary keeps for this is an index of
+root shapes and ids, about 50 bytes a template (24 KB of the 7.0 MB that
+the kept dictionary `mfg` takes at 1M, all its records counted:
+`stored_bytes`; 211 KB at 10k, 1.36 MB at 100k).
