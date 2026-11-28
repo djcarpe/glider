@@ -108,11 +108,82 @@ After this slice:
 
 ## Write hooks for edges and bulk paths
 
-`on_node_write` stays as it is. Beside it an extension can ask for edge
-writes (the edge before and after, with its endpoints and type) and is told
-when the graph is cleared or loaded in bulk. D5 is the test: a database with
-the change journal installed, written to by every path the engine has, has a
-journal that accounts for every difference between the two states.
+*Built (G4). Shown by `tests/write_hooks.rs`.*
+
+`on_node_write` keeps its meaning. Beside it:
+
+- `wants_edge_writes` / `on_edge_write(g, id, before, after)`, with
+  `EdgeImage { from, to, etype, props }`: after every edge add, delete,
+  property set and unset, inside the writing transaction. An extension that
+  does not ask is not called, and a database where none asks pays one
+  check of a cached list per edge write (measured below).
+- Deleting a node, when an extension follows edge writes, deletes its edges
+  first one by one through the hooked path (logged as `EdgeDel` records),
+  a batch at a time, then the node. Without such an extension the node's
+  delete detaches its edges inside one `NodeDel` record, as before.
+- `on_bulk_write(g, BulkWrite::Clear)`, for an extension that follows node
+  or edge writes, after `CLEAR`. `BulkWrite` is `#[non_exhaustive]`: an
+  extension treats a kind it does not know as "everything may have
+  changed".
+- A failing hook fails the write. With autocommit on, the statement rolls
+  back. With autocommit off (the API, or a statement inside `BEGIN`) the
+  whole open transaction rolls back and the error says so: the engine has
+  no savepoints, so undoing only the failed write is not possible, and
+  leaving it in a transaction that can still be committed would let it
+  become durable without the hook's writes. This now holds for node hooks
+  too, which before left the write in the caller's transaction.
+- Recovery and replicas replay what the hooks wrote and never run them
+  (shown by counting hook calls during `from_replica` and crash recovery,
+  and by comparing the replayed keyspace with one made by running the
+  hooks again).
+
+Every path that changes a node or an edge, found by reading every caller of
+the private `Graph::exec` and every direct write to the pager's trees:
+
+| path | what it does now |
+|---|---|
+| statements: `CREATE`, `SET`, `REMOVE`, `DELETE`, `DETACH DELETE`, `CALL ... write:` | the graph API, so per-record hooks |
+| the graph API: `add_node`, `add_edge`, `delete_node`, `delete_edge`, `set_/unset_node_prop`, `set_/unset_edge_prop`, `add_label`, `remove_label` | per-record hooks |
+| `execute_batch`, `BEGIN ... COMMIT` | statements, so per-record hooks |
+| `import_jsonl`, `import_jsonl_from` | `add_node` / `add_edge`, so per-record hooks |
+| `Graph::apply_op` (replayed operations with explicit ids) | each op goes through the hooked path for its kind: node ops as the node API, edge ops as the edge API, `NodeDel` as `delete_node`, `Clear` as `clear`; `ExtensionAdd`/`Del` as their API calls; any `ExtWrite` forgets the cached hook list |
+| `Graph::import_legacy`, `glider <db> migrate`, `Graph::from_bytes` of a legacy image | `apply_op` per record, so per-record hooks (before, they told nobody) |
+| `CLEAR`, `Graph::clear` | one `on_bulk_write(Clear)` |
+| `Graph::bulk_load` | builds a database that must not exist, so nothing is installed in it and nothing derived can be left behind; an extension installed after it builds from a scan. The test checks that a bulk-loaded database has no extension installed |
+| crash recovery, `from_replica`, replica tailing | replay logged records, hook writes included; no hooks (D5 holds because the hooks ran when the records were first written) |
+| `Graph::from_bytes` of a paged image, opening a file | a copy of a state, not a change |
+| `rebuild_adjacency` (format upgrade at open) | rebuilds the adjacency tree from the edges; no node or edge changes |
+
+The `context` text index keeps its behaviour on every path it handled. On
+`apply_op` and `import_legacy`, where it used to drift silently from the
+graph, it now stays right (a test that failed before the change). On
+`CLEAR` it was already right: its configuration survives and its postings
+are wiped with the data.
+
+The proof: a recording extension keeps, for every reported id, the first
+image before and the last image after. A file database is bulk-loaded, then
+written to by statements of every kind, the API, a batch, JSON Lines from a
+string and from a file, `apply_op` of every op kind (new ids and
+overwrites), a legacy import over existing ids, `CLEAR` both ways, and
+rolled-back writes (`ROLLBACK`, API rollback, failing statements, failing
+hooks with autocommit on and off). After each path, every node and edge that
+differs between the graph before and after has been reported, every report
+agrees with both states, and nothing is recorded for the rolled-back
+writes. The change journal (G5) can rely on exactly this.
+
+Cost on edge writes in a database where no extension asks for them
+(`tests/write_hooks_cost.rs`, 400,000 edges added then deleted in a memory
+graph, commits every 10,000; medians of seven runs each, alternated seven
+times between the code before and after on a busy machine):
+
+| | add, before | add, after | delete, before | delete, after |
+|---|---|---|---|---|
+| no extension | 199k/s | 198k/s | 277k/s | 265k/s |
+| `context` with a text index (node hooks only) | 187k/s | 201k/s | 258k/s | 280k/s |
+
+The run-to-run spread on this machine was about 25% and the differences
+point both ways: no cost shows above the noise. In the quietest pair the
+difference was under 1%.
 
 ## `changes`: which nodes and edges changed
 

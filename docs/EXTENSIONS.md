@@ -34,12 +34,32 @@ functions work in any expression as `<extension>.<function>(...)`.
   Keys starting with `!` are configuration and survive `CLEAR`; everything
   else counts as derived from the data and is wiped with it. `DROP EXTENSION`
   deletes the whole keyspace.
-- **Extensions can follow writes.** An extension whose `wants_writes` says so
-  has `on_node_write` called after every node write made through the graph
-  API (queries included), inside the same transaction, with the node before
-  and after. What it writes in response is logged, so recovery and replicas
-  replay the result without running the hook again. Bulk loads do not call
-  hooks; an extension rebuilds from a scan instead (`CALL context.index()`).
+- **Extensions can follow writes.** No change to a node or an edge goes
+  unnoticed by an extension that asks:
+  - `wants_writes` → `on_node_write(id, before, after)` after every node
+    write (labels and properties before and after; `None` for absent);
+  - `wants_edge_writes` → `on_edge_write(id, before, after)` after every
+    edge add, delete, property set and unset (endpoints, type and
+    properties before and after). Deleting a node reports each of its edges
+    first, then the node;
+  - either → `on_bulk_write(BulkWrite::Clear)` after `CLEAR`, which reports
+    no records of its own. Keys not starting with `!` are already wiped.
+
+  Every path calls them: statements (including `CALL` procedures that
+  write, `BEGIN` blocks and `execute_batch`), the graph API, JSON Lines
+  imports, `Graph::apply_op` (replayed operations with explicit ids),
+  `Graph::import_legacy` and `migrate`. They run inside the writing
+  transaction. What a hook writes is logged, so crash recovery and replicas
+  replay the result without running the hook again. A hook that returns an
+  error fails the write: with autocommit on the statement rolls back; with
+  autocommit off the whole open transaction rolls back, and the error ends
+  with "(the transaction was rolled back)", so the write can never be
+  committed without what the hook would have written. An extension that
+  does not ask is never called, and costs nothing.
+
+  `Graph::bulk_load` only builds a new database, so no extension is
+  installed in what it writes; one installed afterwards builds from a scan
+  (`CALL context.index()`).
 
 ### Writing one
 
@@ -77,7 +97,8 @@ ext::register(Arc::new(Geo));
 
 Optional hooks: `install` / `uninstall` / `upgrade(from)` run in the
 transaction of `CREATE` / `DROP` / `ALTER EXTENSION`; `wants_writes` and
-`on_node_write` maintain derived state. The built-in `context` extension
+`on_node_write`, `wants_edge_writes` and `on_edge_write`, and
+`on_bulk_write` maintain derived state. The built-in `context` extension
 (`src/ext/context.rs`, `src/ext/text.rs`) uses all of them and is the
 worked example.
 
@@ -190,9 +211,10 @@ under 300 MB.
 - The text index is lexical (lowercased words, plural `s` dropped, no other
   stemming, a short English stopword list). Semantic search over embeddings
   is not part of it; pass the ids from your own vector search as `seeds:`.
-- Write hooks see node writes only; edge properties are not indexed.
-- Bulk loads (`Graph::bulk_load`, `migrate`) bypass hooks: run
-  `CALL context.index()` after one.
+- The text index follows node writes only; edge properties are not indexed.
+- A database made by `Graph::bulk_load` has nothing installed: install the
+  extension and run `CALL context.index()` after it. `migrate`, imports
+  and replayed operations keep the index current like any other write.
 - `CALL context.index()` builds in one transaction, and its log holds every
   posting until the next checkpoint (about 0.5 GiB for the 8.6M postings in
   the benchmark).
