@@ -156,9 +156,9 @@ impl Extension for Structure {
         })
     }
     fn check(&self, g: &Graph, probe: &mut super::check::Probe) -> Result<bool> {
-        // A kept colouring that no longer matches the graph is stale, which
-        // `read` reports (D4); what can be wrong with it as stored is a
-        // record that does not decode or a node that is gone.
+        // A kept colouring is not maintained as the graph changes: going
+        // stale is what it is expected to do, and `read` says so (D4). What
+        // can be wrong with it as kept is a record that does not decode.
         let mut after: Option<Vec<u8>> = probe.after().map(|a| a.to_vec());
         loop {
             let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -171,34 +171,19 @@ impl Extension for Structure {
             }
             for (k, v) in batch {
                 if !probe.look()? {
+                    // Empty before the first record: no key is empty, so
+                    // the next slice starts at the first.
                     probe.stop_at(after.unwrap_or_default());
                     return Ok(true);
                 }
-                match k.first() {
-                    Some(b'n') => {
-                        let id = k.len().checked_sub(8).map(|at| u64_at(&k, at));
-                        match id {
-                            Some(id) if v.len() == 16 => {
-                                if g.node_shared(id).is_none() {
-                                    probe.found(
-                                        "gone",
-                                        format!("n{id}"),
-                                        format!(
-                                            "a kept colouring lists n{id}, which no longer exists"
-                                        ),
-                                    );
-                                }
-                            }
-                            _ => probe.found("bad_record", hex(&k), "a malformed colour record"),
-                        }
-                    }
-                    Some(b'm') => {
-                        if Meta::decode(&v).is_none() {
-                            probe.found("bad_record", hex(&k), "a malformed colouring record");
-                        }
-                    }
-                    Some(b'w') if v.len() == 16 => {}
-                    _ => probe.found("bad_record", hex(&k), "a record of no known kind"),
+                let sound = match k.first() {
+                    Some(b'n') => k.len() > 9 && v.len() == 16,
+                    Some(b'm') => Meta::decode(&v).is_some(),
+                    Some(b'w') => k == CHAIN && v.len() == 16,
+                    _ => false,
+                };
+                if !sound {
+                    probe.found("bad_record", hex(&k), "a kept colouring's record that does not decode; drop the colouring and compute it again");
                 }
                 after = Some(k);
             }

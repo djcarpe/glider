@@ -873,3 +873,42 @@ fn the_memory_and_paged_tiers_give_the_same_bytes() {
     drop(file);
     cleanup(&p);
 }
+
+#[test]
+fn check_finds_nothing_wrong_with_kept_colourings_even_when_stale() {
+    let mut g = Graph::memory();
+    sample(&mut g);
+    q(&mut g, "CREATE EXTENSION check");
+    q(&mut g, "CALL structure.colors(depth: 2, store: 'a')");
+    q(&mut g, "CREATE (:A {key: 'later'})");
+    for args in ["", ", limit: 1"] {
+        let mut after = String::new();
+        loop {
+            let r = q(
+                &mut g,
+                &format!("CALL check.run(checks: ['derived']{args}{after})"),
+            );
+            assert!(
+                r.rows.iter().all(|row| text(&row[1]) == "summary"),
+                "{:?}",
+                r.rows
+            );
+            let partial = r.rows.iter().find(|row| text(&row[2]) == "partial");
+            match partial {
+                Some(row) => after = format!(", after: '{}'", text(&row[3])),
+                None => break,
+            }
+        }
+    }
+    // A record that does not decode is named.
+    g.ext_write("structure", vec![(b"mbroken".to_vec(), vec![9])], vec![])
+        .unwrap();
+    let r = q(&mut g, "CALL check.run(checks: ['derived'])");
+    assert!(
+        r.rows
+            .iter()
+            .any(|row| text(&row[2]) == "structure.bad_record"),
+        "{:?}",
+        r.rows
+    );
+}
