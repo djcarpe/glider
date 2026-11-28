@@ -40,6 +40,13 @@ functions work in any expression as `<extension>.<function>(...)`.
   and after. What it writes in response is logged, so recovery and replicas
   replay the result without running the hook again. Bulk loads do not call
   hooks; an extension rebuilds from a scan instead (`CALL context.index()`).
+  A write that changes nothing (a property set to the value it has, a label
+  it already has) is not logged and calls no hook.
+- **Extensions can tell whether the graph has moved.** `Graph::revision()`
+  (and `revision` in `STATS`) grows with every committed change, including
+  an extension's own writes, and with nothing else. Record it beside derived
+  state; if it is the same later, nothing has changed since
+  ([`DERIVED.md`](DERIVED.md), "Revision").
 
 ### Writing one
 

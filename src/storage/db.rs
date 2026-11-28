@@ -362,7 +362,9 @@ impl Db {
     /// Give a memory database a log from now on, keeping at most `cap`
     /// bytes of committed log nobody has let go of. It starts where the
     /// pages are (their `wal_lsn`: 0 for a new database, the image's for
-    /// one loaded keeping its lineage), and the database gets a generation
+    /// one loaded keeping its lineage), carried on by what was committed
+    /// since without a log, so the revision does not go back
+    /// ([`Db::revision`]), and the database gets a generation
     /// if it has none. Only between transactions: a log that began inside
     /// one would hold half of it. A database that has a log already keeps
     /// it as it is; a file database has its own, on disk.

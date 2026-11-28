@@ -727,13 +727,13 @@ fn apply(p: &Pager, sch: &mut Schema<'_>, op: &Op) -> SResult<bool> {
                 return Ok(false);
             };
             let old = props_of(&run)?;
-            if get_prop(&old, k).is_some_and(|v| same_value(v, value)) {
-                return Ok(false);
-            }
+            // A value set to itself is still written, so that the pages are
+            // touched as they always were; it is only not a change.
+            let same = get_prop(&old, k).is_some_and(|v| same_value(v, value));
             let mut new = old.clone();
             set_prop(&mut new, k, value.clone());
             store_node(p, sch, *id, Some((&labels, &old)), &labels, &new)?;
-            true
+            !same
         }
         Op::NodeUnset { id, key } => {
             let Some(k) = sch.strings.lookup(key) else {
@@ -756,12 +756,10 @@ fn apply(p: &Pager, sch: &mut Schema<'_>, op: &Op) -> SResult<bool> {
                 return Ok(false);
             };
             let mut props = props_of(&run)?;
-            if get_prop(&props, k).is_some_and(|v| same_value(v, value)) {
-                return Ok(false);
-            }
+            let same = get_prop(&props, k).is_some_and(|v| same_value(v, value));
             set_prop(&mut props, k, value.clone());
             EDGES.put(p, &node_key(*id), &encode_edge(from, to, t, &props))?;
-            true
+            !same
         }
         Op::EdgeUnset { id, key } => {
             let Some(k) = sch.strings.lookup(key) else {

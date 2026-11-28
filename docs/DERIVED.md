@@ -79,16 +79,56 @@ tests cite them.
   as before, with two exceptions that are improvements: `STATS` reports the
   revision, and `CALL` honours the statement budget.
 
-## Revision
+## Revision (*built*)
 
-`STATS` gains `revision` and `generation`. `Graph::revision()` is the same
-number for a library caller.
+`STATS` reports `revision` (an integer) and `generation` (32 hex digits, all
+zeros for a memory graph that has no log). `Graph::revision()` is the same
+number for a library caller; it reads a field and costs nothing.
 
-The write-ahead log's committed position already has most of the properties
-D2 asks for on a file: it only moves when a transaction wrote records, it is
-durable, and older builds move it as well. An in-memory graph without a log
-has no such position. The slice that builds this decides the mechanism; D2 is
-the test.
+**The revision is the committed position of the write-ahead log**: the byte
+offset just past the last committed transaction's marker. No new field is
+stored and the file format is unchanged.
+
+- *Grows with every change.* Every change goes through one logged operation,
+  and a transaction that logged anything writes a commit marker, so the
+  position moves forward. Positions are bytes, so the number is not dense.
+- *Holds for everything else.* An operation that would change nothing (a
+  property set to the value it has, compared exactly, so `1` and `1.0`
+  differ; an absent property or label removed; a label or an index that is
+  already there; an extension writing what it holds) is no longer written to
+  the log, and a node write that changed nothing calls no extension hooks.
+  (A property set to its own value still rewrites the record, so the page
+  cache sees the same accesses it always did; only the log is spared.)
+  A commit that logged nothing writes no marker. A rollback or a failed
+  statement cuts the log back to the last commit. Checkpoints, `COMPACT`,
+  closing and reopening and reads do not write to the log. `CLEAR` always
+  counts as a change.
+- *Durable.* A checkpoint records the position in the superblock and reopen
+  resumes there, whether or not any log segment is left; recovery after a
+  crash ends at the last commit marker.
+- *The same on a replica.* Replicas, file or memory, are made of a base taken
+  at a log position and the log shipped after it, at the same positions, so
+  a restore reports the position it replayed to: the source's revision at
+  that point, and an earlier one for an earlier point.
+- *Memory graphs.* With a log (`enable_log`), the revision is that log's
+  position. Without one, the graph counts the bytes a log would have written
+  for the same transactions, so it reports the same revision a logged graph
+  or a file reports for the same history, and a log enabled later starts
+  there instead of at 0, so enabling a log does not move the revision back. That number lives and dies with the graph object: it is as durable
+  as the graph is, which is not at all. A graph loaded from a file's image
+  (`Graph::from_bytes`) has no lineage and starts at 0.
+- *Bulk load* builds a new file without the log; it ends by logging one
+  record (the id counters it set), so a loaded database is past 0.
+- *Older builds cannot leave it behind.* They log every operation they
+  apply, including the ones that change nothing, commit with a marker, keep
+  the position in the superblock across checkpoints, and carry it through
+  segment deletion and `CLEAR` exactly as this build does. Their revision
+  may grow where this build's would not, which D2 allows. Their migration
+  and bulk load create new files with new generations. So no format bump
+  was needed.
+
+With `generation`, `(generation, revision)` names one committed state of one
+lineage.
 
 ## Budgets for procedures
 
