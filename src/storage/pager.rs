@@ -547,6 +547,9 @@ impl Pager {
         }
         free.extend(chain);
         let durable = sb_epoch(sb);
+        // No lineage, but the image's position: the revision never goes
+        // back across saving and loading an image (docs/DERIVED.md, D2).
+        let wal_lsn = page::get_u64(sb, 72);
         let inner = Inner {
             ps,
             store: Store::Mem(Mem {
@@ -570,7 +573,7 @@ impl Pager {
             meta,
             committed_meta: meta,
             generation: [0; 16],
-            wal_lsn: 0,
+            wal_lsn,
             sb_slot: 0,
             stats: Stats::default(),
         };
@@ -731,10 +734,14 @@ impl Pager {
         }
         // In memory nothing durable refers to the chain: its pages are free.
         free.extend(chain);
+        // Without its lineage a copy still keeps its position: the
+        // revision never goes back across saving and loading an image
+        // (docs/DERIVED.md, D2), so what was derived at the source's
+        // positions is never ahead of the copy's.
         let (generation, wal_lsn) = if keep_lineage {
             (s.generation, s.wal_lsn)
         } else {
-            ([0; 16], 0)
+            ([0; 16], s.wal_lsn)
         };
         let inner = Inner {
             ps,
@@ -2734,7 +2741,7 @@ mod tests {
         assert_eq!(m.memory_usage().unwrap().0, p.memory_usage().unwrap().0);
         assert_eq!((m.wal_lsn(), m.generation()), (1234, snap.generation()));
         let fresh = Pager::from_parts(&refs(&parts), u64::MAX, false).unwrap();
-        assert_eq!((fresh.wal_lsn(), fresh.generation()), (0, [0; 16]));
+        assert_eq!((fresh.wal_lsn(), fresh.generation()), (1234, [0; 16]));
 
         // One segment: the browser's reader takes it too.
         let one = image(&snap, 1 << 20);

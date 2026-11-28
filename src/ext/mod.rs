@@ -24,6 +24,7 @@
 //! `<name>.<function>(...)` in any expression, in every database that
 //! installs it.
 
+pub mod changes;
 pub mod check;
 pub mod context;
 pub mod structure;
@@ -191,7 +192,8 @@ fn registry() -> &'static RwLock<Vec<Arc<dyn Extension>>> {
     static REGISTRY: OnceLock<RwLock<Vec<Arc<dyn Extension>>>> = OnceLock::new();
     REGISTRY.get_or_init(|| {
         RwLock::new(vec![
-            Arc::new(check::Check) as Arc<dyn Extension>,
+            Arc::new(changes::Changes) as Arc<dyn Extension>,
+            Arc::new(check::Check),
             Arc::new(context::Context),
             Arc::new(structure::Structure),
         ])
