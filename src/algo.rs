@@ -8,11 +8,23 @@
 //! the stack. Indices are dense positions, not node ids; a node's position
 //! is its rank in ascending id order, and its neighbours come in the same
 //! order in every view.
+//!
+//! Every algorithm keeps the running statement's budget ([`crate::meter`]):
+//! each node it takes up counts one step, and each edge it looks at
+//! another, the same on every tier. Steps are counted in a local
+//! [`Tally`] and reach the meter [`crate::meter::CHUNK`] at a time, so at
+//! most that many steps, plus one node's neighbour list (or, where an
+//! algorithm resets per-node arrays, one pass over them), happen between
+//! two looks at it. Once the budget is spent an algorithm returns with
+//! whatever partial state it has; the statement then fails with the
+//! budget's error and nothing it computed is used. Outside a metered
+//! statement nothing stops.
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, VecDeque};
 
 use crate::graph::Csr;
+use crate::meter::Tally;
 use crate::ooc::{SpillQueue, SpillStack, StateVec};
 
 /// A graph as the algorithms see it: dense positions `0..len()`, and each
@@ -32,9 +44,16 @@ pub trait Adjacency {
         out
     }
     fn has_negative_weights(&self) -> bool {
+        let mut tally = Tally::new();
         (0..self.len()).any(|v| {
+            if tally.spent(1) {
+                return false;
+            }
             let mut neg = false;
-            self.each(v, &mut |_, w, _| neg |= w < 0.0);
+            self.each(v, &mut |_, w, _| {
+                tally.add(1);
+                neg |= w < 0.0
+            });
             neg
         })
     }
@@ -115,7 +134,11 @@ pub fn bfs_each<A: Adjacency + ?Sized>(
     let mut q: SpillQueue<(u64, u32, u64)> = SpillQueue::new();
     seen.set(source, true);
     q.push_back((source as u64, 0, NO_PARENT));
+    let mut tally = Tally::new();
     while let Some((v, d, parent)) = q.pop_front() {
+        if tally.spent(1) {
+            return;
+        }
         let v = v as usize;
         let visit = Visit {
             node: v,
@@ -131,6 +154,7 @@ pub fn bfs_each<A: Adjacency + ?Sized>(
             }
         }
         a.each(v, &mut |t, _, _| {
+            tally.add(1);
             if !seen.get(t) {
                 seen.set(t, true);
                 q.push_back((t as u64, d + 1, v as u64));
@@ -163,7 +187,11 @@ pub fn dfs_each<A: Adjacency + ?Sized>(
     let mut seen = StateVec::new(n, false);
     let mut stack: SpillStack<(u64, u32, u64)> = SpillStack::new();
     stack.push((source as u64, 0, NO_PARENT));
+    let mut tally = Tally::new();
     while let Some((v, d, parent)) = stack.pop() {
+        if tally.spent(1) {
+            return;
+        }
         let v = v as usize;
         if seen.get(v) {
             continue;
@@ -183,7 +211,9 @@ pub fn dfs_each<A: Adjacency + ?Sized>(
             }
         }
         // Reverse so the first neighbour is explored first.
-        for t in a.targets(v).into_iter().rev() {
+        let targets = a.targets(v);
+        tally.add(targets.len() as u64);
+        for t in targets.into_iter().rev() {
             if !seen.get(t) {
                 stack.push((t as u64, d + 1, v as u64));
             }
@@ -257,10 +287,15 @@ pub fn bfs_paths<A: Adjacency + ?Sized>(a: &A, source: usize) -> Paths {
     p.dist.set(source, 0.0);
     let mut q: SpillQueue<u64> = SpillQueue::new();
     q.push_back(source as u64);
+    let mut tally = Tally::new();
     while let Some(v) = q.pop_front() {
+        if tally.spent(1) {
+            break;
+        }
         let v = v as usize;
         let dv = p.dist.get(v);
         a.each(v, &mut |t, _, _| {
+            tally.add(1);
             if !p.dist.get(t).is_finite() {
                 p.dist.set(t, dv + 1.0);
                 p.parent.set(t, v as u64);
@@ -282,11 +317,16 @@ pub fn dijkstra<A: Adjacency + ?Sized>(a: &A, source: usize) -> Paths {
     let mut heap = BinaryHeap::new();
     p.dist.set(source, 0.0);
     heap.push(Weighted(0.0, source));
+    let mut tally = Tally::new();
     while let Some(Weighted(d, v)) = heap.pop() {
+        if tally.spent(1) {
+            break;
+        }
         if d > p.dist.get(v) {
             continue; // stale entry
         }
         a.each(v, &mut |t, w, _| {
+            tally.add(1);
             let nd = d + w;
             if nd < p.dist.get(t) {
                 p.dist.set(t, nd);
@@ -318,12 +358,17 @@ pub fn astar<A: Adjacency + ?Sized, H: Fn(usize) -> f64>(
     let mut heap = BinaryHeap::new();
     p.dist.set(source, 0.0);
     heap.push(Weighted(h(source), source));
+    let mut tally = Tally::new();
     while let Some(Weighted(_, v)) = heap.pop() {
+        if tally.spent(1) {
+            return None;
+        }
         if v == target {
             break;
         }
         let gv = p.dist.get(v);
         a.each(v, &mut |t, w, _| {
+            tally.add(1);
             let ng = gv + w;
             if ng < p.dist.get(t) {
                 p.dist.set(t, ng);
@@ -362,17 +407,24 @@ pub fn pagerank<A: Adjacency + ?Sized>(
     let mut next = StateVec::new(n, 0.0f64);
     // Out-degrees don't change between iterations: count them once.
     let mut deg = StateVec::new(n, 0u64);
-    for v in 0..n {
-        deg.set(v, a.degree(v) as u64);
-    }
     let mut iterations = 0;
     let mut delta = 0.0;
+    let mut tally = Tally::new();
+    for v in 0..n {
+        if tally.spent(1) {
+            break;
+        }
+        deg.set(v, a.degree(v) as u64);
+    }
 
-    for it in 0..max_iter {
+    'run: for it in 0..max_iter {
         iterations = it + 1;
         // Dangling nodes redistribute their mass evenly.
         let mut dangling = 0.0;
         for v in 0..n {
+            if tally.spent(1) {
+                break 'run;
+            }
             if deg.get(v) == 0 {
                 dangling += rank.get(v);
             }
@@ -381,6 +433,9 @@ pub fn pagerank<A: Adjacency + ?Sized>(
         next.fill((1.0 - damping) * base + leak);
         for v in 0..n {
             let d = deg.get(v);
+            if tally.spent(1 + d) {
+                break 'run;
+            }
             if d == 0 {
                 continue;
             }
@@ -392,6 +447,9 @@ pub fn pagerank<A: Adjacency + ?Sized>(
         }
         delta = 0.0;
         for v in 0..n {
+            if tally.spent(1) {
+                break 'run;
+            }
             delta += (rank.get(v) - next.get(v)).abs();
         }
         rank.swap(&mut next);
@@ -426,9 +484,15 @@ pub fn betweenness_with<A: Adjacency + ?Sized, R: Adjacency + ?Sized>(
     let mut delta = StateVec::new(n, 0.0f64);
     let mut order = StateVec::new(n, 0u64);
 
-    let mut run = |s: usize| {
+    let mut tally = Tally::new();
+    // false once the statement must stop
+    let mut run = |s: usize| -> bool {
         if s >= n {
-            return;
+            return true;
+        }
+        // resetting the per-source arrays looks at every node
+        if tally.spent(n as u64) {
+            return false;
         }
         sigma.fill(0.0);
         dist.fill(-1);
@@ -439,11 +503,15 @@ pub fn betweenness_with<A: Adjacency + ?Sized, R: Adjacency + ?Sized>(
         dist.set(s, 0);
         q.push_back(s as u64);
         while let Some(v) = q.pop_front() {
+            if tally.spent(1) {
+                return false;
+            }
             let v = v as usize;
             order.set(len, v as u64);
             len += 1;
             let (dv, sv) = (dist.get(v), sigma.get(v));
             a.each(v, &mut |t, _, _| {
+                tally.add(1);
                 if dist.get(t) < 0 {
                     dist.set(t, dv + 1);
                     q.push_back(t as u64);
@@ -455,12 +523,16 @@ pub fn betweenness_with<A: Adjacency + ?Sized, R: Adjacency + ?Sized>(
             });
         }
         for i in (0..len).rev() {
+            if tally.spent(1) {
+                return false;
+            }
             let w = order.get(i) as usize;
             let coeff = (1.0 + delta.get(w)) / sigma.get(w);
             let dw = dist.get(w);
             // w's predecessors: nodes one level up with an edge into w, once
             // per such edge, as the forward pass counted them.
             rev.each(w, &mut |v, _, _| {
+                tally.add(1);
                 if dist.get(v) == dw - 1 && dw > 0 {
                     let x = delta.get(v);
                     delta.set(v, x + sigma.get(v) * coeff);
@@ -471,16 +543,21 @@ pub fn betweenness_with<A: Adjacency + ?Sized, R: Adjacency + ?Sized>(
                 score.set(w, x + delta.get(w));
             }
         }
+        true
     };
     match sources {
         Some(srcs) => {
             for &s in srcs {
-                run(s);
+                if !run(s) {
+                    return score;
+                }
             }
         }
         None => {
             for s in 0..n {
-                run(s);
+                if !run(s) {
+                    return score;
+                }
             }
         }
     }
@@ -506,7 +583,12 @@ pub fn betweenness(csr: &Csr, sources: Option<&[usize]>, normalize: bool) -> Sta
 pub fn closeness<A: Adjacency + ?Sized>(a: &A, weighted: bool) -> StateVec<f64> {
     let n = a.len();
     let mut out = StateVec::new(n, 0.0f64);
+    let mut tally = Tally::new();
     for s in 0..n {
+        // the search below, then the distance to every node
+        if tally.spent(1 + n as u64) {
+            break;
+        }
         let mut paths = if weighted {
             dijkstra(a, s)
         } else {
@@ -537,7 +619,11 @@ pub fn degree_centrality<A: Adjacency + ?Sized>(a: &A) -> StateVec<f64> {
     let n = a.len();
     let denom = (n.saturating_sub(1)).max(1) as f64;
     let mut out = StateVec::new(n, 0.0f64);
+    let mut tally = Tally::new();
     for v in 0..n {
+        if tally.spent(1) {
+            break;
+        }
         out.set(v, a.degree(v) as f64 / denom);
     }
     out
@@ -554,14 +640,22 @@ pub fn components<A: Adjacency + ?Sized>(a: &A) -> (StateVec<u64>, u64) {
     let mut comp = StateVec::new(n, NONE);
     let mut count = 0u64;
     let mut q: SpillQueue<u64> = SpillQueue::new();
-    for s in 0..n {
+    let mut tally = Tally::new();
+    'run: for s in 0..n {
+        if tally.spent(1) {
+            break;
+        }
         if comp.get(s) != NONE {
             continue;
         }
         comp.set(s, count);
         q.push_back(s as u64);
         while let Some(v) = q.pop_front() {
+            if tally.spent(1) {
+                break 'run;
+            }
             a.each(v as usize, &mut |t, _, _| {
+                tally.add(1);
                 if comp.get(t) == NONE {
                     comp.set(t, count);
                     q.push_back(t as u64);
@@ -651,8 +745,12 @@ pub fn strongly_connected<A: Adjacency + ?Sized>(a: &A) -> (StateVec<u64>, u64) 
     let mut next_index = 0u64;
     let mut count = 0u64;
     let mut call = DfsFrames::new();
+    let mut tally = Tally::new();
 
-    for root in 0..n {
+    'run: for root in 0..n {
+        if tally.spent(1) {
+            break;
+        }
         if index.get(root) != NONE {
             continue;
         }
@@ -663,7 +761,11 @@ pub fn strongly_connected<A: Adjacency + ?Sized>(a: &A) -> (StateVec<u64>, u64) 
         stack.push(root as u64);
         on_stack.set(root, true);
 
+        // one neighbour looked at, or one node finished, per round
         while let Some((v, next)) = call.next(a) {
+            if tally.spent(1) {
+                break 'run;
+            }
             if let Some(w) = next {
                 if index.get(w) == NONE {
                     index.set(w, next_index);
@@ -757,13 +859,21 @@ pub fn triangles<A: Adjacency + ?Sized>(a: &A) -> (StateVec<u64>, u64) {
     let mut counts = StateVec::new(n, 0u64);
     let mut total = 0u64;
     let mut cache = NbrCache::new();
-    for v in 0..n {
+    let mut tally = Tally::new();
+    'run: for v in 0..n {
         let nv = cache.get(a, v);
+        if tally.spent(1 + nv.len() as u64) {
+            break;
+        }
         for &u in nv.iter() {
             if u <= v {
                 continue;
             }
             let nu = cache.get(a, u);
+            // the intersection looks at both lists
+            if tally.spent((nv.len() + nu.len()) as u64) {
+                break 'run;
+            }
             // Intersect the two sorted neighbour lists.
             let (mut i, mut j) = (0usize, 0usize);
             while i < nv.len() && j < nu.len() {
@@ -793,8 +903,13 @@ pub fn triangles<A: Adjacency + ?Sized>(a: &A) -> (StateVec<u64>, u64) {
 pub fn clustering<A: Adjacency + ?Sized>(a: &A, tri: &mut StateVec<u64>) -> StateVec<f64> {
     let n = a.len();
     let mut out = StateVec::new(n, 0.0f64);
+    let mut tally = Tally::new();
     for v in 0..n {
-        let k = simple_nbrs(a, v).len() as f64;
+        let k = simple_nbrs(a, v).len();
+        if tally.spent(1 + k as u64) {
+            break;
+        }
+        let k = k as f64;
         out.set(
             v,
             if k > 1.0 {
@@ -812,10 +927,18 @@ pub fn core_numbers<A: Adjacency + ?Sized>(a: &A) -> StateVec<u64> {
     let n = a.len();
     let mut deg = StateVec::new(n, 0u64);
     let mut max_deg = 0usize;
+    let mut tally = Tally::new();
     for v in 0..n {
+        if tally.spent(1) {
+            return deg;
+        }
         let d = a.degree(v);
         deg.set(v, d as u64);
         max_deg = max_deg.max(d);
+    }
+    // the bucket sort below looks at every node twice
+    if tally.spent(2 * n as u64) {
+        return deg;
     }
 
     let mut bin = vec![0usize; max_deg + 2];
@@ -844,6 +967,9 @@ pub fn core_numbers<A: Adjacency + ?Sized>(a: &A) -> StateVec<u64> {
     for i in 0..n {
         let v = vert.get(i) as usize;
         let mut seen = a.targets(v);
+        if tally.spent(1 + seen.len() as u64) {
+            break;
+        }
         seen.sort_unstable();
         seen.dedup();
         for u in seen {
@@ -872,13 +998,21 @@ pub fn core_numbers<A: Adjacency + ?Sized>(a: &A) -> StateVec<u64> {
 pub fn topological_sort<A: Adjacency + ?Sized>(a: &A) -> Option<StateVec<u64>> {
     let n = a.len();
     let mut indeg = StateVec::new(n, 0u64);
+    let mut tally = Tally::new();
     for v in 0..n {
+        if tally.spent(1) {
+            return None;
+        }
         a.each(v, &mut |t, _, _| {
+            tally.add(1);
             let x = indeg.get(t);
             indeg.set(t, x + 1);
         });
     }
     let mut q: SpillQueue<u64> = SpillQueue::new();
+    if tally.spent(n as u64) {
+        return None;
+    }
     for v in 0..n {
         if indeg.get(v) == 0 {
             q.push_back(v as u64);
@@ -887,9 +1021,13 @@ pub fn topological_sort<A: Adjacency + ?Sized>(a: &A) -> Option<StateVec<u64>> {
     let mut order = StateVec::new(n, 0u64);
     let mut len = 0usize;
     while let Some(v) = q.pop_front() {
+        if tally.spent(1) {
+            return None;
+        }
         order.set(len, v);
         len += 1;
         a.each(v as usize, &mut |t, _, _| {
+            tally.add(1);
             let x = indeg.get(t) - 1;
             indeg.set(t, x);
             if x == 0 {
@@ -912,13 +1050,21 @@ pub fn topological_sort<A: Adjacency + ?Sized>(a: &A) -> Option<StateVec<u64>> {
 pub fn topological_levels<A: Adjacency + ?Sized>(a: &A) -> Option<(StateVec<u64>, u64)> {
     let n = a.len();
     let mut indeg = StateVec::new(n, 0u64);
+    let mut tally = Tally::new();
     for v in 0..n {
+        if tally.spent(1) {
+            return None;
+        }
         a.each(v, &mut |t, _, _| {
+            tally.add(1);
             let x = indeg.get(t);
             indeg.set(t, x + 1);
         });
     }
     let mut q: SpillQueue<u64> = SpillQueue::new();
+    if tally.spent(n as u64) {
+        return None;
+    }
     for v in 0..n {
         if indeg.get(v) == 0 {
             q.push_back(v as u64);
@@ -928,11 +1074,15 @@ pub fn topological_levels<A: Adjacency + ?Sized>(a: &A) -> Option<(StateVec<u64>
     let mut seen = 0usize;
     let mut count = 0u64;
     while let Some(v) = q.pop_front() {
+        if tally.spent(1) {
+            return None;
+        }
         seen += 1;
         // Final: every predecessor was popped before v's in-degree hit zero.
         let lv = level.get(v as usize);
         count = count.max(lv + 1);
         a.each(v as usize, &mut |t, _, _| {
+            tally.add(1);
             if level.get(t) < lv + 1 {
                 level.set(t, lv + 1);
             }
@@ -965,13 +1115,21 @@ pub fn transitive_reduction<A: Adjacency + ?Sized>(a: &A) -> Option<Vec<u64>> {
     let mut first = StateVec::new(n, UNSEEN);
     let mut redundant = Vec::new();
     let mut stack: SpillStack<u64> = SpillStack::new();
+    let mut tally = Tally::new();
     for u in 0..n {
+        if tally.spent(1) {
+            return None;
+        }
         if a.degree(u) < 2 {
             continue;
         }
         let mark = u as u64;
         a.each(u, &mut |c, _, _| {
+            if tally.spent(1) {
+                return;
+            }
             a.each(c, &mut |t, _, _| {
+                tally.add(1);
                 if seen.get(t) != mark {
                     seen.set(t, mark);
                     stack.push(t as u64);
@@ -979,12 +1137,19 @@ pub fn transitive_reduction<A: Adjacency + ?Sized>(a: &A) -> Option<Vec<u64>> {
             });
         });
         while let Some(v) = stack.pop() {
+            if tally.spent(1) {
+                return None;
+            }
             a.each(v as usize, &mut |t, _, _| {
+                tally.add(1);
                 if seen.get(t) != mark {
                     seen.set(t, mark);
                     stack.push(t as u64);
                 }
             });
+        }
+        if tally.spent(0) {
+            return None;
         }
         a.each(u, &mut |w, _, eid| {
             if seen.get(w) == mark || first.get(w) == mark {
@@ -1002,14 +1167,22 @@ pub fn find_cycle<A: Adjacency + ?Sized>(a: &A) -> Option<Vec<usize>> {
     // 0 = unvisited, 1 = on stack, 2 = done
     let mut state = StateVec::new(n, 0u8);
     let mut parent = StateVec::new(n, NO_PARENT);
+    let mut tally = Tally::new();
     for root in 0..n {
+        if tally.spent(1) {
+            return None;
+        }
         if state.get(root) != 0 {
             continue;
         }
         let mut call = DfsFrames::new();
         call.push(a, root);
         state.set(root, 1);
+        // one neighbour looked at, or one node finished, per round
         while let Some((v, next)) = call.next(a) {
+            if tally.spent(1) {
+                return None;
+            }
             match next {
                 Some(w) => match state.get(w) {
                     0 => {
@@ -1050,13 +1223,21 @@ pub fn find_cycle<A: Adjacency + ?Sized>(a: &A) -> Option<Vec<usize>> {
 pub fn label_propagation<A: Adjacency + ?Sized>(a: &A, max_iter: u32) -> (StateVec<u64>, u64) {
     let n = a.len();
     let mut labels = StateVec::new(n, 0u64);
+    let mut steps = Tally::new();
+    if steps.spent(n as u64) {
+        return (labels, 0);
+    }
     for v in 0..n {
         labels.set(v, v as u64);
     }
-    for _ in 0..max_iter {
+    'run: for _ in 0..max_iter {
         let mut changed = false;
         for v in 0..n {
-            if a.degree(v) == 0 {
+            let d = a.degree(v);
+            if steps.spent(1 + d as u64) {
+                break 'run;
+            }
+            if d == 0 {
                 continue;
             }
             let mut tally: Vec<(u64, u32)> = Vec::new();
@@ -1086,6 +1267,9 @@ pub fn label_propagation<A: Adjacency + ?Sized>(a: &A, max_iter: u32) -> (StateV
     let mut remap = StateVec::new(n, NONE);
     let mut count = 0u64;
     for v in 0..n {
+        if steps.spent(1) {
+            break;
+        }
         let l = labels.get(v) as usize;
         let mut m = remap.get(l);
         if m == NONE {
@@ -1107,8 +1291,13 @@ pub fn minimum_spanning_forest<A: Adjacency + ?Sized>(a: &A) -> (Vec<u64>, f64) 
     let dir = crate::ooc::temp_dir();
     let mut sorter = Sorter::new(&dir, "mst", 64 << 20).expect("mst sort");
     let mut seq = 0u64;
+    let mut tally = Tally::new();
     for v in 0..n {
+        if tally.spent(1) {
+            return (Vec::new(), 0.0);
+        }
         a.each(v, &mut |t, w, eid| {
+            tally.add(1);
             if v < t {
                 // Key: weight in total order, then arrival (a stable sort).
                 let bits = w.to_bits();
@@ -1149,6 +1338,9 @@ pub fn minimum_spanning_forest<A: Adjacency + ?Sized>(a: &A) -> (Vec<u64>, f64) 
     let mut total = 0.0;
     let mut it = sorter.finish().expect("mst sort");
     while let Some((key, val)) = it.next().expect("mst sort") {
+        if tally.spent(1) {
+            break;
+        }
         let k = u64::from_be_bytes(key[..8].try_into().unwrap());
         let bits = if k >> 63 == 1 { k ^ (1 << 63) } else { !k };
         let w = f64::from_bits(bits);

@@ -2562,8 +2562,31 @@ impl Graph {
 
     /// Flatten into compressed sparse row form for the in-memory algorithm
     /// tier. Holds the whole projection in RAM.
+    ///
+    /// Each node and edge read counts a step against the running
+    /// statement's budget ([`crate::meter`]); once it is spent the build
+    /// stops and the projection is empty, for a statement that is failing
+    /// anyway.
     pub fn csr(&self, dir: Dir, etype: Option<u32>, weight: Option<&str>) -> Csr {
-        let ids = self.node_ids();
+        let empty = || Csr {
+            ids: Vec::new(),
+            pos: id_map(),
+            off: vec![0],
+            adj: Vec::new(),
+            eids: Vec::new(),
+            weights: Vec::new(),
+        };
+        let mut ids = Vec::new();
+        let mut from = 0u64;
+        loop {
+            let page = self.nodes_from(from, 4096);
+            let Some(&last) = page.last() else { break };
+            if crate::meter::spent(page.len() as u64) {
+                return empty();
+            }
+            ids.extend_from_slice(&page);
+            from = last + 1;
+        }
         let mut pos: IdMap<u32> = id_map();
         pos.reserve(ids.len());
         for (i, id) in ids.iter().enumerate() {
@@ -2575,7 +2598,9 @@ impl Graph {
         let mut eids: Vec<u64> = Vec::new();
         let mut w: Vec<f64> = Vec::new();
         off.push(0u32);
+        let mut tally = crate::meter::Tally::new();
         for id in &ids {
+            let before = adj.len();
             self.for_each_adj(*id, dir, etype, |a| {
                 let Some(p) = pos.get(&a.other) else { return };
                 adj.push(*p);
@@ -2590,6 +2615,9 @@ impl Graph {
                 });
             });
             off.push(adj.len() as u32);
+            if tally.spent((adj.len() - before) as u64) {
+                return empty();
+            }
         }
         Csr {
             ids,
@@ -3079,6 +3107,11 @@ impl<'g> PagedView<'g> {
         'scan: loop {
             let page = g.nodes_from(from, 4096);
             let Some(&last) = page.last() else { break };
+            // a statement out of budget gets an empty view: it is failing
+            if crate::meter::spent(page.len() as u64) {
+                len = 0;
+                break;
+            }
             for id in page {
                 if len == n {
                     break 'scan;

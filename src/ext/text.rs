@@ -236,6 +236,7 @@ fn clear_data(g: &mut Graph) -> Result<()> {
             if batch.is_empty() {
                 break;
             }
+            crate::meter::steps(batch.len() as u64)?;
             g.ext_write(NS, Vec::new(), batch)?;
         }
     }
@@ -266,6 +267,8 @@ pub fn build(g: &mut Graph, c: &Config, flush_terms: usize) -> Result<Built> {
     let mut seen = id_map::<()>();
     let flush_df = |g: &mut Graph, df: &mut HashMap<String, u64>| -> Result<()> {
         let mut puts = Vec::with_capacity(df.len());
+        // one step per term's count, a write the size of a posting
+        crate::meter::steps(df.len() as u64)?;
         for (t, n) in df.drain() {
             let had = g.ext_get(NS, &df_key(&t)).map(|b| varint(&b)).unwrap_or(0);
             puts.push((df_key(&t), enc(had + n)));
@@ -294,6 +297,7 @@ pub fn build(g: &mut Graph, c: &Config, flush_terms: usize) -> Result<Built> {
             let Some(&last) = batch.last() else { break };
             let mut puts = Vec::new();
             for id in &batch {
+                crate::meter::step()?;
                 if multi && seen.insert(*id, ()).is_some() {
                     continue;
                 }
@@ -330,8 +334,9 @@ pub fn build(g: &mut Graph, c: &Config, flush_terms: usize) -> Result<Built> {
     let mut terms = 0u64;
     g.ext_scan(NS, b"f", &mut |_, _| {
         terms += 1;
-        true
+        !crate::meter::spent(1)
     });
+    crate::meter::check()?;
     Ok(Built {
         docs,
         terms,
@@ -381,7 +386,8 @@ pub fn search(
             e.0 += idf * f as f64 * (k1 + 1.0) / (f as f64 + k1);
             e.1.push((idf, f));
             count += 1;
-            count < MAX_POSTINGS
+            // a posting is a node looked at; a stop is returned by the caller
+            count < MAX_POSTINGS && !crate::meter::spent(1)
         });
         read += count;
     }

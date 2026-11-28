@@ -1644,79 +1644,14 @@ impl Default for QueryLimits {
     }
 }
 
-/// The running statement's budget: when it must stop, and how many matching
-/// steps it has left. Set around a statement by [`execute_capped`] and
-/// [`Cursor::open`]; checked by [`tick`] in the matching loops.
-#[derive(Clone, Copy, Debug)]
-struct Meter {
-    #[cfg(not(target_arch = "wasm32"))]
-    deadline: Option<std::time::Instant>,
-    #[cfg(not(target_arch = "wasm32"))]
-    millis: u64,
-    steps_left: u64,
-    steps: u64,
-    ticks: u32,
-}
-thread_local! { static METER: std::cell::Cell<Option<Meter>> = const { std::cell::Cell::new(None) }; }
-pub(crate) struct MeterGuard(Option<Meter>);
-impl Drop for MeterGuard {
-    fn drop(&mut self) {
-        METER.with(|m| m.set(self.0));
-    }
-}
-/// Starts metering the statement about to run on this thread, if `limits`
-/// bound it; the guard puts the previous meter back.
-pub(crate) fn meter(limits: &QueryLimits) -> MeterGuard {
-    let next = if limits.max_millis.is_none() && limits.max_steps.is_none() {
-        None
-    } else {
-        Some(Meter {
-            #[cfg(not(target_arch = "wasm32"))]
-            deadline: limits
-                .max_millis
-                .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms)),
-            #[cfg(not(target_arch = "wasm32"))]
-            millis: limits.max_millis.unwrap_or(0),
-            steps_left: limits.max_steps.unwrap_or(u64::MAX),
-            steps: limits.max_steps.unwrap_or(0),
-            ticks: 0,
-        })
-    };
-    MeterGuard(METER.with(|m| m.replace(next)))
-}
+pub(crate) use crate::meter::meter;
 /// One matching step of the running statement: an error once its budget is
-/// spent. A step is one candidate checked, one edge scanned or one
-/// neighbour looked at, matched or not, so a scan that rejects everything
-/// counts too. The clock is read every 256 steps (a few microseconds of work).
+/// spent (see [`crate::meter`]). A step is one candidate checked, one edge
+/// scanned or one neighbour looked at, matched or not, so a scan that
+/// rejects everything counts too.
 #[inline]
 pub(crate) fn tick() -> Result<()> {
-    METER.with(|cell| {
-        let Some(mut m) = cell.get() else {
-            return Ok(());
-        };
-        if m.steps_left == 0 {
-            return Err(Error::Msg(format!(
-                "statement stopped: it took more than its budget of {} matching steps",
-                m.steps
-            )));
-        }
-        m.steps_left -= 1;
-        m.ticks = m.ticks.wrapping_add(1);
-        #[cfg(not(target_arch = "wasm32"))]
-        if m.ticks % 256 == 0 {
-            if let Some(d) = m.deadline {
-                if std::time::Instant::now() >= d {
-                    cell.set(Some(m));
-                    return Err(Error::Msg(format!(
-                        "statement stopped: it ran past its time budget of {} ms",
-                        m.millis
-                    )));
-                }
-            }
-        }
-        cell.set(Some(m));
-        Ok(())
-    })
+    crate::meter::step()
 }
 thread_local! { static LIMITS: std::cell::Cell<Option<QueryLimits>> = const { std::cell::Cell::new(None) }; }
 struct LimitsGuard(Option<QueryLimits>);
@@ -1881,11 +1816,29 @@ fn execute_stmt(g: &mut Graph, stmt: Stmt) -> Result<QueryResult> {
 
 /// A statement is one transaction: all of it commits, or (on an error)
 /// none of it. Inside BEGIN it joins the open transaction instead.
+///
+/// A statement stopped by its budget fails as a whole, even when the code
+/// that ran out could not return the error itself (an extension function,
+/// a callback): see [`crate::meter::check`]. Inside BEGIN, a stopped
+/// statement that had written something rolls the open transaction back,
+/// so that nothing it half-wrote can be committed.
 fn atomically<R>(g: &mut Graph, f: impl FnOnce(&mut Graph) -> Result<R>) -> Result<R> {
     let auto = g.autocommit;
+    let before = g.uncommitted();
     g.autocommit = false;
     let r = f(g);
+    // the budget's error, rather than whatever a stopped procedure said
+    let r = crate::meter::check().and(r);
     g.autocommit = auto;
+    if !auto && g.uncommitted() != before && crate::meter::stopped() {
+        if let Err(e) = r {
+            g.rollback()?;
+            g.autocommit = true;
+            return Err(Error::Msg(format!(
+                "{e}; it had written to the open transaction, which was rolled back"
+            )));
+        }
+    }
     if !auto || g.uncommitted() == 0 {
         return r;
     }
@@ -4348,6 +4301,9 @@ fn call_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result
     let budget = g.algorithm_memory();
     let tmp = g.temp_dir();
     let r = crate::ooc::with_budget(budget, tmp, || run_algorithm(g, name, args));
+    // A stopped algorithm returns early with partial state; whatever it
+    // made of that, the statement fails with the budget's error.
+    crate::meter::check()?;
     if r.is_ok() {
         if let Some(e) = g.integrity_error() {
             return Err(Error::Msg(format!("storage error during algorithm: {e}")));
@@ -4380,6 +4336,7 @@ fn scalar_rows(
     let better = |x: &(u64, f64), y: &(u64, f64)| y.1.total_cmp(&x.1).then_with(|| x.0.cmp(&y.0));
     let mut keep: Vec<(u64, f64)> = Vec::new();
     for i in 0..n {
+        crate::meter::step()?;
         let id = ids.get(i);
         let v = value(i);
         if let Some(prop) = &write {
@@ -4488,6 +4445,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
             let p = proj!(dir, weight.as_deref());
             let mut deg = StateVec::new(p.len(), 0u64);
             for v in 0..p.len() {
+                crate::meter::step()?;
                 deg.set(v, p.degree(v) as u64);
             }
             let ids = p.into_ids();
@@ -4640,6 +4598,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                 |x: &(u64, f64), y: &(u64, f64)| x.1.total_cmp(&y.1).then_with(|| x.0.cmp(&y.0));
             let mut keep: Vec<(u64, f64)> = Vec::new();
             for i in 0..ids.len() {
+                crate::meter::step()?;
                 let d = dist.get(i);
                 if !d.is_finite() {
                     continue;
@@ -4819,6 +4778,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
             // Shallowest first, then lower id: the order the levels run in.
             let mut keep: Vec<(u64, u64)> = Vec::new();
             for i in 0..ids.len() {
+                crate::meter::step()?;
                 let (id, lv) = (ids.get(i), level.get(i));
                 if let Some(prop) = &write {
                     g.set_node_prop(id, prop, Value::Int(lv as i64))?;

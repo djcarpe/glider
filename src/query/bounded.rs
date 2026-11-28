@@ -147,6 +147,8 @@ impl Cursor {
         if let Some(e) = g.integrity_error() {
             return Err(Error::Msg(e));
         }
+        // stopped where the error could not be returned (an extension function)
+        crate::meter::check()?;
         writer.flush()?;
         let mut file = writer.into_inner().map_err(|e| Error::Io(e.into_error()))?;
         file.seek(SeekFrom::Start(0))?;

@@ -177,7 +177,7 @@ impl Extension for Context {
                 Ok(QueryResult::message("dropped the text index"))
             }
             "paths" => paths(g, a),
-            "schema" => Ok(text_result(schema(g, a.usize("sample", 200)))),
+            "schema" => Ok(text_result(schema(g, a.usize("sample", 200))?)),
             _ => unreachable!("dispatch checks the procedure list"),
         }
     }
@@ -606,6 +606,7 @@ fn search(g: &Graph, q: &str, o: &SearchOpts) -> Result<Hits> {
     // keys the index may not cover.
     if o.scan == usize::MAX && o.keys.is_empty() && text::config(g).is_some() {
         let (mut scored, read, matched) = text::search(g, q, o.top, o.label);
+        crate::meter::check()?;
         merge_exact(&mut scored, &exact);
         return Ok(Hits {
             hits: scored,
@@ -633,7 +634,7 @@ fn search(g: &Graph, q: &str, o: &SearchOpts) -> Result<Hits> {
         let mut last = None;
         let r = g.scan_nodes(o.label, from, 4096, &mut |id| {
             last = Some(id);
-            if scanned >= o.scan {
+            if scanned >= o.scan || crate::meter::spent(1) {
                 return false;
             }
             scanned += 1;
@@ -698,6 +699,7 @@ fn search(g: &Graph, q: &str, o: &SearchOpts) -> Result<Hits> {
             }
             true
         });
+        crate::meter::check()?;
         match (r, last) {
             (Some((n, _)), Some(l)) if n == 4096 && scanned < o.scan => from = l + 1,
             _ => break,
@@ -794,17 +796,21 @@ impl Walk {
             Dir::In => &[(Dir::In, false)],
             Dir::Both => &[(Dir::Out, true), (Dir::In, false)],
         };
+        let mut edges = 0u64;
         for &(d, outgoing) in sides {
             let go = g.for_each_adj_while(id, d, self.etype, |a| {
+                edges += 1;
                 if self.edge_ok(a.etype) {
                     out.push((a.edge, a.other, a.etype, outgoing));
                 }
                 out.len() <= cap
             });
             if !go {
-                return;
+                break;
             }
         }
+        // every edge scanned counts, followed or not
+        crate::meter::spent(edges);
     }
 }
 
@@ -837,7 +843,7 @@ struct Mass {
 /// a hub ranks as relevant without flooding the context with its
 /// thousands of neighbours. Stops early, still a valid lower bound, past
 /// `cap` remembered nodes.
-fn ppr(g: &Graph, w: &Walk, seeds: &[(u64, f64)], o: &Push) -> (IdMap<Mass>, bool) {
+fn ppr(g: &Graph, w: &Walk, seeds: &[(u64, f64)], o: &Push) -> Result<(IdMap<Mass>, bool)> {
     let Push {
         alpha,
         eps,
@@ -863,6 +869,7 @@ fn ppr(g: &Graph, w: &Walk, seeds: &[(u64, f64)], o: &Push) -> (IdMap<Mass>, boo
     let mut adj = Vec::new();
     let mut capped = false;
     while let Some(u) = q.pop_front() {
+        crate::meter::step()?;
         let Mass { r, hops, .. } = m[&u];
         let e = m.get_mut(&u).unwrap();
         e.queued = false;
@@ -907,7 +914,7 @@ fn ppr(g: &Graph, w: &Walk, seeds: &[(u64, f64)], o: &Push) -> (IdMap<Mass>, boo
             }
         }
     }
-    (m, capped)
+    Ok((m, capped))
 }
 
 #[derive(PartialEq)]
@@ -1040,7 +1047,7 @@ fn retrieve(g: &mut Graph, a: &Args) -> Result<QueryResult> {
             max_fanout,
             cap,
         },
-    );
+    )?;
     // Rank by mass over degree^beta: with beta > 0 a node that is
     // reachable from the seeds mostly because it is adjacent to everything
     // ranks below one the seeds reach through several routes.
@@ -1146,6 +1153,7 @@ fn retrieve(g: &mut Graph, a: &Args) -> Result<QueryResult> {
         };
 
     for (i, &(s, _)) in seeds.iter().enumerate() {
+        crate::meter::step()?;
         let (_, c) = card(g, s);
         if i > 0 && pk.used + c > budget {
             break;
@@ -1154,6 +1162,7 @@ fn retrieve(g: &mut Graph, a: &Args) -> Result<QueryResult> {
     }
     let mut misses = 0;
     while let Some(Cand2(_, v, via)) = frontier.pop() {
+        crate::meter::step()?;
         if pk.in_set.contains(&v) {
             continue;
         }
@@ -1495,6 +1504,7 @@ fn paths(g: &mut Graph, a: &Args) -> Result<QueryResult> {
         };
         let mut next = Vec::new();
         for &u in frontier.iter() {
+            crate::meter::step()?;
             walk.adj(g, u, d, usize::MAX - 1, &mut adj);
             for &(edge, v, _, _) in &adj {
                 match seen.get_mut(&v) {
@@ -1764,7 +1774,7 @@ fn key_summary(samples: &[Vec<(String, Value)>]) -> String {
         .join(", ")
 }
 
-fn schema(g: &Graph, sample: usize) -> String {
+fn schema(g: &Graph, sample: usize) -> Result<String> {
     let st = g.stats();
     let sample = sample.clamp(1, 10_000);
     let mut out = format!(
@@ -1778,6 +1788,7 @@ fn schema(g: &Graph, sample: usize) -> String {
             continue;
         };
         let ids = g.label_members_from(lid, 0, sample);
+        crate::meter::steps(1 + ids.len() as u64)?;
         let samples: Vec<Vec<(String, Value)>> = ids.iter().map(|&id| g.node_props(id)).collect();
         let keys = key_summary(&samples);
         out.push_str(&format!("(:{l}) {n}"));
@@ -1795,6 +1806,7 @@ fn schema(g: &Graph, sample: usize) -> String {
             continue;
         };
         let ids = g.type_members_from(tid, 0, sample);
+        crate::meter::steps(1 + ids.len() as u64)?;
         let mut patterns: Vec<((String, String), usize)> = Vec::new();
         let mut samples = Vec::new();
         let first_label = |id: u64| {
@@ -1851,7 +1863,7 @@ fn schema(g: &Graph, sample: usize) -> String {
         .map(|(n, v)| format!("{n} {v}"))
         .collect();
     out.push_str(&format!("# extensions: {}\n", exts.join(", ")));
-    out
+    Ok(out)
 }
 
 #[cfg(test)]

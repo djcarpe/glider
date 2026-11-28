@@ -11,10 +11,18 @@
 //! identical. Each takes a cap on how many nodes it may remember; past it
 //! they give up and return `None`, and the caller falls back to the
 //! whole-graph algorithm, whose memory is bounded by spilling.
+//!
+//! Each node taken up counts one step against the running statement's
+//! budget, and each edge scanned another ([`crate::meter`]), passed on in
+//! batches by a [`Tally`]. Once the
+//! budget is spent a walk ends where it is (as if it had finished, not as
+//! if it had outgrown its cap, so no whole-graph fallback starts) and the
+//! statement fails with the budget's error.
 
 use std::collections::VecDeque;
 
 use crate::graph::Graph;
+use crate::meter::Tally;
 use crate::types::{id_map, id_set, Dir};
 
 /// One visited node: its id, hops from the start, and the node it was
@@ -49,7 +57,11 @@ pub fn bfs(
         depth: 0,
         parent: None,
     });
+    let mut tally = Tally::new();
     while let Some(v) = q.pop_front() {
+        if tally.spent(1) {
+            return Some(());
+        }
         if !f(v) {
             return Some(());
         }
@@ -57,7 +69,9 @@ pub fn bfs(
             continue;
         }
         let mut over = false;
+        let mut edges = 0u64;
         g.for_each_adj_while(v.node, dir, etype, |a| {
+            edges += 1;
             if seen.insert(a.other) {
                 if seen.len() > cap {
                     over = true;
@@ -71,6 +85,7 @@ pub fn bfs(
             }
             true
         });
+        tally.add(edges);
         if over {
             return None;
         }
@@ -95,7 +110,11 @@ pub fn dfs(
         parent: None,
     }];
     let mut next = Vec::new();
+    let mut tally = Tally::new();
     while let Some(v) = stack.pop() {
+        if tally.spent(1) {
+            return Some(());
+        }
         if !seen.insert(v.node) {
             continue;
         }
@@ -109,7 +128,9 @@ pub fn dfs(
             continue;
         }
         next.clear();
+        let mut edges = 0u64;
         g.for_each_adj(v.node, dir, etype, |a| {
+            edges += 1;
             if !seen.contains(&a.other) {
                 next.push(Visit {
                     node: a.other,
@@ -118,6 +139,7 @@ pub fn dfs(
                 });
             }
         });
+        tally.add(edges);
         stack.extend(next.drain(..).rev());
     }
     Some(())
@@ -150,6 +172,7 @@ pub fn shortest_path(
     bwd.insert(to, u64::MAX);
     let mut ff = vec![from];
     let mut bf = vec![to];
+    let mut tally = Tally::new();
     while !ff.is_empty() && !bf.is_empty() {
         let forward = ff.len() <= bf.len();
         let (frontier, seen, other, d) = if forward {
@@ -160,7 +183,12 @@ pub fn shortest_path(
         let mut next = Vec::new();
         let mut meet = None;
         for &v in frontier.iter() {
+            if tally.spent(1) {
+                return Some(None);
+            }
+            let mut edges = 0u64;
             g.for_each_adj_while(v, d, etype, |a| {
+                edges += 1;
                 if seen.contains_key(&a.other) {
                     return true;
                 }
@@ -172,6 +200,7 @@ pub fn shortest_path(
                 next.push(a.other);
                 true
             });
+            tally.add(edges);
             if meet.is_some() {
                 break;
             }
