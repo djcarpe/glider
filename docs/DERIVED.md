@@ -701,7 +701,13 @@ What is true now, and what this slice decided where the plan was open:
 - **Bounds (D6).** `since` returns at most 10,000 rows a call, continued
   with `after:` (the message gives it); `release` and `cap` forget 4,096
   entries a write. Every loop passes through `step(n)` in
-  `src/ext/changes.rs`, the one place G2 is to count. A write reads the
+  `src/ext/changes.rs`, which counts it against the statement budget (G2,
+  built); the walks and the status count also look at the meter every
+  4,096 entries. A stopped `cap` or `release` forgets nothing, a write
+  stopped while its hook is making room leaves the journal as it was and
+  the next write makes room as before (`tests/journal_budget.rs`), and the
+  hooks inside a statement a procedure runs, on either database, follow the
+  same rules as in an outermost one (`tests/two_databases.rs`). A write reads the
   state (one lookup) and writes one record; deleting or recreating a node
   also looks up its adjacency entry; upkeep is as above. `since` scans
   the entries of the kinds asked for in key order, so a full pass in
@@ -946,10 +952,11 @@ in `docs/EXTENSIONS.md`.
   call, continued with `after:`. A colouring computed in the call is a
   whole-graph computation, so its slices bound what is returned; a kept
   colouring is read in true slices.
-- **Budgets (G2).** Every loop over nodes or edges calls one function,
-  `step(n)` in `src/ext/structure.rs` (per node and per node's edges in a
-  round, per node counted, kept, written or classed); counting a statement
-  step there is a one-line change.
+- **Budgets (G2, built).** Every loop over nodes or edges calls one
+  function, `step(n)` in `src/ext/structure.rs` (per node and per node's
+  edges in a round, per node counted, kept, written or classed), which
+  counts it against the statement budget; the scans of one node's edges
+  count each edge as they go, so a hub's stops with the statement.
 - **On the manufacturing graph** (`bench/KNOWLEDGE.md`, "Structure";
   `bench/tests/mfg_structure.rs`): with the hierarchy and catalogue edge
   types outwards and no properties, depth 4 recovers every design and sets
