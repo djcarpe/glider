@@ -1064,9 +1064,49 @@ pub struct Graph {
     last_edge: std::sync::Mutex<Option<std::sync::Arc<EdgeRef>>>,
     /// Identifies this graph to the telemetry exporter's registry.
     tel_id: u64,
-    /// Installed extensions that maintain state on node writes; computed
-    /// on first write, forgotten whenever installs or config may change.
-    hooks: Option<Vec<std::sync::Arc<dyn crate::ext::Extension>>>,
+    /// Installed extensions that maintain state on writes; computed on
+    /// first write, forgotten whenever installs or config may change.
+    hooks: Option<Hooks>,
+    /// How many write hooks are running: while any is, the graph itself
+    /// may not be written, only extension keyspaces.
+    in_hook: u32,
+    /// A transaction block opened with [`Graph::begin`] (or `BEGIN`) is
+    /// open: one the engine can see start, and so can mark spent.
+    block: bool,
+    /// Set when the engine rolled back the open block because a write or a
+    /// hook failed: the explanation every further write, statement and
+    /// COMMIT in it is refused with, until the caller ends the block.
+    spent: Option<String>,
+}
+
+type Ext = std::sync::Arc<dyn crate::ext::Extension>;
+
+/// The error for a failure that took the caller's open transaction with it.
+fn rolled_back(e: Error) -> Error {
+    const NOTE: &str = "(the transaction was rolled back)";
+    let add = |m: String| {
+        if m.ends_with(NOTE) {
+            m
+        } else {
+            format!("{m} {NOTE}")
+        }
+    };
+    match e {
+        Error::Msg(m) => Error::Msg(add(m)),
+        Error::Full(m) => Error::Full(add(m)),
+        Error::Io(io) => Error::Io(std::io::Error::new(io.kind(), add(io.to_string()))),
+    }
+}
+
+/// Who follows writes in this database.
+#[derive(Clone, Default)]
+struct Hooks {
+    /// `wants_writes`: told about node writes.
+    node: Vec<Ext>,
+    /// `wants_edge_writes`: told about edge writes.
+    edge: Vec<Ext>,
+    /// Either: told about bulk writes.
+    any: Vec<Ext>,
 }
 
 impl Drop for Graph {
@@ -1101,6 +1141,9 @@ impl Graph {
             last_edge: std::sync::Mutex::new(None),
             tel_id: crate::telemetry::next_db_id(),
             hooks: None,
+            in_hook: 0,
+            block: false,
+            spent: None,
         })
     }
 
@@ -1232,8 +1275,11 @@ impl Graph {
 
     /// Copy everything from a legacy-engine graph into this one, keeping
     /// ids: nodes, edges, indexes and id counters. Commits as it goes, so
-    /// memory stays bounded by the source graph, not the copy.
+    /// memory stays bounded by the source graph, not the copy. Each record
+    /// goes through [`apply_op`](Graph::apply_op), so installed extensions
+    /// hear about it.
     pub fn import_legacy(&mut self, old: &crate::legacy::graph::Graph) -> Result<()> {
+        self.refuse_in_block("a legacy import")?;
         let auto = self.autocommit;
         self.autocommit = false;
         let r = (|| -> Result<()> {
@@ -1242,19 +1288,19 @@ impl Graph {
             }
             let mut n = 0u64;
             for id in old.node_ids() {
-                self.exec(Op::NodeAdd {
+                self.apply_op(Op::NodeAdd {
                     id,
                     labels: old.node_labels(id),
                     props: old.node_props(id),
                 })?;
                 n += 1;
                 if n % 50_000 == 0 {
-                    self.commit()?;
+                    self.commit_txn()?;
                 }
             }
             for id in old.edge_ids() {
                 let Some(e) = old.edge(id) else { continue };
-                self.exec(Op::EdgeAdd {
+                self.apply_op(Op::EdgeAdd {
                     id,
                     from: e.from,
                     to: e.to,
@@ -1263,7 +1309,7 @@ impl Graph {
                 })?;
                 n += 1;
                 if n % 50_000 == 0 {
-                    self.commit()?;
+                    self.commit_txn()?;
                 }
             }
             let (next_node, next_edge) = crate::legacy::image::ImageSource::next_ids(old);
@@ -1271,9 +1317,9 @@ impl Graph {
                 next_node,
                 next_edge,
             })?;
-            self.commit()
+            self.commit_txn()
         })();
-        self.autocommit = auto;
+        self.restore_autocommit(auto);
         r
     }
 
@@ -1966,9 +2012,61 @@ impl Graph {
         self.uncommitted
     }
 
+    /// Refuse an operation that has to commit on its own while a block
+    /// opened with [`Graph::begin`] (or `BEGIN`) is open: it would commit
+    /// the block's pending writes before the block's COMMIT, and a block
+    /// that then failed would report "nothing was committed" about writes
+    /// that are durable. In a transaction opened by assigning `autocommit`
+    /// these operations commit what is pending, as they always did.
+    pub(crate) fn refuse_in_block(&self, what: &str) -> Result<()> {
+        if self.block && !self.autocommit {
+            return Err(Error::Msg(format!(
+                "{what} commits on its own, so it cannot run inside a transaction block; \
+                 end the block with COMMIT or ROLLBACK first"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Open a transaction block: autocommit off until [`Graph::commit`] or
+    /// [`Graph::rollback`] ends it (as `BEGIN` does for statements). This
+    /// is the way to open a transaction: if the engine has to roll a block
+    /// back because a write or a write hook failed inside it, the block is
+    /// spent ([`Graph::spent`]) and nothing more can go into it or commit
+    /// from it. A transaction opened by assigning `autocommit = false`
+    /// keeps the older behaviour: the failing call's error says the
+    /// transaction was rolled back, and the caller carries on in a new one.
+    /// Assigning `autocommit` does not end a block opened here.
+    pub fn begin(&mut self) -> Result<()> {
+        if let Some(why) = self.spent() {
+            return Err(Error::Msg(why.to_string()));
+        }
+        self.block = true;
+        self.spent = None;
+        self.autocommit = false;
+        Ok(())
+    }
+
     /// Make the open transaction durable (per the sync mode) and visible as
-    /// the committed state.
+    /// the committed state. A block opened with [`Graph::begin`] ends here
+    /// (autocommit back on); if the engine rolled it back (see
+    /// [`Graph::spent`]) nothing is committed and this is an error that
+    /// says why.
     pub fn commit(&mut self) -> Result<()> {
+        if self.block {
+            self.block = false;
+            self.autocommit = true;
+            if let Some(why) = self.spent.take() {
+                self.rollback_quietly();
+                return Err(Error::Msg(format!("nothing was committed: {why}")));
+            }
+        }
+        self.commit_txn()
+    }
+
+    /// Commit the open transaction without ending a block: for the engine's
+    /// own intermediate commits (imports in slices, autocommit).
+    pub(crate) fn commit_txn(&mut self) -> Result<()> {
         if let Err(e) = self.db.commit() {
             self.rollback_quietly();
             return Err(e.into());
@@ -1977,8 +2075,19 @@ impl Graph {
         Ok(())
     }
 
-    /// Abandon everything since the last commit.
+    /// Abandon everything since the last commit. A block opened with
+    /// [`Graph::begin`] ends here, spent or not.
     pub fn rollback(&mut self) -> Result<()> {
+        if self.block {
+            self.block = false;
+            self.autocommit = true;
+        }
+        self.spent = None;
+        self.rollback_txn()
+    }
+
+    /// Roll back the open transaction without ending a block.
+    pub(crate) fn rollback_txn(&mut self) -> Result<()> {
         self.forget_reads();
         self.hooks = None;
         self.db.rollback()?;
@@ -1997,9 +2106,42 @@ impl Graph {
         self.uncommitted = 0;
     }
 
+    /// Why the caller's open transaction can no longer be committed: the
+    /// engine rolled it back when a write or a write hook failed inside it.
+    /// Writes, statements and COMMIT are refused with this until the caller
+    /// ends the transaction (ROLLBACK, or a COMMIT that reports the error).
+    pub fn spent(&self) -> Option<&str> {
+        if !self.block || self.autocommit {
+            return None;
+        }
+        self.spent.as_deref()
+    }
+
+    /// Put autocommit back after an internal transaction (a statement, an
+    /// import, a batch). Back to on, no transaction of the caller's is open,
+    /// so none can be spent.
+    pub(crate) fn restore_autocommit(&mut self, auto: bool) {
+        self.autocommit = auto;
+    }
+
+    /// Roll back after a failure, and if the caller had a block open (see
+    /// [`Graph::begin`]), mark it spent. The error says what happened,
+    /// whatever its kind.
+    fn abandon(&mut self, e: Error) -> Error {
+        self.rollback_quietly();
+        let e = rolled_back(e);
+        if self.block {
+            self.spent = Some(format!(
+                "the open transaction was rolled back by an earlier error ({e}); \
+                 end it with ROLLBACK and run its writes again"
+            ));
+        }
+        e
+    }
+
     fn maybe_commit(&mut self) -> Result<()> {
         if self.autocommit {
-            self.commit()
+            self.commit_txn()
         } else {
             Ok(())
         }
@@ -2016,6 +2158,26 @@ impl Graph {
     /// revision ([`Graph::revision`]); replaying the log without it gives
     /// the same state, since it did nothing.
     fn exec_changed(&mut self, op: Op) -> Result<bool> {
+        if let Some(why) = self.spent() {
+            return Err(Error::Msg(why.to_string()));
+        }
+        if self.in_hook > 0
+            && !matches!(
+                op,
+                Op::ExtWrite { .. }
+                    | Op::ExtensionAdd { .. }
+                    | Op::ExtensionDel { .. }
+                    | Op::IndexAdd { .. }
+                    | Op::IndexDel { .. }
+                    | Op::Counters { .. }
+            )
+        {
+            return Err(Error::Msg(
+                "a write hook may write only extension keyspaces (Graph::ext_write); \
+                 it may not write a node, an edge, a label or a property, nor clear the graph"
+                    .into(),
+            ));
+        }
         // Checked before anything is logged, so a refused value leaves the
         // transaction exactly as it was. Every value written passes here
         // (statements, the API, imports; recovery replays only what once
@@ -2050,14 +2212,7 @@ impl Graph {
             });
         let changed = match r {
             Ok(c) => c,
-            Err(e) => {
-                self.rollback_quietly();
-                let e: Error = e.into();
-                return Err(match e {
-                    Error::Full(m) => Error::Full(format!("{m} (the transaction was rolled back)")),
-                    other => other,
-                });
-            }
+            Err(e) => return Err(self.abandon(e.into())),
         };
         self.uncommitted += 1;
         self.maybe_commit()?;
@@ -2298,10 +2453,31 @@ impl Graph {
     // ---------------------------------------------------------- mutations
 
     /// Apply one logged operation with its explicit ids: for loaders and
-    /// migrations that must reproduce ids exactly.
+    /// migrations that must reproduce ids exactly. Write hooks run as they
+    /// do for the matching API call.
     #[doc(hidden)]
     pub fn apply_op(&mut self, op: Op) -> Result<()> {
-        self.exec(op)
+        match op {
+            Op::NodeAdd { id, .. }
+            | Op::NodeSet { id, .. }
+            | Op::NodeUnset { id, .. }
+            | Op::LabelAdd { id, .. }
+            | Op::LabelDel { id, .. } => self.exec_node(id, op),
+            Op::NodeDel { id } => self.delete_node(id).map(|_| ()),
+            Op::EdgeAdd { id, .. }
+            | Op::EdgeDel { id }
+            | Op::EdgeSet { id, .. }
+            | Op::EdgeUnset { id, .. } => self.exec_edge(id, op),
+            Op::Clear => self.clear(),
+            Op::ExtensionAdd { name, version } => self.add_extension(&name, &version),
+            Op::ExtensionDel { name } => self.drop_extension(&name),
+            op @ Op::ExtWrite { .. } => {
+                // Which keys are configuration is not known here.
+                self.hooks = None;
+                self.exec(op)
+            }
+            op @ (Op::IndexAdd { .. } | Op::IndexDel { .. } | Op::Counters { .. }) => self.exec(op),
+        }
     }
 
     pub fn add_node(&mut self, labels: &[String], props: Vec<(String, Value)>) -> Result<u64> {
@@ -2331,29 +2507,63 @@ impl Graph {
             return Err(Error::Msg(format!("no node {}", to)));
         }
         let id = self.pager().meta(M_NEXT_EDGE);
-        self.exec(Op::EdgeAdd {
+        self.exec_edge(
             id,
-            from,
-            to,
-            etype: etype.to_string(),
-            props,
-        })?;
+            Op::EdgeAdd {
+                id,
+                from,
+                to,
+                etype: etype.to_string(),
+                props,
+            },
+        )?;
         Ok(id)
     }
 
+    /// Delete a node and every edge it has. Extensions that follow edge
+    /// writes hear about each edge, then the node.
     pub fn delete_node(&mut self, id: u64) -> Result<bool> {
         if !self.node_exists(id) {
             return Ok(false);
         }
-        self.exec_node(id, Op::NodeDel { id })?;
+        if self.write_hooks().edge.is_empty() {
+            self.exec_node(id, Op::NodeDel { id })?;
+        } else {
+            self.unit(|g| {
+                g.detach(id)?;
+                g.exec_node(id, Op::NodeDel { id })
+            })?;
+        }
         Ok(true)
+    }
+
+    /// Delete a node's edges one at a time through the hooked path, a
+    /// batch at a time: never modify the adjacency tree while walking it.
+    fn detach(&mut self, id: u64) -> Result<()> {
+        loop {
+            let mut batch = Vec::new();
+            self.for_each_adj_while(id, Dir::Both, None, |a| {
+                // A self-loop is listed twice; an entry whose edge is gone
+                // is left for the node's own delete to remove.
+                if (a.other != id || !batch.contains(&a.edge)) && self.edge_exists(a.edge) {
+                    batch.push(a.edge);
+                }
+                batch.len() < BATCH
+            });
+            if batch.is_empty() {
+                return Ok(());
+            }
+            for e in batch {
+                self.exec_edge(e, Op::EdgeDel { id: e })?;
+            }
+        }
     }
 
     pub fn delete_edge(&mut self, id: u64) -> Result<bool> {
         if !self.edge_exists(id) {
             return Ok(false);
         }
-        self.exec(Op::EdgeDel { id })?;
+        self.exec_edge(id, Op::EdgeDel { id })?;
         Ok(true)
     }
 
@@ -2385,18 +2595,24 @@ impl Graph {
         if !self.edge_exists(id) {
             return Err(Error::Msg(format!("no edge {}", id)));
         }
-        self.exec(Op::EdgeSet {
+        self.exec_edge(
             id,
-            key: key.to_string(),
-            value,
-        })
+            Op::EdgeSet {
+                id,
+                key: key.to_string(),
+                value,
+            },
+        )
     }
 
     pub fn unset_edge_prop(&mut self, id: u64, key: &str) -> Result<()> {
-        self.exec(Op::EdgeUnset {
+        self.exec_edge(
             id,
-            key: key.to_string(),
-        })
+            Op::EdgeUnset {
+                id,
+                key: key.to_string(),
+            },
+        )
     }
 
     pub fn add_label(&mut self, id: u64, label: &str) -> Result<()> {
@@ -2544,19 +2760,65 @@ impl Graph {
         })
     }
 
-    fn write_hooks(&mut self) -> Vec<std::sync::Arc<dyn crate::ext::Extension>> {
+    fn write_hooks(&mut self) -> &Hooks {
         if self.hooks.is_none() {
-            let mut hooks = Vec::new();
+            let mut hooks = Hooks::default();
             for (name, _) in self.extensions() {
                 if let Some(e) = crate::ext::find(&name) {
-                    if e.wants_writes(self) {
-                        hooks.push(e);
+                    let (n, ed) = (e.wants_writes(self), e.wants_edge_writes(self));
+                    if n {
+                        hooks.node.push(e.clone());
+                    }
+                    if ed {
+                        hooks.edge.push(e.clone());
+                    }
+                    if n || ed {
+                        hooks.any.push(e);
                     }
                 }
             }
             self.hooks = Some(hooks);
         }
-        self.hooks.clone().unwrap_or_default()
+        self.hooks.get_or_insert_with(Hooks::default)
+    }
+
+    /// Several writes, and the hooks that follow them, as one unit: with
+    /// autocommit on they commit together, and a failure takes all of them
+    /// back. Inside the caller's transaction a failure after something was
+    /// written rolls that whole transaction back and says so: undoing only
+    /// this unit is not possible, and a write must never become durable
+    /// without the hook writes that belong with it.
+    fn unit(&mut self, f: impl FnOnce(&mut Graph) -> Result<()>) -> Result<()> {
+        let auto = self.autocommit;
+        let start = self.uncommitted;
+        self.autocommit = false;
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        self.autocommit = auto;
+        let r = match r {
+            Ok(r) => r,
+            // A hook panicked: take its unit back, as for an error, before
+            // the panic goes on to whoever catches it.
+            Err(panic) => {
+                if auto {
+                    self.rollback_quietly();
+                } else if self.uncommitted > start {
+                    let _ = self.abandon(Error::Msg("a write hook panicked".into()));
+                }
+                std::panic::resume_unwind(panic)
+            }
+        };
+        match r {
+            Ok(()) => self.maybe_commit(),
+            Err(e) if auto => {
+                self.rollback_quietly();
+                Err(e)
+            }
+            Err(e) if self.uncommitted > start => Err(self.abandon(e)),
+            // Nothing was written (a refused value, or a failure that
+            // already rolled the transaction back): the transaction is as
+            // the caller left it.
+            Err(e) => Err(e),
+        }
     }
 
     fn node_image(&self, id: u64) -> Option<crate::ext::NodeImage> {
@@ -2571,34 +2833,67 @@ impl Graph {
     /// with autocommit on they commit together, and a failing hook takes
     /// the write back with it.
     fn exec_node(&mut self, id: u64, op: Op) -> Result<()> {
-        let hooks = self.write_hooks();
-        if hooks.is_empty() {
+        if self.write_hooks().node.is_empty() {
             return self.exec(op);
         }
+        let hooks = self.write_hooks().node.clone();
         let before = self.node_image(id);
-        let auto = self.autocommit;
-        self.autocommit = false;
-        let r = (|| -> Result<()> {
+        self.unit(|g| {
             // A write that changed nothing has nothing to tell the hooks.
-            if !self.exec_changed(op)? {
+            if !g.exec_changed(op)? {
                 return Ok(());
             }
-            let after = self.node_image(id);
-            for h in &hooks {
-                h.on_node_write(self, id, before.as_ref(), after.as_ref())?;
+            let after = g.node_image(id);
+            // A replayed op on a node that does not exist (it may still
+            // have logged a newly seen name) has nothing to report.
+            if before.is_none() && after.is_none() {
+                return Ok(());
             }
-            Ok(())
-        })();
-        self.autocommit = auto;
-        match r {
-            Ok(()) => self.maybe_commit(),
-            Err(e) => {
-                if auto {
-                    self.rollback_quietly();
+            g.in_hooks(|g| {
+                for h in &hooks {
+                    h.on_node_write(g, id, before.as_ref(), after.as_ref())?;
                 }
-                Err(e)
-            }
+                Ok(())
+            })
+        })
+    }
+
+    fn edge_image(&self, id: u64) -> Option<crate::ext::EdgeImage> {
+        let e = self.edge(id)?;
+        Some(crate::ext::EdgeImage {
+            from: e.from,
+            to: e.to,
+            etype: self.strings.name(e.etype).to_string(),
+            props: self.edge_props(id),
+        })
+    }
+
+    /// An edge write and the hooks that follow it, as [`exec_node`] does
+    /// for nodes. A write that touched no edge at all (absent before and
+    /// after) calls nothing.
+    fn exec_edge(&mut self, id: u64, op: Op) -> Result<()> {
+        if self.write_hooks().edge.is_empty() {
+            return self.exec(op);
         }
+        let hooks = self.write_hooks().edge.clone();
+        let before = self.edge_image(id);
+        self.unit(|g| {
+            // A write that changed nothing is not logged, does not move the
+            // revision, and has nothing to tell the hooks.
+            if !g.exec_changed(op)? {
+                return Ok(());
+            }
+            let after = g.edge_image(id);
+            if before.is_none() && after.is_none() {
+                return Ok(());
+            }
+            g.in_hooks(|g| {
+                for h in &hooks {
+                    h.on_edge_write(g, id, before.as_ref(), after.as_ref())?;
+                }
+                Ok(())
+            })
+        })
     }
 
     /// The installed version of an extension, if this database has it.
@@ -2629,15 +2924,49 @@ impl Graph {
         })())
     }
 
+    /// Delete every node and edge, keeping index definitions and installed
+    /// extensions. Extensions that follow writes are told with one
+    /// [`on_bulk_write`](crate::ext::Extension::on_bulk_write).
     pub fn clear(&mut self) -> Result<()> {
-        self.exec(Op::Clear)
+        if self.write_hooks().any.is_empty() {
+            return self.exec(Op::Clear);
+        }
+        let hooks = self.write_hooks().any.clone();
+        // CLEAR always counts as a change, on an empty graph too: it resets
+        // the id counters and wipes derived data. It is logged, moves the
+        // revision and is reported.
+        self.unit(|g| {
+            g.exec(Op::Clear)?;
+            g.in_hooks(|g| {
+                for h in &hooks {
+                    h.on_bulk_write(g, crate::ext::BulkWrite::Clear)?;
+                }
+                Ok(())
+            })
+        })
+    }
+
+    /// Run write hooks: while they run, only extension keyspaces may be
+    /// written, so a hook can never set off hooks again.
+    /// The count is restored on every way out, a panic included, so a
+    /// handle whose embedder catches panics stays writable.
+    fn in_hooks(&mut self, f: impl FnOnce(&mut Graph) -> Result<()>) -> Result<()> {
+        self.in_hook += 1;
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        self.in_hook -= 1;
+        match r {
+            Ok(r) => r,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 
     /// Reclaim space: folds the log into the pages. (Pages freed by deletes
-    /// are reused by later writes; the file does not shrink.)
+    /// are reused by later writes; the file does not shrink.) It commits
+    /// what is pending, so it is refused inside a [`Graph::begin`] block.
     pub fn compact(&mut self) -> Result<u64> {
+        self.refuse_in_block("COMPACT")?;
         let before = self.file_len();
-        self.commit()?;
+        self.commit_txn()?;
         self.db.checkpoint()?;
         Ok(before)
     }
