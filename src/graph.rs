@@ -1000,9 +1000,22 @@ pub struct Graph {
     last_edge: std::sync::Mutex<Option<std::sync::Arc<EdgeRef>>>,
     /// Identifies this graph to the telemetry exporter's registry.
     tel_id: u64,
-    /// Installed extensions that maintain state on node writes; computed
-    /// on first write, forgotten whenever installs or config may change.
-    hooks: Option<Vec<std::sync::Arc<dyn crate::ext::Extension>>>,
+    /// Installed extensions that maintain state on writes; computed on
+    /// first write, forgotten whenever installs or config may change.
+    hooks: Option<Hooks>,
+}
+
+type Ext = std::sync::Arc<dyn crate::ext::Extension>;
+
+/// Who follows writes in this database.
+#[derive(Clone, Default)]
+struct Hooks {
+    /// `wants_writes`: told about node writes.
+    node: Vec<Ext>,
+    /// `wants_edge_writes`: told about edge writes.
+    edge: Vec<Ext>,
+    /// Either: told about bulk writes.
+    any: Vec<Ext>,
 }
 
 impl Drop for Graph {
@@ -1168,7 +1181,9 @@ impl Graph {
 
     /// Copy everything from a legacy-engine graph into this one, keeping
     /// ids: nodes, edges, indexes and id counters. Commits as it goes, so
-    /// memory stays bounded by the source graph, not the copy.
+    /// memory stays bounded by the source graph, not the copy. Each record
+    /// goes through [`apply_op`](Graph::apply_op), so installed extensions
+    /// hear about it.
     pub fn import_legacy(&mut self, old: &crate::legacy::graph::Graph) -> Result<()> {
         let auto = self.autocommit;
         self.autocommit = false;
@@ -1178,7 +1193,7 @@ impl Graph {
             }
             let mut n = 0u64;
             for id in old.node_ids() {
-                self.exec(Op::NodeAdd {
+                self.apply_op(Op::NodeAdd {
                     id,
                     labels: old.node_labels(id),
                     props: old.node_props(id),
@@ -1190,7 +1205,7 @@ impl Graph {
             }
             for id in old.edge_ids() {
                 let Some(e) = old.edge(id) else { continue };
-                self.exec(Op::EdgeAdd {
+                self.apply_op(Op::EdgeAdd {
                     id,
                     from: e.from,
                     to: e.to,
@@ -2198,10 +2213,31 @@ impl Graph {
     // ---------------------------------------------------------- mutations
 
     /// Apply one logged operation with its explicit ids: for loaders and
-    /// migrations that must reproduce ids exactly.
+    /// migrations that must reproduce ids exactly. Write hooks run as they
+    /// do for the matching API call.
     #[doc(hidden)]
     pub fn apply_op(&mut self, op: Op) -> Result<()> {
-        self.exec(op)
+        match op {
+            Op::NodeAdd { id, .. }
+            | Op::NodeSet { id, .. }
+            | Op::NodeUnset { id, .. }
+            | Op::LabelAdd { id, .. }
+            | Op::LabelDel { id, .. } => self.exec_node(id, op),
+            Op::NodeDel { id } => self.delete_node(id).map(|_| ()),
+            Op::EdgeAdd { id, .. }
+            | Op::EdgeDel { id }
+            | Op::EdgeSet { id, .. }
+            | Op::EdgeUnset { id, .. } => self.exec_edge(id, op),
+            Op::Clear => self.clear(),
+            Op::ExtensionAdd { name, version } => self.add_extension(&name, &version),
+            Op::ExtensionDel { name } => self.drop_extension(&name),
+            op @ Op::ExtWrite { .. } => {
+                // Which keys are configuration is not known here.
+                self.hooks = None;
+                self.exec(op)
+            }
+            op @ (Op::IndexAdd { .. } | Op::IndexDel { .. } | Op::Counters { .. }) => self.exec(op),
+        }
     }
 
     pub fn add_node(&mut self, labels: &[String], props: Vec<(String, Value)>) -> Result<u64> {
@@ -2231,29 +2267,63 @@ impl Graph {
             return Err(Error::Msg(format!("no node {}", to)));
         }
         let id = self.pager().meta(M_NEXT_EDGE);
-        self.exec(Op::EdgeAdd {
+        self.exec_edge(
             id,
-            from,
-            to,
-            etype: etype.to_string(),
-            props,
-        })?;
+            Op::EdgeAdd {
+                id,
+                from,
+                to,
+                etype: etype.to_string(),
+                props,
+            },
+        )?;
         Ok(id)
     }
 
+    /// Delete a node and every edge it has. Extensions that follow edge
+    /// writes hear about each edge, then the node.
     pub fn delete_node(&mut self, id: u64) -> Result<bool> {
         if !self.node_exists(id) {
             return Ok(false);
         }
-        self.exec_node(id, Op::NodeDel { id })?;
+        if self.write_hooks().edge.is_empty() {
+            self.exec_node(id, Op::NodeDel { id })?;
+        } else {
+            self.unit(|g| {
+                g.detach(id)?;
+                g.exec_node(id, Op::NodeDel { id })
+            })?;
+        }
         Ok(true)
+    }
+
+    /// Delete a node's edges one at a time through the hooked path, a
+    /// batch at a time: never modify the adjacency tree while walking it.
+    fn detach(&mut self, id: u64) -> Result<()> {
+        loop {
+            let mut batch = Vec::new();
+            self.for_each_adj_while(id, Dir::Both, None, |a| {
+                // A self-loop is listed twice; an entry whose edge is gone
+                // is left for the node's own delete to remove.
+                if (a.other != id || !batch.contains(&a.edge)) && self.edge_exists(a.edge) {
+                    batch.push(a.edge);
+                }
+                batch.len() < BATCH
+            });
+            if batch.is_empty() {
+                return Ok(());
+            }
+            for e in batch {
+                self.exec_edge(e, Op::EdgeDel { id: e })?;
+            }
+        }
     }
 
     pub fn delete_edge(&mut self, id: u64) -> Result<bool> {
         if !self.edge_exists(id) {
             return Ok(false);
         }
-        self.exec(Op::EdgeDel { id })?;
+        self.exec_edge(id, Op::EdgeDel { id })?;
         Ok(true)
     }
 
@@ -2285,18 +2355,24 @@ impl Graph {
         if !self.edge_exists(id) {
             return Err(Error::Msg(format!("no edge {}", id)));
         }
-        self.exec(Op::EdgeSet {
+        self.exec_edge(
             id,
-            key: key.to_string(),
-            value,
-        })
+            Op::EdgeSet {
+                id,
+                key: key.to_string(),
+                value,
+            },
+        )
     }
 
     pub fn unset_edge_prop(&mut self, id: u64, key: &str) -> Result<()> {
-        self.exec(Op::EdgeUnset {
+        self.exec_edge(
             id,
-            key: key.to_string(),
-        })
+            Op::EdgeUnset {
+                id,
+                key: key.to_string(),
+            },
+        )
     }
 
     pub fn add_label(&mut self, id: u64, label: &str) -> Result<()> {
@@ -2422,19 +2498,45 @@ impl Graph {
         })
     }
 
-    fn write_hooks(&mut self) -> Vec<std::sync::Arc<dyn crate::ext::Extension>> {
+    fn write_hooks(&mut self) -> &Hooks {
         if self.hooks.is_none() {
-            let mut hooks = Vec::new();
+            let mut hooks = Hooks::default();
             for (name, _) in self.extensions() {
                 if let Some(e) = crate::ext::find(&name) {
-                    if e.wants_writes(self) {
-                        hooks.push(e);
+                    let (n, ed) = (e.wants_writes(self), e.wants_edge_writes(self));
+                    if n {
+                        hooks.node.push(e.clone());
+                    }
+                    if ed {
+                        hooks.edge.push(e.clone());
+                    }
+                    if n || ed {
+                        hooks.any.push(e);
                     }
                 }
             }
             self.hooks = Some(hooks);
         }
-        self.hooks.clone().unwrap_or_default()
+        self.hooks.get_or_insert_with(Hooks::default)
+    }
+
+    /// Several writes, and the hooks that follow them, as one unit: with
+    /// autocommit on they commit together, and a failure takes all of them
+    /// back. Inside the caller's transaction, the caller decides.
+    fn unit(&mut self, f: impl FnOnce(&mut Graph) -> Result<()>) -> Result<()> {
+        let auto = self.autocommit;
+        self.autocommit = false;
+        let r = f(self);
+        self.autocommit = auto;
+        match r {
+            Ok(()) => self.maybe_commit(),
+            Err(e) => {
+                if auto {
+                    self.rollback_quietly();
+                }
+                Err(e)
+            }
+        }
     }
 
     fn node_image(&self, id: u64) -> Option<crate::ext::NodeImage> {
@@ -2449,31 +2551,51 @@ impl Graph {
     /// with autocommit on they commit together, and a failing hook takes
     /// the write back with it.
     fn exec_node(&mut self, id: u64, op: Op) -> Result<()> {
-        let hooks = self.write_hooks();
-        if hooks.is_empty() {
+        if self.write_hooks().node.is_empty() {
             return self.exec(op);
         }
+        let hooks = self.write_hooks().node.clone();
         let before = self.node_image(id);
-        let auto = self.autocommit;
-        self.autocommit = false;
-        let r = (|| -> Result<()> {
-            self.exec(op)?;
-            let after = self.node_image(id);
+        self.unit(|g| {
+            g.exec(op)?;
+            let after = g.node_image(id);
             for h in &hooks {
-                h.on_node_write(self, id, before.as_ref(), after.as_ref())?;
+                h.on_node_write(g, id, before.as_ref(), after.as_ref())?;
             }
             Ok(())
-        })();
-        self.autocommit = auto;
-        match r {
-            Ok(()) => self.maybe_commit(),
-            Err(e) => {
-                if auto {
-                    self.rollback_quietly();
-                }
-                Err(e)
-            }
+        })
+    }
+
+    fn edge_image(&self, id: u64) -> Option<crate::ext::EdgeImage> {
+        let e = self.edge(id)?;
+        Some(crate::ext::EdgeImage {
+            from: e.from,
+            to: e.to,
+            etype: self.strings.name(e.etype).to_string(),
+            props: self.edge_props(id),
+        })
+    }
+
+    /// An edge write and the hooks that follow it, as [`exec_node`] does
+    /// for nodes. A write that touched no edge at all (absent before and
+    /// after) calls nothing.
+    fn exec_edge(&mut self, id: u64, op: Op) -> Result<()> {
+        if self.write_hooks().edge.is_empty() {
+            return self.exec(op);
         }
+        let hooks = self.write_hooks().edge.clone();
+        let before = self.edge_image(id);
+        self.unit(|g| {
+            g.exec(op)?;
+            let after = g.edge_image(id);
+            if before.is_none() && after.is_none() {
+                return Ok(());
+            }
+            for h in &hooks {
+                h.on_edge_write(g, id, before.as_ref(), after.as_ref())?;
+            }
+            Ok(())
+        })
     }
 
     /// The installed version of an extension, if this database has it.
@@ -2504,8 +2626,21 @@ impl Graph {
         })())
     }
 
+    /// Delete every node and edge, keeping index definitions and installed
+    /// extensions. Extensions that follow writes are told with one
+    /// [`on_bulk_write`](crate::ext::Extension::on_bulk_write).
     pub fn clear(&mut self) -> Result<()> {
-        self.exec(Op::Clear)
+        if self.write_hooks().any.is_empty() {
+            return self.exec(Op::Clear);
+        }
+        let hooks = self.write_hooks().any.clone();
+        self.unit(|g| {
+            g.exec(Op::Clear)?;
+            for h in &hooks {
+                h.on_bulk_write(g, crate::ext::BulkWrite::Clear)?;
+            }
+            Ok(())
+        })
     }
 
     /// Reclaim space: folds the log into the pages. (Pages freed by deletes
