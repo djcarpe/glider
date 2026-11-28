@@ -349,8 +349,8 @@ changed and at what revision. It does not keep old values: the graph has the
 current ones, and that is what a rebuild needs.
 
 ```
-CALL changes.since(revision: 1042, limit: 1000)   ids changed after a revision, oldest change first
-CALL changes.since(revision: 1042, kinds: ["node"], after: "1100:node:7")
+CALL changes.since(revision: 1042, limit: 1000)   ids changed after a revision, by kind then id
+CALL changes.since(revision: 1042, kinds: ["node"], after: "node:7")
 CALL changes.status()                             oldest revision still answerable, entries, bytes, cap
 CALL changes.release(below: 1500)                 forget changes at or below a revision
 CALL changes.cap(entries: 100000)                 bound the journal
@@ -376,8 +376,17 @@ What is true now, and what this slice decided where the plan was open:
   took the database from R1 to R2 carries r with R1 < r < R2. Hence, for a
   caller reading `revision` at commit boundaries, `since(R1)` taken at R2
   lists every id written by a transaction committed after R1, at its latest
-  change, and none written at or before R1. Entries come in (revision,
-  kind, id) order, kinds node < edge < adjacency, the same on both tiers.
+  change, and none written at or before R1. Rows come in (kind, id)
+  order, kinds node < edge < adjacency, the same on both tiers. (The first
+  version listed them oldest change first, through an index by revision;
+  that index was dropped for write cost, below.)
+- **The format: one record per change.** A write adds one extension record
+  with one blind put per (kind, id) it changed, and nothing else: no
+  revision index, no count, no state rewritten, no read of the entry it
+  replaces. Key `<kind><length><id, big-endian without leading zeros>`
+  (so keys sort by kind, then id), value `<change><revision, big-endian
+  without leading zeros>`: 16-21 bytes an entry stored with its namespace,
+  21 in the log for ids below 2^24 and revisions below 2^40.
   Positions within an open transaction are positions, not revisions any
   caller can have read; a caller that reads `log_end()` mid-transaction
   (as `structure` does) gets the same property for that position.
@@ -407,28 +416,41 @@ What is true now, and what this slice decided where the plan was open:
   floor is raised by: installation (to `log_end()` at install, so a
   `CREATE EXTENSION` in a statement of its own answers for the revision
   before it, and one after other writes in a block does not); `release`
-  (to `below:`, clamped to the log's end; with `limit:` in slices, each to
-  the last entry it forgot); the cap (to the revision of each entry it
-  pushes out); and `CLEAR` or any other bulk notification (to `log_end()`
+  (to `below:`, clamped to the log's end, before anything is forgotten,
+  so forgetting can go in slices with `limit:`); the cap (to the newest
+  revision it forgets); and `CLEAR` or any other bulk notification (to `log_end()`
   in its hook: everything before must be rebuilt, and the journal answers
   exactly from there on). `CLEAR` keeps the cap.
-- **The cap.** In entries, default 1,000,000, at least 8 (one write makes
-  at most five entries, so eviction never forgets what it is writing).
-  `CREATE EXTENSION` takes no arguments, so "set when it is installed"
-  means `CALL changes.cap(entries:)` in the same block as the install;
-  lowering it forgets the oldest entries at once. Past it, each write
-  forgets the oldest entries in the same record.
-- **Status.** `oldest, why, entries, bytes, cap, revision`. `bytes` is what
-  the keyspace holds: 54 bytes an entry (its id record and its revision
-  index record, keys with the namespace and values) plus the 59-byte state.
+- **The cap.** In entries, default 1,000,000, at least 16. `CREATE
+  EXTENSION` takes no arguments, so "set when it is installed" means
+  `CALL changes.cap(entries:)` in the same block as the install; lowering
+  it forgets the oldest entries at once. With no count kept, the journal
+  cannot see the cap coming write by write, so the state (`s`, written
+  only by install, `CLEAR`, `release`, `cap` and upkeep) holds a log
+  position, `look_at`. Every entry costs at least 15 bytes of its own
+  record (`MIN_ENTRY_LOG`) and one write makes at most 5, so after
+  counting n entries at position p the journal cannot pass the cap before
+  p + 15 (cap - n - 5). The first write at or past `look_at` does the
+  upkeep in its own transaction: it forgets entries at or below the floor,
+  counts the rest (one scan), and when more than half the cap remains
+  raises the floor to a revision chosen from a 4,096-bucket histogram of
+  revisions and forgets the oldest down to half the cap or fewer. So the
+  journal never holds more than the cap (`a_small_cap_...` checks it after
+  every write with a cap of 16), and its upkeep costs one or two scans per
+  15 x (cap/2 - 5) bytes of log written once it is half full: about one
+  entry scanned per 7 log bytes in the worst case, none while it is less
+  than half full. The write that does the upkeep is the slow one.
+- **Status.** `oldest, why, entries, bytes, cap, revision`, counted by a
+  scan. `bytes` is what the keyspace holds: keys with the namespace, and
+  values (17.6 bytes an entry on the manufacturing graph).
 - **Recovery and replicas** replay the journal's records and never run
   its hooks: after crash recovery and `from_replica` the keyspace is
   byte-identical to the source's and a witness extension's list of hook
   calls is unchanged.
 - **For other extensions** (`glider::ext::changes`): `answers(g, R)`,
   `oldest(g)`, `changed(g, R, kind, ids) -> Option<Vec<bool>>`,
-  `changed_any(g, R, kind) -> Option<bool>` (from a per-kind latest
-  revision in the state, no scan), `entry(g, kind, id)`, `since(g, R,
+  `changed_any(g, R, kind) -> Option<bool>` (a scan of the kind's
+  entries until one is newer than R), `entry(g, kind, id)`, `since(g, R,
   kinds, after, limit)` and `status(g)`. `None` means "cannot answer:
   assume everything changed". `structure` uses `changed_any`: a kept
   colouring is stale exactly when a node or an edge changed since its
@@ -437,24 +459,32 @@ What is true now, and what this slice decided where the plan was open:
 - **Check.** The journal implements `Extension::check`: records that do not
   decode, a `put` for an id that does not exist, an entry or a floor past
   the log's end (`log_end()`, so the open transaction's entries are not
-  faults), an entry missing from the revision index or an index entry
-  that is not its id's latest change, and, over a walk from the start in
-  one slice, a state count that differs from the entries held.
+  faults), and, over a walk from the start in one slice, more entries
+  than the cap. A `put` at or below the floor is not consulted and not
+  checked.
 - **Bounds (D6).** `since` returns at most 10,000 rows a call, continued
   with `after:` (the message gives it); `release` and `cap` forget 4,096
   entries a write. Every loop passes through `step(n)` in
   `src/ext/changes.rs`, the one place G2 is to count. A write reads the
-  state and the entries it replaces (one to five) and writes one record.
-- **Cost** (`bench/KNOWLEDGE.md`, "Change tracking", 10k to 1M nodes,
-  both tiers): with the journal, node writes run at a third to a quarter
-  of their speed and edge writes at a quarter to a fifth; a node write
-  logs about 151 bytes instead of 20, an edge write 281-341 instead of
-  13-29. An entry holds 54 bytes. `since` reads about 7-8 million entries
-  a second, `since` for the last commit takes 0.01 ms, `changed` for 1,000
-  ids 0.3-0.5 ms. This is far above the 17% of a hook that does nothing:
-  the price is the revision index and the state rewritten per write, and
-  it is where a later slice would make it cheaper. A database without the
-  journal pays nothing.
+  state (one lookup) and writes one record; deleting or recreating a node
+  also looks up its adjacency entry; upkeep is as above. `since` scans
+  the entries of the kinds asked for in key order, so a full pass in
+  slices reads every entry once.
+- **Cost**: `bench/KNOWLEDGE.md`, "Change tracking", has the first
+  version and this one side by side. In transactions of 1,000 writes, node
+  writes run at about 0.3-0.45 of their speed without the journal (first
+  version: 0.2-0.3) and edge writes at about 0.45-0.6 (0.2-0.3); a node
+  write logs about 52 bytes instead of 20 (151 before), an edge add 98
+  instead of 28 (305), an edge delete 84 instead of 13 (341). What stands
+  in the way of more: a hook that does nothing already costs node writes
+  about 30% (the before and after images and the unit around each hooked
+  write, G4), and each entry is one insert into the extension tree, about
+  as dear as the node write itself. Neither goes away by writing once per
+  transaction (the second direction considered), which would only save
+  the per-write record; packing a transaction's ids into one value would,
+  but then `changed` for a set of ids becomes a scan. Edge deletes log 13
+  bytes, so even one entry of at least 15 bytes is past three times that.
+  A database without the journal pays nothing.
 - Left out, as planned: old values, named consumers with cursors (a
   consumer keeps its own revision), and vectors (G10).
 

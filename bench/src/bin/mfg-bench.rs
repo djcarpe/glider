@@ -795,9 +795,11 @@ fn structure(run: &mut Run) -> Result<(), String> {
 // -------------------------------------------------------------------- main
 
 /// Writes to time with and without the journal: node property sets, edge
-/// adds, edge deletes, committed every `COMMIT_EVERY`.
+/// adds, edge deletes, committed every `COMMIT_EVERY`; and `SINGLE` of
+/// each, one transaction a write.
 const WRITES: u64 = 100_000;
-const COMMIT_EVERY: u64 = 10_000;
+const COMMIT_EVERY: u64 = 1_000;
+const SINGLE: u64 = 10_000;
 
 /// One timed pass of `n` writes of one kind; returns writes a second and
 /// log bytes a write. `round` makes every value new, so each write changes
@@ -806,6 +808,7 @@ fn write_pass(
     g: &mut Graph,
     kind: &str,
     n: u64,
+    every: u64,
     round: u64,
     edges: &mut Vec<u64>,
 ) -> Result<(f64, f64), String> {
@@ -829,7 +832,7 @@ fn write_pass(
             _ => g.delete_edge(edges[i as usize]).map(|_| ()),
         };
         r.map_err(|e| format!("{kind}: {e}"))?;
-        if (i + 1) % COMMIT_EVERY == 0 {
+        if (i + 1) % every == 0 {
             g.commit().map_err(|e| e.to_string())?;
         }
     }
@@ -856,19 +859,22 @@ fn changes(run: &mut Run) -> Result<(), String> {
             run.run(&format!("CALL changes.cap(entries: {})", 10 * n), &[])?;
         }
         let from = run.g.revision();
-        for kind in ["node set", "edge add", "edge delete"] {
-            round += 1;
-            let (rate, log) = write_pass(&mut run.g, kind, n, round, &mut edges)?;
-            run.emit(
-                "changes.write",
-                Obj::new()
-                    .s("write", kind)
-                    .b("journal", journal)
-                    .u("round", round)
-                    .u("writes", n)
-                    .u("per_s", rate as u64)
-                    .raw("log_bytes_per_write", &format!("{log:.1}")),
-            );
+        for (every, count) in [(COMMIT_EVERY, n), (1, SINGLE.min(n))] {
+            for kind in ["node set", "edge add", "edge delete"] {
+                round += 1;
+                let (rate, log) = write_pass(&mut run.g, kind, count, every, round, &mut edges)?;
+                run.emit(
+                    "changes.write",
+                    Obj::new()
+                        .s("write", kind)
+                        .b("journal", journal)
+                        .u("round", round)
+                        .u("writes", count)
+                        .u("per_commit", every)
+                        .u("per_s", rate as u64)
+                        .raw("log_bytes_per_write", &format!("{log:.1}")),
+                );
+            }
         }
         if !journal {
             continue;

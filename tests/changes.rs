@@ -257,7 +257,7 @@ fn check_all(g: &mut Graph, bs: &[Boundary], what: &str) -> usize {
                         "{what}: {e:?} outside ({r1}, {})",
                         now.rev
                     );
-                    let pos = (e.revision, e.kind, e.id);
+                    let pos = (e.kind, e.id);
                     assert!(last < Some(pos), "{what}: out of order");
                     last = Some(pos);
                     assert!(seen.insert((e.kind, e.id)), "{what}: {e:?} listed twice");
@@ -758,13 +758,7 @@ fn since_lists_exactly_what_changed_between_any_two_commit_boundaries() {
 #[test]
 fn a_small_cap_forgets_the_oldest_and_refuses_what_it_no_longer_holds() {
     let mut g = Graph::memory();
-    let (_, answered, refused) = workload(
-        &mut g,
-        0x1234_5678,
-        120,
-        Some(changes::MIN_CAP * 5),
-        "cap 40",
-    );
+    let (_, answered, refused) = workload(&mut g, 0x1234_5678, 120, Some(40), "cap 40");
     let s = changes::status(&g).unwrap();
     assert!(s.entries <= 40, "{} entries past the cap", s.entries);
     assert_eq!(s.cap, 40);
@@ -778,14 +772,24 @@ fn a_small_cap_forgets_the_oldest_and_refuses_what_it_no_longer_holds() {
     for i in 0..30 {
         q(&mut g, &format!("CREATE (:C {{i: {i}}})"));
     }
-    let r = q(&mut g, "CALL changes.cap(entries: 8)");
-    assert!(r.message.unwrap().contains("22 forgotten"));
+    let held = changes::status(&g).unwrap().entries;
+    assert!(held > 16 && held <= 40, "{held}");
+    let r = q(&mut g, "CALL changes.cap(entries: 16)");
+    let m = r.message.unwrap();
+    assert!(m.contains(&format!("{} forgotten", held - 16)), "{m}");
     let s = changes::status(&g).unwrap();
-    assert_eq!((s.entries, s.cap, s.why), (8, 8, changes::Floor::Cap));
-    let e = query::execute(&mut g, "CALL changes.cap(entries: 7)")
+    assert_eq!((s.entries, s.cap, s.why), (16, 16, changes::Floor::Cap));
+    let e = query::execute(&mut g, "CALL changes.cap(entries: 15)")
         .err()
         .unwrap();
-    assert!(e.to_string().contains("at least 8"), "{e}");
+    assert!(e.to_string().contains("at least 16"), "{e}");
+    // Past the cap, a write forgets the oldest down to half of it, and
+    // the journal never holds more than the cap.
+    for i in 0..200 {
+        q(&mut g, &format!("CREATE (:D {{i: {i}}})-[:DD]->(:D)"));
+        let n = changes::status(&g).unwrap().entries;
+        assert!(n <= 16, "{n} entries past the cap of 16");
+    }
 }
 
 #[test]
@@ -992,7 +996,11 @@ fn since_says_plainly_when_it_cannot_answer_and_from_where_it_can() {
         ["oldest", "why", "entries", "bytes", "cap", "revision"]
     );
     assert_eq!(s.rows[0][2], Value::Int(1));
-    assert_eq!(s.rows[0][3], Value::Int(changes::ENTRY_BYTES as i64 + 59));
+    let stored: usize = keyspace(&g, changes::NS)
+        .iter()
+        .map(|(k, v)| changes::NS.len() + 1 + k.len() + v.len())
+        .sum();
+    assert_eq!(s.rows[0][3], Value::Int(stored as i64));
     assert_eq!(s.rows[0][4], Value::Int(changes::DEFAULT_CAP as i64));
     assert_eq!(s.rows[0][5], Value::Int(g.revision() as i64));
     // Arguments that make no sense say what to pass.
@@ -1066,8 +1074,8 @@ fn adjacency_follows_the_edges_at_a_node_and_whether_the_node_exists() {
     assert_eq!(
         got(&g, r3),
         [
-            (Kind::Edge, e, Change::Drop),
             (Kind::Node, c, Change::Drop),
+            (Kind::Edge, e, Change::Drop),
             (Kind::Adjacency, c, Change::Drop)
         ]
     );
@@ -1163,27 +1171,32 @@ fn check_run_finds_what_is_wrong_with_the_journal_and_nothing_when_it_is_sound()
 
     let end = g.log_end();
     let ghost = 1_000_000u64;
-    let mut ik = vec![b'i', 0];
-    ik.extend_from_slice(&ghost.to_be_bytes());
-    let mut v = 5u64.to_be_bytes().to_vec();
-    v.push(1);
-    let mut future = vec![b'i', 1];
-    future.extend_from_slice(&ghost.to_be_bytes());
-    let mut fv = (end + 1000).to_be_bytes().to_vec();
-    fv.push(0);
-    g.ext_write(
-        changes::NS,
-        vec![(ik, v), (future, fv), (b"r\x01".to_vec(), b"junk".to_vec())],
-        Vec::new(),
-    )
-    .unwrap();
+    let entry = |kind, id, revision, change| {
+        changes::encode_entry(&changes::Entry {
+            revision,
+            kind,
+            id,
+            change,
+        })
+    };
+    q(&mut g, "CALL changes.cap(entries: 16)");
+    // A put for a node that does not exist, an edge entry past the log's
+    // end, a key that does not decode, and more entries than the cap.
+    let mut puts = vec![
+        entry(Kind::Node, ghost, end, Change::Put),
+        entry(Kind::Edge, ghost, end + 1000, Change::Drop),
+        (vec![1, 9], b"junk".to_vec()),
+    ];
+    for i in 0..20 {
+        puts.push(entry(Kind::Node, ghost + 1 + i, end, Change::Drop));
+    }
+    g.ext_write(changes::NS, puts, Vec::new()).unwrap();
     let found = derived_findings(&mut g);
     let kinds: BTreeSet<&str> = found.iter().map(|(k, _)| k.as_str()).collect();
     for k in [
         "changes.missing",
         "changes.future",
         "changes.bad_record",
-        "changes.unindexed",
         "changes.count",
     ] {
         assert!(kinds.contains(k), "{k} not found in {found:?}");

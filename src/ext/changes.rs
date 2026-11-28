@@ -2,8 +2,8 @@
 //!
 //! ```text
 //! CREATE EXTENSION changes                     start a journal at the current revision
-//! CALL changes.since(revision: 1042)           ids changed after a revision, oldest change first
-//! CALL changes.since(revision: 1042, kinds: ["node"], after: "1100:node:7", limit: 1000)
+//! CALL changes.since(revision: 1042)           ids changed after a revision, by kind and id
+//! CALL changes.since(revision: 1042, kinds: ["node"], after: "node:7", limit: 1000)
 //! CALL changes.status()                        what it can answer for, entries, bytes, cap
 //! CALL changes.release(below: 1500)            forget changes at or below a revision
 //! CALL changes.cap(entries: 100000)            bound the journal
@@ -29,28 +29,34 @@
 //! R2 lists exactly the ids written by the transactions committed after R1
 //! (each once, at its latest change), and nothing written at or before R1.
 //!
-//! **Bounds.** The journal holds at most `cap` entries (default
-//! [`DEFAULT_CAP`], at least [`MIN_CAP`]); past it the oldest entries are
-//! forgotten. `release(below:)` forgets entries at or below a revision.
-//! Either raises the journal's *floor*, the oldest revision it can answer
-//! for; so do its installation (it knows nothing before it) and `CLEAR`
-//! (everything before it must be rebuilt). `since(R)` with R below the
-//! floor is an error that says why and names the floor: it never returns a
-//! partial list as if it were whole.
+//! **One record per change, nothing else.** A write adds one extension
+//! record holding one entry per (kind, id) it changed, written blind: no
+//! index by revision, no count, no state rewritten. Keys are
+//! `<kind><length><id, big-endian, no leading zeros>`, so they sort by kind
+//! then id, and values `<change><revision, big-endian, no leading zeros>`.
+//! `since` scans the entries in key order; the order of its rows is kind
+//! (node, edge, adjacency), then id.
 //!
-//! **Cost.** Each node or edge write adds one extension record to the
-//! log (one `ext_write` with the entries, their revision index and the
-//! journal's state), and reads the state and the entries it replaces.
+//! **Bounds.** The journal holds at most `cap` entries (default
+//! [`DEFAULT_CAP`], at least [`MIN_CAP`]). Without a count it cannot see
+//! the cap coming one write at a time, so the state (`s`, written only by
+//! install, `CLEAR`, `release`, `cap` and upkeep) says from which log
+//! position on it must look again: every entry costs at least
+//! [`MIN_ENTRY_LOG`] bytes of its own records, so after counting `n`
+//! entries at position p the journal cannot pass the cap before
+//! p + MIN_ENTRY_LOG x (cap - n - MAX_PER_WRITE). The write that reaches
+//! that position first counts the entries (one scan), forgets those at or
+//! below the floor, and when it holds more than half the cap raises the
+//! floor and forgets the oldest down to half. Raising the floor is what
+//! makes forgetting safe: `since(R)` with R below the floor is an error
+//! that says why and names the floor, never a partial list.
 //!
 //! **Keys** (keyspace `changes`): `!cap` -> the cap (configuration, so it
-//! survives `CLEAR`); `s` -> the state ([`State`]); `i<kind><id>` ->
-//! revision, change; `r<revision><kind><id>` -> change, the index `since`
-//! reads in order. Kinds are 0 node, 1 edge, 2 adjacency.
+//! survives `CLEAR`); `s` -> the state ([`State`]); every other key is an
+//! entry.
 //!
 //! Every loop over entries passes through [`step`], the one place the
 //! statement budget (slice G2) is to be counted.
-
-use std::collections::BTreeSet;
 
 use super::{Args, EdgeImage, Extension, NodeImage, Spec};
 use crate::graph::{Error, Graph, Result};
@@ -65,20 +71,26 @@ pub const NS: &str = "changes";
 /// Entries the journal holds when no cap was set.
 pub const DEFAULT_CAP: u64 = 1_000_000;
 
-/// The smallest cap: one write makes at most this many entries (an edge
-/// moved by a replayed `EdgeAdd` over an existing id: itself and four
-/// endpoints), so eviction never has to forget the entries it is writing.
-pub const MIN_CAP: u64 = 8;
+/// The smallest cap.
+pub const MIN_CAP: u64 = 16;
+
+/// The most entries one write makes: an edge moved by a replayed `EdgeAdd`
+/// over an existing id, itself and four endpoints.
+pub const MAX_PER_WRITE: u64 = 5;
+
+/// The fewest log bytes an entry costs in its record: the key's length,
+/// the namespace and its separator, kind, length and at least one byte of
+/// id, the value's length, the change and at least one byte of revision.
+pub const MIN_ENTRY_LOG: u64 = 1 + NS.len() as u64 + 1 + 3 + 1 + 2;
 
 /// Rows one `since` call returns at most.
 pub const MAX_ROWS: usize = 10_000;
 
-/// Entries deleted per write by `release` and `cap`.
+/// Entries deleted per write by upkeep, `release` and `cap`.
 const BATCH: usize = 4_096;
 
-/// Bytes the keyspace holds per entry: its `i` and `r` records, keys
-/// (with the namespace the tree stores them under) and values.
-pub const ENTRY_BYTES: u64 = 2 * (NS.len() as u64 + 1) + (1 + 1 + 8 + 9) + (1 + 8 + 1 + 8 + 1);
+/// Buckets of the revision histogram that chooses what the cap forgets.
+const BUCKETS: usize = 4_096;
 
 const CAP_KEY: &[u8] = b"!cap";
 const STATE_KEY: &[u8] = b"s";
@@ -87,7 +99,7 @@ const PROCEDURES: &[Spec] = &[
     Spec {
         name: "since",
         args: "(revision, kinds, after, limit)",
-        doc: "Nodes, edges and adjacencies changed after a revision, once each with its latest change (put or drop), oldest first; an error when the journal cannot answer for it",
+        doc: "Nodes, edges and adjacencies changed after a revision, once each with its latest change (put or drop), by kind then id; an error when the journal cannot answer for it",
     },
     Spec {
         name: "status",
@@ -198,7 +210,7 @@ pub struct Entry {
 impl Entry {
     /// Where a slice that ended at this entry continues, for `after:`.
     pub fn cursor(&self) -> String {
-        format!("{}:{}:{}", self.revision, self.kind.name(), self.id)
+        format!("{}:{}", self.kind.name(), self.id)
     }
 }
 
@@ -260,46 +272,57 @@ impl Floor {
     }
 }
 
-/// The journal's state, one record.
+/// The journal's state: one record, rewritten only by install, `CLEAR`,
+/// `release`, `cap` and upkeep, never by an ordinary write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct State {
-    /// Entries held (`i` records).
-    pub entries: u64,
     pub cap: u64,
     /// The oldest revision it answers for: `since(R)` needs R >= floor.
     pub floor: u64,
     pub why: Floor,
-    /// The latest revision of a change of each kind (0: none since the
-    /// floor), for [`changed_any`].
-    pub latest: [u64; 3],
+    /// The log position from which the next write counts the entries.
+    pub look_at: u64,
 }
 
 impl State {
     fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(50);
-        out.push(1u8);
-        out.extend_from_slice(&self.entries.to_be_bytes());
+        let mut out = Vec::with_capacity(26);
+        out.push(2u8);
         out.extend_from_slice(&self.cap.to_be_bytes());
         out.extend_from_slice(&self.floor.to_be_bytes());
         out.push(self.why.byte());
-        for l in self.latest {
-            out.extend_from_slice(&l.to_be_bytes());
-        }
+        out.extend_from_slice(&self.look_at.to_be_bytes());
         out
     }
 
     fn decode(b: &[u8]) -> Option<State> {
-        if b.len() != 50 || b[0] != 1 {
+        if b.len() != 26 || b[0] != 2 {
             return None;
         }
         Some(State {
-            entries: u64_at(b, 1),
-            cap: u64_at(b, 9),
-            floor: u64_at(b, 17),
-            why: Floor::of(b[25])?,
-            latest: [u64_at(b, 26), u64_at(b, 34), u64_at(b, 42)],
+            cap: u64_at(b, 1),
+            floor: u64_at(b, 9),
+            why: Floor::of(b[17])?,
+            look_at: u64_at(b, 18),
         })
     }
+
+    /// Where to look again after counting `n` entries at `pos`.
+    fn next_look(&mut self, pos: u64, n: u64) {
+        let room = self.cap.saturating_sub(n + MAX_PER_WRITE);
+        self.look_at = pos.saturating_add(MIN_ENTRY_LOG * room);
+    }
+}
+
+/// What `status` reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Status {
+    pub entries: u64,
+    /// Keys (with the namespace the tree stores them under) and values.
+    pub bytes: u64,
+    pub cap: u64,
+    pub floor: u64,
+    pub why: Floor,
 }
 
 /// G2 (statement budgets): one statement step per entry looked at goes
@@ -313,53 +336,60 @@ fn u64_at(b: &[u8], at: usize) -> u64 {
     u64::from_be_bytes(b[at..at + 8].try_into().unwrap())
 }
 
-fn id_key(kind: Kind, id: u64) -> Vec<u8> {
+/// Big-endian with no leading zero bytes (at least one byte).
+fn put_min(out: &mut Vec<u8>, v: u64) {
+    let b = v.to_be_bytes();
+    let skip = (v.leading_zeros() / 8).min(7) as usize;
+    out.extend_from_slice(&b[skip..]);
+}
+
+fn get_min(b: &[u8]) -> Option<u64> {
+    if b.is_empty() || b.len() > 8 {
+        return None;
+    }
+    Some(b.iter().fold(0u64, |a, &x| (a << 8) | x as u64))
+}
+
+fn entry_key(kind: Kind, id: u64) -> Vec<u8> {
     let mut k = Vec::with_capacity(10);
-    k.push(b'i');
     k.push(kind.byte());
-    k.extend_from_slice(&id.to_be_bytes());
+    k.push(0);
+    put_min(&mut k, id);
+    k[1] = (k.len() - 2) as u8;
     k
 }
 
-fn rev_key(rev: u64, kind: Kind, id: u64) -> Vec<u8> {
-    let mut k = Vec::with_capacity(18);
-    k.push(b'r');
-    k.extend_from_slice(&rev.to_be_bytes());
-    k.push(kind.byte());
-    k.extend_from_slice(&id.to_be_bytes());
-    k
-}
-
-fn id_value(rev: u64, change: Change) -> Vec<u8> {
-    let mut v = rev.to_be_bytes().to_vec();
+fn entry_value(rev: u64, change: Change) -> Vec<u8> {
+    let mut v = Vec::with_capacity(9);
     v.push(change.byte());
+    put_min(&mut v, rev);
     v
 }
 
-/// An `i` record: (kind, id) -> (revision, change).
-fn decode_id(k: &[u8], v: &[u8]) -> Option<Entry> {
-    if k.len() != 10 || k[0] != b'i' || v.len() != 9 {
+/// One entry as stored: its key and value. For tests that plant faults.
+pub fn encode_entry(e: &Entry) -> (Vec<u8>, Vec<u8>) {
+    (entry_key(e.kind, e.id), entry_value(e.revision, e.change))
+}
+
+fn decode_entry(k: &[u8], v: &[u8]) -> Option<Entry> {
+    if k.len() < 3 || k[1] as usize != k.len() - 2 || v.len() < 2 {
+        return None;
+    }
+    let id = get_min(&k[2..])?;
+    // The shortest form only, so one id has one key.
+    if k.len() > 3 && k[2] == 0 {
         return None;
     }
     Some(Entry {
-        revision: u64_at(v, 0),
-        kind: Kind::of(k[1])?,
-        id: u64_at(k, 2),
-        change: Change::of(v[8])?,
+        revision: get_min(&v[1..])?,
+        kind: Kind::of(k[0])?,
+        id,
+        change: Change::of(v[0])?,
     })
 }
 
-/// An `r` record: (revision, kind, id) -> change.
-fn decode_rev(k: &[u8], v: &[u8]) -> Option<Entry> {
-    if k.len() != 18 || k[0] != b'r' || v.len() != 1 {
-        return None;
-    }
-    Some(Entry {
-        revision: u64_at(k, 1),
-        kind: Kind::of(k[9])?,
-        id: u64_at(k, 10),
-        change: Change::of(v[0])?,
-    })
+fn is_entry_key(k: &[u8]) -> bool {
+    k.first().is_some_and(|&b| b <= 2)
 }
 
 fn installed(g: &Graph) -> bool {
@@ -373,52 +403,108 @@ fn cap_config(g: &Graph) -> u64 {
         .unwrap_or(DEFAULT_CAP)
 }
 
-/// The state as kept; a missing or unreadable one starts again at the
-/// log's end, knowing nothing before it.
-fn state_or_reset(g: &Graph) -> State {
-    g.ext_get(NS, STATE_KEY)
-        .and_then(|v| State::decode(&v))
-        .unwrap_or_else(|| State {
-            entries: 0,
-            cap: cap_config(g),
-            floor: g.log_end(),
-            why: Floor::Reset,
-            latest: [0; 3],
-        })
+/// A fresh state at the log's end, knowing nothing before it, that looks
+/// again once the journal could hold the cap.
+fn fresh(g: &Graph, why: Floor) -> State {
+    let mut s = State {
+        cap: cap_config(g),
+        floor: g.log_end(),
+        why,
+        look_at: 0,
+    };
+    s.next_look(g.log_end(), 0);
+    s
+}
+
+fn state(g: &Graph) -> Option<State> {
+    State::decode(&g.ext_get(NS, STATE_KEY)?)
+}
+
+/// Walk the entries of `kinds` (all when empty) in key order, starting
+/// after `after`, until `f` returns false. An entry that does not decode
+/// is passed as None.
+fn walk(
+    g: &Graph,
+    kinds: &[Kind],
+    after: Option<&[u8]>,
+    f: &mut dyn FnMut(&[u8], Option<Entry>) -> bool,
+) {
+    let all = [Kind::Node, Kind::Edge, Kind::Adjacency];
+    let mut list: Vec<Kind> = if kinds.is_empty() {
+        all.to_vec()
+    } else {
+        all.iter().copied().filter(|k| kinds.contains(k)).collect()
+    };
+    if let Some(a) = after {
+        list.retain(|k| a.first().map_or(true, |&b| k.byte() >= b));
+    }
+    let mut go = true;
+    for k in list {
+        if !go {
+            return;
+        }
+        let prefix = [k.byte()];
+        let from = after.filter(|a| a.first() == Some(&k.byte()));
+        g.ext_scan_after(NS, &prefix, from, &mut |key, v| {
+            go = f(key, decode_entry(key, v));
+            go
+        });
+    }
 }
 
 // ------------------------------------------------------------- the Rust API
 
 /// The journal's state, or None when it is not installed (or its state is
 /// unreadable, which `check.run` reports).
-pub fn status(g: &Graph) -> Option<State> {
+pub fn state_of(g: &Graph) -> Option<State> {
     if !installed(g) {
         return None;
     }
-    State::decode(&g.ext_get(NS, STATE_KEY)?)
+    state(g)
+}
+
+/// Entries, bytes, cap and floor, counted by a scan; None when the journal
+/// is not installed.
+pub fn status(g: &Graph) -> Option<Status> {
+    let s = state_of(g)?;
+    let (mut entries, mut bytes) = (0u64, 0u64);
+    g.ext_scan(NS, b"", &mut |k, v| {
+        if is_entry_key(k) {
+            entries += 1;
+        }
+        bytes += (NS.len() + 1 + k.len() + v.len()) as u64;
+        true
+    });
+    Some(Status {
+        entries,
+        bytes,
+        cap: s.cap,
+        floor: s.floor,
+        why: s.why,
+    })
 }
 
 /// The oldest revision the journal can answer for, and why it is that one;
 /// None when it is not installed.
 pub fn oldest(g: &Graph) -> Option<(u64, Floor)> {
-    status(g).map(|s| (s.floor, s.why))
+    state_of(g).map(|s| (s.floor, s.why))
 }
 
 /// Whether the journal is installed and can answer for `since`: every
 /// change after it is still listed.
 pub fn answers(g: &Graph, since: u64) -> bool {
-    status(g).is_some_and(|s| since >= s.floor)
+    state_of(g).is_some_and(|s| since >= s.floor)
 }
 
 /// The latest change to one id of `kind`, if the journal holds one.
 pub fn entry(g: &Graph, kind: Kind, id: u64) -> Option<Entry> {
-    let v = g.ext_get(NS, &id_key(kind, id))?;
-    decode_id(&id_key(kind, id), &v)
+    let k = entry_key(kind, id);
+    decode_entry(&k, &g.ext_get(NS, &k)?)
 }
 
 /// Which of `ids` (of `kind`) changed after revision `since`, one bool
 /// each; None when the journal is not installed or cannot answer for
-/// `since`, so the caller must assume all of them did.
+/// `since`, so the caller must assume all of them did. One lookup an id.
 pub fn changed(g: &Graph, since: u64, kind: Kind, ids: &[u64]) -> Option<Vec<bool>> {
     if !answers(g, since) {
         return None;
@@ -431,25 +517,36 @@ pub fn changed(g: &Graph, since: u64, kind: Kind, ids: &[u64]) -> Option<Vec<boo
 }
 
 /// Whether anything of `kind` changed after revision `since`; None when
-/// the journal is not installed or cannot answer for `since`.
+/// the journal is not installed or cannot answer for `since`. Scans the
+/// entries of the kind until it finds one.
 pub fn changed_any(g: &Graph, since: u64, kind: Kind) -> Option<bool> {
-    let s = status(g)?;
-    (since >= s.floor).then(|| s.latest[kind.byte() as usize] > since)
+    if !answers(g, since) {
+        return None;
+    }
+    let mut found = false;
+    let mut looked = 0u64;
+    walk(g, &[kind], None, &mut |_, e| {
+        looked += 1;
+        // An entry that does not decode might be anything.
+        found = e.map_or(true, |e| e.revision > since);
+        !found
+    });
+    step(looked).ok()?;
+    Some(found)
 }
 
-/// The entries changed after revision `since`, oldest change first (by
-/// revision, then kind, then id), starting after `after` (an entry's
-/// position, from [`Entry::cursor`]), of `kinds` (all when empty), at most
-/// `limit`; and whether more follow. An error when the journal is not
-/// installed or cannot answer for `since`.
+/// The entries changed after revision `since`, by kind then id, starting
+/// after `after` (an entry's (kind, id), from [`Entry::cursor`]), of
+/// `kinds` (all when empty), at most `limit`; and whether more follow. An
+/// error when the journal is not installed or cannot answer for `since`.
 pub fn since(
     g: &Graph,
     since: u64,
     kinds: &[Kind],
-    after: Option<(u64, Kind, u64)>,
+    after: Option<(Kind, u64)>,
     limit: usize,
 ) -> Result<(Vec<Entry>, bool)> {
-    let Some(s) = status(g) else {
+    let Some(s) = state_of(g) else {
         return Err(Error::Msg(if installed(g) {
             "the change journal's state does not decode; CALL check.run(checks: [\"derived\"]) reports it, and DROP EXTENSION changes then CREATE EXTENSION changes starts it again".into()
         } else {
@@ -465,27 +562,18 @@ pub fn since(
             s.floor
         )));
     }
-    let start = match after {
-        Some((r, k, id)) if r > since => rev_key(r, k, id),
-        // Past every entry at or below `since`.
-        _ => {
-            let mut k = vec![b'r'];
-            k.extend_from_slice(&since.to_be_bytes());
-            k.extend_from_slice(&[0xff; 9]);
-            k
-        }
-    };
+    let start = after.map(|(k, id)| entry_key(k, id));
     let mut out = Vec::new();
     let mut more = false;
     let mut bad = false;
     let mut looked = 0u64;
-    g.ext_scan_after(NS, b"r", Some(&start), &mut |k, v| {
+    walk(g, kinds, start.as_deref(), &mut |_, e| {
         looked += 1;
-        let Some(e) = decode_rev(k, v) else {
+        let Some(e) = e else {
             bad = true;
             return false;
         };
-        if !kinds.is_empty() && !kinds.contains(&e.kind) {
+        if e.revision <= since {
             return true;
         }
         if out.len() == limit {
@@ -506,60 +594,114 @@ pub fn since(
 
 // --------------------------------------------------------------- recording
 
-/// Record `entries` (kind, id, change) at the log's end: one write with the
-/// entries, their revision index and the state, forgetting the oldest
-/// entries past the cap.
+/// Record `entries` (kind, id, change) at the log's end, in one write;
+/// first, when the log has reached the state's `look_at`, count and trim.
 fn note(g: &mut Graph, entries: &[(Kind, u64, Change)]) -> Result<()> {
-    let mut s = state_or_reset(g);
     let rev = g.log_end();
-    let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(2 * entries.len() + 1);
-    let mut dels: Vec<Vec<u8>> = Vec::new();
-    let mut replaced: Vec<Vec<u8>> = Vec::new();
-    for &(kind, id, change) in entries {
-        step(1)?;
-        let ik = id_key(kind, id);
-        match g.ext_get(NS, &ik).and_then(|v| decode_id(&ik, &v)) {
-            Some(old) => {
-                let rk = rev_key(old.revision, kind, id);
-                if old.revision != rev {
-                    dels.push(rk.clone());
-                }
-                replaced.push(rk);
-            }
-            None => s.entries += 1,
+    let mut s = match state(g) {
+        Some(s) => s,
+        None => {
+            let s = fresh(g, Floor::Reset);
+            g.ext_write(NS, vec![(STATE_KEY.to_vec(), s.encode())], Vec::new())?;
+            s
         }
-        puts.push((ik, id_value(rev, change)));
-        puts.push((rev_key(rev, kind, id), vec![change.byte()]));
-        s.latest[kind.byte() as usize] = rev;
+    };
+    if rev >= s.look_at {
+        let keep = s.cap / 2;
+        upkeep(g, &mut s, keep)?;
     }
-    if s.entries > s.cap {
-        // The oldest entries that are not being rewritten here. A write
-        // makes at most MIN_CAP entries, so with entries <= cap before it
-        // there are always enough of them.
-        let excess = (s.entries - s.cap) as usize;
-        let mut gone: Vec<Entry> = Vec::with_capacity(excess);
-        g.ext_scan(NS, b"r", &mut |k, v| {
-            if replaced.iter().any(|r| r == k) {
-                return true;
+    step(entries.len() as u64)?;
+    let puts = entries
+        .iter()
+        .map(|&(kind, id, change)| (entry_key(kind, id), entry_value(rev, change)))
+        .collect();
+    g.ext_write(NS, puts, Vec::new())
+}
+
+/// Count the entries, forget those at or below the floor, and when more
+/// than `keep` remain past it raise the floor and forget the oldest down
+/// to `keep` or fewer; then write the state with where to look again.
+/// Returns how many were forgotten.
+fn upkeep(g: &mut Graph, s: &mut State, keep: u64) -> Result<u64> {
+    let mut gone = forget_below(g, s.floor, u64::MAX)?;
+    // Count what is left, with a histogram of revisions above the floor.
+    let (mut n, mut hi) = (0u64, s.floor);
+    walk(g, &[], None, &mut |_, e| {
+        n += 1;
+        if let Some(e) = e {
+            hi = hi.max(e.revision);
+        }
+        true
+    });
+    step(n)?;
+    if n > keep && hi > s.floor {
+        let lo = s.floor + 1;
+        let width = ((hi - lo) / BUCKETS as u64) + 1;
+        let mut hist = vec![0u64; BUCKETS];
+        walk(g, &[], None, &mut |_, e| {
+            if let Some(e) = e {
+                hist[((e.revision.max(lo) - lo) / width) as usize] += 1;
             }
-            if let Some(e) = decode_rev(k, v) {
-                gone.push(e);
-            }
-            gone.len() < excess
+            true
         });
-        step(gone.len() as u64)?;
-        for e in &gone {
-            dels.push(rev_key(e.revision, e.kind, e.id));
-            dels.push(id_key(e.kind, e.id));
-            s.entries -= 1;
-            if e.revision >= s.floor {
-                s.floor = e.revision;
-                s.why = Floor::Cap;
+        step(n)?;
+        let need = n - keep;
+        let (mut cum, mut cut) = (0u64, hi);
+        for (b, c) in hist.iter().enumerate() {
+            cum += c;
+            if cum >= need {
+                cut = (lo + (b as u64 + 1) * width - 1).min(hi);
+                break;
             }
         }
+        s.floor = cut;
+        s.why = Floor::Cap;
+        let more = forget_below(g, cut, u64::MAX)?;
+        gone += more;
+        n -= more;
     }
-    puts.push((STATE_KEY.to_vec(), s.encode()));
-    g.ext_write(NS, puts, dels)
+    // Counted from before the state's own record: earlier, so safe.
+    s.next_look(g.log_end(), n);
+    g.ext_write(NS, vec![(STATE_KEY.to_vec(), s.encode())], Vec::new())?;
+    Ok(gone)
+}
+
+/// Forget entries at or below `below` (at most `limit`), a batch per
+/// write, walking every entry once. Returns how many went.
+fn forget_below(g: &mut Graph, below: u64, limit: u64) -> Result<u64> {
+    let mut gone = 0u64;
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let room = (limit - gone).min(BATCH as u64) as usize;
+        if room == 0 {
+            return Ok(gone);
+        }
+        let mut dels: Vec<Vec<u8>> = Vec::new();
+        let mut last: Option<Vec<u8>> = None;
+        let mut looked = 0u64;
+        let mut ended = true;
+        walk(g, &[], after.as_deref(), &mut |k, e| {
+            looked += 1;
+            last = Some(k.to_vec());
+            if e.is_some_and(|e| e.revision <= below) {
+                dels.push(k.to_vec());
+            }
+            if dels.len() == room || looked >= 16 * BATCH as u64 {
+                ended = false;
+                return false;
+            }
+            true
+        });
+        step(looked)?;
+        gone += dels.len() as u64;
+        if !dels.is_empty() {
+            g.ext_write(NS, Vec::new(), dels)?;
+        }
+        if ended {
+            return Ok(gone);
+        }
+        after = last;
+    }
 }
 
 /// The adjacency entry's change for node `n`: put while it exists.
@@ -568,65 +710,6 @@ fn adjacency(g: &Graph, n: u64) -> Change {
         Change::Put
     } else {
         Change::Drop
-    }
-}
-
-/// Forget entries in key order from `start` while `take` says so, a batch
-/// per write, raising the floor to the revision of each one forgotten.
-/// Returns how many went and whether the walk ended by `take` (or a
-/// limit) rather than by running out.
-fn forget(
-    g: &mut Graph,
-    s: &mut State,
-    why: Floor,
-    limit: u64,
-    take: &dyn Fn(&Entry) -> bool,
-) -> Result<(u64, bool)> {
-    let mut gone = 0u64;
-    loop {
-        let room = (limit - gone).min(BATCH as u64) as usize;
-        if room == 0 {
-            return Ok((gone, true));
-        }
-        let mut batch: Vec<Entry> = Vec::new();
-        let mut stopped = false;
-        g.ext_scan(NS, b"r", &mut |k, v| {
-            match decode_rev(k, v) {
-                Some(e) if take(&e) => batch.push(e),
-                Some(_) => {
-                    stopped = true;
-                    return false;
-                }
-                // An undecodable entry stops the walk; check.run names it.
-                None => {
-                    stopped = true;
-                    return false;
-                }
-            }
-            batch.len() < room
-        });
-        step(batch.len() as u64)?;
-        let mut dels = Vec::with_capacity(2 * batch.len());
-        for e in &batch {
-            dels.push(rev_key(e.revision, e.kind, e.id));
-            dels.push(id_key(e.kind, e.id));
-            s.entries = s.entries.saturating_sub(1);
-            if e.revision >= s.floor {
-                s.floor = e.revision;
-                s.why = why;
-            }
-        }
-        gone += batch.len() as u64;
-        let done = stopped || batch.len() < room;
-        if !batch.is_empty() || done {
-            g.ext_write(NS, vec![(STATE_KEY.to_vec(), s.encode())], dels)?;
-        }
-        if stopped {
-            return Ok((gone, true));
-        }
-        if batch.len() < room {
-            return Ok((gone, false));
-        }
     }
 }
 
@@ -670,23 +753,22 @@ fn kinds_arg(a: &Args) -> Result<Vec<Kind>> {
     Ok(out)
 }
 
-fn after_arg(a: &Args) -> Result<Option<(u64, Kind, u64)>> {
+fn after_arg(a: &Args) -> Result<Option<(Kind, u64)>> {
     let Some(s) = a.str("after") else {
         return Ok(None);
     };
     let bad = || {
         Error::Msg(format!(
-            "after: '{s}' is not a position; pass back the one the previous call's message gave (revision:kind:id)"
+            "after: '{s}' is not a position; pass back the one the previous call's message gave (kind:id)"
         ))
     };
     let mut parts = s.split(':');
-    let r = parts.next().and_then(|p| p.parse().ok()).ok_or_else(bad)?;
     let k = parts.next().and_then(Kind::parse).ok_or_else(bad)?;
     let id = parts.next().and_then(|p| p.parse().ok()).ok_or_else(bad)?;
     if parts.next().is_some() {
         return Err(bad());
     }
-    Ok(Some((r, k, id)))
+    Ok(Some((k, id)))
 }
 
 fn since_proc(g: &mut Graph, a: &Args) -> Result<QueryResult> {
@@ -731,7 +813,6 @@ fn status_proc(g: &mut Graph) -> Result<QueryResult> {
     let s = status(g).ok_or_else(|| {
         Error::Msg("the change journal's state does not decode; CALL check.run(checks: [\"derived\"]) reports it".into())
     })?;
-    let bytes = s.entries * ENTRY_BYTES + (NS.len() as u64 + 1 + STATE_KEY.len() as u64 + 50);
     let mut out = QueryResult::table(
         ["oldest", "why", "entries", "bytes", "cap", "revision"]
             .iter()
@@ -741,7 +822,7 @@ fn status_proc(g: &mut Graph) -> Result<QueryResult> {
             Value::Int(s.floor as i64),
             Value::Text(s.why.name().into()),
             Value::Int(s.entries as i64),
-            Value::Int(bytes as i64),
+            Value::Int(s.bytes as i64),
             Value::Int(s.cap as i64),
             Value::Int(g.revision() as i64),
         ]],
@@ -756,6 +837,12 @@ fn status_proc(g: &mut Graph) -> Result<QueryResult> {
     Ok(out)
 }
 
+fn state_or_err(g: &Graph) -> Result<State> {
+    state(g).ok_or_else(|| {
+        Error::Msg("the change journal's state does not decode; DROP EXTENSION changes and CREATE EXTENSION changes start it again".into())
+    })
+}
+
 fn release_proc(g: &mut Graph, a: &Args) -> Result<QueryResult> {
     let below = revision_arg(a, "below", "release")?.min(g.log_end());
     let limit = match a.get("limit") {
@@ -767,24 +854,24 @@ fn release_proc(g: &mut Graph, a: &Args) -> Result<QueryResult> {
             )))
         }
     };
-    let mut s = state_or_reset(g);
-    let (gone, cut) = forget(g, &mut s, Floor::Released, limit, &|e| e.revision <= below)?;
-    // Stopped by the limit with more at or below `below` left: the floor is
-    // where it got to. Otherwise everything at or below `below` is gone.
-    let finished = !cut || entry_at_or_below(g, below).is_none();
-    if finished && below > s.floor {
+    // The floor goes up first: from then on nothing at or below it is
+    // consulted, so forgetting it can be done in slices.
+    let mut s = state_or_err(g)?;
+    if below > s.floor {
         s.floor = below;
         s.why = Floor::Released;
         g.ext_write(NS, vec![(STATE_KEY.to_vec(), s.encode())], Vec::new())?;
     }
-    let mut out = QueryResult::message(if finished {
+    let gone = forget_below(g, s.floor, limit)?;
+    let left = gone == limit && forget_below_count(g, s.floor) > 0;
+    let mut out = QueryResult::message(if left {
         format!(
-            "released {gone} entries; the journal answers for revision {} and later",
+            "released {gone} entries; the journal answers for revision {} and later; more: CALL changes.release(below: {below}) again to forget the rest",
             s.floor
         )
     } else {
         format!(
-            "released {gone} entries, up to revision {}; more: CALL changes.release(below: {below}) again",
+            "released {gone} entries; the journal answers for revision {} and later",
             s.floor
         )
     });
@@ -792,13 +879,17 @@ fn release_proc(g: &mut Graph, a: &Args) -> Result<QueryResult> {
     Ok(out)
 }
 
-fn entry_at_or_below(g: &Graph, below: u64) -> Option<Entry> {
-    let mut first = None;
-    g.ext_scan(NS, b"r", &mut |k, v| {
-        first = decode_rev(k, v);
-        false
+/// Whether any entry at or below `below` is left (1) or not (0).
+fn forget_below_count(g: &Graph, below: u64) -> u64 {
+    let mut found = 0;
+    walk(g, &[], None, &mut |_, e| {
+        if e.is_some_and(|e| e.revision <= below) {
+            found = 1;
+            return false;
+        }
+        true
     });
-    first.filter(|e| e.revision <= below)
+    found
 }
 
 fn cap_proc(g: &mut Graph, a: &Args) -> Result<QueryResult> {
@@ -816,11 +907,9 @@ fn cap_proc(g: &mut Graph, a: &Args) -> Result<QueryResult> {
         vec![(CAP_KEY.to_vec(), cap.to_be_bytes().to_vec())],
         Vec::new(),
     )?;
-    let mut s = state_or_reset(g);
+    let mut s = state_or_err(g)?;
     s.cap = cap;
-    let excess = s.entries.saturating_sub(cap);
-    let (gone, _) = forget(g, &mut s, Floor::Cap, excess, &|_| true)?;
-    g.ext_write(NS, vec![(STATE_KEY.to_vec(), s.encode())], Vec::new())?;
+    let gone = upkeep(g, &mut s, cap)?;
     let mut out = QueryResult::message(format!(
         "the journal holds at most {cap} entries; {gone} forgotten, it answers for revision {} and later",
         s.floor
@@ -852,13 +941,7 @@ impl Extension for Changes {
         }
     }
     fn install(&self, g: &mut Graph) -> Result<()> {
-        let s = State {
-            entries: 0,
-            cap: cap_config(g),
-            floor: g.log_end(),
-            why: Floor::Installed,
-            latest: [0; 3],
-        };
+        let s = fresh(g, Floor::Installed);
         g.ext_write(NS, vec![(STATE_KEY.to_vec(), s.encode())], Vec::new())
     }
     fn wants_writes(&self, _g: &Graph) -> bool {
@@ -879,8 +962,8 @@ impl Extension for Changes {
         } else {
             Change::Drop
         };
-        // A node that appears or goes: its adjacency entry, if it has one,
-        // follows, so a `put` never names a node that is gone.
+        // A node that goes or comes back: its adjacency entry, if it has
+        // one, follows, so a `put` never names a node that is gone.
         if before.is_some() != after.is_some() && entry(g, Kind::Adjacency, id).is_some() {
             return note(
                 g,
@@ -901,16 +984,24 @@ impl Extension for Changes {
         } else {
             Change::Drop
         };
-        let mut ends = BTreeSet::new();
+        // The endpoints before and after, each once (an edge moved by a
+        // replayed add has four).
+        let mut ends = [0u64; 4];
+        let mut n = 0;
         for e in [before, after].into_iter().flatten() {
-            ends.insert(e.from);
-            ends.insert(e.to);
+            for end in [e.from, e.to] {
+                if !ends[..n].contains(&end) {
+                    ends[n] = end;
+                    n += 1;
+                }
+            }
         }
-        let mut entries = vec![(Kind::Edge, id, change)];
-        for n in ends {
-            entries.push((Kind::Adjacency, n, adjacency(g, n)));
+        let mut entries = [(Kind::Edge, id, change); 5];
+        for (i, &end) in ends[..n].iter().enumerate() {
+            entries[1 + i] = (Kind::Adjacency, end, adjacency(g, end));
         }
-        note(g, &entries)
+        let entries = &entries[..1 + n];
+        note(g, entries)
     }
     fn on_bulk_write(&self, g: &mut Graph, _what: super::BulkWrite) -> Result<()> {
         // CLEAR has already wiped every entry with the data; a bulk write
@@ -930,13 +1021,7 @@ impl Extension for Changes {
             step(dels.len() as u64)?;
             g.ext_write(NS, Vec::new(), dels)?;
         }
-        let s = State {
-            entries: 0,
-            cap: cap_config(g),
-            floor: g.log_end(),
-            why: Floor::Cleared,
-            latest: [0; 3],
-        };
+        let s = fresh(g, Floor::Cleared);
         g.ext_write(NS, vec![(STATE_KEY.to_vec(), s.encode())], Vec::new())
     }
     fn check(&self, g: &Graph, probe: &mut super::check::Probe) -> Result<bool> {
@@ -944,16 +1029,18 @@ impl Extension for Changes {
     }
 }
 
-/// `check.run`'s `derived` check: every record decodes; every `i` entry
-/// has its `r` entry and the other way round; a `put` names an id that
-/// exists; no entry is past the log's end; and, over a whole walk, the
-/// state's count is the number of entries.
+/// `check.run`'s `derived` check: every record decodes; a `put` above the
+/// floor names an id that exists; no entry and no floor is past the log's
+/// end; and, over a walk from the start in one slice, the journal holds no
+/// more than its cap.
 fn check_journal(g: &Graph, probe: &mut super::check::Probe) -> Result<bool> {
     let whole = probe.after().is_none();
     let end = g.log_end();
+    let st = state(g);
+    let floor = st.map(|s| s.floor).unwrap_or(0);
     let mut after: Option<Vec<u8>> = probe.after().map(|a| a.to_vec());
     let mut counted = 0u64;
-    let mut state: Option<Option<State>> = None;
+    let mut seen_state = false;
     loop {
         let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         g.ext_scan_after(NS, b"", after.as_deref(), &mut |k, v| {
@@ -968,62 +1055,47 @@ fn check_journal(g: &Graph, probe: &mut super::check::Probe) -> Result<bool> {
                 probe.stop_at(after.unwrap_or_default());
                 return Ok(true);
             }
-            let name = hex(&k);
-            match k.first() {
-                Some(b'i') => match decode_id(&k, &v) {
-                    None => probe.found("bad_record", name, "a journal entry that does not decode; DROP EXTENSION changes and CREATE EXTENSION changes start the journal again"),
+            if is_entry_key(&k) {
+                match decode_entry(&k, &v) {
+                    None => probe.found("bad_record", hex(&k), "a journal entry that does not decode; DROP EXTENSION changes and CREATE EXTENSION changes start the journal again"),
                     Some(e) => {
                         counted += 1;
                         let handle = handle(e.kind, e.id);
                         if e.revision > end {
                             probe.found("future", handle.clone(), format!("an entry at revision {} is past the log's end at {end}", e.revision));
                         }
-                        if e.change == Change::Put && !exists(g, e.kind, e.id) {
-                            probe.found("missing", handle.clone(), format!("a put entry for a {} that does not exist", e.kind.name()));
-                        }
-                        let rk = rev_key(e.revision, e.kind, e.id);
-                        if g.ext_get(NS, &rk).as_deref() != Some(&[e.change.byte()][..]) {
-                            probe.found("unindexed", handle, "an entry missing from the revision index, so since() would not list it");
+                        if e.revision > floor && e.change == Change::Put && !exists(g, e.kind, e.id) {
+                            probe.found("missing", handle, format!("a put entry for a {} that does not exist", e.kind.name()));
                         }
                     }
-                },
-                Some(b'r') => match decode_rev(&k, &v) {
-                    None => probe.found("bad_record", name, "a revision index entry that does not decode; DROP EXTENSION changes and CREATE EXTENSION changes start the journal again"),
-                    Some(e) => {
-                        let ik = id_key(e.kind, e.id);
-                        let held = g.ext_get(NS, &ik).and_then(|v| decode_id(&ik, &v));
-                        if held != Some(e) {
-                            probe.found("stray", handle(e.kind, e.id), format!("a revision index entry at {} that is not the id's latest change", e.revision));
-                        }
-                    }
-                },
-                Some(b's') if k == STATE_KEY => match State::decode(&v) {
-                    None => {
-                        state = Some(None);
-                        probe.found("bad_record", name, "the journal's state does not decode; DROP EXTENSION changes and CREATE EXTENSION changes start the journal again");
-                    }
-                    Some(s) => {
-                        state = Some(Some(s));
-                        if s.floor > end {
-                            probe.found("future", "state", format!("the journal's floor {} is past the log's end at {end}", s.floor));
-                        }
-                    }
-                },
-                Some(b'!') if k == CAP_KEY && v.len() == 8 => {}
-                _ => probe.found("bad_record", name, "a record the journal does not write; DROP EXTENSION changes and CREATE EXTENSION changes start the journal again"),
+                }
+            } else if k == STATE_KEY {
+                seen_state = true;
+                match State::decode(&v) {
+                    None => probe.found("bad_record", "state", "the journal's state does not decode; DROP EXTENSION changes and CREATE EXTENSION changes start the journal again"),
+                    Some(s) if s.floor > end => probe.found("future", "state", format!("the journal's floor {} is past the log's end at {end}", s.floor)),
+                    Some(_) => {}
+                }
+            } else if !(k == CAP_KEY && v.len() == 8) {
+                probe.found("bad_record", hex(&k), "a record the journal does not write; DROP EXTENSION changes and CREATE EXTENSION changes start the journal again");
             }
             after = Some(k);
         }
     }
     if whole {
-        match state {
-            None => probe.found("missing", "state", "the journal has no state record; DROP EXTENSION changes and CREATE EXTENSION changes start it again"),
-            Some(Some(s)) if s.entries != counted => probe.found(
-                "count",
-                "state",
-                format!("the state counts {} entries and the journal holds {counted}", s.entries),
-            ),
-            _ => {}
+        if !seen_state {
+            probe.found("missing", "state", "the journal has no state record; DROP EXTENSION changes and CREATE EXTENSION changes start it again");
+        } else if let Some(s) = st {
+            if counted > s.cap {
+                probe.found(
+                    "count",
+                    "state",
+                    format!(
+                        "the journal holds {counted} entries, past its cap of {}",
+                        s.cap
+                    ),
+                );
+            }
         }
     }
     Ok(true)
@@ -1052,28 +1124,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn records_read_back_as_written() {
+    fn records_read_back_as_written_and_keys_sort_by_kind_then_id() {
         let s = State {
-            entries: 7,
             cap: 9,
             floor: 1234,
             why: Floor::Cap,
-            latest: [1, 2, 3],
+            look_at: 77,
         };
         assert_eq!(State::decode(&s.encode()), Some(s));
-        let e = Entry {
-            revision: 99,
-            kind: Kind::Adjacency,
-            id: 5,
-            change: Change::Drop,
-        };
-        let ik = id_key(e.kind, e.id);
-        assert_eq!(decode_id(&ik, &id_value(e.revision, e.change)), Some(e));
-        let rk = rev_key(e.revision, e.kind, e.id);
-        assert_eq!(decode_rev(&rk, &[e.change.byte()]), Some(e));
+        let mut keys = Vec::new();
+        for kind in Kind::ALL {
+            for id in [0u64, 1, 255, 256, 65_535, 1 << 40, u64::MAX] {
+                for rev in [0u64, 1, 1 << 33, u64::MAX] {
+                    let e = Entry {
+                        revision: rev,
+                        kind,
+                        id,
+                        change: Change::Drop,
+                    };
+                    let (k, v) = encode_entry(&e);
+                    assert_eq!(decode_entry(&k, &v), Some(e));
+                    assert!(is_entry_key(&k));
+                }
+                keys.push(((kind, id), entry_key(kind, id)));
+            }
+        }
+        let mut by_key = keys.clone();
+        by_key.sort_by(|a, b| a.1.cmp(&b.1));
+        assert_eq!(by_key, keys, "key order is (kind, id) order");
+        // The fewest log bytes an entry takes in a record.
+        let (k, v) = encode_entry(&Entry {
+            revision: 0,
+            kind: Kind::Node,
+            id: 0,
+            change: Change::Put,
+        });
         assert_eq!(
-            ENTRY_BYTES,
-            2 * (NS.len() as u64 + 1) + ik.len() as u64 + 9 + rk.len() as u64 + 1
+            1 + NS.len() + 1 + k.len() + 1 + v.len(),
+            MIN_ENTRY_LOG as usize
         );
     }
 }

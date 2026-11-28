@@ -271,8 +271,8 @@ says exactly which nodes and edges did, since a revision.
 
 ```
 CREATE EXTENSION changes
-CALL changes.since(revision: 1042)                         ids changed after it, oldest change first
-CALL changes.since(revision: 1042, kinds: ["node"], limit: 1000, after: "1100:node:7")
+CALL changes.since(revision: 1042)                         ids changed after it, by kind then id
+CALL changes.since(revision: 1042, kinds: ["node"], limit: 1000, after: "node:7")
 CALL changes.status()                                      oldest, why, entries, bytes, cap, revision
 CALL changes.release(below: 1500)                          forget changes at or below a revision
 CALL changes.cap(entries: 100000)                          the most entries it holds (default 1,000,000)
@@ -282,8 +282,8 @@ Rows of `since` are `revision, kind, id, change`: `kind` is `node`, `edge`
 or `adjacency` (the edges at a node: one added, removed or altered at either
 end), `change` is what happened to it last, `put` (it exists, with what the
 graph holds now) or `drop` (it is gone). An id appears once per kind, with
-its latest change; old values are not kept. Rows come in revision order,
-then kind, then id; at most 10,000 a call (`limit:` lowers it), and the
+its latest change; old values are not kept. Rows come by kind (node,
+edge, adjacency), then id; at most 10,000 a call (`limit:` lowers it), and the
 message gives the `after:` to continue with.
 
 **How to use it.** Read `revision` (from `STATS` or `Graph::revision()`)
@@ -311,7 +311,7 @@ kept colouring is stale only when a node or an edge changed since it was
 computed.
 
 **What it costs**: one extension record a write (an edge write updates the
-edge and its two endpoints), 54 bytes an entry in the keyspace, and the
+edge and its two endpoints), 16-21 bytes an entry in the keyspace, and the
 write throughput measured in `bench/KNOWLEDGE.md`, "Change tracking".
 `check.run` checks it (records that do not decode, a `put` for an id that
 does not exist, an entry past the log's end). Recovery and replicas hold
@@ -324,8 +324,11 @@ the same journal as the source.
   the one it commits at. Ask with revisions read at commit boundaries.
 - A replayed `CLEAR` or any bulk write ends what it can answer for: ids
   are not listed for it.
-- `since` with `kinds:` still reads the entries of other kinds in its
-  range.
+- `since` reads every entry of the kinds asked for, whatever the
+  revision: about 50 ms for 300,000 entries. `changed` for given ids is
+  one lookup an id. When the journal is more than half full, the write
+  that reaches its next count does the counting and trimming and is
+  slower than the rest.
 
 ## `check`: is the graph whole
 
