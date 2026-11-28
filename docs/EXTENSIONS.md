@@ -34,14 +34,69 @@ functions work in any expression as `<extension>.<function>(...)`.
   Keys starting with `!` are configuration and survive `CLEAR`; everything
   else counts as derived from the data and is wiped with it. `DROP EXTENSION`
   deletes the whole keyspace.
-- **Extensions can follow writes.** An extension whose `wants_writes` says so
-  has `on_node_write` called after every node write made through the graph
-  API (queries included), inside the same transaction, with the node before
-  and after. What it writes in response is logged, so recovery and replicas
-  replay the result without running the hook again. Bulk loads do not call
-  hooks; an extension rebuilds from a scan instead (`CALL context.index()`).
-  A write that changes nothing (a property set to the value it has, a label
-  it already has) is not logged and calls no hook.
+- **Extensions can follow writes.** No change to a node or an edge goes
+  unnoticed by an extension that asks:
+  - `wants_writes` → `on_node_write(id, before, after)` after every node
+    write (labels and properties before and after; `None` for absent);
+  - `wants_edge_writes` → `on_edge_write(id, before, after)` after every
+    edge add, delete, property set and unset (endpoints, type and
+    properties before and after). Deleting a node reports each of its edges
+    first, then the node;
+  - either → `on_bulk_write(BulkWrite::Clear)` after every `CLEAR`, an
+    empty graph's too (it resets the id counters, so it always counts as a
+    change). Keys not starting with `!` are already wiped.
+
+  Every path calls them: statements (including `CALL` procedures that
+  write, `BEGIN` blocks and `execute_batch`), the graph API, JSON Lines
+  imports, `Graph::apply_op` (replayed operations with explicit ids),
+  `Graph::import_legacy` and `migrate`. They run inside the writing
+  transaction. What a hook writes is logged, so crash recovery and replicas
+  replay the result without running the hook again.
+
+  A hook may write only extension keyspaces (`Graph::ext_write`). A node,
+  edge, label or property write, or a `CLEAR`, attempted from inside any
+  hook is refused with an error saying so, which fails the statement like
+  any hook failure; so a hook never sets off hooks again.
+
+  A hook that returns an error fails the write: with autocommit on the
+  statement rolls back; with autocommit off the whole open transaction
+  rolls back, and the error ends with "(the transaction was rolled back)"
+  whatever its kind. Open a transaction with `BEGIN` or `Graph::begin()`
+  and end it with `COMMIT`/`ROLLBACK` or `commit()`/`rollback()`: such a
+  block is then spent (`Graph::spent()`): every further write and
+  statement in it is refused with that explanation, and `COMMIT` answers
+  "nothing was committed: ..." and ends the block, so nothing run after the
+  failure can commit as if it were the whole transaction. The same holds
+  when the engine itself rolls back an open block (a memory graph past
+  `max_memory`, a storage error). A spent state never reaches the next
+  block. A transaction opened by assigning `autocommit = false` keeps the
+  older behaviour: the failing call's error says the transaction was
+  rolled back, and the caller carries on in a new one. Inside a `begin()`
+  block, operations that commit on their own (`import_jsonl`,
+  `import_jsonl_from`, `import_legacy`, `COMPACT`, `execute_batch`) are
+  refused until the block ends; in a field-opened transaction they commit
+  what is pending, as before. Do not assign `autocommit` inside a
+  `begin()` block: it does not end the block, but the next write then
+  autocommits, taking the block's earlier writes with it.
+
+  A hook that panics leaves the handle usable: the open transaction is
+  rolled back (the caller's earlier pending writes too) and autocommit and
+  the hook state restored before the panic goes on, so an embedder that
+  catches panics can keep the handle. Inside a `begin()` block the block
+  is spent with the reason; in a field-opened transaction the panic is the
+  only report.
+
+  An extension that does not ask is never called, and costs nothing. A
+  write that changes nothing (a property set to the value it has, an unset
+  of an absent property, a label it already has, a delete of what is not
+  there) is not logged, does not move the revision and calls no hook. A
+  hook is never called with nothing before and nothing after. The revision
+  moving does not mean a hook was called: a replayed operation on a record
+  that does not exist may still log a newly seen name.
+
+  `Graph::bulk_load` only builds a new database, so no extension is
+  installed in what it writes; one installed afterwards builds from a scan
+  (`CALL context.index()`).
 - **Extensions can tell whether the graph has moved.** `Graph::revision()`
   (and `revision` in `STATS`) grows with every committed change, including
   an extension's own writes, and with nothing else. Record it beside derived
@@ -84,8 +139,9 @@ ext::register(Arc::new(Geo));
 
 Optional hooks: `install` / `uninstall` / `upgrade(from)` run in the
 transaction of `CREATE` / `DROP` / `ALTER EXTENSION`; `wants_writes` and
-`on_node_write` maintain derived state; `check(g, probe)` compares that state
-with the graph for `CALL check.run()` (below). The built-in `context`
+`on_node_write`, `wants_edge_writes` and `on_edge_write`, and
+`on_bulk_write` maintain derived state; `check(g, probe)` compares that
+state with the graph for `CALL check.run()` (below). The built-in `context`
 extension (`src/ext/context.rs`, `src/ext/text.rs`) uses all of them and is
 the worked example.
 
@@ -198,9 +254,10 @@ under 300 MB.
 - The text index is lexical (lowercased words, plural `s` dropped, no other
   stemming, a short English stopword list). Semantic search over embeddings
   is not part of it; pass the ids from your own vector search as `seeds:`.
-- Write hooks see node writes only; edge properties are not indexed.
-- Bulk loads (`Graph::bulk_load`, `migrate`) bypass hooks: run
-  `CALL context.index()` after one.
+- The text index follows node writes only; edge properties are not indexed.
+- A database made by `Graph::bulk_load` has nothing installed: install the
+  extension and run `CALL context.index()` after it. `migrate`, imports
+  and replayed operations keep the index current like any other write.
 - `CALL context.index()` builds in one transaction, and its log holds every
   posting until the next checkpoint (about 0.5 GiB for the 8.6M postings in
   the benchmark).

@@ -749,7 +749,7 @@ fn bench(graph: &mut Graph, n: usize) -> Result<(), String> {
     let edges_per_node = 4usize;
     println!("building a {}-node, ~{}-edge graph", n, n * edges_per_node);
 
-    graph.autocommit = false;
+    graph.begin().map_err(|e| e.to_string())?;
     let start = Instant::now();
     let mut ids = Vec::with_capacity(n);
     for i in 0..n {
@@ -765,6 +765,7 @@ fn bench(graph: &mut Graph, n: usize) -> Result<(), String> {
         ids.push(id);
     }
     graph.commit().map_err(|e| e.to_string())?;
+    graph.begin().map_err(|e| e.to_string())?;
     let node_secs = start.elapsed().as_secs_f64();
     println!(
         "  nodes: {:.2}s  ({:.0}/s)",
@@ -796,7 +797,6 @@ fn bench(graph: &mut Graph, n: usize) -> Result<(), String> {
         }
     }
     graph.commit().map_err(|e| e.to_string())?;
-    graph.autocommit = true;
     let edge_secs = start.elapsed().as_secs_f64();
     println!(
         "  edges: {:.2}s  ({:.0}/s)",

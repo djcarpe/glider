@@ -571,6 +571,33 @@ fn indexes_finds_an_entry_that_does_not_match_its_node_and_a_node_left_out() {
 
 // ------------------------------------------------------- derived data
 
+/// Run a write as a path below the hooks would have: afterwards the text
+/// index is put back as it was before. Every path the engine has keeps the
+/// index current (rule D5), so this is the only way to make it stale.
+fn below_the_hooks(g: &mut Graph, f: impl FnOnce(&mut Graph)) {
+    let scan = |g: &Graph| {
+        let mut out = std::collections::BTreeMap::new();
+        g.ext_scan("context", b"", &mut |k, v| {
+            out.insert(k.to_vec(), v.to_vec());
+            true
+        });
+        out
+    };
+    let before = scan(g);
+    f(g);
+    let after = scan(g);
+    let dels = after
+        .keys()
+        .filter(|k| !before.contains_key(*k))
+        .cloned()
+        .collect();
+    let puts = before
+        .into_iter()
+        .filter(|(k, v)| after.get(k) != Some(v))
+        .collect();
+    g.ext_write("context", puts, dels).unwrap();
+}
+
 fn indexed() -> Graph {
     let mut g = Graph::memory();
     people(&mut g);
@@ -638,12 +665,14 @@ fn the_text_index_check_names_each_node_that_differs_from_a_rebuild() {
     .unwrap();
     // A node written by a path that runs no hooks: never indexed.
     let id = g.raw_meta().next_node;
-    g.apply_op(Op::NodeAdd {
-        id,
-        labels: vec!["Person".into()],
-        props: vec![("name".into(), Value::from("unhooked"))],
-    })
-    .unwrap();
+    below_the_hooks(&mut g, |g| {
+        g.apply_op(Op::NodeAdd {
+            id,
+            labels: vec!["Person".into()],
+            props: vec![("name".into(), Value::from("unhooked"))],
+        })
+        .unwrap();
+    });
     let got = derived(&mut g);
     assert_eq!(
         got,
@@ -671,7 +700,7 @@ fn the_text_index_check_names_a_node_that_is_gone() {
     let mut g = indexed();
     let p6 = g.nodes_with_label("Person")[6];
     // Deleted below the hooks: its postings and length stay behind.
-    g.apply_op(Op::NodeDel { id: p6 }).unwrap();
+    below_the_hooks(&mut g, |g| g.apply_op(Op::NodeDel { id: p6 }).unwrap());
     // Named once, by its length entry; its postings are its, so they are
     // not named again; the totals count it.
     assert_eq!(
