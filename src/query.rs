@@ -1796,6 +1796,14 @@ pub fn execute_with(g: &mut Graph, src: &str, params: &[(String, Value)]) -> Res
 }
 
 fn execute_stmt(g: &mut Graph, stmt: Stmt) -> Result<QueryResult> {
+    // In a transaction the engine already rolled back, only ending it is
+    // allowed: nothing run after the failure may commit as if it were the
+    // whole transaction.
+    if !matches!(stmt, Stmt::Commit | Stmt::Rollback) {
+        if let Some(why) = g.spent() {
+            return Err(Error::Msg(why.to_string()));
+        }
+    }
     // STATS reports the damage itself; everything else must not return
     // results computed from an image that failed a checksum along the way.
     let reports_damage = matches!(stmt, Stmt::Stats);
@@ -1823,9 +1831,11 @@ fn execute_stmt(g: &mut Graph, stmt: Stmt) -> Result<QueryResult> {
 ///
 /// A statement stopped by its budget fails as a whole, even when the code
 /// that ran out could not return the error itself (an extension function,
-/// a callback): see [`crate::meter::check`]. Inside BEGIN, a stopped
-/// statement that had written something rolls the open transaction back,
-/// so that nothing it half-wrote can be committed.
+/// a callback): see [`crate::meter::check`]. Inside the caller's
+/// transaction, a stopped statement that had written something rolls it
+/// back as any failure there does, so that nothing it half-wrote can be
+/// committed: a block is spent, a transaction opened by assigning
+/// `autocommit` goes on in a new one.
 fn atomically<R>(g: &mut Graph, f: impl FnOnce(&mut Graph) -> Result<R>) -> Result<R> {
     thread_local! { static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
     struct Nested;
@@ -1844,17 +1854,28 @@ fn atomically<R>(g: &mut Graph, f: impl FnOnce(&mut Graph) -> Result<R>) -> Resu
     let auto = g.autocommit;
     let before = g.uncommitted();
     g.autocommit = false;
-    let r = f(g);
+    // A panic (in an extension, say) must not leave the handle with
+    // autocommit off and the statement's writes pending.
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(g)));
+    g.restore_autocommit(auto);
+    let r = match r {
+        Ok(r) => r,
+        Err(panic) => {
+            if auto {
+                let _ = g.rollback_txn();
+            }
+            std::panic::resume_unwind(panic)
+        }
+    };
     // the budget's error, rather than whatever a stopped procedure said
     let r = crate::meter::check().and(r);
-    g.autocommit = auto;
+    // Stopped after writing inside the caller's transaction: the engine
+    // rolls it back, as for any failure there (Graph::abandon). A block
+    // (BEGIN, Graph::begin) is then spent; a transaction opened by
+    // assigning `autocommit` carries on in a new one.
     if outermost && !auto && g.uncommitted() != before && crate::meter::stopped() {
         if let Err(e) = r {
-            g.rollback()?;
-            g.autocommit = true;
-            return Err(Error::Msg(format!(
-                "{e}; it had written to the open transaction, which was rolled back"
-            )));
+            return Err(g.abandon(e));
         }
     }
     if !auto || g.uncommitted() == 0 {
@@ -1862,11 +1883,11 @@ fn atomically<R>(g: &mut Graph, f: impl FnOnce(&mut Graph) -> Result<R>) -> Resu
     }
     match r {
         Ok(v) => {
-            g.commit()?;
+            g.commit_txn()?;
             Ok(v)
         }
         Err(e) => {
-            let _ = g.rollback();
+            let _ = g.rollback_txn();
             Err(e)
         }
     }
@@ -2045,12 +2066,15 @@ fn run(g: &mut Graph, stmt: Stmt) -> Result<QueryResult> {
             Ok(QueryResult::message("graph cleared"))
         }
         Stmt::Begin => {
-            g.autocommit = false;
+            g.begin()?;
             Ok(QueryResult::message("transaction open (autocommit off)"))
         }
         Stmt::Commit => {
-            g.commit()?;
+            // COMMIT ends the block whatever happens; a spent block reports
+            // that nothing was committed.
+            let r = g.commit();
             g.autocommit = true;
+            r?;
             Ok(QueryResult::message("committed"))
         }
         Stmt::Rollback => {
@@ -5035,6 +5059,7 @@ fn label_of(g: &Graph, id: u64) -> Value {
 
 /// Load JSON Lines: one `{"type":"node"|"edge", ...}` object per line.
 pub fn import_jsonl(g: &mut Graph, text: &str) -> Result<(usize, usize)> {
+    g.refuse_in_block("a JSON Lines import")?;
     let was_auto = g.autocommit;
     g.autocommit = false;
     let result = import_lines(g, text);
@@ -5044,7 +5069,7 @@ pub fn import_jsonl(g: &mut Graph, text: &str) -> Result<(usize, usize)> {
     if result.is_err() && was_auto {
         let _ = g.rollback();
     }
-    g.autocommit = was_auto;
+    g.restore_autocommit(was_auto);
     result
 }
 
@@ -5102,10 +5127,10 @@ fn import_lines(g: &mut Graph, text: &str) -> Result<(usize, usize)> {
             }
         }
         if (nodes + edges) % 20_000 == 0 {
-            g.commit()?;
+            g.commit_txn()?;
         }
     }
-    g.commit()?;
+    g.commit_txn()?;
     Ok((nodes, edges))
 }
 

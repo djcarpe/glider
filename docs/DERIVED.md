@@ -306,11 +306,162 @@ slices.
 
 ## Write hooks for edges and bulk paths
 
-`on_node_write` stays as it is. Beside it an extension can ask for edge
-writes (the edge before and after, with its endpoints and type) and is told
-when the graph is cleared or loaded in bulk. D5 is the test: a database with
-the change journal installed, written to by every path the engine has, has a
-journal that accounts for every difference between the two states.
+*Built (G4). Shown by `tests/write_hooks.rs` and the adopted review tests
+in `tests/review_g4.rs`.*
+
+`on_node_write` keeps its meaning. Beside it:
+
+- `wants_edge_writes` / `on_edge_write(g, id, before, after)`, with
+  `EdgeImage { from, to, etype, props }`: after every edge add, delete,
+  property set and unset, inside the writing transaction. An extension that
+  does not ask is not called, and a database where none asks pays one
+  check of a cached list per edge write (measured below). One that asks
+  pays for two edge images per write and the transaction wrapper: the
+  review measured a hook that does nothing at about 17% slower edge adds
+  and deletes (200,000 edges, memory graph).
+- Deleting a node, when an extension follows edge writes, deletes its edges
+  first one by one through the hooked path (logged as `EdgeDel` records),
+  a batch at a time, then the node. Without such an extension the node's
+  delete detaches its edges inside one `NodeDel` record, as before. The
+  whole delete is one transaction, so it grows linearly with the node's
+  degree: about 13 log bytes per edge (2.6 MB for a 200,000-edge node,
+  where one `NodeDel` is 20 bytes) plus whatever the hooks write per edge,
+  and the copy-on-write pages it touches. What bounds it is the database's
+  ordinary limits: a memory graph's `max_memory` and a file's disk.
+  Deleting frees about as many pages as it copies, so what grows is the
+  log (in memory only for a memory graph with a log) and what the hooks
+  write: a follower that writes a few bytes per edge deletes a
+  225,000-edge hub inside 24 MiB, one that writes a kilobyte per edge runs
+  out, and the test asserts that this ends in `Error::Full`, rolled back,
+  with the graph, the revision and the hook's keyspace as they were. A file database cannot checkpoint inside the transaction, so its
+  log holds the whole delete until it commits. Detach memory itself stays
+  at one batch of 4,096 edge ids.
+- `on_bulk_write(g, BulkWrite::Clear)`, for an extension that follows node
+  or edge writes, after `CLEAR`. `BulkWrite` is `#[non_exhaustive]`: an
+  extension treats a kind it does not know as "everything may have
+  changed".
+- A hook may write only extension keyspaces. A node, edge, label or
+  property write, or a `CLEAR`, from inside any hook (node, edge or bulk)
+  is refused with an error that says so, before anything is written; a
+  hook that passes it on fails the statement, one that swallows it has
+  written nothing to the graph. Hooks therefore never nest, and there is
+  nothing to bound (before, a hook that wrote the graph ran the hooks again
+  on the stack until the process aborted).
+- A failing hook fails the write. With autocommit on, the statement rolls
+  back. With autocommit off (the API, or a statement inside `BEGIN`) the
+  whole open transaction rolls back and the error says so, whatever its
+  kind (an I/O error keeps its kind, with the note added): the engine has
+  no savepoints, so undoing only the failed write is not possible. A block
+  the engine can see start — the `BEGIN` statement, or `Graph::begin()`,
+  added beside `commit()` and `rollback()` as the way to open a
+  transaction — is then *spent* (`Graph::spent()`): every further write
+  and statement in it is refused with the explanation, and `COMMIT` is an
+  error ("nothing was committed: ...") that ends the block, so the writes
+  made after the failure can never commit as if they were the whole
+  transaction. The same rule covers the engine's own rollback inside such
+  a block (`Error::Full` past `max_memory`, a storage error), which before
+  let the statements after it commit as a partial unit; no existing test
+  or document relied on that. A block opened with `begin()` ends only with
+  `commit()` or `rollback()` (or `COMMIT`/`ROLLBACK`), and a spent state
+  belongs to that block alone: what happens depends only on what the
+  caller did, never on whether some other call ran in between. Inside such
+  a block nothing commits before its COMMIT, so "nothing was committed"
+  is true whenever it is said: every operation that has to commit on its
+  own is refused there with an error saying to end the block first, and
+  the block's pending writes stay pending. Found by reading every commit
+  path: `import_jsonl`, `import_jsonl_from`, `import_legacy` (and so
+  `glider <db> migrate` and `Graph::from_bytes` of a legacy image, which
+  use a fresh graph and never meet a block), `COMPACT` / `Graph::compact`,
+  and `execute_batch` (already refused). `Graph::checkpoint` inside a
+  transaction only flushes the log, which recovery ignores without a
+  commit marker, so it commits nothing and is allowed. In a transaction
+  opened by assigning `autocommit = false` these operations commit what is
+  pending, as they always did. Assigning `autocommit = true` in the middle
+  of a `begin()` block does not end the block, but makes the next write
+  autocommit, and that commit takes the block's earlier writes with it: a
+  caller who opens blocks with `begin()` should not assign the field. A
+  transaction opened by assigning the public `autocommit` field cannot be
+  seen to start or end, so it keeps the behaviour it had before this
+  slice: the failing call's error says the transaction was rolled back,
+  and the caller carries on in a new one. The embedding binding opens its
+  transactions that way and tracks failure itself; it can move to
+  `begin()` later.
+- A hook that panics: the hook state, autocommit and the statement's
+  transaction are restored on the way out (the C interface catches panics
+  and keeps the handle, which then stays writable). The transaction is
+  rolled back, the caller's earlier pending writes included. Inside a
+  `begin()` block the block is then spent with the reason ("a write hook
+  panicked"); in a transaction opened by assigning `autocommit = false`
+  the caller learns of the rollback only through the panic itself, and
+  its next writes start a new transaction.
+- With the revision (D2): a write that changes nothing (the same value set
+  again, an unset of an absent property, a delete of what is not there) is
+  not logged, does not move the revision and is reported to no hook; every
+  write a hook is told about was logged, so it has moved the revision by
+  the time its transaction commits. `CLEAR` always counts as a change, on
+  an empty graph too (it resets the id counters and wipes derived data, as
+  the revision slice decided): it moves the revision and the bulk
+  notification is sent. The test checks, for every write path, that the
+  hooks heard something exactly when the revision moved. The writes that
+  move the revision with nothing to report are an index definition (not a
+  node or an edge) and a replayed operation on a record that does not
+  exist that logs a newly seen key or label (`apply_op` of `NodeSet`,
+  `EdgeSet` or `LabelAdd` on a missing id). No hook is ever called with
+  nothing before and nothing after. **The revision moving does not imply
+  that any hook was called**: a journal must not count on one entry per
+  revision step.
+- Recovery and replicas replay what the hooks wrote and never run them
+  (shown by counting hook calls during `from_replica` and crash recovery,
+  and by comparing the replayed keyspace with one made by running the
+  hooks again).
+
+Every path that changes a node or an edge, found by reading every caller of
+the private `Graph::exec` and every direct write to the pager's trees:
+
+| path | what it does now |
+|---|---|
+| statements: `CREATE`, `SET`, `REMOVE`, `DELETE`, `DETACH DELETE`, `CALL ... write:` | the graph API, so per-record hooks |
+| the graph API: `add_node`, `add_edge`, `delete_node`, `delete_edge`, `set_/unset_node_prop`, `set_/unset_edge_prop`, `add_label`, `remove_label` | per-record hooks |
+| `execute_batch`, `BEGIN ... COMMIT` | statements, so per-record hooks |
+| `import_jsonl`, `import_jsonl_from` | `add_node` / `add_edge`, so per-record hooks |
+| `Graph::apply_op` (replayed operations with explicit ids) | each op goes through the hooked path for its kind: node ops as the node API, edge ops as the edge API, `NodeDel` as `delete_node`, `Clear` as `clear`; `ExtensionAdd`/`Del` as their API calls; any `ExtWrite` forgets the cached hook list |
+| `Graph::import_legacy`, `glider <db> migrate`, `Graph::from_bytes` of a legacy image | `apply_op` per record, so per-record hooks (before, they told nobody) |
+| `CLEAR`, `Graph::clear` | one `on_bulk_write(Clear)` |
+| `Graph::bulk_load` | builds a database that must not exist, so nothing is installed in it and nothing derived can be left behind; an extension installed after it builds from a scan. The test checks that a bulk-loaded database has no extension installed |
+| crash recovery, `from_replica`, replica tailing | replay logged records, hook writes included; no hooks (D5 holds because the hooks ran when the records were first written) |
+| `Graph::from_bytes` of a paged image, opening a file | a copy of a state, not a change |
+| `rebuild_adjacency` (format upgrade at open) | rebuilds the adjacency tree from the edges; no node or edge changes |
+
+The `context` text index keeps its behaviour on every path it handled. On
+`apply_op` and `import_legacy`, where it used to drift silently from the
+graph, it now stays right (a test that failed before the change). On
+`CLEAR` it was already right: its configuration survives and its postings
+are wiped with the data.
+
+The proof: a recording extension keeps, for every reported id, the first
+image before and the last image after. A file database is bulk-loaded, then
+written to by statements of every kind, the API, a batch, JSON Lines from a
+string and from a file, `apply_op` of every op kind (new ids and
+overwrites), a legacy import over existing ids, `CLEAR` both ways, and
+rolled-back writes (`ROLLBACK`, API rollback, failing statements, failing
+hooks with autocommit on and off). After each path, every node and edge that
+differs between the graph before and after has been reported, every report
+agrees with both states, and nothing is recorded for the rolled-back
+writes. The change journal (G5) can rely on exactly this.
+
+Cost on edge writes in a database where no extension asks for them
+(`tests/write_hooks_cost.rs`, 400,000 edges added then deleted in a memory
+graph, commits every 10,000; medians of seven runs each, alternated seven
+times between the code before and after on a busy machine):
+
+| | add, before | add, after | delete, before | delete, after |
+|---|---|---|---|---|
+| no extension | 199k/s | 198k/s | 277k/s | 265k/s |
+| `context` with a text index (node hooks only) | 187k/s | 201k/s | 258k/s | 280k/s |
+
+The run-to-run spread on this machine was about 25% and the differences
+point both ways: no cost shows above the noise. In the quietest pair the
+difference was under 1%.
 
 ## `changes`: which nodes and edges changed
 
@@ -415,8 +566,10 @@ What is true now, and what this slice decided where the plan was open:
   storage layer below the graph (`storage::db::Db`) and one tree entry or
   counter deleted, added or changed there, then reopened (the same file
   loaded into memory gives the same rows); for `derived`,
-  `Graph::ext_write` into the `context` keyspace and writes through
-  `Graph::apply_op`, which runs no hooks.
+  `Graph::ext_write` into the `context` keyspace, and writes made as a
+  path below the hooks would make them: since G4 every path runs the hooks
+  (D5), so the test makes a write through `Graph::apply_op` and then puts
+  the `context` keyspace back as it was before it.
 - **On the manufacturing graph** (`bench/tests/mfg_check.rs`, and
   `mfg-bench`'s `check` measurement in `bench/KNOWLEDGE.md`): the database
   checks find nothing; `orphans` and parallel edges are exactly the planted

@@ -211,6 +211,7 @@ pub fn execute_batch(
     g: &mut Graph,
     statements: &[(String, Vec<(String, Value)>)],
 ) -> Result<usize> {
+    g.refuse_in_block("a batch")?;
     if !g.autocommit || g.uncommitted() > 0 {
         return Err(Error::Msg(
             "batch cannot join an existing transaction".into(),
@@ -260,7 +261,7 @@ pub fn execute_batch(
     if result.is_err() {
         let _ = g.rollback();
     }
-    g.autocommit = true;
+    g.restore_autocommit(true);
     result
 }
 
@@ -273,6 +274,7 @@ pub fn import_jsonl_from(
     reader: &mut impl BufRead,
     max_record_bytes: u64,
 ) -> Result<(usize, usize)> {
+    g.refuse_in_block("a JSON Lines import")?;
     if !g.autocommit || max_record_bytes == 0 || max_record_bytes > g.query_memory() / 8 {
         return Err(budget_error());
     }
@@ -371,7 +373,7 @@ pub fn import_jsonl_from(
     if result.is_err() {
         let _ = g.rollback();
     }
-    g.autocommit = true;
+    g.restore_autocommit(true);
     drop(map);
     result
 }
