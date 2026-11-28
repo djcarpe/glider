@@ -2272,9 +2272,15 @@ impl Graph {
         })();
         let _ = std::fs::remove_dir_all(&tmp);
         r?;
-        // The load went around the log; one record of what it set (the id
-        // counters, which replay leaves as they are) moves the log, and the
-        // revision with it, past the empty database the file began as.
+        // The load went around the log. Its pages are made durable first;
+        // then one record of what it set (the id counters, which replay
+        // leaves as they are) moves the log, and the revision with it, past
+        // the empty database the file began as, and a second checkpoint
+        // folds that record in. A crash between the two reopens the loaded
+        // pages at revision 0, as a load did before revisions; never the
+        // empty file past 0.
+        g.db.commit()?;
+        g.db.checkpoint()?;
         let (next_node, next_edge) = (
             g.db.pager().meta(M_NEXT_NODE),
             g.db.pager().meta(M_NEXT_EDGE),

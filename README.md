@@ -159,10 +159,13 @@ trace. `BEGIN` groups the statements that follow into one transaction;
 `STATS` reports counts, sizes and two numbers that name the database's
 state: `generation`, its lineage (the id its replicas are filed under), and
 `revision`, which grows with every committed transaction that changed
-something and with nothing else: not with a statement that changed nothing,
-a rollback, a checkpoint, `COMPACT`, a reopen or a read. It is durable,
-survives a crash, and a replica restored to the same point reports the same
-one. A library caller has `Graph::revision()` and `Graph::generation()`.
+something, and not with a statement that changed nothing, a rollback, a
+checkpoint, `COMPACT`, a reopen or a read (it may grow when a transaction's
+writes cancel out). It is durable, survives a crash, and a replica restored
+to the same point reports the same one. A restored copy that is then
+written to is a new line of history and may come to share a pair with its
+source, so a cache outside the database should treat a restore as a new
+source. A library caller has `Graph::revision()` and `Graph::generation()`.
 Anything computed from a graph can record the revision it was computed at
 and later ask, cheaply, whether the graph has moved since
 ([`docs/DERIVED.md`](docs/DERIVED.md), "Revision").
