@@ -194,6 +194,13 @@ subgraph that fits a token budget (personalised PageRank by local push, hub
 damping, omissions reported), path explanations and a schema card, in a
 compact text form at a third or less of the tokens of JSON.
 
+The built-in **`structure`** extension says which nodes have the same
+surroundings: Weisfeiler-Lehman colours over labels, chosen properties and
+typed, directed edges (`CALL structure.colors(depth: 4)`), and classes of
+interchangeable nodes (`CALL structure.classes(by: "neighbours")`). It
+reports and never merges; a colouring can be kept, and says when the
+database has changed since. See docs/EXTENSIONS.md.
+
 ```
 » CREATE EXTENSION context
 » CALL context.index()

@@ -333,6 +333,11 @@ impl Wal {
         self.committed
     }
 
+    /// Position just past the last record written, committed or not.
+    pub fn end_lsn(&self) -> u64 {
+        self.lsn
+    }
+
     /// Bytes of log since `lsn`.
     pub fn bytes_since(&self, lsn: u64) -> u64 {
         self.lsn.saturating_sub(lsn)
@@ -631,6 +636,11 @@ impl MemLog {
     /// Position just past the last commit marker.
     pub fn committed_lsn(&self) -> u64 {
         self.committed
+    }
+
+    /// Position just past the last record appended, committed or not.
+    pub fn end_lsn(&self) -> u64 {
+        self.lsn
     }
 
     pub fn cap(&self) -> u64 {

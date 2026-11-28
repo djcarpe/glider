@@ -1,7 +1,7 @@
 //! mfg-bench: the baseline over a manufacturing graph from `mfg-gen`.
 //!
 //!   mfg-bench --data DIR [--tiers memory,file] [--budgets 250,1000,4000]
-//!             [--only stats,retrieve,...] [--out FILE] [--label NAME] [--detail]
+//!             [--only stats,retrieve,check,structure,...] [--out FILE] [--label NAME] [--detail]
 //!
 //! Loads DIR/graph.jsonl into glider (in memory, and as a file in DIR), then
 //! runs each measurement in [`MEASURES`] and appends one JSON object per
@@ -25,6 +25,7 @@ use glider::query::{self, QueryResult};
 use glider::value::{parse_json, Json, Value};
 use glider_bench::checks::{self, Planted, Score};
 use glider_bench::mfg::Obj;
+use glider_bench::structure::{self as shapes, Station};
 
 /// The measurements, in the order they run. Each sees the graph as the
 /// previous one left it (`retrieve` installs the `context` extension and
@@ -35,6 +36,7 @@ const MEASURES: &[(&str, Measure)] = &[
     ("pagerank", pagerank),
     ("communities", communities),
     ("check", check),
+    ("structure", structure),
 ];
 
 type Measure = fn(&mut Run) -> Result<(), String>;
@@ -57,6 +59,8 @@ pub struct Run<'a> {
     pub detail: bool,
     /// What the generator planted, from truth.jsonl.
     pub planted: &'a Planted,
+    /// Every station's design and whether it deviates, from truth.jsonl.
+    pub stations: &'a [Station],
     meta: &'a Meta,
     out: &'a mut dyn Write,
 }
@@ -155,6 +159,18 @@ fn read_planted(path: &Path) -> Planted {
         .map(|l| parse_json(&l).expect("a truth line"))
         .collect();
     checks::planted(&lines)
+}
+
+/// The stations of truth.jsonl.
+fn read_stations(path: &Path) -> Vec<Station> {
+    let f = File::open(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let lines: Vec<Json> = BufReader::new(f)
+        .lines()
+        .map(|l| l.expect("reading truth"))
+        .filter(|l| l.starts_with("{\"kind\":\"station\""))
+        .map(|l| parse_json(&l).expect("a truth line"))
+        .collect();
+    shapes::stations(&lines)
 }
 
 fn read_meta(path: &Path, label: String) -> Meta {
@@ -604,6 +620,177 @@ fn check(run: &mut Run) -> Result<(), String> {
     Ok(())
 }
 
+/// Run a statement and measure it: (result, ms, resident before, peak
+/// added during it), in MiB.
+fn measured(run: &mut Run, src: &str) -> Result<(QueryResult, f64, u64, u64), String> {
+    let (before, _) = rss_mb();
+    reset_peak();
+    let (r, ms) = run.run(src, &[])?;
+    let (_, peak) = rss_mb();
+    Ok((r, ms, before, peak.saturating_sub(before)))
+}
+
+/// `structure`: station colours over the hierarchy and the catalogue,
+/// depth by depth; at each depth up to the design depth, kept and read back
+/// in slices and scored against the designs; a colouring until stable; classes by
+/// neighbours of the catalogue labels scored against the planted
+/// duplicates and look-alikes; and classes by the kept colouring.
+fn structure(run: &mut Run) -> Result<(), String> {
+    run.run("CREATE EXTENSION IF NOT EXISTS structure", &[])?;
+    let types = shapes::types_arg(shapes::DESIGN_TYPES);
+    let base = format!("types: {types}, dir: 'out', labels: ['Station']");
+    // Colours per depth, all nodes and stations.
+    let (r, ms, before, added) = measured(
+        run,
+        &format!(
+            "CALL structure.colors(depth: {}, {base}, summary: true)",
+            shapes::DESIGN_DEPTH + 1
+        ),
+    )?;
+    let counts: Vec<String> = r
+        .rows
+        .iter()
+        .map(|row| format!("[{},{},{}]", row[0], row[1], row[2]))
+        .collect();
+    run.emit(
+        "structure.colors",
+        Obj::new()
+            .s("what", "colours per depth")
+            .u("depth", shapes::DESIGN_DEPTH as u64 + 1)
+            .i("ms", ms as i64)
+            .u("rss_before_mb", before)
+            .u("rss_added_mb", added)
+            .raw("depths", &format!("[{}]", counts.join(","))),
+    );
+    // The design depth, kept, then read back a slice at a time and scored;
+    // and the depths before it, scored the same way.
+    for depth in 1..=shapes::DESIGN_DEPTH {
+        let name = format!("depth{depth}");
+        let (r, ms, before, added) = measured(
+            run,
+            &format!("CALL structure.colors(depth: {depth}, {base}, limit: 1, store: '{name}')"),
+        )?;
+        let mut c = std::collections::BTreeMap::new();
+        let mut after = 0i64;
+        let t = Instant::now();
+        let mut slices = 0u64;
+        loop {
+            let src =
+                format!("CALL structure.read(name: '{name}', fresh: 'require', after: {after})");
+            let (r, _) = run.run(&src, &[])?;
+            if r.rows.is_empty() {
+                break;
+            }
+            slices += 1;
+            after = r.rows.last().unwrap()[0].as_i64().unwrap_or(0);
+            c.extend(shapes::colours(&r));
+        }
+        let read_ms = t.elapsed().as_secs_f64() * 1e3;
+        let rec = shapes::recovery(&c, run.stations);
+        let o = Obj::new()
+            .s("what", "design recovery")
+            .u("depth", depth as u64)
+            .i("ms", ms as i64)
+            .u("rss_before_mb", before)
+            .u("rss_added_mb", added)
+            .s("message", r.message.as_deref().unwrap_or(""))
+            .u("stations", c.len() as u64)
+            .u("station_colours", rec.colours as u64)
+            .u("designs", rec.designs as u64)
+            .u("designs_whole", rec.whole as u64)
+            .u("designs_alone", rec.alone as u64)
+            .u("deviated", rec.deviated as u64)
+            .u("deviated_apart", rec.apart as u64)
+            .b("exact", rec.exact())
+            .s("kept", &name)
+            .i("read_ms", read_ms as i64)
+            .u("read_slices", slices);
+        run.emit("structure.colors", o);
+    }
+    // Until nothing changes.
+    let (r, ms, before, added) = measured(
+        run,
+        &format!("CALL structure.colors(depth: 'stable', {base}, summary: true)"),
+    )?;
+    run.emit(
+        "structure.colors",
+        Obj::new()
+            .s("what", "stable")
+            .i("ms", ms as i64)
+            .u("rss_before_mb", before)
+            .u("rss_added_mb", added)
+            .u("depths", r.rows.len() as u64)
+            .s("message", r.message.as_deref().unwrap_or("")),
+    );
+    // Classes by neighbours of the catalogue, against the truth.
+    let p = run.planted;
+    for (label, (keys, pairs)) in &p.duplicates {
+        let keys: Vec<&str> = keys.iter().map(|k| k.as_str()).collect();
+        let (types, dir) = shapes::duplicate_types(label);
+        let args = format!(
+            "by: 'neighbours', labels: ['{label}'], keys: {}, types: {}, dir: '{dir}'",
+            shapes::types_arg(&keys),
+            shapes::types_arg(types)
+        );
+        let (r, ms, before, added) = measured(run, &format!("CALL structure.classes({args})"))?;
+        let found = shapes::class_pairs(&r);
+        let planted = shapes::closure(pairs);
+        let s = Score::of(&planted, &found);
+        let look = p.lookalikes.get(label).cloned().unwrap_or_default();
+        let (sizes, _) = run.run(
+            &format!("CALL structure.classes({args}, min_size: 1, summary: true)"),
+            &[],
+        )?;
+        let dist: Vec<String> = shapes::sizes(&sizes)
+            .iter()
+            .map(|(s, n)| format!("[{s},{n}]"))
+            .collect();
+        run.emit(
+            "structure.classes",
+            Obj::new()
+                .s("by", "neighbours")
+                .s("label", label)
+                .i("ms", ms as i64)
+                .u("rss_before_mb", before)
+                .u("rss_added_mb", added)
+                .u("classes", r.rows.len() as u64)
+                .u("planted", s.planted as u64)
+                .u("found", s.found as u64)
+                .u("hit", s.hit as u64)
+                .b("exact", s.exact())
+                .u("lookalikes", look.len() as u64)
+                .u(
+                    "lookalikes_reported",
+                    look.intersection(&found).count() as u64,
+                )
+                .raw("sizes", &format!("[{}]", dist.join(","))),
+        );
+    }
+    // Classes of stations by the kept colouring: the designs.
+    let (r, ms, before, added) = measured(
+        run,
+        &format!(
+            "CALL structure.classes(by: 'colors', colors: 'depth{}', fresh: 'require', min_size: 1, summary: true)",
+            shapes::DESIGN_DEPTH
+        ),
+    )?;
+    let dist: Vec<String> = shapes::sizes(&r)
+        .iter()
+        .map(|(s, n)| format!("[{s},{n}]"))
+        .collect();
+    run.emit(
+        "structure.classes",
+        Obj::new()
+            .s("by", "colors")
+            .s("label", "Station")
+            .i("ms", ms as i64)
+            .u("rss_before_mb", before)
+            .u("rss_added_mb", added)
+            .raw("sizes", &format!("[{}]", dist.join(","))),
+    );
+    Ok(())
+}
+
 // -------------------------------------------------------------------- main
 
 fn main() {
@@ -640,6 +827,7 @@ fn main() {
     let questions = read_questions(&data.join("questions.jsonl"));
     let meta = read_meta(&data.join("truth.jsonl"), label);
     let planted = read_planted(&data.join("truth.jsonl"));
+    let stations = read_stations(&data.join("truth.jsonl"));
     let mut buf: Vec<u8> = Vec::new();
     for tier in &tiers {
         let tier: &'static str = match tier.as_str() {
@@ -655,6 +843,7 @@ fn main() {
             budgets: budgets.clone(),
             detail,
             planted: &planted,
+            stations: &stations,
             meta: &meta,
             out: &mut buf,
         };

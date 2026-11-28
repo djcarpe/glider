@@ -2,3 +2,4 @@
 
 pub mod checks;
 pub mod mfg;
+pub mod structure;
