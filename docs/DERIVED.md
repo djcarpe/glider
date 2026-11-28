@@ -403,8 +403,10 @@ What is true now, and what this slice decided where the plan was open:
   storage layer below the graph (`storage::db::Db`) and one tree entry or
   counter deleted, added or changed there, then reopened (the same file
   loaded into memory gives the same rows); for `derived`,
-  `Graph::ext_write` into the `context` keyspace and writes through
-  `Graph::apply_op`, which runs no hooks.
+  `Graph::ext_write` into the `context` keyspace, and writes made as a
+  path below the hooks would make them: since G4 every path runs the hooks
+  (D5), so the test makes a write through `Graph::apply_op` and then puts
+  the `context` keyspace back as it was before it.
 - **On the manufacturing graph** (`bench/tests/mfg_check.rs`, and
   `mfg-bench`'s `check` measurement in `bench/KNOWLEDGE.md`): the database
   checks find nothing; `orphans` and parallel edges are exactly the planted
