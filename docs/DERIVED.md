@@ -174,19 +174,27 @@ memory budget a built-in algorithm gets.
 matter or not. In a query: a candidate checked, an edge scanned, a neighbour
 looked at, a combination of pattern parts tried (as before). In a `CALL`: a
 node an algorithm or walk takes up, each edge it follows, each node a scan
-reads, each per-node array entry a reset or a sort goes over, each node a
-result is written back to; in the text index a posting read or written. An
-extension function evaluated for a row is one step. Algorithms count the same
-steps on the in-memory and paged tiers: the views do not count, the
-algorithms do.
+reads, each per-node array entry a pass goes over, each node a result is
+written back to, each result row; in the text index a posting read or
+written; in `check.run` a record; in label propagation each label compared.
+An extension function evaluated for a row is one step. The same call takes
+the same steps on the in-memory and the paged tier (tested for every
+algorithm): the algorithms count, the views do not, and building a
+projection counts its nodes, a page of 4,096 at a time, on both tiers. The
+edges the in-memory build reads are not steps, since the paged view reads
+none; the build looks at the meter every 4,096 of them, so a time budget
+still bounds it, but a step budget bounds it only by its nodes.
 
 **The meter** is `src/meter.rs` (public as `glider::meter`, re-exported as
 `glider::ext::{step, steps, spent, check, stopped}`). It is per thread, set
 around a statement by `execute_capped` and `Cursor::open`. `steps(n)` is one
 thread-local decrement of a credit of at most 256 steps; when the credit is
 used up the meter is looked at, the clock read, and more credit handed out.
-Tight loops count into a local `meter::Tally` and pass steps on 256 at a
-time. Once the budget is spent the statement is *stopped*, and stays stopped:
+Tight loops count into a local `meter::Tally`, which passes steps on 256 at
+a time and the rest when the loop is done (`flush`), so no step is dropped
+however the work is cut up: 50,000 walks of a few steps each count as one
+long walk would. Once the budget is spent the statement is *stopped*, and
+stays stopped:
 every later count fails, so code that could not return the error where it
 noticed (a callback, an extension function, an algorithm with no `Result`)
 stops at its next count. The statement checks at its end and fails with the
@@ -195,18 +203,40 @@ gets, word for word (`statement stopped: it took more than its budget of N
 matching steps`, `... ran past its time budget of N ms`), so callers that
 match on it need no change.
 
-**The bound.** Between two looks at the meter (and the clock) at most 256
-steps happen, plus the work of one count: one node's neighbour list, a page
-of 4,096 node ids while a projection is built, or, in the few places that go
-over every node at once doing a constant amount for each, one such pass
-(resetting the arrays per source in betweenness and closeness, pagerank's two
-sums per iteration, the components scan for unvisited nodes, k-core's bucket
-sort, the topological sorts' and label propagation's setup). A stop therefore comes within one adjacency list or one
-array pass of the budget. Measured on a 200,000-node, 1,000,000-edge graph
-(`tests/statement_budget.rs`), a 50 ms budget returned at 50.0 to 51.8 ms for
-pagerank and betweenness (hours unbounded), a whole-graph BFS by the local
-walk and by the paged projection (0.35 s), `context.retrieve` (2.5 s) and
-`context.index` (1.5 s).
+**The bound.** The work between two looks at the meter (and the clock) is a
+fixed number of steps whatever a node's degree: at most 256 counted steps,
+or 4,096 entries of a scan that is not counted step by step. Concretely:
+counting goes through a `Tally` (256 at a time); the paged view (which
+reads a hub's list from the tree 4,096 entries at a time), `Csr::targets`,
+the in-memory projection build,
+the reverse projection, the paged degree, a sort of a neighbour list
+(`meter::sort`: runs of 4,096 sorted, then merged, looking between), the
+intersection of two hubs' lists in `triangles` and k-core's pass over one
+node's neighbours all look at the meter every 4,096 entries; passes over
+every node (pagerank's sums, the components scan, the topological sorts',
+k-core's, label propagation's and MST's setup, closeness's distances, the
+normalisation in betweenness) count 4,096 nodes at a time; the walks, the
+context walk, `structure`'s scans and `neighbors` count each edge as they
+read it and stop the scan. `Csr::each` is the exception that keeps its
+loop as it was (a look at the meter in it cost pagerank a tenth, by keeping
+the callback from being inlined): the algorithms' callbacks count each edge,
+and once the statement is stopped they pass over the rest of a hub's list
+doing nothing, a few nanoseconds an entry. A stop noticed inside a callback
+sticks to its tally, so the loop around the callback stops at its next
+count. Three things
+are not cut: allocating or resetting a per-node array (`StateVec::new` and
+`fill`, at memory speed, per source in betweenness and closeness), the
+external sort's work inside one push when a 64 MB run fills (MST), and the
+merge set up by its `finish`. Measured with 50 ms budgets
+(`tests/statement_budget.rs`): on a 200,000-node, 1,000,000-edge graph,
+50.0 to 51.8 ms for pagerank and betweenness (hours unbounded), a whole-graph
+BFS by the local walk and by the paged projection (0.35 s), `context.retrieve`
+(2.5 s) and `context.index` (1.5 s); on one hub with 1.5 million edges, every
+procedure that reaches it (BFS on both tiers, `neighbors`, `subgraph`, MST on
+both tiers, k-core, triangles, clustering, communities, paged pagerank,
+degree on both tiers, betweenness, `context.retrieve`, `structure.colors`
+and `structure.classes`) within 300 ms, almost all at 50 to 52 ms (MST on
+the paged tier took 1.3 s before the hub was cut up).
 
 **Leaving nothing behind.** A stopped statement rolls back like any failed
 one: a stopped `CALL pagerank(write: "rank")` has written no `rank` (tested at
@@ -223,7 +253,18 @@ files it held are freed when it returns (`tests/procedure_memory.rs`).
 **Memory for extensions.** `ext::call` runs the procedure inside
 `ooc::with_budget(g.algorithm_memory(), g.temp_dir(), ...)`, so `StateVec`,
 `SpillQueue` and `SpillStack` spill to `<db>-tmp/` past `work_mem` exactly as
-they do for `CALL pagerank()`.
+they do for `CALL pagerank()`. `with_budget` puts the thread's budget and
+spill directory back however the procedure ends, a panic included, as the
+meter's guard does for the meter: on a pool of threads shared by many
+databases, one database's failure changes nothing for the next call.
+
+**Statements inside statements.** A statement a procedure runs (through
+`execute_capped` or `execute`) is bounded by the outer statement's budget as
+well as by any of its own: the tighter step count and the earlier deadline
+hold. When it returns, the outer meter carries on with the inner steps
+counted; an inner statement stopped by the outer budget stops the outer one
+too. The transaction belongs to the outermost statement: an inner one never
+commits or rolls back on its own.
 
 **Without a budget** nothing changes: no result differs (every existing test
 passes untouched, and every algorithm on every tier answers byte for byte the
@@ -236,8 +277,15 @@ raced against itself differs by under 2%):
 
 | graph | pagerank (20 iterations) | BFS, whole graph | components |
 |---|---|---|---|
-| 200,000 nodes, 1,200,000 edges | 119 → 115 ms (−3.5%) | 43 → 44 ms (+2 to +4%) | 25 → 25 ms (+1.4%) |
-| 1,000,000 nodes, 2,000,000 edges | 721 → 722 ms (+0.2%) | 183 → 188 ms (+2.9%) | 138 → 142 ms (+3.0%) |
+| 200,000 nodes, 1,200,000 edges | −2.2 to −2.9% | +0.1 to +3.1% | +5.0 to +7.9% |
+
+That race runs a copy of the old code inside the new build. Across builds
+(the base engine and this one, the same harness, interleaved, best of 20)
+the numbers move more than the change does: the old code's copy, the same
+source in both, ran pagerank in 129 ms in both builds but BFS in 43 ms in
+one and 23 to 31 ms in the other. Read that way, base → head: pagerank over
+a `Csr` 120 → 126 ms (+5%), over the projection a `CALL` uses 224 → 231 ms
+(+3%), BFS 43 → 23 to 32 ms, components 28 → 27 to 38 ms.
 
 End to end through `CALL` (projection build included), the before and after
 builds differ by less than the machine's noise (±10% between runs). Two

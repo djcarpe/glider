@@ -116,15 +116,22 @@ nothing to set up for either.
   `ext::steps` is one thread-local decrement, and never fails outside a
   metered statement. In a loop too tight even for that, count into a local
   `glider::meter::Tally` (`tally.spent(n)` is true once the statement must
-  stop), which passes the steps on 256 at a time. In a callback that cannot
-  return an error, `ext::spent(n)` counts and says whether to stop; the stop
-  sticks, so the next `steps` returns the error.
+  stop), which passes the steps on 256 at a time; call `tally.flush()` when
+  the loop is done, or the last few are not counted. In a callback that
+  cannot return an error, `ext::spent(n)` counts and says whether to stop;
+  the stop sticks, so the next `steps` returns the error. A scan that is
+  long but not counted step by step calls `glider::meter::poll()` every few
+  thousand entries, and `glider::meter::sort` sorts a long list the same way.
 - **Functions** cannot return an error. Each evaluation counts one step by
   itself; one that does more counts it with `ext::spent(n)`, and the
   statement stops at its next step.
 
-Built-in algorithms called from a procedure (`glider::algo::pagerank` over
-`g.projection(...)`) count their own steps. A procedure that carries on after
+Built-in algorithms and walks called from a procedure (`glider::algo::pagerank`
+over `g.projection(...)`, `glider::traverse::bfs`) count their own steps, every
+one of them, however many calls the work is cut into. A statement a procedure
+runs with `query::execute_capped` is bounded by the outer statement's budget
+too, and its steps count against it. A procedure that panics leaves the
+thread's budgets as they were. A procedure that carries on after
 a stop, or returns normally from one, still fails: the statement ends with
 the budget's error whatever the procedure returned, and rolls back, so a
 procedure stopped part-way has written nothing. Inside `BEGIN`, a stopped
