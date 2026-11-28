@@ -872,16 +872,23 @@ fn a_log_starts_between_transactions_and_only_in_memory() {
     assert_eq!(g.log_span(), None);
     g.rollback().unwrap();
     g.autocommit = true;
+    // The log starts where the graph's revision is: past the commit made
+    // without a log, so the revision never goes back.
+    let start = g.revision();
+    assert!(start > 0);
     g.enable_log(1 << 20).unwrap();
     let lineage = g.generation();
     assert_ne!(lineage, [0; 16]);
-    assert_eq!(g.log_span(), Some((0, 0)));
+    assert_eq!(g.log_span(), Some((start, start)));
     g.add_node(&["A".into()], vec![]).unwrap();
     let (_, end) = g.log_span().unwrap();
     // Enabled again, nothing changes.
     g.enable_log(1).unwrap();
-    assert_eq!((g.generation(), g.log_span()), (lineage, Some((0, end))));
-    assert_eq!(g.log_committed_end(0).unwrap(), Committed::To(end));
+    assert_eq!(
+        (g.generation(), g.log_span()),
+        (lineage, Some((start, end)))
+    );
+    assert_eq!(g.log_committed_end(start).unwrap(), Committed::To(end));
 }
 
 #[test]

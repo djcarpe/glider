@@ -55,11 +55,20 @@ functions work in any expression as `<extension>.<function>(...)`.
   autocommit off the whole open transaction rolls back, and the error ends
   with "(the transaction was rolled back)", so the write can never be
   committed without what the hook would have written. An extension that
-  does not ask is never called, and costs nothing.
+  does not ask is never called, and costs nothing. A write that changes
+  nothing (a property set to the value it has, an unset of an absent
+  property, a label it already has, a delete of what is not there, a
+  `CLEAR` of an empty graph) is not logged, does not move the revision and
+  calls no hook.
 
   `Graph::bulk_load` only builds a new database, so no extension is
   installed in what it writes; one installed afterwards builds from a scan
   (`CALL context.index()`).
+- **Extensions can tell whether the graph has moved.** `Graph::revision()`
+  (and `revision` in `STATS`) grows with every committed change, including
+  an extension's own writes, and with nothing else. Record it beside derived
+  state; if it is the same later, nothing has changed since
+  ([`DERIVED.md`](DERIVED.md), "Revision").
 
 ### Writing one
 

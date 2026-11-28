@@ -265,8 +265,8 @@ fn keyspace(g: &Graph, ns: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
 fn recorded(g: &Graph) -> Recorded {
     let mut r = Recorded::default();
     for (k, v) in keyspace(g, NS) {
-        if k == b"!failbulk" {
-            panic!("the bulk failure switch survived");
+        if k.starts_with(b"!") {
+            continue;
         }
         if k == b"bulk" {
             r.bulk = true;
@@ -288,7 +288,11 @@ fn recorded(g: &Graph) -> Recorded {
 }
 
 fn forget_records(g: &mut Graph) {
-    let keys: Vec<Vec<u8>> = keyspace(g, NS).into_iter().map(|(k, _)| k).collect();
+    let keys: Vec<Vec<u8>> = keyspace(g, NS)
+        .into_iter()
+        .map(|(k, _)| k)
+        .filter(|k| !k.starts_with(b"!"))
+        .collect();
     g.ext_write(NS, Vec::new(), keys).unwrap();
     assert_eq!(recorded(g), Recorded::default());
 }
@@ -325,14 +329,27 @@ fn account(
     changed
 }
 
-/// Run one write path and check the recorder heard about all of it.
-/// Returns how many nodes and edges it changed.
+/// Run one write path and check the recorder heard about all of it, and
+/// that it heard something exactly when the revision moved (rule D2: only
+/// a committed change moves it). Returns how many nodes and edges changed.
 fn path(g: &mut Graph, name: &str, f: impl FnOnce(&mut Graph)) -> usize {
     forget_records(g);
     let before = observe(g);
+    let rev = g.revision();
     f(g);
     let after = observe(g);
     let rec = recorded(g);
+    let heard = rec.bulk || !rec.nodes.is_empty() || !rec.edges.is_empty();
+    // An index definition is logged and moves the revision, but is not a
+    // node or an edge: the one write that moves it with nothing to report.
+    if !name.starts_with("INDEX") {
+        assert_eq!(
+            heard,
+            g.revision() != rev,
+            "{name}: hooks heard a change {heard}, revision {rev} -> {}",
+            g.revision()
+        );
+    }
     if rec.bulk {
         // One call that says everything may have changed covers anything.
         return usize::from(before != after);
@@ -355,7 +372,9 @@ fn path(g: &mut Graph, name: &str, f: impl FnOnce(&mut Graph)) -> usize {
 fn rolled_back(g: &mut Graph, name: &str, f: impl FnOnce(&mut Graph)) {
     forget_records(g);
     let before = observe(g);
+    let rev = g.revision();
     f(g);
+    assert_eq!(g.revision(), rev, "{name}: the revision moved");
     assert_eq!(observe(g), before, "{name}: the graph changed");
     assert_eq!(
         recorded(g),
@@ -588,6 +607,48 @@ fn every_write_path_is_accounted_for_by_the_hooks() {
         g.import_legacy(&legacy(2, 30, 50)).unwrap();
     });
 
+    // Writes that change nothing: not logged, the revision stays, and no
+    // hook hears of them.
+    let unchanged = |g: &mut Graph| {
+        let e = *g
+            .edge_ids()
+            .iter()
+            .find(|&&e| g.edge_prop(e, "w").is_some())
+            .unwrap();
+        let n = *g
+            .node_ids()
+            .iter()
+            .find(|&&n| g.node_prop(n, "name").is_some())
+            .unwrap();
+        let w = g.edge_prop(e, "w").unwrap();
+        g.set_edge_prop(e, "w", w).unwrap();
+        let k = g.node_prop(n, "name").unwrap();
+        g.set_node_prop(n, "name", k).unwrap();
+        let labels = g.node_labels(n);
+        g.add_label(n, &labels[0]).unwrap();
+        g.unset_edge_prop(e, "absent").unwrap();
+        g.unset_node_prop(n, "absent").unwrap();
+        g.remove_label(n, "Absent").unwrap();
+        assert!(!g.delete_edge(1_000_000).unwrap());
+        assert!(!g.delete_node(1_000_000).unwrap());
+        for op in [
+            Op::EdgeDel { id: 1_000_000 },
+            Op::EdgeUnset {
+                id: e,
+                key: "absent".into(),
+            },
+            Op::NodeDel { id: 1_000_000 },
+            Op::NodeUnset {
+                id: n,
+                key: "absent".into(),
+            },
+        ] {
+            g.apply_op(op).unwrap();
+        }
+        q(g, "MATCH ()-[r]->() WHERE r.never = 1 DELETE r");
+    };
+    assert_eq!(path(&mut g, "writes that change nothing", unchanged), 0);
+
     // CLEAR, by statement and as a replayed operation.
     run(&mut g, "CLEAR", &|g| {
         q(g, "CLEAR");
@@ -675,16 +736,27 @@ fn every_write_path_is_accounted_for_by_the_hooks() {
             q(g, "COMMIT");
         }
     });
+    let switch = |g: &Graph| g.ext_get(NS, b"!failbulk").is_some();
+    assert!(!switch(&g), "a rolled-back switch survived");
+    g.ext_write(NS, vec![(b"!failbulk".to_vec(), Vec::new())], Vec::new())
+        .unwrap();
     rolled_back(&mut g, "CLEAR, autocommit on", |g| {
-        g.ext_write(NS, vec![(b"!failbulk".to_vec(), Vec::new())], Vec::new())
-            .unwrap();
         let e = query::execute(g, "CLEAR").err().expect("refused");
         assert!(e.to_string().contains("the recorder refuses"), "{e}");
-        g.ext_write(NS, Vec::new(), vec![b"!failbulk".to_vec()])
-            .unwrap();
     });
+    g.ext_write(NS, Vec::new(), vec![b"!failbulk".to_vec()])
+        .unwrap();
 
     let total: usize = changed.iter().map(|(_, n)| n).sum();
+    // Clearing an empty graph changes nothing and tells no one.
+    let mut empty = Graph::memory();
+    q(&mut empty, "CREATE EXTENSION recorder");
+    assert_eq!(
+        path(&mut empty, "CLEAR of an empty graph", |g| {
+            q(g, "CLEAR");
+        }),
+        0
+    );
     for (name, n) in &changed {
         // Everything but the index definition changed something.
         assert!(
@@ -816,6 +888,34 @@ fn some_writes(g: &mut Graph) {
     let n = g.add_node(&["Api".into()], vec![]).unwrap();
     g.add_edge(n, 2, "API", vec![]).unwrap();
     g.delete_node(3).unwrap();
+    // Replayed operations and a legacy import, through the hooked paths.
+    g.apply_op(Op::NodeAdd {
+        id: 500,
+        labels: vec!["Replayed".into()],
+        props: vec![],
+    })
+    .unwrap();
+    g.apply_op(Op::EdgeAdd {
+        id: 900,
+        from: 500,
+        to: 2,
+        etype: "R".into(),
+        props: vec![],
+    })
+    .unwrap();
+    g.apply_op(Op::EdgeSet {
+        id: 900,
+        key: "x".into(),
+        value: Value::Int(1),
+    })
+    .unwrap();
+    g.apply_op(Op::NodeDel { id: 2 }).unwrap();
+    g.import_legacy(&legacy(4, 12, 20)).unwrap();
+    // And writes that change nothing.
+    let e = g.edge_ids()[0];
+    let w = g.edge_prop(e, "w").unwrap();
+    g.set_edge_prop(e, "w", w).unwrap();
+    g.apply_op(Op::EdgeDel { id: 900_000 }).unwrap();
 }
 
 #[test]
@@ -845,6 +945,12 @@ fn recovery_and_replicas_replay_what_the_hooks_wrote_without_running_them() {
     let (m, _) = Graph::from_replica(&refs, &[(from, &log)], u64::MAX, 1 << 20).unwrap();
     assert_eq!(calls(), before, "replay ran a hook");
     assert_eq!(observe(&m), observe(&g));
+    assert_eq!(query::export_jsonl(&m), query::export_jsonl(&g));
+    assert_eq!(
+        m.revision(),
+        g.revision(),
+        "the replica is at the source's revision"
+    );
     assert_eq!(keyspace(&m, NS), live);
 
     // Running the hooks again on the same writes gives the same state.
@@ -853,10 +959,12 @@ fn recovery_and_replicas_replay_what_the_hooks_wrote_without_running_them() {
     q(&mut again, "CREATE (:Before)");
     some_writes(&mut again);
     assert_eq!(keyspace(&again, NS), live);
+    assert_eq!(again.revision(), g.revision());
 
     // Crash recovery: the log replayed at open, with no checkpoint after
     // the writes.
     let path = temp("recovery");
+    let recovered_from;
     {
         let mut f = Graph::open(&path, Sync::Always).unwrap();
         f.set_checkpoint_bytes(u64::MAX);
@@ -864,12 +972,19 @@ fn recovery_and_replicas_replay_what_the_hooks_wrote_without_running_them() {
         q(&mut f, "CREATE (:Before)");
         some_writes(&mut f);
         assert_eq!(keyspace(&f, NS), live);
+        recovered_from = f.revision();
         std::mem::forget(f);
     }
     let before = calls();
     let f = Graph::open_forced(&path, Sync::Always).unwrap();
     assert_eq!(calls(), before, "recovery ran a hook");
     assert_eq!(observe(&f), observe(&g));
+    assert_eq!(query::export_jsonl(&f), query::export_jsonl(&g));
+    assert_eq!(
+        f.revision(),
+        recovered_from,
+        "recovery reaches the revision the source had"
+    );
     assert_eq!(keyspace(&f, NS), live);
     drop(f);
     cleanup(&path);
