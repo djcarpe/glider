@@ -162,7 +162,7 @@ second:
 
 ```
 mfg-bench --data DIR [--tiers memory,file] [--budgets 250,1000,4000]
-          [--only stats,retrieve,pagerank,communities,check] [--out FILE] [--label NAME] [--detail]
+          [--only stats,retrieve,pagerank,communities,check,structure] [--out FILE] [--label NAME] [--detail]
 ```
 
 For each tier it imports `graph.jsonl` with the streaming importer, then runs
@@ -179,6 +179,9 @@ every measurement in `MEASURES`, appending JSON lines to
 | `pagerank`, `communities` | `ms`, the message |
 | `check.indexes` | `ms` to create `INDEX ON :WorkElement(code)` and `:WorkInstruction(text)`, so the index checks have something to read |
 | `check` | per `check` (each database check alone, `all` of them, `orphans`, `duplicates` (parallel edges), `duplicates:<label>` on the properties the truth says that label's duplicates agree on, `required` for `Station -HAS_SIDE->`): `ms`, `records`, `problems`, `faults`, `rss_before_mb`, `rss_added_mb` (peak resident during the call less resident before, the peak reset first); for data checks `planted`, `found`, `hit`, `exact`, and `lookalikes_reported`. Then `all, slices of 100000`: `ms`, `calls`, `rows` |
+
+| `structure.colors` | `what: "colours per depth"`: `depths` as `[depth, colours over every node, colours among stations]` to depth 5; `what: "design recovery"` at depths 1 to 4: the colouring kept (`kept`), read back in slices (`read_ms`, `read_slices`) and scored (`stations`, `station_colours`, `designs`, `designs_whole`, `designs_alone`, `deviated`, `deviated_apart`, `exact`); `what: "stable"`: `depth: "stable"`, its depths and message. Each with `ms`, `rss_before_mb`, `rss_added_mb` |
+| `structure.classes` | `by: "neighbours"` per catalogue label, on the properties its duplicates agree on: `classes`, `planted` / `found` / `hit` / `exact` (pairs, the truth's pairs closed under "duplicate of the same original"), `lookalikes`, `lookalikes_reported`, `sizes` (`[size, classes]`, singletons included); `by: "colors"` over the kept depth-4 colouring of stations: `sizes`. Each with `ms` and memory |
 
 A later slice adds a measurement by writing `fn(&mut Run) -> Result<(),
 String>` and adding it to `MEASURES`: `Run` gives the loaded graph, the
@@ -297,3 +300,92 @@ What it says:
   `work_mem`).
 - Slicing costs little: 494 calls of 100,000 records at 1M nodes take
   about what one call takes in memory, and 13% more on the file tier.
+
+## Structure: which nodes are the same shape
+
+Measured on the graphs without faults (`n<size>-s1`), release build, one
+run each on a shared machine (`mfg-bench --only structure`; lines
+labelled `g7-structure`). Times in ms, memory tier / file tier; every count
+is the same on both tiers.
+
+Colours follow the hierarchy and the catalogue outwards
+(`HAS_PLANT` ... `HAS_ELEMENT`, `HAS_INSTRUCTION`, `USES_TOOL`, `CONSUMES`,
+`FOLLOWS`, `DEPENDS_ON`, `dir: "out"`), with no properties: a station is
+seen only through what is under it and what that uses. Distinct colours by
+depth, over every node / among the stations:
+
+| dataset | nodes | stations | designs | 0 | 1 | 2 | 3 | 4 | 5 | stable |
+|---|---|---|---|---|---|---|---|---|---|---|
+| n10000-s1 | 10,055 | 328 | 6 | 14 / 1 | 82 / 2 | 196 / 5 | 259 / 14 | 289 / 34 | 293 / 38 | at depth 5 |
+| n100000-s1 | 103,004 | 2,949 | 17 | 14 / 1 | 129 / 2 | 726 / 8 | 1,301 / 47 | 1,532 / 149 | 1,617 / 203 | at depth 9 |
+| n1000000-s1 | 1,023,660 | 28,795 | 24 | 14 / 1 | 144 / 2 | 1,844 / 8 | 6,057 / 77 | 7,498 / 364 | 7,989 / 698 | at depth 9 |
+
+**Design recovery.** A design is recovered when its stations without a
+recorded deviation share one colour (*whole*) that no station of another
+design has (*alone*); a deviation is set apart when the station's colour is
+not its design's. Designs whole / alone, deviations apart:
+
+| dataset | depth 1 | depth 2 | depth 3 | depth 4 |
+|---|---|---|---|---|
+| n10000-s1 | 6 / 0, 0 of 39 | 6 / 4, 0 of 39 | 6 / 6, 17 of 39 | **6 / 6, 39 of 39** |
+| n100000-s1 | 17 / 0, 0 of 350 | 17 / 3, 0 of 350 | 17 / 12, 183 of 350 | **17 / 17, 350 of 350** |
+| n1000000-s1 | 24 / 0, 0 of 3,600 | 24 / 1, 0 of 3,600 | 24 / 18, 1,782 of 3,600 | **24 / 24, 3,600 of 3,600** |
+
+Depth 4 is the depth this needs and the one to use: station, side,
+location, work element, and then what the element uses. Depth 3 sees an
+extra work element (the 1,782 at 1M) but not a missing tool, which is four
+hops down; below 3 the designs are not yet told apart. Depth 4 recovers
+every design and sets apart every deviation at all three sizes, on both
+tiers (`station_colours_recover_the_designs_and_set_apart_every_deviation`
+in `bench/tests/mfg_structure.rs` asserts it, and that depths 1 to 3 do
+not). Deviating stations often share a colour among themselves (the same
+tool missing from the same element), which is right: they are built alike.
+On the `--faults` graphs a station whose `USES_TOOL` edge was written twice
+also leaves its design's colour, since edges are counted with their
+multiplicity; it is structurally different, and the truth lists it as a
+fault, not as a deviation.
+
+Classes of stations by the kept depth-4 colouring, largest first (1M):
+6,720, 3,297, 2,285, 1,618, 1,355, ... down to deviating stations alone:
+the designs, each with its deviations split off.
+
+**Time and memory** of a colouring (the call, not the load), memory /
+file, and the resident memory it added:
+
+| dataset | depth 4, kept | to depth 5 | stable | added (depth 4) | read back in slices of 10,000 |
+|---|---|---|---|---|---|
+| n10000-s1 | 22 / 32 | 28 / 27 | 33 / 37 | 0 / 0 MB | 1 slice, under 1 ms |
+| n100000-s1 | 290 / 291 | 353 / 413 | 712 / 692 | 4 / 5 MB | 1 slice, under 1 ms |
+| n1000000-s1 | 3,977 / 3,518 | 5,398 / 4,228 | 9,452 / 7,769 | 48 / 58 MB | 3 slices, 7 / 8 ms |
+
+About a microsecond per node per round. The memory is the per-node state
+(41 bytes a node: 42 MB at 1M) and the sort that counts colours, inside
+half and a quarter of `algorithm_memory()` (128 and 64 MB at the default
+`work_mem`); past them they spill (tested in `tests/structure.rs`).
+
+**Duplicates by neighbours.** `structure.classes(by: "neighbours")` over
+each catalogue label, on the properties its planted duplicates agree on
+(`Tool`: `kind, maker, model, spec`; `Part`: `part_number, material,
+size`; `WorkInstruction`: `text, revision, scope`), with the edges that say
+what an entry hangs off: `SUPPLIED_BY` out for tools; `SUPPLIED_BY`,
+`APPLIES_TO` out for parts; `APPLIES_TO`, `ISSUED_BY`, `HAS_INSTRUCTION`
+both ways for instructions. Pairs planted / found, look-alikes reported:
+
+| dataset | `Tool` | `Part` | `WorkInstruction` | `WorkInstruction` ms | added |
+|---|---|---|---|---|---|
+| n10000-s1 | 3 / 3, 0 of 5 | 3 / 3, 0 of 3 | 5 / 5, 0 of 63 | 10 / 10 | 0 MB |
+| n100000-s1 | 8 / 8, 0 of 12 | 12 / 12, 0 of 9 | 14 / 14, 0 of 248 | 121 / 120 | 0 MB |
+| n1000000-s1 | 11 / 11, 0 of 17 | 13 / 13, 0 of 8 | 18 / 18, 0 of 389 | 1,712 / 1,603 | 24 / 48 MB |
+
+Precision and recall are 1 at every size for all three labels (the 12 at
+100k include a part entered four times: one class of 4, six pairs).
+`Tool` and `Part` take under a millisecond. Where `check`'s `duplicates`
+finds the planted instruction pairs among thousands of look-alikes (the
+same design element's instruction at every station of the design, equal on
+every property), the neighbours tell them apart: a local instruction
+belongs to its own work element through `HAS_INSTRUCTION`, and a planted
+duplicate of a standard instruction hangs off the same models and the same
+enterprise as its original. At 1M the 454,546 instructions fall into 18
+classes of two and 454,510 alone. A class is a candidate, as `check`'s are:
+two stations of one design are two stations, and a duplicate pair is for a
+person or a rule to decide on; nothing is merged.

@@ -3100,6 +3100,16 @@ impl Graph {
         self.db.revision()
     }
 
+    /// Where the log ends, counting the open transaction's records:
+    /// [`Graph::revision`] when nothing is pending, and past it while a
+    /// transaction has logged something. Each logged operation adds its
+    /// record (`store::Op::encode_record`) and a frame of
+    /// `storage::log::FRAME_BYTES`, and a commit adds one more frame, so
+    /// derived data can say which revision its own write will commit at.
+    pub fn log_end(&self) -> u64 {
+        self.db.log_end()
+    }
+
     /// The graph's lineage: the generation its replicas are filed under. A
     /// memory graph has one once it has a log; until then it is zeros.
     pub fn generation(&self) -> [u8; 16] {
