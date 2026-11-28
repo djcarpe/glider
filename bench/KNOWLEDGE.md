@@ -162,7 +162,7 @@ second:
 
 ```
 mfg-bench --data DIR [--tiers memory,file] [--budgets 250,1000,4000]
-          [--only stats,retrieve,pagerank,communities,check,structure,templates] [--out FILE] [--label NAME] [--detail]
+          [--only stats,retrieve,pagerank,communities,check,structure,templates,changes] [--out FILE] [--label NAME] [--detail]
 ```
 
 For each tier it imports `graph.jsonl` with the streaming importer, then runs
@@ -182,6 +182,9 @@ every measurement in `MEASURES`, appending JSON lines to
 
 | `structure.colors` | `what: "colours per depth"`: `depths` as `[depth, colours over every node, colours among stations]` to depth 5; `what: "design recovery"` at depths 1 to 4: the colouring kept (`kept`), read back in slices (`read_ms`, `read_slices`) and scored (`stations`, `station_colours`, `designs`, `designs_whole`, `designs_alone`, `deviated`, `deviated_apart`, `exact`); `what: "stable"`: `depth: "stable"`, its depths and message. Each with `ms`, `rss_before_mb`, `rss_added_mb` |
 | `structure.classes` | `by: "neighbours"` per catalogue label, on the properties its duplicates agree on: `classes`, `planted` / `found` / `hit` / `exact` (pairs, the truth's pairs closed under "duplicate of the same original"), `lookalikes`, `lookalikes_reported`, `sizes` (`[size, classes]`, singletons included); `by: "colors"` over the kept depth-4 colouring of stations: `sizes`. Each with `ms` and memory |
+| `changes.write` | per `write` (`node set`: a property set on node `1 + i mod nodes`; `edge add` between pseudo-random nodes; `edge delete` of those edges), `journal` (installed or not), `round`: `writes`, `per_commit`, `per_s`, `log_bytes_per_write` (revision moved / writes): 100,000 writes (or the node count when smaller) committed every 1,000, then 10,000 committed one by one. Rounds alternate without and with the journal, twice |
+| `changes.read` | after each round with the journal: `entries`, `bytes`, `bytes_per_entry` (from `changes.status`), `since_rows`, `since_calls`, `since_all_ms` (every entry since the install, by statement, 10,000 a call), `since_tail_rows` / `since_tail_ms` (the last commit), `changed_us` (`changes::changed` for 1,000 node ids), `changed_any_us` |
+| `changes.cap` | at a cap of a fifth of the writes (at least 1,000), so the journal sweeps throughout: `writes`, `per_s`, `log_bytes_per_write` for node sets in 1,000-write transactions; then 10,000 single writes: `single_per_s`, `single_slowest_us`, `single_biggest_log_bytes`; `entries` held after, `floor_rose` |
 
 | `structure.templates` | over `HAS_PLANT` ... `HAS_INSTRUCTION` outwards: `what: "design recovery"` (roots of `Station`): `templates`, `designs`, `designs_eligible` (two or more stations without a deviation), `designs_recovered` (exactly one template's instances), `deviated`, `deviated_in_design` (deviated stations among a design's template's instances: must be 0), `deviation_templates`, `exact`, `instances_ms`/`instances_calls` to list every instance; `what: "all shapes"` (every root): `templates`, `by_root` as `[label, templates, instances, largest]` |
 | `structure.paths` | `what: "patterns"`: the first pattern (`top`, `top_hops`, `top_paths`, `top_maximal`); `what: "chains"`: chains in the first slice |

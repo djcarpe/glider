@@ -262,6 +262,80 @@ under 300 MB.
   posting until the next checkpoint (about 0.5 GiB for the 8.6M postings in
   the benchmark).
 
+## `changes`: which nodes and edges changed
+
+Things derived from a graph and kept (a text index, a colouring, vectors an
+application paid a model to make) need to know what to recompute after the
+graph changes. The revision only says that *something* did. `changes`
+says exactly which nodes and edges did, since a revision.
+
+```
+CREATE EXTENSION changes
+CALL changes.since(revision: 1042)                         ids changed after it, by kind then id
+CALL changes.since(revision: 1042, kinds: ["node"], limit: 1000, after: "node:7")
+CALL changes.status()                                      oldest, why, entries, bytes, cap, revision
+CALL changes.release(below: 1500)                          forget changes at or below a revision
+CALL changes.cap(entries: 100000)                          the most entries it holds (default 1,000,000)
+```
+
+Rows of `since` are `revision, kind, id, change`: `kind` is `node`, `edge`
+or `adjacency` (the edges at a node: one added, removed or altered at either
+end), `change` is what happened to it last, `put` (it exists, with what the
+graph holds now) or `drop` (it is gone). An id appears once per kind, with
+its latest change; old values are not kept. Rows come by kind (node,
+edge, adjacency), then id; at most 10,000 a call (`limit:` lowers it), and the
+message gives the `after:` to continue with.
+
+**How to use it.** Read `revision` (from `STATS` or `Graph::revision()`)
+when you derive something, and keep it beside what you derived. Later, ask
+`since` for that revision: what it lists is exactly what was written by the
+transactions committed since, by any path (statements, the API, imports,
+replayed operations), and nothing else. Recompute those ids, and keep the
+revision you did it at. Rolled-back work never appears.
+
+**When it cannot answer.** The journal is bounded: the cap forgets the
+oldest entries, `release` forgets entries at or below a revision, and it
+knows nothing from before it was installed or before a `CLEAR`. Asking for
+an older revision is an error that says why and names the oldest revision
+it answers for: rebuild from a scan of the graph, then carry on from that
+revision. It never returns a partial list as if it were whole. To set the
+cap from the start, run `CALL changes.cap(entries: N)` in the same
+`BEGIN ... COMMIT` as `CREATE EXTENSION changes`.
+
+**From another extension** (`glider::ext::changes`): `changed(g, since,
+Kind::Node, &ids)` says which of the ids changed, `changed_any(g, since,
+kind)` whether anything of that kind did, `answers(g, since)` whether the
+journal can say; each returns `None` when it cannot, which means "assume
+everything changed". `structure` uses it: with the journal installed, a
+kept colouring is stale only when a node or an edge changed since it was
+computed.
+
+**What it costs**: one extension record a write (an edge write updates the
+edge and its two endpoints), 16-21 bytes an entry in the keyspace, and the
+write throughput measured in `bench/KNOWLEDGE.md`, "Change tracking".
+`check.run` checks it (records that do not decode, a `put` for an id that
+does not exist, an entry past the log's end). Recovery and replicas hold
+the same journal as the source.
+
+### Limits
+
+- A revision is a position in the log, not a counter: entries of one
+  transaction carry different positions between the revision before it and
+  the one it commits at. Ask with revisions read at commit boundaries.
+- A replayed `CLEAR` or any bulk write ends what it can answer for: ids
+  are not listed for it.
+- `since` reads every entry of the kinds asked for, whatever the
+  revision: about 50 ms for 300,000 entries. `changed` for given ids is
+  one lookup an id. `changed_any` (and so a kept colouring's freshness)
+  reads every entry of the kind when nothing changed: a few milliseconds
+  for a few hundred thousand entries.
+- Past three quarters of the cap, each write also looks at 64 entries of
+  the journal and rewrites its state, until the sweep ends; that is the
+  cap's whole cost, spread over writes.
+- The journal refuses to answer while it holds a position past the
+  database's (a revision from another line of history, or a copy of a
+  later state), and starts again with the next writes.
+
 ## `check`: is the graph whole
 
 `glider <db> verify` proves that pages and trees are sound. `check` proves
@@ -421,7 +495,8 @@ nodes, colors, code, args`), `structure.drop(name:)` forgets one. Only the
 extension's own writes do not count as a move, so keeping or dropping one
 colouring leaves the others fresh; a write to any node, edge, index or other
 extension makes them all stale, whether or not it touched what they
-describe. `write: "<key>"` also sets the colour as a text property on each
+describe; with `changes` installed (and able to answer for the
+colouring's revision), only a change to a node or an edge does. `write: "<key>"` also sets the colour as a text property on each
 node (refused for a key in `props:`, which would change what it records).
 Without `store:` or `write:` nothing is written and the revision does not
 move. A kept colouring is derived data: `CLEAR` and `DROP EXTENSION` remove
@@ -443,7 +518,9 @@ rows, byte for byte, in memory and from a file.
 - Colours are computed for every node, also when `labels:` asks about a
   few; `labels:` chooses what is reported and kept.
 - Staleness is by revision, not by comparison: any change makes a kept
-  colouring stale, including one it does not depend on.
+  colouring stale, including one it does not depend on, unless `changes`
+  is installed, when only node and edge changes do (one to a node or an
+  edge the colouring does not reach still does).
 - The edges of one node are read once per round; a colouring at depth `d`
   reads the adjacency `d` times.
 - Measured on the manufacturing graph: `bench/KNOWLEDGE.md`, "Structure".
