@@ -104,6 +104,7 @@ impl Hier {
             max_nodes: count("max_nodes", MAX_NODES, 1)?,
             names: Names {
                 identity: a.strs("identity"),
+                shared: Default::default(),
             },
         })
     }
@@ -129,7 +130,10 @@ impl Hier {
             min_nodes,
             min_count,
             max_nodes,
-            names: Names { identity },
+            names: Names {
+                identity,
+                shared: Default::default(),
+            },
         }
     }
 
@@ -427,6 +431,7 @@ impl Forest {
         drop(stamp);
         // Bottom-up: a node is ready when every node it owns is done.
         let mut pending = StateVec::new(len, 0u64);
+        step(2 * len as u64)?;
         for v in 0..len {
             let o = owner.get(v);
             if o != NONE {
@@ -540,6 +545,7 @@ impl Forest {
             }
         }
         // Bottom-up, children before parents: reverse preorder.
+        step(order.len() as u64)?;
         let mut hashed: HashMap<u64, (Colour, Colour, u64)> = HashMap::with_capacity(order.len());
         let mut kids_of: HashMap<u64, Vec<Kid>> = HashMap::new();
         for &(v, par, e, t) in order.iter().rev() {
@@ -667,6 +673,7 @@ impl Forest {
             }
         }
         // Bottom-up over the complete ones.
+        step(2 * ids.len() as u64)?;
         let mut pending: HashMap<u64, usize> = HashMap::new();
         let mut ready: Vec<u64> = Vec::new();
         for &v in &ids {
@@ -1000,6 +1007,10 @@ pub struct Template {
     /// Where another template is used for a part of this one: (position,
     /// index of that template in the list this one belongs to).
     pub nested: Vec<(u32, usize)>,
+    /// Per edge, how the definition names the node it refers to (empty for
+    /// an edge inside the shape): what a use claims of that node, checked
+    /// against the graph before a kept definition is used.
+    pub handles: Vec<String>,
     /// Slots in the order a use writes their values.
     pub slots: Vec<SlotRef>,
     /// Its instances: `count` roots from `start` in the list of roots.
@@ -1303,10 +1314,19 @@ fn make(
         props,
         edges,
         nested: Vec::new(),
+        handles: Vec::new(),
         slots: Vec::new(),
         start: 0,
         count: 0,
     };
+    t.handles = t
+        .edges
+        .iter()
+        .map(|e| match e.to {
+            To::Node(n) => names.handle(g, n),
+            To::Pos(_) => String::new(),
+        })
+        .collect();
     t.id = template_id(g, names, &t);
     t.slots = definition(g, names, &t, &[], "T", &|_| String::new()).1;
     t
@@ -1544,8 +1564,7 @@ pub fn definition(
             }
             s.push('\n');
             // The nested template's slots, at its positions here.
-            let first_here = edge_starts(t);
-            let first_there = edge_starts(ut);
+            let map = nest_map(t, a, ut);
             for r in &ut.slots {
                 if r.pos == 0 && r.edge == NO_SLOT_EDGE && given(r.key as usize) {
                     continue;
@@ -1555,8 +1574,7 @@ pub fn definition(
                     edge: if r.edge == NO_SLOT_EDGE {
                         NO_SLOT_EDGE
                     } else {
-                        let src = ut.edges[r.edge as usize].src;
-                        first_here[(src + a) as usize] + (r.edge - first_there[src as usize])
+                        map[r.edge as usize]
                     },
                     key: r.key,
                 });
@@ -1587,16 +1605,28 @@ pub fn definition(
     }
     // Edges from the positions this definition writes itself, per source
     // as plain text writes them.
+    // An edge is a nested template's when that template has it (under
+    // `dir: "in"` a nested root's edge to its owner here is not, and is
+    // written here).
+    let mut theirs = vec![false; t.edges.len()];
+    for &(a, _, u) in &ranges {
+        for j in nest_map(t, a, &all[u]) {
+            theirs[j as usize] = true;
+        }
+    }
+    let _ = inside;
     let mut by_src: Vec<Vec<usize>> = vec![Vec::new(); t.nodes()];
     for (j, e) in t.edges.iter().enumerate() {
-        let own = !inside(e.src) && !ranges.iter().any(|r| r.0 == e.src);
-        if own {
+        if !theirs[j] {
             by_src[e.src as usize].push(j);
         }
     }
-    let target = |to: To| match to {
+    let target = |j: usize| match t.edges[j].to {
         To::Pos(q) => format!(".{}", q + 1),
-        To::Node(n) => names.handle(g, n),
+        To::Node(n) => match t.handles.get(j) {
+            Some(h) if !h.is_empty() => h.clone(),
+            _ => names.handle(g, n),
+        },
     };
     for (src, list) in by_src.iter().enumerate() {
         let mut lines: Vec<(String, bool, String, String, usize)> = list
@@ -1616,7 +1646,7 @@ pub fn definition(
                     }
                     ps.push('}');
                 }
-                (e.etype.clone(), !e.props.is_empty(), target(e.to), ps, j)
+                (e.etype.clone(), !e.props.is_empty(), target(j), ps, j)
             })
             .collect();
         lines.sort();
@@ -1657,18 +1687,39 @@ pub fn definition(
     (s, slots)
 }
 
-/// For each position, the index of its first edge (edges are sorted by
-/// source position); one past the end for the last.
-fn edge_starts(t: &Template) -> Vec<u32> {
-    let mut v = vec![0u32; t.nodes() + 1];
-    let mut j = 0usize;
-    for (p, slot) in v.iter_mut().enumerate() {
-        while j < t.edges.len() && (t.edges[j].src as usize) < p {
-            j += 1;
-        }
-        *slot = j as u32;
-    }
-    v
+/// Which edge of `t` each edge of `u` is, with `u` used from position
+/// `p` of `t`: the same source, type and target (positions shifted by
+/// `p`), the k-th of such alike edges for the k-th. Matched, not counted,
+/// because `t` can have an edge from that part that `u` does not (under
+/// `dir: "in"`, the nested root's edge to its owner in `t`).
+fn nest_map(t: &Template, p: u32, u: &Template) -> Vec<u32> {
+    let mut used = vec![false; t.edges.len()];
+    u.edges
+        .iter()
+        .map(|e| {
+            let to = match e.to {
+                To::Pos(q) => To::Pos(q + p),
+                n => n,
+            };
+            // Edges are sorted by source: look only at this source's.
+            let from = t.edges.partition_point(|x| x.src < e.src + p);
+            let j = from
+                + t.edges[from..]
+                    .iter()
+                    .enumerate()
+                    .position(|(k, x)| {
+                        !used[from + k]
+                            && x.src == e.src + p
+                            && x.etype == e.etype
+                            && x.to == to
+                            && x.props.len() == e.props.len()
+                            && x.props.iter().zip(&e.props).all(|(a, b)| a.0 == b.0)
+                    })
+                    .expect("a nested template's edges are the outer one's");
+            used[j] = true;
+            j as u32
+        })
+        .collect()
 }
 
 fn prop_text(p: &Prop, out: &mut String) {
@@ -1688,27 +1739,28 @@ fn prop_text(p: &Prop, out: &mut String) {
 }
 
 /// A use: `T3 n242..281 "P01" 50 ...`, then any edge from its nodes that
-/// is not part of the shape. Ids are left out for nodes written by
-/// identity, whose handle the slots or the template already give.
+/// is not part of the shape. Without `identity:` the ids of every position
+/// come first, runs folded (`n242..244,247`); with it, only the positions
+/// whose node is written by id are listed, each with its position
+/// (`.5=n246,.7=n248`), and every other node's handle is its identity
+/// value, which the template and the slots give.
 pub fn use_text(g: &Graph, names: &Names, t: &Template, inst: &Inst, name: &str) -> String {
     let mut s = String::from(name);
-    let listed: Vec<u64> = if names.identity.is_empty() {
-        inst.ids.clone()
+    if names.identity.is_empty() {
+        s.push(' ');
+        notation::id_list(&inst.ids, &mut s);
     } else {
-        inst.ids
+        let listed: Vec<String> = inst
+            .ids
             .iter()
             .zip(&inst.nodes)
-            .filter(|(_, n)| names.identity_key(&n.props).is_none())
-            .map(|(id, _)| *id)
-            .collect()
-    };
-    if !listed.is_empty() {
-        s.push(' ');
-        if names.identity.is_empty() {
-            notation::id_list(&listed, &mut s);
-        } else {
-            let hs: Vec<String> = listed.iter().map(|id| format!("n{id}")).collect();
-            s.push_str(&hs.join(","));
+            .enumerate()
+            .filter(|(_, (_, n))| names.identity_key(&n.props).is_none())
+            .map(|(p, (id, _))| format!(".{}=n{id}", p + 1))
+            .collect();
+        if !listed.is_empty() {
+            s.push(' ');
+            s.push_str(&listed.join(","));
         }
     }
     for v in slot_values(t, inst) {
@@ -1743,7 +1795,7 @@ pub fn use_text(g: &Graph, names: &Names, t: &Template, inst: &Inst, name: &str)
 pub fn plain_text(g: &Graph, names: &Names, inst: &Inst) -> String {
     let mut s = String::new();
     for &id in &inst.ids {
-        notation::plain_block(g, names, id, &|_| false, &mut s);
+        let _ = notation::plain_block(g, names, id, &|_| false, &mut s);
     }
     s
 }
@@ -2021,12 +2073,14 @@ pub fn templates(g: &mut Graph, a: &Args) -> Result<QueryResult> {
         // The kept dictionary's templates, as the graph has them now.
         Some(d) => {
             let k = super::plan::load(g, &d, super::fresh_arg(a)?)?;
-            let h = k.meta.hier.rebind(g);
+            let mut h = k.meta.hier.rebind(g);
+            h.names = Names::scoped(g, h.names.identity.clone(), None)?;
             let found = super::plan::find_kept(g, &h, &k.dict)?;
             (h, found)
         }
         None => {
-            let h = Hier::from(g, a)?;
+            let mut h = Hier::from(g, a)?;
+            h.names = Names::scoped(g, h.names.identity.clone(), None)?;
             let found = find(g, &h)?;
             (h, found)
         }
@@ -2451,11 +2505,8 @@ pub fn nest(
             })
             .collect();
     }
-    let ft = edge_starts(t);
-    let fu = edge_starts(u);
-    for (j, e) in u.edges.iter().enumerate() {
-        let tj = ft[(e.src + p) as usize] + (j as u32 - fu[e.src as usize]);
-        t2.edges[tj as usize].props = e.props.clone();
+    for (j, tj) in nest_map(t, p, u).into_iter().enumerate() {
+        t2.edges[tj as usize].props = u.edges[j].props.clone();
     }
     t2.slots = definition(g, names, &t2, all, "T", &|_| "T".into()).1;
     t2

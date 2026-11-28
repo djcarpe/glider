@@ -606,13 +606,79 @@ one followed edge in and one out, between two that do not: `chain` (named
 nodes`; `expand(of: "chain:<id>")` gives the interior nodes and the run's
 edges.
 
-**The notation, `glider-compact/1`.** A text is one block per node: its card
-and its outgoing edges, as `context` writes them but in full (no value cut
-short, every property) and in a fixed order:
+**The notation, `glider-compact/1`.** This is the whole of it: a reader
+with a text and, when the text names one, its dictionary needs nothing
+else (`tests/structure_notation.rs` decodes from this description alone).
+
+*Lines.* A text is lines. The first is the header:
+`# glider-compact/1`, then ` dictionary <hash>` when the text is written
+with a dictionary, then ` identity <k1>, <k2>` when nodes are named by
+identity. Other lines starting with `#` are comments (the legend, `# body`).
+A dictionary is a legend line, definitions and patterns; a text that
+carries its dictionary has it after the header and before `# body`, and a
+text written with a kept dictionary has only the header and the body.
+
+*Names and values.* A label, key or type is bare when it is `[A-Za-z_]`
+then `[A-Za-z0-9_]*`, otherwise in backticks with a backtick doubled. A
+value is `null`, `true`, `false`, an integer in digits, a float with a point
+or an exponent (`1.0`, `-0.5`, `1e300`, `NaN`, `inf`, `-inf`), a JSON string,
+or a list `[a, b]` (comma and one space).
+
+*Handles.* `n12` is the node with id 12. With `identity` in the header,
+`@code="P01-S1"` is the one node whose identity key `code` has that value:
+its identity key is the first of the header's keys it has, the handle names
+it with its value, and its card leaves that property off (the handle
+carries it). A node that has none of the keys, or whose value another node
+of the text has under the same key, is written `n<id>` and keeps every
+property on its card, so a handle names exactly one node.
+
+*Plain blocks.* One per node: a card `handle:Label:Other k=v ...` (labels
+sorted, properties by key rank then name), then its outgoing edges, by
+type: `handle -TYPE-> h1, h2` for the edges without properties (targets
+sorted by handle), then `handle -TYPE{k=v, ...}-> h` one line per edge with
+properties. Parallel edges are listed as often as they exist.
+
+*Definitions.* `Tn #<16 hex>` and then lines that start with a space. A
+node line is ` .k:Label k=spec ...` (positions in preorder, `.1` the root,
+numbered consecutively). A spec is a value (a constant), `$` (a slot), or a
+derivation `~"x"` (the value of the same key at the root of the definition
+the line belongs to, then `x`) or `~N"x"` (its first N bytes, then `x`). A
+nested line ` .k=Tm` says that positions `.k` to `.k+size(Tm)-1` are `Tm`'s
+nodes in `Tm`'s order, with `Tm`'s edges between them and from them (its
+targets shifted by `k-1`); `k=spec` pairs after it give values of `Tm`'s
+root where `Tm` has a slot, and a `~` there refers to the root of the
+definition the line is in, while every derivation inside `Tm` refers to
+`Tm`'s root (here, `.k`). Edge lines ` .k -TYPE-> t1, t2` and
+` .k -TYPE{k=spec, ...}-> t` follow the node lines; a target is a position
+`.m` or a handle. A definition writes every edge of its nodes that no nested
+template it uses has: under `dir: "in"` that includes a nested root's edge
+to its owner.
+
+*Slots.* A definition's slots, in order: its node lines top to bottom, each
+line's `$` left to right, where a nested line contributes the nested
+template's slots in that template's own order, less those the line gives;
+then its edge lines top to bottom, each line's `$` left to right.
+
+*Uses.* `Tn ids v1 v2 ...`: the template's name, then which nodes these
+are, then one value per slot, separated by single spaces. Without
+`identity`, ids are every position's node id in position order, as `n`
+followed by comma-separated ids and runs (`n242..244,247` is 242, 243, 244,
+247). With `identity`, only the positions whose node is written by id are
+listed, as `.k=n<id>` separated by commas (`.5=n246,.7=n248`), or nothing
+when there are none; every other node's handle is `@key=value` from its
+values as the use gives them. Edges of the use's nodes that are not the
+template's (under `dir: "in"`, the root's edge to its owner) are written
+after the use line as plain edge lines.
+
+*Chains and patterns.* `Pn #<16 hex> -T1-> (:L1) -T2-> ... -Tk->` (or
+`<-T-` steps under `dir: "in"`) is a pattern: edge types with the labels
+of the nodes between them. `a -Pn-> b [x y]` in a node's block is the run
+`a -T1-> x -T2-> y -T3-> b` (for a `<-T-` step the edge goes the other
+way), every edge without properties; those edges are not written again.
 
 ```
 # glider-compact/1 dictionary 0f472ec37f752451c3de9ff727ef1bcb
-# .k: a template's k-th node in preorder, .1 its root; $: a slot, ...
+# .k: a template's k-th node in preorder, ...
 T1 #1a78f86e1f72f9c0
  .1:WorkElement name="Check tailgate fit" code=$ seq=12 std_time_seconds=$
  .2:WorkInstruction title="Examine tailgate fit" number=$ revision="A" scope="local" text="Examine the tailgate fit to 9 mm. ..."
@@ -633,17 +699,9 @@ T39 n242..244,247..248,... "Station 010 Battery tray torque cell" "P01-S1-L1-ST0
 n1459 -P1-> n1707 [n1705 n1706]
 ```
 
-A definition lists its positions in preorder (`.1` the root), with
-constants, `$` slots and `~` derivations, then its edges; `.2=T31` says that
-positions from `.2` on are template `T31`'s, with any value of `T5`'s root
-that this definition derives itself written after it. A use is the
-template's name, the instance's node ids in position order (runs as
-`a..b`), then its slot values. `a -P1-> b [x y]` is the run `a -> x -> y -> b`
-along chain pattern `P1`. With `identity:` (a key or a list of keys, the
-first a node has winning) a node is written by its identity value
-(`@"P01-S1-L1-ST010"`) and that property is left off its card, and a use
-lists ids only for nodes without one; with every node identified, the text
-is the same for the same data under other ids.
+Here `.2=T31 code=~"1"` says positions `.2` on are `T31`'s and gives
+`T31`'s root `code` as `T36`'s root code followed by `1`. With every node
+identified, a text is the same for the same data under other ids.
 
 **The plan.** `structure.plan` writes the part of the graph asked for (the
 whole graph, or `nodes:`) plainly and with templates and chain patterns, and
@@ -667,20 +725,27 @@ extension's keyspace: its definitions, its text, the revision it was made
 at, the arguments, the code version (`structure-templates/1`) and the hash
 that names its text. `plan(dictionary: "<name>")` writes with it without
 repeating it (the text's first line names it by hash), so many answers can
-share one dictionary given to a model once; every use is checked against
-the graph in full, so a stale dictionary still writes the graph exactly,
-only less of it by reference. `structure.dictionaries()` lists them (`name,
+share one dictionary given to a model once. An occurrence is written as a
+use only when it agrees with the definition in everything the definition
+says, including the handles of the nodes it refers to, so a stale
+dictionary costs uses, never truth. `structure.dictionaries()` lists them (`name,
 revision, fresh, hash, templates, patterns, bytes, tokens, code, args`);
 `fresh: "require"` refuses a stale one; `structure.drop(dictionary:)`
-forgets one; `stored_bytes` counts every record kept for one. Freshness works as for colourings, and keeping or dropping
-either leaves the other fresh.
+forgets one; `stored_bytes` counts every record kept for one. Freshness
+works as for colourings: with the `changes` journal installed, a
+dictionary is stale only when a node or an edge changed since; without it,
+any write but the extension's own makes it stale. Keeping or dropping
+either leaves the other fresh. With nothing chosen, `store:` keeps a
+dictionary of the legend alone, and `text: "dictionary"` returns it.
 
 Which nodes are instances is never kept: a selection works it out from the
 graph as it is now (ownership from each node's own edges, each candidate
 root's shape hashed and matched in full against the kept definition), so a
 node changed since the dictionary was made is written plainly unless it
 still matches exactly, and nothing is written from a membership that may
-no longer hold. Beside the definitions a dictionary keeps an index of each
+no longer hold. A definition also says how it names the nodes it refers
+to; an occurrence whose referred node is named otherwise now (a tool whose
+code changed) is written plainly. Beside the definitions a dictionary keeps an index of each
 template's root shape and id (about 50 bytes a template), so a selection
 reads only the definitions its shapes can use.
 

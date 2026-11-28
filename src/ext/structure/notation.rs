@@ -17,13 +17,15 @@
 //!
 //! ```text
 //! # glider-compact/1
-//! n242:Station code="P01-S1-L1-ST010" name="Station 010" number=1
+//! n242:Station name="Station 010" code="P01-S1-L1-ST010" number=1
 //! n242 -HAS_SIDE-> n243, n265
 //! ```
 //!
-//! With `identity:` a node is written by its identity value (`@"P01-S1"`)
-//! instead of its id, and that property is not repeated on its card; a node
-//! without one keeps its id. The dictionary, templates and their uses are
+//! With `identity:` a node is written by its first identity key and value
+//! (`@code="P01-S1"`) instead of its id, the header names the keys, and that
+//! property is not repeated on its card; a node without one, or whose value
+//! another node of the text has, keeps its id (see [`Names`]). The
+//! dictionary, templates and their uses are
 //! written by [`super::templates`] and [`super::plan`] in the same
 //! notation.
 
@@ -156,28 +158,51 @@ pub fn sort_props(props: &mut [(String, Value)]) {
 }
 
 /// How nodes are named in a text.
+///
+/// By id, `n12`, unless `identity:` names keys: then a node is written
+/// `@code="P01-S1"`, by the first of those keys it has and that key's value,
+/// when that (key, value) belongs to no other node of the text's scope
+/// ([`Names::scoped`]). A node without one, or whose value another node of
+/// the scope shares, is written by its id and keeps the property on its
+/// card, so a handle always names exactly one node and the text says which
+/// property and value it carries.
 #[derive(Clone, Debug, Default)]
 pub struct Names {
     /// Properties that identify a node, the first one a node has winning.
     pub identity: Vec<String>,
+    /// (key, value) pairs that more than one node of the scope has.
+    pub shared: std::sync::Arc<std::collections::HashSet<Vec<u8>>>,
+}
+
+/// A (key, value) pair as [`Names::shared`] holds it.
+pub fn pair(key: &str, v: &Value) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&(key.len() as u32).to_be_bytes());
+    b.extend_from_slice(key.as_bytes());
+    super::templates::exact(&mut b, v);
+    b
 }
 
 impl Names {
-    /// The identity key a node with these properties is written by.
+    /// The identity key a node with these properties is written by, if
+    /// any: the first it has, unless its value is shared in the scope.
     pub fn identity_key<'a>(&self, props: &'a [(String, Value)]) -> Option<&'a str> {
-        self.identity.iter().find_map(|k| {
+        let (k, v) = self.identity.iter().find_map(|k| {
             props
                 .iter()
                 .find(|(pk, v)| pk == k && *v != Value::Null)
-                .map(|(pk, _)| pk.as_str())
-        })
+                .map(|(pk, v)| (pk.as_str(), v))
+        })?;
+        (!self.shared.contains(&pair(k, v))).then_some(k)
     }
 
-    /// `n12`, or `@"P01-S1"` by identity.
+    /// `n12`, or `@code="P01-S1"` by identity.
     pub fn handle_of(&self, id: u64, props: &[(String, Value)]) -> String {
         if let Some(k) = self.identity_key(props) {
             let v = &props.iter().find(|(pk, _)| pk == k).unwrap().1;
             let mut s = String::from("@");
+            name(k, &mut s);
+            s.push('=');
             value(v, &mut s);
             return s;
         }
@@ -190,6 +215,96 @@ impl Names {
         }
         let props = g.node_props(id);
         self.handle_of(id, &props)
+    }
+
+    /// The names for a text about `scope` (every node when `None`): the
+    /// (key, value) pairs more than one of them has are found, by an
+    /// external sort, and their nodes are written by id.
+    pub fn scoped(
+        g: &Graph,
+        identity: Vec<String>,
+        scope: Option<&mut dyn Iterator<Item = u64>>,
+    ) -> crate::graph::Result<Names> {
+        let mut names = Names {
+            identity,
+            shared: Default::default(),
+        };
+        if names.identity.is_empty() {
+            return Ok(names);
+        }
+        let mut s = super::sorter(g, "structure-identity")?;
+        let push = |id: u64, s: &mut crate::storage::extsort::Sorter| -> crate::graph::Result<()> {
+            super::step(1)?;
+            let props = g.node_props(id);
+            let first = names.identity.iter().find_map(|k| {
+                props
+                    .iter()
+                    .find(|(pk, v)| pk == k && *v != Value::Null)
+                    .map(|(pk, v)| pair(pk, v))
+            });
+            if let Some(k) = first {
+                let mut key = k;
+                key.extend_from_slice(&id.to_be_bytes());
+                s.push(&key, &[]).map_err(crate::graph::Error::Io)?;
+            }
+            Ok(())
+        };
+        match scope {
+            Some(it) => {
+                for id in it {
+                    push(id, &mut s)?;
+                }
+            }
+            None => {
+                let mut failed = None;
+                g.scan_nodes(None, 0, usize::MAX, &mut |id| match push(id, &mut s) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        failed = Some(e);
+                        false
+                    }
+                });
+                if let Some(e) = failed {
+                    return Err(e);
+                }
+            }
+        }
+        let mut sorted = s.finish().map_err(crate::graph::Error::Io)?;
+        let mut shared = std::collections::HashSet::new();
+        let mut last: Option<(Vec<u8>, u64)> = None;
+        while let Some((k, _)) = sorted.next().map_err(crate::graph::Error::Io)? {
+            let (p, id) = k.split_at(k.len() - 8);
+            let id = u64::from_be_bytes(id.try_into().unwrap());
+            if let Some((lp, lid)) = &last {
+                if lp == p && *lid != id {
+                    shared.insert(p.to_vec());
+                }
+            }
+            last = Some((p.to_vec(), id));
+        }
+        names.shared = std::sync::Arc::new(shared);
+        Ok(names)
+    }
+
+    /// The text's first line: the notation, the dictionary it names, and
+    /// the identity keys handles carry.
+    pub fn header(&self, dictionary: Option<&str>) -> String {
+        let mut s = format!("# {NOTATION}");
+        if let Some(h) = dictionary {
+            s.push_str(" dictionary ");
+            s.push_str(h);
+        }
+        if !self.identity.is_empty() {
+            s.push_str(" identity ");
+            for (i, k) in self.identity.iter().enumerate() {
+                if i > 0 {
+                    s.push_str(", ");
+                }
+                name(k, &mut s);
+            }
+        }
+        s.push('\n');
+        s
     }
 }
 
@@ -330,17 +445,21 @@ pub fn out_edges(g: &Graph, names: &Names, id: u64, omit: &dyn Fn(u64) -> bool) 
 }
 
 /// A node's plain block: its card and its outgoing edges.
+/// Returns the number of edges it wrote, for the caller's step count.
 pub fn plain_block(
     g: &Graph,
     names: &Names,
     id: u64,
     omit: &dyn Fn(u64) -> bool,
     out: &mut String,
-) {
-    let Some(n) = node_text(g, id) else { return };
+) -> u64 {
+    let Some(n) = node_text(g, id) else { return 0 };
     card(names, id, &n, out);
     let from = names.handle_of(id, &n.props);
-    edge_lines(&from, out_edges(g, names, id, omit), out);
+    let edges = out_edges(g, names, id, omit);
+    let k = edges.len() as u64;
+    edge_lines(&from, edges, out);
+    k
 }
 
 /// Ids in order, consecutive runs written `a..b`: `n242..281,290`.

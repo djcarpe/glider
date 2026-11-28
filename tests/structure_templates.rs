@@ -162,9 +162,7 @@ fn snapshot(g: &Graph, identity: Option<&str>) -> Snapshot {
     let handle = |id: u64| -> String {
         if let Some(k) = identity {
             if let Some(v) = g.node_prop(id, k) {
-                let mut s = String::from("@");
-                s.push_str(&lit(&v));
-                return s;
+                return format!("@{k}={}", lit(&v));
             }
         }
         format!("n{id}")
@@ -338,8 +336,10 @@ impl<'a> Lex<'a> {
     /// `n12` or `@<value>`.
     fn handle(&mut self) -> String {
         if self.eat("@") {
+            let k = self.name();
+            assert!(self.eat("="));
             let v = self.value();
-            return format!("@{}", lit(&v));
+            return format!("@{k}={}", lit(&v));
         }
         assert!(self.eat("n"), "a handle at {:?}", self.rest());
         let start = self.at;
@@ -585,7 +585,21 @@ fn decode(text: &str, dictionary: Option<&str>, identity: Option<&str>) -> Snaps
             let f = flatten(&defs, &name);
             x.ws();
             let mut listed: Vec<String> = Vec::new();
-            if x.peek() == Some(b'n') && x.s.get(x.at + 1).is_some_and(|b| b.is_ascii_digit()) {
+            let mut by_pos: HashMap<usize, String> = HashMap::new();
+            if x.eat(".") {
+                // With identity: the positions written by id.
+                loop {
+                    let p: usize = x.name().parse().unwrap();
+                    assert!(x.eat("="));
+                    let h = x.handle();
+                    by_pos.insert(p - 1, h);
+                    if !x.eat(",.") {
+                        break;
+                    }
+                }
+            } else if x.peek() == Some(b'n')
+                && x.s.get(x.at + 1).is_some_and(|b| b.is_ascii_digit())
+            {
                 x.at += 1;
                 loop {
                     let start = x.at;
@@ -612,7 +626,6 @@ fn decode(text: &str, dictionary: Option<&str>, identity: Option<&str>) -> Snaps
                     if !x.eat(",") {
                         break;
                     }
-                    x.eat("n");
                 }
             }
             let mut vals = Vec::new();
@@ -661,9 +674,12 @@ fn decode(text: &str, dictionary: Option<&str>, identity: Option<&str>) -> Snaps
             let mut next = listed.into_iter();
             let handles: Vec<String> = (0..f.nodes.len())
                 .map(|p| {
+                    if let Some(h) = by_pos.get(&p) {
+                        return h.clone();
+                    }
                     if let Some(key) = identity {
                         if let Some(j) = f.nodes[p].1.iter().position(|(k, _)| k == key) {
-                            return format!("@{}", lit(node_vals[p][j].as_ref().unwrap()));
+                            return format!("@{key}={}", lit(node_vals[p][j].as_ref().unwrap()));
                         }
                     }
                     next.next().expect("an id for every node")
@@ -747,9 +763,11 @@ fn decode(text: &str, dictionary: Option<&str>, identity: Option<&str>) -> Snaps
             labels.push(x.name());
         }
         let mut ps = Vec::new();
-        if let (Some(key), Some(v)) = (identity, h.strip_prefix('@')) {
-            let mut y = Lex::new(v);
-            ps.push((key.to_string(), y.value()));
+        if let Some(kv) = h.strip_prefix('@') {
+            let mut y = Lex::new(kv);
+            let key = y.name();
+            assert!(y.eat("="));
+            ps.push((key, y.value()));
         }
         while x.eat(" ") {
             let k = x.name();
@@ -1872,7 +1890,7 @@ fn the_same_data_under_other_ids_has_the_same_templates_dictionary_and_plan() {
     assert_eq!(dump(&ca), dump(&cb));
     let tx = text(&total(&ca)[14]);
     assert!(
-        !tx.contains(" n1") && tx.contains("@\"P01-L1-ST010\""),
+        !tx.contains(" n1") && tx.contains("@code=\"P01-L1-ST010\""),
         "{}",
         &tx[..400]
     );

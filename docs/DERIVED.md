@@ -868,11 +868,15 @@ the user-facing description is in `docs/EXTENSIONS.md`, "Templates".
   the hash of the dictionary's text, counts, the hierarchy), `s<name>`
   (each template's root shape and id), `t<name>\0<i>`
   (each definition), `p<name>\0<i>` (each chain pattern), `x<name>\0<i>`
-  (the text, in chunks). Freshness is the colourings' stretch of the
+  (the text, in chunks). Freshness is the colourings': with the change
+  journal installed and able to answer, stale exactly when a node or an
+  edge changed since; otherwise the conservative stretch of the
   extension's own writes, so keeping or dropping a dictionary or a
-  colouring leaves the others fresh. A text written with a kept dictionary
+  colouring leaves the others fresh
+  (`a_kept_dictionary_is_stale_only_when_a_node_or_an_edge_changed_given_the_journal`). A text written with a kept dictionary
   names it by hash and does not repeat it; every use is matched against
-  the graph in full, so a stale dictionary still writes the graph exactly.
+  the graph in full, the handles of the nodes a definition refers to as
+  well, so a stale dictionary costs uses, never truth.
   `check.run` reports kept records that do not decode.
 - **A selection with a kept dictionary is local.** `plan(dictionary:,
   nodes:)` builds the forest over the selection alone (`Forest::part`:
@@ -894,14 +898,40 @@ the user-facing description is in `docs/EXTENSIONS.md`, "Templates".
   `drop(dictionary:)`. A dictionary kept inside a `begin()` block goes
   with its rollback and stays with its commit
   (`a_dictionary_kept_inside_a_transaction_block_goes_with_a_rollback_and_stays_with_a_commit`).
+- **Handles name one node (review, finding 4).** With `identity:`, a node
+  is written `@key="value"`, its first identity key and that key's value,
+  and the header says ` identity k1, k2`; a node without one, or whose
+  (key, value) another node of the text's scope has, is written `n<id>`
+  with the property kept on its card. The scope is the nodes the text
+  writes and the nodes their edges reach (the whole graph for a
+  whole-graph text); its shared pairs are found by an external sort. A use
+  lists by position (`.5=n246`) the nodes it writes by id.
+- **A use states only what is true (findings 3, 1, 2).** A kept definition
+  records how it names each node it refers to; an occurrence is a use only
+  when that handle is the node's handle in this text now, besides its shape
+  and values matching in full, so a stale dictionary costs uses, never
+  truth. A nested template's edges are matched to the outer one's (not
+  counted), and the outer definition writes every edge the nested one does
+  not have (under `dir: "in"` the nested root's edge to its owner). A chain
+  is written only when every node whose block it changes (where its use
+  goes and the source of each of its edges) is written plainly, so no edge
+  is written twice. The compact text reads back as the graph for every
+  direction (`fuzz_compact_text_reads_back_as_the_graph`, in
+  `tests/structure_notation.rs`: 300 random graphs per direction, by
+  tokens and bytes, by id and by identity, in memory and from a file).
+- **Priced as written (finding 6).** A candidate is priced with the longest
+  name it can get (`T99` among up to 99 templates; a kept template's own
+  name), so once named it costs at most its price, and every chosen row's
+  saving is at least 1 in the measure asked for. Chain patterns likewise.
 - **The same answer (D7).** Template ids are content-only always. With
   `identity:` naming a property every node has (or a list: the first a node
   has wins, `["code", "number"]` on the manufacturing graph), the
   dictionary, the plan's rows and the compact text are byte for byte the
   same for the same data under other ids
   (`the_same_data_under_other_ids_has_the_same_templates_dictionary_and_plan`);
-  without it, uses carry ids and their lengths can differ. Both tiers give
-  the same bytes.
+  without it, uses carry ids and their lengths can differ. Chains are tried
+  and their uses written in the order of their handles, so chain patterns
+  are the same too (finding 5). Both tiers give the same bytes.
 - **Bounds (D6).** Ids, owners, sizes and the two hashes are 56 bytes a
   node (and 16 more while they are built) in `StateVec`s within half of
   `algorithm_memory()`, spilling past it

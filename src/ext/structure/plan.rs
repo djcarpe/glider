@@ -45,7 +45,7 @@ use crate::value::Value;
 pub const CODE: &str = "structure-templates/1";
 
 /// What a reader needs to read a dictionary, written at its head.
-pub const LEGEND: &str = "# .k: a template's k-th node in preorder, .1 its root; $: a slot, filled in order by each use; ~\"x\": the root's value of the same key, then x; ~N\"x\": its first N bytes, then x; .k=Tm: template Tm from .k on; a -Pm-> b [x y]: the run a -> x -> y -> b along pattern Pm\n";
+pub const LEGEND: &str = "# .k: a template's k-th node in preorder, .1 its root; $: a slot, filled by each use in reading order (a nested template's at its .k=Tm line, then edge-line slots); ~\"x\": the value of the same key at the root of the definition the line is in, then x; ~N\"x\": its first N bytes, then x; .k=Tm: Tm's nodes and edges from .k on, values after it given for Tm's root; nN: the node with id N; @k=v: the one node whose identity key k (the header's, first it has) is v, that property left off its card; use: Tm, ids (n1..3,7 by position, or with identity .k=nN for nodes written by id), slot values; a -Pm-> b [x y]: the run a -> x -> y -> b along pattern Pm\n";
 
 const BODY: &str = "# body\n";
 const CHUNK: usize = 60_000;
@@ -193,11 +193,53 @@ impl<'a> Planner<'a> {
         }
     }
 
+    /// The name a template is priced with: its kept name, or the longest
+    /// a new dictionary can give it.
+    fn price_name(&self, t: usize) -> String {
+        if self.cached {
+            format!("T{}", t + 1)
+        } else {
+            bound_name('T', self.found.templates.len())
+        }
+    }
+
+    /// What a use costs beyond its price with the name `T`.
+    fn name_extra(&self, t: usize) -> i64 {
+        let n = self.price_name(t);
+        let c = Cost {
+            bytes: n.len() as u64 - 1,
+            tokens: (notation::Cost::of(&n).tokens).saturating_sub(1),
+        };
+        self.by(c)
+    }
+
+    /// Price every definition as it can be written at most: with the
+    /// longest name, and every template it uses named so too.
+    fn price_definitions(&mut self) {
+        if self.cached {
+            return;
+        }
+        let n = bound_name('T', self.found.templates.len());
+        for t in 0..self.found.templates.len() {
+            let d = tp::definition(
+                self.g,
+                &self.h.names,
+                &self.found.templates[t],
+                &self.found.templates,
+                &n,
+                &|_| n.clone(),
+            )
+            .0;
+            self.found.def_cost[t] = Cost::of(&d);
+        }
+    }
+
     fn select(&mut self) -> Result<()> {
         let n = self.found.templates.len();
         let mut order: Vec<(usize, usize, i64)> = Vec::with_capacity(n);
         for i in 0..n {
             let s = tp::saving(&mut self.found, i);
+            step(self.found.templates[i].count as u64)?;
             order.push((
                 i,
                 self.found.templates[i].nodes(),
@@ -223,7 +265,7 @@ impl<'a> Planner<'a> {
                     continue;
                 }
                 let (pc, uc) = (self.found.plain_cost.get(r), self.found.use_cost.get(r));
-                let gi = self.pair_by(pc) - self.pair_by(uc);
+                let gi = self.pair_by(pc) - self.pair_by(uc) - self.name_extra(i);
                 if gi <= 0 {
                     continue;
                 }
@@ -282,10 +324,16 @@ impl<'a> Planner<'a> {
             u,
             &self.found.templates,
         );
+        let bound = bound_name('T', self.found.templates.len());
         let def2 = Cost::of(
-            &tp::definition(g, &self.h.names, &t2, &self.found.templates, "T", &|_| {
-                "T".into()
-            })
+            &tp::definition(
+                g,
+                &self.h.names,
+                &t2,
+                &self.found.templates,
+                &bound,
+                &|_| bound.clone(),
+            )
             .0,
         );
         let mut delta = self.by(def2) - self.by(self.found.def_cost[t]);
@@ -301,7 +349,9 @@ impl<'a> Planner<'a> {
         if before == after {
             return Ok((delta, t2, def2, costs));
         }
-        for (r, root) in self.used_roots(t) {
+        let used = self.used_roots(t);
+        step(used.len() as u64)?;
+        for (r, root) in used {
             step(1)?;
             let inst = tp::walk(g, &mut self.found.forest, &self.h, root)?;
             let c = Cost::of(&tp::use_text(g, &self.h.names, &t2, &inst, "T"));
@@ -314,6 +364,7 @@ impl<'a> Planner<'a> {
 
     fn nesting(&mut self) -> Result<()> {
         let by_root = self.root_index();
+        step(by_root.len() as u64)?;
         let mut order: Vec<usize> = (0..self.found.templates.len()).collect();
         order.sort_by(|&a, &b| {
             let (x, y) = (&self.found.templates[a], &self.found.templates[b]);
@@ -327,6 +378,7 @@ impl<'a> Planner<'a> {
                 continue;
             }
             let roots = self.used_roots(t);
+            step(self.found.templates[t].count as u64)?;
             if roots.is_empty() {
                 continue;
             }
@@ -450,7 +502,7 @@ impl<'a> Planner<'a> {
                 let p = Cost::of(&tp::plain_text(g, &self.h.names, &inst));
                 self.found.use_cost.set(r, (u.bytes, u.tokens));
                 self.found.plain_cost.set(r, (p.bytes, p.tokens));
-                if self.by(p) > self.by(u) {
+                if self.by(p) > self.by(u) + self.name_extra(t) {
                     self.take(t, r, &ids);
                 }
             }
@@ -465,13 +517,35 @@ impl<'a> Planner<'a> {
         let g = self.g;
         let names = &self.h.names;
         let mut s = String::new();
-        notation::plain_block(g, names, v, &|e| self.omit.contains(&e), &mut s);
+        let _ = notation::plain_block(g, names, v, &|e| self.omit.contains(&e), &mut s);
         if let Some(list) = self.extra.get(&v) {
-            for (pi, c) in list {
-                s.push_str(&chain_use(g, names, c, &pnames(*pi)));
+            // In content order, so the same data under other ids is
+            // written the same.
+            let mut lines: Vec<String> = list
+                .iter()
+                .map(|(pi, c)| chain_use(g, names, c, &pnames(*pi)))
+                .collect();
+            lines.sort();
+            for l in lines {
+                s.push_str(&l);
             }
         }
         s
+    }
+
+    /// The nodes whose blocks a chain changes: where its use is written
+    /// and every source of its edges (under `dir: "in"` that includes its
+    /// far end).
+    fn chain_nodes(&self, c: &Chain) -> Vec<u64> {
+        let mut v = vec![c.from];
+        for &e in &c.edges {
+            if let Some(er) = self.g.edge(e) {
+                v.push(er.from);
+            }
+        }
+        v.sort_unstable();
+        v.dedup();
+        v
     }
 
     fn chains(&mut self) -> Result<()> {
@@ -495,8 +569,11 @@ impl<'a> Planner<'a> {
             let Some(c) = chain_at(g, &self.h, head)? else {
                 continue;
             };
-            let mut ok = self.in_part(c.from) && c.props_free(g);
-            for &x in std::iter::once(&c.from).chain(c.interior.iter()) {
+            // Every node whose block it changes is written plainly and in
+            // the part: an edge a use already writes is never also a
+            // chain's.
+            let mut ok = c.props_free(g);
+            for x in self.chain_nodes(&c) {
                 if !ok {
                     break;
                 }
@@ -529,21 +606,34 @@ impl<'a> Planner<'a> {
                 .cmp(&a.chains.len())
                 .then_with(|| a.id.cmp(&b.id))
         });
-        let provisional = |_: usize| "P0".to_string();
+        // Chains in content order (by the handles of their ends), so what
+        // is tried first does not depend on ids.
+        let names = self.h.names.clone();
+        for pat in pats.iter_mut() {
+            let mut keyed: Vec<(String, String, Chain)> = pat
+                .chains
+                .drain(..)
+                .map(|c| (names.handle(g, c.from), names.handle(g, c.interior[0]), c))
+                .collect();
+            keyed.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+            pat.chains = keyed.into_iter().map(|x| x.2).collect();
+        }
+        // Priced with the longest name a pattern can get.
+        let bound = bound_name('P', pats.len());
+        let provisional = |_: usize| bound.clone();
         for pat in pats {
             let pi = self.pats.len();
             let def = if self.cached {
                 0
             } else {
-                self.by(Cost::of(&format!("P0 #{} {}\n", pat.id, pat.text)))
+                self.by(Cost::of(&format!("{bound} #{} {}\n", pat.id, pat.text)))
             };
             let mut sum = 0i64;
             let mut applied: Vec<Chain> = Vec::new();
             for c in &pat.chains {
                 step(1)?;
-                let nodes: Vec<u64> = std::iter::once(c.from)
-                    .chain(c.interior.iter().copied())
-                    .collect();
+                let nodes = self.chain_nodes(c);
+                step(2 * nodes.len() as u64)?;
                 let before: i64 = nodes
                     .iter()
                     .map(|&v| self.by(Cost::of(&self.block(v, &provisional))))
@@ -596,6 +686,14 @@ impl<'a> Planner<'a> {
     }
 }
 
+/// The longest name the `n`-th of `n` entries can be written with: `T99`
+/// for up to 99 of them. A candidate is priced with it, so it costs at
+/// most what it was priced at once named.
+pub fn bound_name(letter: char, n: usize) -> String {
+    let digits = n.max(1).to_string().len();
+    format!("{letter}{}", "9".repeat(digits))
+}
+
 /// `a -P3-> b [x y]`.
 pub fn chain_use(g: &Graph, names: &Names, c: &Chain, name: &str) -> String {
     let mut s = names.handle(g, c.from);
@@ -612,6 +710,31 @@ pub fn chain_use(g: &Graph, names: &Names, c: &Chain, name: &str) -> String {
     }
     s.push_str("]\n");
     s
+}
+
+/// The names for a text about the part (the whole graph when `None`): the
+/// nodes it writes and the nodes their edges reach.
+fn scope_names(g: &Graph, identity: Vec<String>, part: &Option<HashSet<u64>>) -> Result<Names> {
+    match part {
+        None => Names::scoped(g, identity, None),
+        Some(p) => {
+            if identity.is_empty() {
+                return Names::scoped(g, identity, None);
+            }
+            let mut scope: Vec<u64> = Vec::new();
+            for &id in p {
+                if g.node_shared(id).is_none() {
+                    continue;
+                }
+                scope.push(id);
+                g.for_each_adj(id, Dir::Out, None, |a| scope.push(a.other));
+            }
+            scope.sort_unstable();
+            scope.dedup();
+            step(scope.len() as u64)?;
+            Names::scoped(g, identity, Some(&mut scope.into_iter()))
+        }
+    }
 }
 
 /// The nodes of the part in the order texts write them: by id, or by
@@ -722,11 +845,11 @@ impl Planner<'_> {
         let pname = |i: usize| pnames[i].clone();
         let mut plain = Sink::new(keep);
         let mut compact = Sink::new(keep);
-        plain.put(&format!("# {NOTATION}\n"));
+        plain.put(&self.h.names.header(None));
         let mut dict_out: Option<(Dict, String, String)> = None;
         let anything = !chosen.is_empty() || !self.pats.is_empty();
         if let Some((_, hash)) = kept {
-            compact.put(&format!("# {NOTATION} dictionary {hash}\n"));
+            compact.put(&self.h.names.header(Some(hash)));
         } else if anything {
             let mut d = Dict::default();
             for &i in &chosen {
@@ -740,12 +863,12 @@ impl Planner<'_> {
             }
             let text = d.text(g, &self.h.names);
             let hash = hash_hex(&text);
-            compact.put(&format!("# {NOTATION} dictionary {hash}\n"));
+            compact.put(&self.h.names.header(Some(&hash)));
             compact.put(&text);
             compact.put(BODY);
             dict_out = Some((d, text, hash));
         } else {
-            compact.put(&format!("# {NOTATION}\n"));
+            compact.put(&self.h.names.header(None));
         }
         let mut tally = vec![Tally::default(); self.found.templates.len()];
         let mut pat_tally = vec![(Cost::default(), Cost::default()); self.pats.len()];
@@ -761,7 +884,8 @@ impl Planner<'_> {
         for v in node_order(g, &self.h.names, &self.part)? {
             step(1)?;
             let mut pb = String::new();
-            notation::plain_block(g, &self.h.names, v, &|_| false, &mut pb);
+            let edges = notation::plain_block(g, &self.h.names, v, &|_| false, &mut pb);
+            step(edges)?;
             plain.put(&pb);
             let p = self.pos(v);
             let r = self.root_of.get(p);
@@ -869,7 +993,8 @@ pub fn plan(g: &mut Graph, a: &Args) -> Result<QueryResult> {
     let at = g.log_end();
     let (h, found, cached) = match &kept {
         Some((_, k)) => {
-            let h = k.hier(g);
+            let mut h = k.hier(g);
+            h.names = scope_names(g, h.names.identity.clone(), &part)?;
             let found = match local.take() {
                 Some(f) => find_kept_in(g, &h, &k.dict, f)?,
                 None => find_kept(g, &h, &k.dict)?,
@@ -877,7 +1002,8 @@ pub fn plan(g: &mut Graph, a: &Args) -> Result<QueryResult> {
             (h, found, true)
         }
         None => {
-            let h = Hier::from(g, a)?;
+            let mut h = Hier::from(g, a)?;
+            h.names = scope_names(g, h.names.identity.clone(), &part)?;
             let found = tp::find(g, &h)?;
             (h, found, false)
         }
@@ -905,6 +1031,7 @@ pub fn plan(g: &mut Graph, a: &Args) -> Result<QueryResult> {
         omit: HashSet::new(),
         extra: HashMap::new(),
     };
+    pl.price_definitions();
     pl.select()?;
     if !cached {
         pl.nesting()?;
@@ -918,6 +1045,7 @@ pub fn plan(g: &mut Graph, a: &Args) -> Result<QueryResult> {
     let shorter = w.compact.cost.by(tokens) < w.plain.cost.by(tokens);
     if !shorter {
         pl.in_dict.iter_mut().for_each(|x| *x = false);
+        step((roots + len) as u64)?;
         for r in 0..roots {
             pl.used.set(r, false);
         }
@@ -947,6 +1075,7 @@ pub fn plan(g: &mut Graph, a: &Args) -> Result<QueryResult> {
     let hash = match (&kept, &w.dict) {
         (Some((_, k)), _) => Value::Text(k.meta.hash.clone()),
         (None, Some((_, _, h))) => Value::Text(h.clone()),
+        _ if store.is_some() => Value::Text(hash_hex(&Dict::default().text(pl.g, &pl.h.names))),
         _ => Value::Null,
     };
     let uses: u64 = w.tally.iter().map(|t| t.uses).sum::<u64>()
@@ -957,6 +1086,9 @@ pub fn plan(g: &mut Graph, a: &Args) -> Result<QueryResult> {
         Some("dictionary") => Value::Text(match (&kept, &w.dict) {
             (Some((_, k)), _) => k.text.clone(),
             (None, Some((_, t, _))) => t.clone(),
+            // Nothing chosen: what `store:` keeps is the dictionary with no
+            // entries, its legend alone.
+            _ if store.is_some() => Dict::default().text(pl.g, &pl.h.names),
             _ => String::new(),
         }),
         _ => Value::Null,
@@ -1002,6 +1134,11 @@ pub fn plan(g: &mut Graph, a: &Args) -> Result<QueryResult> {
             None => Vec::new(),
         },
     };
+    let dict_pos: HashMap<usize, usize> = dict_names
+        .iter()
+        .enumerate()
+        .map(|(k, &i)| (i, k))
+        .collect();
     let mut nested_in = vec![0i64; n];
     for &i in &dict_names {
         for &(_, u) in &pl.found.templates[i].nested {
@@ -1012,10 +1149,26 @@ pub fn plan(g: &mut Graph, a: &Args) -> Result<QueryResult> {
     for i in 0..n {
         let t = &pl.found.templates[i];
         let chosen = pl.in_dict[i];
+        // Chosen: as written, with the names the dictionary gives; not
+        // chosen: as it was priced, with the longest name it could get.
         let def = if cached {
             Cost::default()
+        } else if let Some(&k) = dict_pos.get(&i) {
+            let short = |u: usize| format!("T{}", dict_pos.get(&u).map_or(0, |x| x + 1));
+            Cost::of(
+                &tp::definition(
+                    gr,
+                    &names,
+                    t,
+                    &pl.found.templates,
+                    &format!("T{}", k + 1),
+                    &short,
+                )
+                .0,
+            )
         } else {
-            Cost::of(&tp::definition(gr, &names, t, &pl.found.templates, "T", &|_| "T".into()).0)
+            let b = bound_name('T', n);
+            Cost::of(&tp::definition(gr, &names, t, &pl.found.templates, &b, &|_| b.clone()).0)
         };
         let (count, used, plain) = if chosen {
             let tl = w.tally[i];
@@ -1086,7 +1239,12 @@ pub fn plan(g: &mut Graph, a: &Args) -> Result<QueryResult> {
         let def = if cached {
             Cost::default()
         } else {
-            Cost::of(&format!("P{} #{} {}\n", pi + 1, p.id, p.text))
+            let k = w
+                .dict
+                .as_ref()
+                .and_then(|(d, _, _)| d.patterns.iter().position(|(id, _)| *id == p.id))
+                .unwrap_or(pi);
+            Cost::of(&format!("P{} #{} {}\n", k + 1, p.id, p.text))
         };
         let (before, after_) = w.pat_tally[pi];
         let sb = before.bytes as i64 - after_.bytes as i64 - def.bytes as i64;
@@ -1204,7 +1362,7 @@ pub fn plan(g: &mut Graph, a: &Args) -> Result<QueryResult> {
             if k.fresh {
                 "fresh"
             } else {
-                "stale: the database has changed since (every use was checked against the graph)"
+                "stale: the database has changed since (every use agrees with the graph now in everything its definition says)"
             }
         ));
     }
@@ -1346,7 +1504,7 @@ impl DictMeta {
 }
 
 pub fn encode_template(t: &Template) -> Vec<u8> {
-    let mut b = vec![1u8];
+    let mut b = vec![2u8];
     codec::put_str(&mut b, &t.id);
     b.extend_from_slice(&t.group.to_be_bytes());
     b.extend_from_slice(&t.shape.to_be_bytes());
@@ -1393,6 +1551,7 @@ pub fn encode_template(t: &Template) -> Vec<u8> {
         codec::put_u32(&mut b, s.edge);
         codec::put_u32(&mut b, s.key);
     }
+    put_list(&mut b, &t.handles);
     b
 }
 
@@ -1435,7 +1594,7 @@ fn get_prop(r: &mut Reader<'_>) -> std::result::Result<Prop, String> {
 pub fn decode_template(b: &[u8]) -> Option<Template> {
     let mut r = Reader::new(b);
     let go = |r: &mut Reader<'_>| -> std::result::Result<Template, String> {
-        if r.u8()? != 1 {
+        if r.u8()? != 2 {
             return Err("version".into());
         }
         let id = r.string()?;
@@ -1500,6 +1659,7 @@ pub fn decode_template(b: &[u8]) -> Option<Template> {
                 key: r.u32()?,
             });
         }
+        let handles = get_list(r)?;
         Ok(Template {
             id,
             group,
@@ -1510,6 +1670,7 @@ pub fn decode_template(b: &[u8]) -> Option<Template> {
             props,
             edges,
             nested,
+            handles,
             slots,
             start: 0,
             count: 0,
@@ -1674,6 +1835,7 @@ pub fn load_with(
                         props: Vec::new(),
                         edges: Vec::new(),
                         nested: Vec::new(),
+                        handles: Vec::new(),
                         slots: Vec::new(),
                         start: 0,
                         count: 0,
@@ -1797,7 +1959,18 @@ pub fn find_kept_in(g: &Graph, h: &Hier, d: &Dict, mut forest: Forest) -> Result
         let inst = tp::walk(g, &mut forest, h, id)?;
         let st = tp::structure(&inst);
         if let Some(&i) = by_group.get(&sip128(&st)) {
-            if tp::matches(&d.templates[i], &inst, &st).is_ok() {
+            let t = &d.templates[i];
+            // Everything the definition says must be true now, what it
+            // says of the nodes it refers to as well: a node it names
+            // `@code="TL-01"` must still be the one node named so here.
+            let refs_hold = t.edges.iter().enumerate().all(|(j, e)| match e.to {
+                tp::To::Node(n) => t
+                    .handles
+                    .get(j)
+                    .is_some_and(|hd| *hd == h.names.handle(g, n)),
+                tp::To::Pos(_) => true,
+            });
+            if refs_hold && tp::matches(t, &inst, &st).is_ok() {
                 per[i].push(id);
             }
         }
