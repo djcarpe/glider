@@ -449,6 +449,17 @@ of disk for every size and engine at once.
 | `bench/wasm/` | glider and SQLite as WebAssembly in a browser worker |
 | `bench/results/` | raw results of every run described here |
 
+## A manufacturing graph with known answers
+
+`mfg-gen` generates a plant hierarchy (plants down to work instructions)
+from a seed and a size, with many stations built from a handful of designs,
+shared tools and instructions, effectivity dates, dependencies and topic
+vocabularies, and writes beside it the truth (which stations share a design,
+planted duplicates and look-alikes, topic groups, faults) and questions with
+expected answers. `mfg-bench` loads it and records the baseline the
+derived-data work is measured against. Formats, method and numbers:
+`bench/KNOWLEDGE.md`; raw results: `bench/results/mfg.jsonl`.
+
 ## Neo4j, on its own example graphs
 
 `bench/neo4j_bench.py` loads Neo4j's `recommendations` (28,863 nodes /

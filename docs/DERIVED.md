@@ -315,6 +315,9 @@ note. The benchmark below decides, and its results are recorded in
 
 ## Benchmark
 
+*Built (G3): the generator, its truth and questions, and the harness's
+skeleton with today's baseline. Described in `bench/KNOWLEDGE.md`.*
+
 `bench/` gains a generator for a manufacturing graph and a harness over it.
 
 The graph: plants, shops, lines, stations, sides, work locations, work
@@ -336,6 +339,28 @@ Measured, at several sizes, against that truth:
   vectors, and the cost of an update after a small change against a full run;
 - change tracking: write throughput with and without `changes`;
 - integrity: time for `check.run` and that planted faults are all found.
+
+What is true now:
+
+- `mfg-gen --nodes N --seed S [--faults]` writes `graph.jsonl`,
+  `truth.jsonl` and `questions.jsonl`, streaming: the generator holds the
+  catalogue, the designs and one record per line, under 10 MB at ten million
+  nodes. The output is byte-identical for the same arguments (a checksum is
+  pinned in a test, and is the same on Rust 1.74 and current stable).
+- Node and edge ids are written in order from 1, so the truth and questions
+  name ids that an import into an empty database reproduces; `code` and
+  `number` properties identify nodes across databases, for `identity:` (D7).
+- Decided here: one station in eight deviates from its design, by one extra
+  work element or one missing tool; designs are 3 for a few hundred nodes,
+  growing with the square root of the station count to 24; planted
+  duplicates are not used by work elements (they hang off the catalogue
+  exactly as their originals do), so only their properties and their
+  neighbours, not their degree, give them away; look-alikes include the
+  same design element's instruction at two stations, which is identical text
+  under a different number and must never be merged (D1).
+- `mfg-bench` records load, `STATS`, `context.retrieve` from anchors and from
+  words at three budgets, `pagerank` and `communities`, on both tiers;
+  a measurement is added by adding a function to its `MEASURES` list.
 
 ## Slices
 

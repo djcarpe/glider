@@ -1,0 +1,3 @@
+//! Shared code for the benchmark binaries and their tests.
+
+pub mod mfg;
