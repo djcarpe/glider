@@ -158,8 +158,9 @@ pub fn spent(n: u64) -> bool {
 /// Steps counted in a local variable and passed to the meter [`CHUNK`] at a
 /// time, for loops too tight to count each step through the thread-local
 /// meter. A stop is noticed when a batch is passed, so at most `CHUNK`
-/// steps (plus the last count) go by after the budget is spent. What is
-/// left when it is dropped is passed on then.
+/// steps (plus the last count) go by after the budget is spent. The fewer
+/// than `CHUNK` steps still in it when it goes out of scope are not passed
+/// on: a `Drop` that did so cost a tight loop a third of its speed.
 #[derive(Debug, Default)]
 pub struct Tally(u64);
 
@@ -184,16 +185,10 @@ impl Tally {
 
     /// Passes the steps counted so far to the meter; true once the
     /// statement must stop.
+    #[cold]
+    #[inline(never)]
     pub fn flush(&mut self) -> bool {
         spent(std::mem::take(&mut self.0))
-    }
-}
-
-impl Drop for Tally {
-    fn drop(&mut self) {
-        if self.0 > 0 {
-            self.flush();
-        }
     }
 }
 

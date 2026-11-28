@@ -14,8 +14,8 @@
 //! another, the same on every tier. Steps are counted in a local
 //! [`Tally`] and reach the meter [`crate::meter::CHUNK`] at a time, so at
 //! most that many steps, plus one node's neighbour list (or, where an
-//! algorithm resets per-node arrays, one pass over them), happen between
-//! two looks at it. Once the budget is spent an algorithm returns with
+//! algorithm goes over every node doing a constant amount for each, that
+//! one pass), happen between two looks at it. Once the budget is spent an algorithm returns with
 //! whatever partial state it has; the statement then fails with the
 //! budget's error and nothing it computed is used. Outside a metered
 //! statement nothing stops.
@@ -421,10 +421,11 @@ pub fn pagerank<A: Adjacency + ?Sized>(
         iterations = it + 1;
         // Dangling nodes redistribute their mass evenly.
         let mut dangling = 0.0;
+        // a pass over every node, counted at once
+        if tally.spent(n as u64) {
+            break 'run;
+        }
         for v in 0..n {
-            if tally.spent(1) {
-                break 'run;
-            }
             if deg.get(v) == 0 {
                 dangling += rank.get(v);
             }
@@ -446,10 +447,10 @@ pub fn pagerank<A: Adjacency + ?Sized>(
             });
         }
         delta = 0.0;
+        if tally.spent(n as u64) {
+            break 'run;
+        }
         for v in 0..n {
-            if tally.spent(1) {
-                break 'run;
-            }
             delta += (rank.get(v) - next.get(v)).abs();
         }
         rank.swap(&mut next);
@@ -641,10 +642,12 @@ pub fn components<A: Adjacency + ?Sized>(a: &A) -> (StateVec<u64>, u64) {
     let mut count = 0u64;
     let mut q: SpillQueue<u64> = SpillQueue::new();
     let mut tally = Tally::new();
+    // the pass over every node, counted at once; the searches count as
+    // they go
+    if tally.spent(n as u64) {
+        return (comp, count);
+    }
     'run: for s in 0..n {
-        if tally.spent(1) {
-            break;
-        }
         if comp.get(s) != NONE {
             continue;
         }

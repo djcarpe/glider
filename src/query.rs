@@ -1621,11 +1621,15 @@ pub fn edge_value(g: &Graph, id: u64) -> Value {
 /// Caps on one materialized response. Cursor caps apply to each batch.
 ///
 /// `max_millis` and `max_steps` bound the statement itself, not its result:
-/// matching stops with an error, and the graph is released, once the
-/// statement has run that long or taken that many matching steps (a step is
-/// one candidate checked, one edge scanned, one neighbour looked at or one
-/// combination of pattern parts tried, whether it matches or not). `max_millis` needs a clock and is ignored
-/// on wasm32; `max_steps` works everywhere.
+/// the statement stops with an error, rolls back, and the graph is
+/// released, once it has run that long or taken that many steps. A step is
+/// one node or one edge looked at, whether it matters or not: in a query a
+/// candidate checked, an edge scanned, a neighbour looked at or a
+/// combination of pattern parts tried; in a `CALL` (a built-in algorithm, a
+/// walk, an extension procedure) a node taken up or an edge followed; an
+/// extension function evaluated for a row. The same count bounds all of
+/// them ([`crate::meter`]). `max_millis` needs a clock and is ignored on
+/// wasm32; `max_steps` works everywhere.
 #[derive(Clone, Copy, Debug)]
 pub struct QueryLimits {
     pub max_rows: usize,
