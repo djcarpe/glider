@@ -81,6 +81,51 @@ transaction of `CREATE` / `DROP` / `ALTER EXTENSION`; `wants_writes` and
 (`src/ext/context.rs`, `src/ext/text.rs`) uses all of them and is the
 worked example.
 
+### Budgets
+
+A procedure runs under the same two budgets as a built-in algorithm, and has
+nothing to set up for either.
+
+- **Memory.** `call` runs inside the graph's algorithm memory
+  (`Graph::algorithm_memory()`, `work_mem` for a file). The spilling types in
+  `glider::ooc` (`StateVec`, `SpillQueue`, `SpillStack`) stay in memory while
+  they fit and spill to the database's own temporary directory
+  (`Graph::temp_dir()`, `<db>-tmp/` for a file) past it, exactly as they do
+  for `CALL pagerank()`. Use them for anything sized by the graph.
+- **Time and steps.** The statement's `max_millis` and `max_steps` hold for a
+  procedure as for a query. A *step* is one node or one edge looked at,
+  whether it turns out to matter or not. Count them and return the error you
+  get back:
+
+  ```rust
+  for id in page {
+      ext::step()?;          // one node
+      // ... look at it, and at its edges:
+      ext::steps(edges)?;    // one per edge
+  }
+  ```
+
+  `ext::steps` is one thread-local decrement, and never fails outside a
+  metered statement. In a loop too tight even for that, count into a local
+  `glider::meter::Tally` (`tally.spent(n)` is true once the statement must
+  stop), which passes the steps on 256 at a time. In a callback that cannot
+  return an error, `ext::spent(n)` counts and says whether to stop; the stop
+  sticks, so the next `steps` returns the error.
+- **Functions** cannot return an error. Each evaluation counts one step by
+  itself; one that does more counts it with `ext::spent(n)`, and the
+  statement stops at its next step.
+
+Built-in algorithms called from a procedure (`glider::algo::pagerank` over
+`g.projection(...)`) count their own steps. A procedure that carries on after
+a stop, or returns normally from one, still fails: the statement ends with
+the budget's error whatever the procedure returned, and rolls back, so a
+procedure stopped part-way has written nothing. Inside `BEGIN`, a stopped
+statement that had written anything rolls the open transaction back with it
+(the error says so); one that had written nothing leaves it open.
+
+`max_millis` needs a clock, so it is not kept on wasm32, for procedures as for
+queries; `max_steps` is kept everywhere.
+
 ## `context`: graph retrieval for language models
 
 A model asked about a knowledge graph needs a small, relevant, faithful slice
@@ -196,3 +241,7 @@ under 300 MB.
 - `CALL context.index()` builds in one transaction, and its log holds every
   posting until the next checkpoint (about 0.5 GiB for the 8.6M postings in
   the benchmark).
+- Every `context` procedure keeps the statement budget: a step is a node
+  scanned, pushed or admitted, an edge looked at, or a posting read or
+  written by the text index. `context.index()` stopped by its budget leaves
+  no index (it builds in one transaction).

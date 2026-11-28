@@ -90,21 +90,97 @@ durable, and older builds move it as well. An in-memory graph without a log
 has no such position. The slice that builds this decides the mechanism; D2 is
 the test.
 
-## Budgets for procedures
+## Budgets for procedures (*built*, G2)
 
-Today the statement budget (`max_millis`, `max_steps`) is checked only while
-matching patterns. `CALL pagerank()` and `CALL context.retrieve()` run to
-their end whatever the caller asked for, and an extension procedure does not
-get the spilling memory budget the built-in algorithms get.
+The statement budget (`QueryLimits::max_millis`, `max_steps`) holds for every
+`CALL` as it does for a query, and an extension procedure gets the spilling
+memory budget a built-in algorithm gets.
 
-After this slice:
+**What a step is.** One node or one edge looked at, whether it turns out to
+matter or not. In a query: a candidate checked, an edge scanned, a neighbour
+looked at, a combination of pattern parts tried (as before). In a `CALL`: a
+node an algorithm or walk takes up, each edge it follows, each node a scan
+reads, each per-node array entry a reset or a sort goes over, each node a
+result is written back to; in the text index a posting read or written. An
+extension function evaluated for a row is one step. Algorithms count the same
+steps on the in-memory and paged tiers: the views do not count, the
+algorithms do.
 
-- every loop over nodes or edges in an algorithm, a walk or an extension
-  procedure counts steps against the statement budget, and stops with the
-  same `statement stopped` error a query gets;
-- an extension procedure runs with the same memory budget and spill directory
-  as a built-in algorithm, without asking;
-- an extension has a public way to count a step.
+**The meter** is `src/meter.rs` (public as `glider::meter`, re-exported as
+`glider::ext::{step, steps, spent, check, stopped}`). It is per thread, set
+around a statement by `execute_capped` and `Cursor::open`. `steps(n)` is one
+thread-local decrement of a credit of at most 256 steps; when the credit is
+used up the meter is looked at, the clock read, and more credit handed out.
+Tight loops count into a local `meter::Tally` and pass steps on 256 at a
+time. Once the budget is spent the statement is *stopped*, and stays stopped:
+every later count fails, so code that could not return the error where it
+noticed (a callback, an extension function, an algorithm with no `Result`)
+stops at its next count. The statement checks at its end and fails with the
+budget's error whatever the procedure returned. The error is the one a query
+gets, word for word (`statement stopped: it took more than its budget of N
+matching steps`, `... ran past its time budget of N ms`), so callers that
+match on it need no change.
+
+**The bound.** Between two looks at the meter (and the clock) at most 256
+steps happen, plus the work of one count: one node's neighbour list, a page
+of 4,096 node ids while a projection is built, or, in the few places that go
+over every node at once doing a constant amount for each, one such pass
+(resetting the arrays per source in betweenness and closeness, pagerank's two
+sums per iteration, the components scan for unvisited nodes, k-core's bucket
+sort, the topological sorts' and label propagation's setup). A stop therefore comes within one adjacency list or one
+array pass of the budget. Measured on a 200,000-node, 1,000,000-edge graph
+(`tests/statement_budget.rs`), a 50 ms budget returned at 50.0 to 51.8 ms for
+pagerank and betweenness (hours unbounded), a whole-graph BFS by the local
+walk and by the paged projection (0.35 s), `context.retrieve` (2.5 s) and
+`context.index` (1.5 s).
+
+**Leaving nothing behind.** A stopped statement rolls back like any failed
+one: a stopped `CALL pagerank(write: "rank")` has written no `rank` (tested at
+every point it can stop, computing or writing), a stopped `context.index()`
+leaves no index. Inside `BEGIN` a failed statement does not normally undo
+what it wrote; a *stopped* one that had written anything rolls the open
+transaction back and says so, so that half of a procedure cannot be
+committed. One that had written nothing leaves the transaction open. A
+stopped algorithm returns early with partial state that nothing uses; a
+stopped projection build returns an empty projection; a stopped local walk
+ends as if finished, so no whole-graph fallback starts. The memory and spill
+files it held are freed when it returns (`tests/procedure_memory.rs`).
+
+**Memory for extensions.** `ext::call` runs the procedure inside
+`ooc::with_budget(g.algorithm_memory(), g.temp_dir(), ...)`, so `StateVec`,
+`SpillQueue` and `SpillStack` spill to `<db>-tmp/` past `work_mem` exactly as
+they do for `CALL pagerank()`.
+
+**Without a budget** nothing changes: no result differs (every existing test
+passes untouched, and every algorithm on every tier answers byte for byte the
+same under a budget it does not reach), and counting costs one thread-local
+decrement per count. Measured with `bench/src/bin/algobench.rs` on a shared,
+busy machine, the algorithms themselves (`CORE=1`: the engine's code against
+a copy of the code before this slice, on one in-memory projection,
+interleaved run by run, fastest of 40 runs, pinned to one core; the same code
+raced against itself differs by under 2%):
+
+| graph | pagerank (20 iterations) | BFS, whole graph | components |
+|---|---|---|---|
+| 200,000 nodes, 1,200,000 edges | 119 → 115 ms (−3.5%) | 43 → 44 ms (+2 to +4%) | 25 → 25 ms (+1.4%) |
+| 1,000,000 nodes, 2,000,000 edges | 721 → 722 ms (+0.2%) | 183 → 188 ms (+2.9%) | 138 → 142 ms (+3.0%) |
+
+End to end through `CALL` (projection build included), the before and after
+builds differ by less than the machine's noise (±10% between runs). Two
+things the first version got wrong, for whoever counts in a hot loop next:
+giving `Tally` a `Drop` that passed on its remainder made pagerank 2.3 times
+slower (the drop flag and the call kept the count out of registers), and
+counting each node of a pass that does a constant amount per node cost
+pagerank 4 to 7%; such passes are counted at once.
+
+**wasm.** There is no clock on wasm32, so `max_millis` is not kept there, for
+procedures as for queries; `max_steps` is kept everywhere.
+
+**Not covered.** `CREATE EXTENSION`'s install hook and `on_node_write` are
+part of a write and bounded by it, not by the meter. `utils::Digraph` is Rust
+API only, not reachable from a statement. Cancelling from another thread,
+progress reports and slicing a procedure with `after:`/`limit:` are later
+slices.
 
 ## Write hooks for edges and bulk paths
 
