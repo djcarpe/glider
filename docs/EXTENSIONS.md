@@ -524,3 +524,101 @@ rows, byte for byte, in memory and from a file.
 - The edges of one node are read once per round; a colouring at depth `d`
   reads the adjacency `d` times.
 - Measured on the manufacturing graph: `bench/KNOWLEDGE.md`, "Structure".
+
+## `vector`: vectors beside the graph
+
+To find things by meaning rather than by words, an application gives nodes
+a vector (from a text model over a node's description, or computed from
+the graph) and looks for the nearest ones to a question's vector. `vector`
+keeps those vectors beside the graph, in named spaces, as packed 32-bit
+floats, and says which of them no longer match what they were made from.
+
+```
+CREATE EXTENSION changes        so that staleness can be known (recommended)
+CREATE EXTENSION vector
+CALL vector.create(space: "text", dims: 384, metric: "cosine", labels: ["WorkInstruction"],
+                   model: "my-model", model_version: "3", at: "2026-11-28")
+CALL vector.put(space: "text", ids: [12, 13], vectors: [[...], [...]], hashes: ["9f2c", "41aa"])
+CALL vector.search(space: "text", vector: [...], top: 10)                     id, score, state
+CALL vector.search(space: "text", vector: [...], top: 10, labels: ["WorkInstruction"], min_score: 0.4)
+CALL vector.similar(space: "text", id: 12, top: 10)                          from a stored vector
+CALL vector.stale(space: "text")                                             what to put again
+CALL vector.hashes(space: "text", ids: [12, 13])                             the stored source hashes
+CALL vector.get(space: "text", ids: [12])     CALL vector.delete(space: "text", ids: [12])
+CALL vector.spaces()                          CALL vector.drop(space: "text")
+```
+
+**A space** is made once with everything that decides whether two vectors
+may be compared and where they came from: `dims`, `metric` (`cosine`,
+`dot` or `l2`; default `cosine`), `normalized` (store unit vectors; a put
+normalises them), `of` (`node`, `edge`, or `key` for vectors about a group
+or a whole graph that you name with a string; default `node`), `labels`
+(the nodes expected to have a vector), `algorithm`, `config`, `model`,
+`model_version`, `code` (your application's version) and `at` (a time you
+supply; the engine records none). It cannot be changed: a different
+definition under the same name is refused, so drop the space and make it
+again. `vector.spaces()` lists every space with its definition, how many
+vectors it holds, their bytes and the revision it last changed at.
+
+**Putting vectors.** `ids:` (node or edge ids, or `n12` / `e12` handles)
+or, in a key space, `keys:`, with one vector each and optionally one source
+hash each, up to 10,000 a call. A put is all or nothing: a vector of the
+wrong length, a value that is not a finite 32-bit float, an id that does
+not exist, an id given twice, or an all-zero vector in a cosine or
+normalised space is refused and nothing is written. Pass a hash of the
+text (or whatever) you made the vector from: when it equals the stored
+one, the put only records that the vector is current (pass `null` for the
+vector to skip sending it), and `vector.hashes` gives the stored hashes so
+you can tell which sources changed without the engine seeing your text.
+
+**Searching** is exact: every candidate is scored and the best returned,
+ties to the lower id. Higher scores are closer for every metric: cosine
+similarity, the dot product, or the negated Euclidean distance for `l2`
+(so `min_score: -0.5` keeps vectors within 0.5). A query of the wrong
+length is refused. `labels:` restricts a node space's candidates to nodes
+with one of the labels. `similar` searches from a stored vector, in its
+own space or, with `in:`, in another space whose dimensions, metric,
+algorithm, model and model version agree; vectors from different models
+are never compared. A search returns ids and scores, never a node: ask the
+graph what a node is.
+
+**Staleness.** Each result row says whether its vector is `fresh`,
+`stale` (its node or edge changed after it was put) or `unknown` (the
+engine cannot tell: `changes` is not installed, or cannot answer for when
+the vector was put, or, for a key, anything changed since). The message
+says how many of the space's vectors are stale, missing (a node of the
+space's labels without one) or unknown; `fresh: "require"` turns any of
+them into an error. `vector.stale` lists them, in slices (`limit:`, then
+`after:` as its message says), with why. Install `changes` before putting
+vectors: a vector put before the journal existed stays unknown until it is
+put again. The usual round: `vector.stale`, recompute those ids'
+sources' hashes, `vector.hashes` to see which differ, put those again with
+their vectors and the rest with `null` and their unchanged hash.
+
+**What happens to vectors when the graph changes.** A deleted node's
+vectors go with it, and a deleted edge's, in the same transaction. `CLEAR`
+removes every vector and keeps the spaces, empty. `DROP EXTENSION vector`
+removes everything. Images, replicas and crash recovery hold the same
+vectors and give the same answers as their source. `check.run` checks the
+vectors (an id that does not exist, a wrong length, a value that is not
+finite, a revision past the database's, a count that disagrees).
+
+**What it costs.** 4 bytes a dimension and 48 bytes a vector beside (plus
+its hash), against 9 a dimension as a list property; a search reads every
+candidate's floats, and counting how fresh the space is reads every
+vector's metadata and journal entry as well. Measured in
+`bench/KNOWLEDGE.md`, "Vectors". A database with the extension and no
+space pays nothing on writes; with a space, node deletes (and edge
+deletes, with an edge space) look up and remove their vectors.
+
+### Limits
+
+- Exact search only: its time grows with the space. There is no
+  approximate index yet.
+- `labels:` applies to node spaces; an edge space cannot say which edges
+  should have a vector.
+- A node's vector is stale when the node's labels or properties change,
+  not when its edges do.
+- A space cannot be altered, only dropped and made again.
+- Staleness needs `changes`, and is as good as what it can answer for
+  (its cap and `release` push old changes out: such vectors turn unknown).
