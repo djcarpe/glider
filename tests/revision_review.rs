@@ -199,10 +199,6 @@ fn a_workload_of_writes_that_change_nothing_agrees_across_source_recovery_and_re
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Point 2 on the memory tier, and point 5: a memory graph that committed
-/// without a log, then enabled one, then replicated; restored to memory
-/// and to a file, it matches.
-
 /// A memory graph that committed without a log, then enabled one: a base
 /// taken right after, and the log shipped later, restore to memory and to a
 /// file matching the source.
@@ -312,9 +308,6 @@ fn a_statement_that_runs_out_of_memory_leaves_the_revision_and_the_replica_agree
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Point 1, file tier: inside BEGIN, a failed value check, a checkpoint
-/// asked for inside the transaction, a commit, then a crash.
-
 /// Inside BEGIN: no-op sets with real ones, a refused value, a checkpoint
 /// asked for mid-transaction; then a statement that writes and fails; a crash
 /// copy recovers to the same content and revision.
@@ -357,9 +350,6 @@ fn a_transaction_with_a_refused_value_and_a_checkpoint_inside_recovers_exactly()
     drop((g, c));
     let _ = std::fs::remove_dir_all(&root);
 }
-
-/// The note's claim that a memory graph without a log counts what a file
-/// would, for a long history across segments and checkpoints.
 
 /// Over a long history across segments and checkpoints, a memory graph
 /// without a log counts exactly what a file and a logged memory graph log.
