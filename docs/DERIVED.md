@@ -559,7 +559,16 @@ the user-facing description is in `docs/EXTENSIONS.md`, "Templates".
   with these; template plus differences for deviations; numbering siblings
   so that id lists fold into longer runs.
 - **On the manufacturing graph** (`bench/KNOWLEDGE.md`, "Templates";
-  `bench/tests/mfg_templates.rs`): see the numbers there.
+  `bench/tests/mfg_templates.rs`): at 10k, 100k and 1M nodes, on both
+  tiers, every design is a template whose instances are exactly its
+  stations without a deviation (6, 17 and 24 of them) and no deviating
+  station is an instance of its design's; side, location and element
+  templates are found and nested (151 of 467 chosen at 1M); the 8-hop
+  hierarchy path is the first pattern; the whole graph planned takes 18-23%
+  of its plain tokens (103M to 18.3M at 1M, dictionary 0.6M), a station
+  written with the kept dictionary 12-16%; every instance of the kept
+  dictionary (192,865 at 1M) expands exactly. A plan of the 1M graph takes
+  78-87 s and 115 MB.
 
 Built-in algorithms gain three names beside the existing ones:
 `CALL louvain()` (communities by modularity, deterministic, with levels),

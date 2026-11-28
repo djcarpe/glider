@@ -162,7 +162,7 @@ second:
 
 ```
 mfg-bench --data DIR [--tiers memory,file] [--budgets 250,1000,4000]
-          [--only stats,retrieve,pagerank,communities,check,structure] [--out FILE] [--label NAME] [--detail]
+          [--only stats,retrieve,pagerank,communities,check,structure,templates] [--out FILE] [--label NAME] [--detail]
 ```
 
 For each tier it imports `graph.jsonl` with the streaming importer, then runs
@@ -182,6 +182,11 @@ every measurement in `MEASURES`, appending JSON lines to
 
 | `structure.colors` | `what: "colours per depth"`: `depths` as `[depth, colours over every node, colours among stations]` to depth 5; `what: "design recovery"` at depths 1 to 4: the colouring kept (`kept`), read back in slices (`read_ms`, `read_slices`) and scored (`stations`, `station_colours`, `designs`, `designs_whole`, `designs_alone`, `deviated`, `deviated_apart`, `exact`); `what: "stable"`: `depth: "stable"`, its depths and message. Each with `ms`, `rss_before_mb`, `rss_added_mb` |
 | `structure.classes` | `by: "neighbours"` per catalogue label, on the properties its duplicates agree on: `classes`, `planted` / `found` / `hit` / `exact` (pairs, the truth's pairs closed under "duplicate of the same original"), `lookalikes`, `lookalikes_reported`, `sizes` (`[size, classes]`, singletons included); `by: "colors"` over the kept depth-4 colouring of stations: `sizes`. Each with `ms` and memory |
+
+| `structure.templates` | over `HAS_PLANT` ... `HAS_INSTRUCTION` outwards: `what: "design recovery"` (roots of `Station`): `templates`, `designs`, `designs_eligible` (two or more stations without a deviation), `designs_recovered` (exactly one template's instances), `deviated`, `deviated_in_design` (deviated stations among a design's template's instances: must be 0), `deviation_templates`, `exact`, `instances_ms`/`instances_calls` to list every instance; `what: "all shapes"` (every root): `templates`, `by_root` as `[label, templates, instances, largest]` |
+| `structure.paths` | `what: "patterns"`: the first pattern (`top`, `top_hops`, `top_paths`, `top_maximal`); `what: "chains"`: chains in the first slice |
+| `structure.plan` | `what: "whole graph"`, kept as `mfg`: `plain_*`, `compact_*`, `dictionary_*` (bytes and tokens), `saving_tokens`, `uses`, `templates_chosen`, `templates_nested`, `nested_standalone_uses`, `patterns_chosen`, `candidates`; `what: "one station"` / `"one line"` (the first station without a deviation and its line, with everything below): `plain_*`, `alone_*` (planned with its dictionary inline), `kept_*` (written with the kept dictionary, not repeated), `ms_alone`, `ms_kept` |
+| `structure.expand` | every instance of the kept dictionary, expanded 1,000 roots a call and compared with the graph: `templates`, `instances`, `exact`, `all_exact`, `ms`, `calls`, memory, `list_ms`/`list_calls` |
 
 A later slice adds a measurement by writing `fn(&mut Run) -> Result<(),
 String>` and adding it to `MEASURES`: `Run` gives the loaded graph, the
@@ -389,3 +394,94 @@ enterprise as its original. At 1M the 454,546 instructions fall into 18
 classes of two and 454,510 alone. A class is a candidate, as `check`'s are:
 two stations of one design are two stations, and a duplicate pair is for a
 person or a rule to decide on; nothing is merged.
+
+## Templates: a repeated shape said once
+
+Measured on the graphs without faults (`n<size>-s1`), release build, one
+run each on a shared machine (`mfg-bench --only templates`; lines labelled
+`g8-templates`). The hierarchy is `HAS_PLANT` ... `HAS_INSTRUCTION`,
+outwards; tools, parts, standards and dependencies are references and
+internal edges of the shapes. Every count, byte and token below is the same
+on both tiers; times are memory / file, in ms unless marked.
+
+**Designs.** Templates of stations, against the truth:
+
+| dataset | stations | designs | recovered | deviated | deviated in a design's template | other station templates |
+|---|---|---|---|---|---|---|
+| n10000-s1 | 328 | 6 | **6 of 6** | 39 | 0 | 2 |
+| n100000-s1 | 2,949 | 17 | **17 of 17** | 350 | 0 | 37 |
+| n1000000-s1 | 28,795 | 24 | **24 of 24** | 3,600 | 0 | 292 |
+
+Every design is a template whose instances are exactly its stations
+without a recorded deviation, and no deviating station is an instance of
+its design's template. The other station templates are stations that
+deviate the same way (the same tool missing from the same element), which
+are alike and say so exactly.
+
+**Smaller shapes.** With every node a possible root: 51 templates at 10k
+(9 of sides, 9 of locations, 25 of work elements with their instructions,
+8 of stations), 219 at 100k, 878 at 1M. The plan nests them in station
+definitions (`.k=Tm`) and uses them on their own for the parts of
+deviating stations they fit: 31 of the 41 chosen templates at 10k are
+nested in others (107 uses on their own), 94 of 149 at 100k (764), 151 of
+467 at 1M (15,800).
+
+**The long path.** The first pattern at every size is the whole hierarchy,
+`(:Enterprise) -HAS_PLANT-> (:Plant) -HAS_SHOP-> (:Shop) -HAS_LINE-> (:Line)
+-HAS_STATION-> (:Station) -HAS_SIDE-> (:Side) -HAS_LOCATION->
+(:WorkLocation) -HAS_ELEMENT-> (:WorkElement) -HAS_INSTRUCTION->
+(:WorkInstruction)`, 8 hops, followed by 4,075 / 45,272 / 454,308 paths:
+one per local instruction. Chains (`-HAS_ELEMENT-> (:WorkElement)
+-HAS_INSTRUCTION->` from a location through an element with one
+instruction, or a station with one side) are chosen only where writing them
+as one hop pays: 1, 4 and 6 patterns.
+
+**Bytes and tokens**, plain against planned:
+
+| dataset | part | plain | planned, dictionary inline | with the kept dictionary | dictionary |
+|---|---|---|---|---|---|
+| n10000-s1 | whole graph (10,055 nodes) | 2.59 MB, 950,841 tokens | 514 KB, 218,405 (23%) | | 49.8 KB, 18,162 |
+| n10000-s1 | one station (40 nodes) | 10,514 B, 3,734 | not shorter: plain | 905 B, 441 (12%) | |
+| n10000-s1 | one line (345 nodes) | 90,056 B, 31,947 | 56,835 B, 20,979 (66%) | 13,896 B, 5,919 (19%) | |
+| n100000-s1 | whole graph (103,004) | 28.8 MB, 10,395,457 | 4.70 MB, 2,042,178 (20%) | | 310 KB, 113,170 |
+| n100000-s1 | one station (18) | 4,893 B, 1,770 | plain | 480 B, 223 (13%) | |
+| n100000-s1 | one line (361) | 100,826 B, 35,821 | 56,082 B, 20,865 (58%) | 13,318 B, 5,827 (16%) | |
+| n1000000-s1 | whole graph (1,023,660) | 291 MB, 103,283,695 | 42.0 MB, 18,305,719 (18%) | | 1.66 MB, 610,774 |
+| n1000000-s1 | one station (8) | 1,889 B, 683 | plain | 263 B, 109 (16%) | |
+| n1000000-s1 | one line (447) | 126,292 B, 45,525 | 83,710 B, 31,305 (69%) | 10,310 B, 5,034 (11%) | |
+
+(Percentages are of the plain tokens; "one station" is the first station
+without a deviation, a different design at each size.) The whole graph
+written with templates takes a fifth of the tokens, measured by writing
+both. A single station planned alone is not shorter: a dictionary for one
+instance costs more than it saves, so nothing is chosen. With the kept
+dictionary given to the model once, a station is one use line and a line a
+tenth to a fifth of its plain text: that is the case `context`'s compact
+form (G16) is for.
+
+**Expansion.** Every instance of the kept dictionary (2,149 / 18,903 /
+192,865 instances of 41 / 149 / 467 templates, nested ones included)
+expanded and compared with the graph, node, edge and value: **all exact**,
+at every size, on both tiers.
+
+**Time and memory** of the calls (the graph already loaded), memory /
+file, and the resident memory added in memory:
+
+| dataset | station templates | all shapes | patterns | plan, whole graph | plan of a part, alone / kept | expand, every instance | list every instance (calls) |
+|---|---|---|---|---|---|---|---|
+| n10000-s1 | 196 / 204 | 408 / 519 | 30 / 19 | 975 / 593, +1 MB | 508 / 382 | 286 / 361, 41 calls | 581 / 570 (2) |
+| n100000-s1 | 2,632 / 2,096 | 5,175 / 5,508 | 232 / 237 | 6,867 / 7,051, +12 MB | 5,042 / 3,941 | 4,337 / 3,899, 149 calls | 7,788 / 7,277 (2) |
+| n1000000-s1 | 23.6 / 24.2 s | 50.4 / 48.5 s | 2.5 / 2.6 s | 78 / 87 s, +115 MB | 48 / 40 s | 49 / 45 s, 570 calls | 121 / 114 s (3) |
+
+Finding templates is a whole-graph computation, about 50 µs a node at 1M
+with every node a root: the forest (56 bytes a node), then a walk of every
+root whose forest shape repeats, twice more for each group's members, with
+their plain and compact text priced. A plan adds nesting, the chains and
+writing both texts in full (291 MB and 42 MB at 1M, counted, not kept). A
+plan of a few nodes costs what finding templates costs, with or without a
+kept dictionary (its instances are found and checked again each call);
+expansion reads only the shape under each root (about 0.25 ms an instance).
+The memory is the per-node state and the sorts, inside half and a quarter
+of `algorithm_memory()`, spilling past them
+(`forest_state_spills_past_its_budget_with_the_same_hashes`,
+`state_spills_past_the_memory_budget_and_nothing_changes`).
