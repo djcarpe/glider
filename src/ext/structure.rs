@@ -980,8 +980,20 @@ fn at_chain_end(g: &Graph, end: u64) -> bool {
 }
 
 /// Whether a colouring computed at log position `at` still describes the
-/// graph: nothing but this extension's own writes since.
+/// graph. When the change journal is installed and answers for `at`, that
+/// is whether no node or edge changed since (an index, another
+/// extension's writes or a write that changed nothing leave it fresh);
+/// otherwise, whether nothing but this extension's own writes came since.
 fn is_fresh(g: &Graph, at: u64) -> bool {
+    use super::changes::{changed_any, Kind};
+    // A node's labels and properties and its edges are all a colour reads;
+    // every adjacency change is an edge change too.
+    if let (Some(n), Some(e)) = (
+        changed_any(g, at, Kind::Node),
+        changed_any(g, at, Kind::Edge),
+    ) {
+        return !n && !e;
+    }
     match chain(g) {
         Some((from, end)) => from <= at && at_chain_end(g, end),
         None => false,
