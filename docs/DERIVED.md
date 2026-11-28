@@ -324,28 +324,97 @@ CALL changes.release(below: 1500)                 forget changes at or below a r
 - Its cost on a write is one extension record. It is measured in the
   benchmark and stated here.
 
-## `check`: is the graph whole
+## `check`: is the graph whole (*built*)
 
-`glider <db> verify` checks pages and trees. Nothing checks the graph those
-trees hold. `CALL check.run()` does, and repairs nothing:
+`glider <db> verify` checks pages and trees. Nothing checked the graph those
+trees hold. `CALL check.run()` (`CREATE EXTENSION check`) does, and repairs
+nothing (D1): it writes no node, edge or extension record, and the revision
+is the same afterwards, whatever it finds. Its user-facing description is
+in `docs/EXTENSIONS.md`.
 
 | check | what it finds |
 |---|---|
 | `endpoints` | an edge whose source or target node does not exist |
-| `adjacency` | an edge missing from either endpoint's adjacency, or an adjacency entry with no edge |
+| `adjacency` | an edge missing from either endpoint's adjacency or listed there with the wrong far end; an adjacency entry with no edge, or one that is not its edge's (another node, type or direction) |
 | `membership` | a label or type membership entry without its record, or a record missing from its membership |
-| `counters` | label, type and index counts that differ from what a scan counts; id counters behind an existing id |
-| `indexes` | a property index entry that does not match the node, or a node missing from an index it belongs in |
-| `derived` | an extension's derived state older than the changes to its sources, or referring to ids that are gone |
-| `duplicates` | parallel edges with the same endpoints, type and properties; nodes of a label that agree on the properties named in `keys:` |
-| `orphans` | nodes with no edges, optionally of given labels |
-| `required` | nodes of a label lacking an edge the caller says they must have (`label:`, `type:`, `dir:`) |
+| `counters` | label, type, node, edge and index counts (entries and distinct values) that differ from what a scan counts; node, edge and index id counters behind an existing id |
+| `indexes` | a property index entry that does not match the node (gone, without the label or key, under another value), or a node missing from an index it belongs in |
+| `derived` | each installed extension's own check of its derived state: anything that differs from what a rebuild would make, including ids that are gone |
+| `duplicates` | parallel edges with the same endpoints, type and properties; nodes of `label:` that agree on every property in `keys:` |
+| `orphans` | nodes with no edges, optionally of given `labels:` |
+| `required` | nodes of `label:` lacking an edge of `type:` in `dir:` |
 
-It yields `check, severity, kind, id, detail`, takes `checks:` to run a
-subset, `after:` and `limit:` to run in slices, and ends with a summary row
-per check. The first five are faults in the database. The rest are facts
-about the data that an application may or may not consider faults, so they
-run only when asked for.
+What is true now, and what this slice decided where the plan was open:
+
+- **Which run.** With no `checks:`, the first six run: `derived` counts as a
+  check of the database, since derived data that disagrees with its graph
+  is a fault of the database, not a fact about the data. The last three run
+  only when named. Checks always run in the order of the table.
+- **Rows.** `check, severity, kind, id, detail`. Severity is `fault` for the
+  database's checks, `candidate` for the data's, `info` for an installed
+  extension that cannot be checked (not available in this build, or no
+  `check` method), and `summary` for the row that ends each check (`kind`
+  `done` or `partial`, `detail` `{"records":N,"problems":M}`). `id` is a
+  handle (`n12`, `e12`) or the name of the label, type, index, counter or
+  term at fault. Within a check, rows come in the order its walks meet
+  them: trees in key order, so nodes and edges ascending by id (D7).
+- **The extension's half.** `Extension::check(g, probe) -> Result<bool>` is
+  the new optional trait method (default: `false`, "cannot check"). The
+  `context` text index implements it as a comparison with a rebuild that
+  does not rebuild: covered nodes in id order (every posting and length a
+  rebuild writes is there and equal), lengths (each a covered node's),
+  postings term by term (each term's count is its document frequency, each
+  posting's node is covered), document frequencies (each has postings), the
+  totals, and only when the counts show extra postings on covered nodes, a
+  second walk of the postings to name them. A node is named once where it
+  can be: a node deleted below the hooks is named by its length entry, not
+  by each of its postings.
+- **Staleness by comparison, not by revision.** "Derived state older than
+  the changes to its sources" is found by comparing it with the graph,
+  which finds staleness of any age. Comparing revisions needs derived
+  records that carry one (D3), which the text index does not yet; a later
+  slice that adds them can make `derived` cheaper, not more right.
+- **Duplicates.** Naming `duplicates` always runs its parallel-edge half;
+  the node half runs with `label:` and `keys:`. Edge properties are
+  compared exactly, by key; node values as an index compares them (`1`
+  equals `1.0`). Nodes lacking any of the keys are not compared. A group of
+  more than two is reported as each later member against the first.
+- **Slices (D6).** `limit:` caps the records a call looks at and 10,000 the
+  rows it returns; past either the call ends with a `partial` summary whose
+  `id` is a cursor (`check:phase:key:carry`), which `after:` takes back.
+  Running counts (members of the label being counted, entries of the index
+  being counted, the text index's totals) travel in the cursor, so a call
+  holds nothing between slices, and the slices' rows together are exactly
+  one whole run's (`slices_together_report_exactly_what_one_whole_run_reports`,
+  with limits of 1, 2, 7, 50 and 1000 records). Memory per call is a few
+  batches of records; the parallel edges of one node and the members of a
+  label for node duplicates go through an external sort in half of `algorithm_memory()`
+  (64 KiB at least), spilling past it. The node half of `duplicates` sorts
+  again at every slice, so a slice bounds what it reports, not what it
+  reads.
+- **Budgets (G2).** Every record a check looks at passes through one
+  function, `Run::look` in `src/ext/check.rs` (and `Probe::look` for an
+  extension's records); each already returns a `Result`, so counting a
+  statement step per record is one line in each.
+- **How faults were planted in tests** (`tests/check.rs`), since the graph
+  API cannot write one: a bulk load from a source that breaks its contract
+  (an edge to a node it never lists) for `endpoints`; for `adjacency`,
+  `membership`, `counters` and `indexes`, the database file opened with the
+  storage layer below the graph (`storage::db::Db`) and one tree entry or
+  counter deleted, added or changed there, then reopened (the same file
+  loaded into memory gives the same rows); for `derived`,
+  `Graph::ext_write` into the `context` keyspace and writes through
+  `Graph::apply_op`, which runs no hooks.
+- **On the manufacturing graph** (`bench/tests/mfg_check.rs`, and
+  `mfg-bench`'s `check` measurement in `bench/KNOWLEDGE.md`): the database
+  checks find nothing; `orphans` and parallel edges are exactly the planted
+  faults; `duplicates` of `Tool` and `Part` on the properties the truth
+  says their duplicates agree on are exactly the planted pairs and no
+  look-alike. For `WorkInstruction` on `text, revision, scope` the planted
+  pairs are found among thousands of other candidates: the same design
+  element's local instruction at every station of the design is the same
+  text, which the truth lists as look-alikes. No choice of keys separates
+  them; that is why these are candidates and nothing is merged.
 
 ## `structure`: sameness and repetition
 
@@ -562,7 +631,7 @@ tests, and adds its section to `docs/EXTENSIONS.md` and its numbers to
 | G3 | the manufacturing generator and the harness's skeleton | |
 | G4 | edge and bulk write hooks (D5) | |
 | G5 | `changes` | G1, G4 |
-| G6 | `check` | G1 |
+| G6 | `check` (*built*) | G1 |
 | G7 | `structure`: colours, classes, duplicates in `check` | G2 |
 | G8 | `structure`: templates, path patterns, plan, expand | G7 |
 | G9 | `structure`: quotient; `louvain`, `ppr`, `steiner` | G2 |

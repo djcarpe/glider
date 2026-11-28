@@ -122,9 +122,10 @@ ext::register(Arc::new(Geo));
 Optional hooks: `install` / `uninstall` / `upgrade(from)` run in the
 transaction of `CREATE` / `DROP` / `ALTER EXTENSION`; `wants_writes` and
 `on_node_write`, `wants_edge_writes` and `on_edge_write`, and
-`on_bulk_write` maintain derived state. The built-in `context` extension
-(`src/ext/context.rs`, `src/ext/text.rs`) uses all of them and is the
-worked example.
+`on_bulk_write` maintain derived state; `check(g, probe)` compares that
+state with the graph for `CALL check.run()` (below). The built-in `context`
+extension (`src/ext/context.rs`, `src/ext/text.rs`) uses all of them and is
+the worked example.
 
 ## `context`: graph retrieval for language models
 
@@ -242,3 +243,83 @@ under 300 MB.
 - `CALL context.index()` builds in one transaction, and its log holds every
   posting until the next checkpoint (about 0.5 GiB for the 8.6M postings in
   the benchmark).
+
+## `check`: is the graph whole
+
+`glider <db> verify` proves that pages and trees are sound. `check` proves
+that the graph those trees hold agrees with itself, and that what
+extensions derived from it still matches it. It reports and never repairs:
+no node, edge or extension record is written, and the revision is the same
+afterwards.
+
+```
+CREATE EXTENSION check
+CALL check.run()                                            the database's own checks
+CALL check.run(checks: ["orphans"], labels: ["Tool", "Part"])
+CALL check.run(checks: ["duplicates"], label: "Tool", keys: ["kind", "maker", "model", "spec"])
+CALL check.run(checks: ["required"], label: "Station", type: "HAS_SIDE", dir: "out")
+CALL check.run(limit: 100000)                               a slice; continue with after:
+```
+
+| check | finds | severity |
+|---|---|---|
+| `endpoints` | an edge whose source or target node does not exist | fault |
+| `adjacency` | an edge missing from an endpoint's adjacency, an entry naming the wrong far end, an entry with no edge or another edge's | fault |
+| `membership` | a node or edge not listed under its label or type, a label or type entry without its record | fault |
+| `counters` | a label, type, node, edge or index count that differs from a scan; a node, edge or index id counter that would hand out an id in use | fault |
+| `indexes` | an index entry that does not match its node (gone, relabelled, another value), a covered node missing from an index | fault |
+| `derived` | each installed extension's own check of its derived data (`context`: its text index against a rebuild) | fault |
+| `duplicates` | parallel edges with the same endpoints, type and properties; with `label:` and `keys:`, nodes of the label equal on every key | candidate |
+| `orphans` | nodes with no edges, of `labels:` when given | candidate |
+| `required` | nodes of `label:` with no edge of `type:` in `dir:` (`out`, `in`, `both`; default `out`) | candidate |
+
+With no `checks:` the first six run; the last three run only when named,
+because what they find are facts about the data that an application may or
+may not call faults. Candidates are for a person or a rule to decide on:
+two tools that agree on kind, maker, model and specification may be one
+tool entered twice or two of the same tool.
+
+Rows are `check, severity, kind, id, detail`. `id` is `n12` for a node,
+`e12` for an edge (the handles `context` uses and accepts back), or names
+the label (`:Tool`), type, index (`:Tool(code)`), counter or term at fault;
+`detail` says what is wrong in a sentence. An extension's findings have its
+name in `kind` (`context.stale_node`). An extension that does not implement
+`check` gets one `info` row saying so. Each check ends with a summary row:
+`severity: "summary"`, `kind: "done"` (or `"partial"`), `detail`
+`{"records":N,"problems":M}`. Checks run in the order of the table, each
+walking its trees in key order, so the same database gives the same rows
+every time and on both tiers.
+
+**Slices.** `limit:` caps the records one call looks at; a call also stops
+once it holds 10,000 rows. A call that stops ends with a `partial` summary
+whose `id` is a cursor: call again with `after:` set to it and the same
+other arguments, and the next call carries on from the next record. Slices
+together report exactly the rows of one whole run, and their counts add up
+to it. A call holds a few batches of records, plus an external sort within
+`algorithm_memory()` for the parallel edges of a hub and for node
+duplicates. A cursor is a position, not a snapshot: a caller who writes
+between slices gets an answer about a mix of states.
+
+**For extensions.** `Extension::check(&self, g, probe) -> Result<bool>`
+compares what the extension keeps with what a rebuild would make: call
+`probe.look()?` before each record (false: the slice is full; call
+`probe.stop_at(cursor)` and return), `probe.found(kind, id, detail)` for
+each difference, and resume from `probe.after()`. Return `false` when there
+is nothing the extension knows how to check. The `context` text index
+checks, without rebuilding: every covered node's postings and length are
+there, every length belongs to a covered node, each term's postings match
+its document frequency and belong to covered nodes, the totals match, and
+only when the counts show postings a rebuild would not make for nodes it
+does cover, walks the postings again to name those nodes.
+
+### Limits
+
+- The node half of `duplicates` sorts the label's members by their key
+  values again at every slice: a slice bounds the rows and records it
+  reports, not the reading. Nodes missing any key are not compared; values
+  compare as the index compares them (`1` equals `1.0`).
+- It checks what the caller names. Constraints declared in a schema
+  (uniqueness, required properties) are not part of it.
+- Staleness of derived data is found by comparison with the graph, not by
+  revisions: the text index records none yet (D3 is a later slice).
+- Measured on the manufacturing graph: `bench/KNOWLEDGE.md`, "Integrity".

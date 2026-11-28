@@ -2633,11 +2633,33 @@ impl Graph {
     /// Keys of extension `ns` starting with `prefix`, in order, until `f`
     /// returns false. Keys are passed without the namespace.
     pub fn ext_scan(&self, ns: &str, prefix: &[u8], f: &mut dyn FnMut(&[u8], &[u8]) -> bool) {
+        self.ext_scan_after(ns, prefix, None, f)
+    }
+
+    /// [`Graph::ext_scan`], starting after the key `after` instead of at
+    /// the start of the prefix: work over a keyspace can then be done in
+    /// slices, each continuing where the last one stopped.
+    pub fn ext_scan_after(
+        &self,
+        ns: &str,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        f: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+    ) {
         let full = Self::ext_full_key(ns, prefix);
+        let from = match after {
+            // The least key greater than `a` is `a` followed by a zero.
+            Some(a) if a >= prefix => {
+                let mut k = Self::ext_full_key(ns, a);
+                k.push(0);
+                k
+            }
+            _ => full.clone(),
+        };
         let skip = ns.len() + 1;
         self.note((|| -> SResult<()> {
             let p = self.pager();
-            let mut c = EXT.seek(p, &full)?;
+            let mut c = EXT.seek(p, &from)?;
             while let Some((k, v)) = c.next()? {
                 if !k.starts_with(&full) {
                     break;
@@ -3186,6 +3208,102 @@ impl Graph {
         Ok(n)
     }
 
+    // ------------------------------------------ raw reads, for `check`
+    //
+    // `ext::check` asks whether the trees agree with each other, so it has
+    // to read them as stored, not through the views above (which skip what
+    // cannot be). These read and never write; they are not an API.
+
+    /// Up to `max` entries of `tree` whose keys start with `prefix` and are
+    /// greater than `after` (from the prefix's start when None), in key
+    /// order, values loaded; the batch also ends once it holds `max_bytes`.
+    #[doc(hidden)]
+    pub fn raw_batch(
+        &self,
+        tree: RawTree,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        max: usize,
+        max_bytes: usize,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.note((|| -> SResult<Vec<(Vec<u8>, Vec<u8>)>> {
+            let p = self.pager();
+            let from = match after {
+                // The least key greater than `a` is `a` followed by a zero.
+                Some(a) if a >= prefix => {
+                    let mut f = a.to_vec();
+                    f.push(0);
+                    f
+                }
+                _ => prefix.to_vec(),
+            };
+            let mut out = Vec::new();
+            let mut bytes = 0usize;
+            let mut c = tree.tree().seek(p, &from)?;
+            while let Some((k, v)) = c.next()? {
+                if !k.starts_with(prefix) || out.len() >= max.max(1) || bytes >= max_bytes {
+                    break;
+                }
+                let v = v.load(p)?.into_owned();
+                bytes += k.len() + v.len();
+                out.push((k.to_vec(), v));
+            }
+            Ok(out)
+        })())
+    }
+
+    /// One entry of `tree`, as stored.
+    #[doc(hidden)]
+    pub fn raw_get(&self, tree: RawTree, key: &[u8]) -> Option<Vec<u8>> {
+        self.note(tree.tree().get(self.pager(), key))
+    }
+
+    /// The counters kept beside the trees.
+    #[doc(hidden)]
+    pub fn raw_meta(&self) -> RawMeta {
+        let p = self.pager();
+        RawMeta {
+            next_node: p.meta(M_NEXT_NODE),
+            next_edge: p.meta(M_NEXT_EDGE),
+            nodes: p.meta(M_NODES),
+            edges: p.meta(M_EDGES),
+            next_index: p.meta(M_NEXT_INDEX),
+        }
+    }
+
+    /// Property index definitions as `(index id, label, key)`, by id.
+    #[doc(hidden)]
+    pub fn raw_indexes(&self) -> Vec<(u32, u32, u32)> {
+        let mut v: Vec<_> = self
+            .indexes
+            .iter()
+            .map(|(&(l, k), d)| (d.id, l, k))
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// The key prefix an index stores `v` under, and whether it was cut to
+    /// fit a key (a node id follows it in the entry).
+    #[doc(hidden)]
+    pub fn raw_index_prefix(&self, index: u32, v: &Value) -> (Vec<u8>, bool) {
+        idx_prefix(self.pager(), index, v)
+    }
+
+    /// A node record's labels and properties; None when it does not decode.
+    #[doc(hidden)]
+    pub fn raw_decode_node(bytes: &[u8]) -> Option<(Vec<u32>, Vec<(u32, Value)>)> {
+        let (labels, run) = decode_node(bytes).ok()?;
+        Some((labels, props_of(&run).ok()?))
+    }
+
+    /// An edge record's source, target, type and properties.
+    #[doc(hidden)]
+    pub fn raw_decode_edge(bytes: &[u8]) -> Option<(u64, u64, u32, Vec<(u32, Value)>)> {
+        let (from, to, t, run) = decode_edge(bytes).ok()?;
+        Some((from, to, t, props_of(&run).ok()?))
+    }
+
     /// Page-cache and transaction statistics.
     pub fn pager_stats(&self) -> pager::Stats {
         self.pager().stats()
@@ -3288,6 +3406,45 @@ pub struct Stats {
     /// [`Graph::generation`].
     pub generation: [u8; 16],
     pub integrity_error: Option<String>,
+}
+
+/// The trees [`Graph::raw_batch`] reads, laid out as the module
+/// documentation says.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawTree {
+    Catalog,
+    Nodes,
+    Edges,
+    Adj,
+    Labels,
+    Types,
+    Props,
+}
+
+impl RawTree {
+    fn tree(self) -> Tree {
+        match self {
+            RawTree::Catalog => CATALOG,
+            RawTree::Nodes => NODES,
+            RawTree::Edges => EDGES,
+            RawTree::Adj => ADJ,
+            RawTree::Labels => LABELS,
+            RawTree::Types => TYPES,
+            RawTree::Props => PROPS,
+        }
+    }
+}
+
+/// The counters [`Graph::raw_meta`] reads.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawMeta {
+    pub next_node: u64,
+    pub next_edge: u64,
+    pub nodes: u64,
+    pub edges: u64,
+    pub next_index: u64,
 }
 
 // ------------------------------------------------------ algorithm projections
