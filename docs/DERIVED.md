@@ -40,7 +40,8 @@ tests cite them.
 - **D2. A database has a revision.** `revision` is a 64-bit number that grows
   with every committed transaction that changed something: it never stays
   still across a change. It does not grow with an empty commit, a write that
-  changes nothing, a checkpoint, a reopen or a restore; it may also grow when
+  changes nothing, a checkpoint, a reopen, a restore or loading an image; it
+  never goes back across saving and loading one; it may also grow when
   a transaction's operations cancel each other out. It is durable. A replica
   that has replayed the same transactions reports the same revision. With
   `generation` (the lineage) it names one state along one line of history:
@@ -126,8 +127,22 @@ stored and the file format is unchanged.
   for the same transactions, so it reports the same revision a logged graph
   or a file reports for the same history, and a log enabled later starts
   there instead of at 0, so enabling a log does not move the revision back. That number lives and dies with the graph object: it is as durable
-  as the graph is, which is not at all. A graph loaded from a file's image
-  (`Graph::from_bytes`) has no lineage and starts at 0.
+  as the graph is, which is not at all.
+- *Loading an image* (`Graph::from_bytes`, how a host without a
+  filesystem reopens a database) gives a graph with no lineage at the
+  image's revision: a file's image is its state at its last checkpoint and
+  carries that checkpoint's revision; a memory graph's snapshot image
+  carries the revision it was taken at; a memory graph without a log
+  cannot write an image, and once given one its positions carry on from
+  what it counted, so its image carries that. Writes on the copy carry on
+  above it. (The revision slice decided that such a graph starts at 0; the
+  change journal's review showed why that is wrong: a journal or a kept
+  colouring inside the image holds the source's positions, and a copy that
+  started again below them answered "nothing changed" for a change.
+  `a_database_loaded_from_an_image_carries_on_from_the_images_revision`
+  in `tests/revision.rs` failed before and passes now.) A legacy image
+  is migrated into a new database by `import_legacy`, which counts from 0
+  as any new database does.
 - *Bulk load* builds a new file without the log. It checkpoints the loaded
   pages, then logs one record (the id counters it set) and checkpoints
   again, so a loaded database is past 0. A crash between the two reopens the
@@ -421,25 +436,49 @@ What is true now, and what this slice decided where the plan was open:
   revision it forgets); and `CLEAR` or any other bulk notification (to `log_end()`
   in its hook: everything before must be rebuilt, and the journal answers
   exactly from there on). `CLEAR` keeps the cap.
-- **The cap.** In entries, default 1,000,000, at least 16. `CREATE
+- **Positions past the database's.** The journal never answers while
+  anything it holds lies past `log_end()`: its state records the position
+  it was written at, and `since`, `changed` and `changed_any` refuse
+  ("cannot answer: it holds positions past this database's ...") when that
+  position, the floor or any entry they read is past it, or when the
+  revision asked about is (it belongs to another line of history). The
+  next write then starts it again: it records nothing and forgets 64
+  entries a write (`SWEEP`), answering nothing meanwhile, and once empty
+  takes the floor where it is (`why: reset`). A kept colouring whose
+  position is past the database's is stale. With images keeping their
+  revision (D2) this needs a path that moves positions back, which the
+  engine no longer has; it is shown by copying a journal and a colouring
+  from a graph further along into one that is behind
+  (`a_journal_holding_positions_past_the_databases_refuses_and_starts_again`)
+  and by the review's image tests (`tests/review_g5_image.rs`).
+- **The cap.** In entries, default 1,000,000, at least 64. `CREATE
   EXTENSION` takes no arguments, so "set when it is installed" means
   `CALL changes.cap(entries:)` in the same block as the install; lowering
-  it forgets the oldest entries at once. With no count kept, the journal
-  cannot see the cap coming write by write, so the state (`s`, written
-  only by install, `CLEAR`, `release`, `cap` and upkeep) holds a log
-  position, `look_at`. Every entry costs at least 15 bytes of its own
-  record (`MIN_ENTRY_LOG`) and one write makes at most 5, so after
-  counting n entries at position p the journal cannot pass the cap before
-  p + 15 (cap - n - 5). The first write at or past `look_at` does the
-  upkeep in its own transaction: it forgets entries at or below the floor,
-  counts the rest (one scan), and when more than half the cap remains
-  raises the floor to a revision chosen from a 4,096-bucket histogram of
-  revisions and forgets the oldest down to half the cap or fewer. So the
-  journal never holds more than the cap (`a_small_cap_...` checks it after
-  every write with a cap of 16), and its upkeep costs one or two scans per
-  15 x (cap/2 - 5) bytes of log written once it is half full: about one
-  entry scanned per 7 log bytes in the worst case, none while it is less
-  than half full. The write that does the upkeep is the slow one.
+  it forgets the oldest entries at once (that call does the whole
+  journal, as asked). Otherwise no single write pays more than one slice:
+  with no count kept, the state holds a log position, `look_at`. Every
+  entry costs at least 15 bytes of its own record (`MIN_ENTRY_LOG`) and
+  one write makes at most 5 (`MAX_PER_WRITE`), so after counting at most
+  n entries at position p the journal cannot pass three quarters of the
+  cap before p + 15 (3/4 cap - n - 5). From the first write at or past it,
+  each write takes one step of a *sweep*: it looks at the next 64 entries
+  (`SWEEP`) in key order, forgets those at or below the floor, counts the
+  rest into the state (with a 16-bucket histogram of their revisions),
+  and rewrites the state. A sweep over N entries takes about N/64 writes,
+  during which at most 5 entries a write are added, so it ends below the
+  cap from three quarters of it (64 is the smallest cap for which this
+  holds). At its end, if more than half the cap may be held (the count
+  plus 5 a write of the sweep), the floor rises to the histogram bucket
+  that leaves half or fewer, and a sweep starts again at once to forget
+  what is now below it; otherwise `look_at` is set again. Entries at or
+  below the floor linger until a sweep reaches them; nothing answers from
+  them. So a write pays at most: 64 entries looked at and deleted, one
+  state record (about 230 bytes of log) beside its own, and 64 + its own entries in
+  steps; the review's write that used to take 133 ms and 1.7 MB of log at
+  the default cap now takes under a millisecond and 276 bytes
+  (`tests/review_g5_cap.rs`). A write that fails or is stopped during a
+  sweep takes its step back with it; the next write takes the same
+  bounded step. `a_small_cap_...` checks the cap after every write.
 - **Status.** `oldest, why, entries, bytes, cap, revision`, counted by a
   scan. `bytes` is what the keyspace holds: keys with the namespace, and
   values (17.6 bytes an entry on the manufacturing graph).

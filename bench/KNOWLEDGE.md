@@ -184,6 +184,7 @@ every measurement in `MEASURES`, appending JSON lines to
 | `structure.classes` | `by: "neighbours"` per catalogue label, on the properties its duplicates agree on: `classes`, `planted` / `found` / `hit` / `exact` (pairs, the truth's pairs closed under "duplicate of the same original"), `lookalikes`, `lookalikes_reported`, `sizes` (`[size, classes]`, singletons included); `by: "colors"` over the kept depth-4 colouring of stations: `sizes`. Each with `ms` and memory |
 | `changes.write` | per `write` (`node set`: a property set on node `1 + i mod nodes`; `edge add` between pseudo-random nodes; `edge delete` of those edges), `journal` (installed or not), `round`: `writes`, `per_commit`, `per_s`, `log_bytes_per_write` (revision moved / writes): 100,000 writes (or the node count when smaller) committed every 1,000, then 10,000 committed one by one. Rounds alternate without and with the journal, twice |
 | `changes.read` | after each round with the journal: `entries`, `bytes`, `bytes_per_entry` (from `changes.status`), `since_rows`, `since_calls`, `since_all_ms` (every entry since the install, by statement, 10,000 a call), `since_tail_rows` / `since_tail_ms` (the last commit), `changed_us` (`changes::changed` for 1,000 node ids), `changed_any_us` |
+| `changes.cap` | at a cap of a fifth of the writes (at least 1,000), so the journal sweeps throughout: `writes`, `per_s`, `log_bytes_per_write` for node sets in 1,000-write transactions; then 10,000 single writes: `single_per_s`, `single_slowest_us`, `single_biggest_log_bytes`; `entries` held after, `floor_rose` |
 
 A later slice adds a measurement by writing `fn(&mut Run) -> Result<(),
 String>` and adding it to `MEASURES`: `Run` gives the loaded graph, the
@@ -481,3 +482,48 @@ What it says:
   3 ms. `changed` for 1,000 ids is unchanged at about 0.3 ms.
 - **A database without the journal pays nothing.** The engine did not
   change.
+
+### After the review (`g5-changes-review`)
+
+The review found that one write paid for the whole cap: at the default
+cap the write that trimmed took 133 ms and logged 1.7 MB. Now the cap is
+paid a slice at a time (docs/DERIVED.md, "The cap"), and the measurement
+was run again by the same harness (`mfg-bench --only changes --label
+g5-changes-review`, same busy machine).
+
+Ordinary writes, with the journal far from its cap, are where they were
+(share of write speed kept, log bytes as a multiple of without):
+
+| dataset | tier | per transaction | node set | edge add | edge delete |
+|---|---|---|---|---|---|
+| n10000-s1 | memory | 1,000 | 0.39 (2.6x) | 0.47 (3.9x) | 0.25 (6.9x) |
+| n100000-s1 | memory | 1,000 | 0.55 (2.5x) | 0.66 (3.8x) | 0.34 (7.2x) |
+| n100000-s1 | file | 1,000 | 0.67 (2.5x) | 0.57 (3.8x) | 0.33 (7.2x) |
+| n1000000-s1 | memory | 1,000 | 0.42 (2.5x) | 0.63 (3.8x) | 0.47 (7.1x) |
+| n1000000-s1 | file | 1,000 | 0.36 (2.5x) | 0.62 (3.8x) | 0.48 (7.1x) |
+| n100000-s1 | memory | 1 | 0.56 (2.1x) | 0.61 (2.9x) | 0.41 (4.4x) |
+| n1000000-s1 | memory | 1 | 0.25 (6.8x) | 0.59 (2.9x) | 0.51 (4.1x) |
+
+(The 1M single node sets ran while the journal was sweeping, so each
+rewrote the state: 6.8x.)
+
+Sweeping all the time (`changes.cap`, the cap a fifth of the writes):
+
+| dataset | tier | cap | node sets/s, 1,000 a transaction | log bytes a write | single writes/s | slowest single write | largest single write's log |
+|---|---|---|---|---|---|---|---|
+| n10000-s1 | memory | 2,011 | 171k | 98 | 91k | 64 µs | 1,108 B |
+| n10000-s1 | file | 2,011 | 166k | 98 | 68k | 72 µs | 1,108 B |
+| n100000-s1 | memory | 20,000 | 155k | 101 | 69k | 106 µs | 1,174 B |
+| n100000-s1 | file | 20,000 | 141k | 101 | 40k | 349 µs | 1,174 B |
+| n1000000-s1 | memory | 20,000 | 141k | 101 | 41k | 572 µs | 1,175 B |
+| n1000000-s1 | file | 20,000 | 83k | 101 | 29k | 184 µs | 1,175 B |
+
+At the default cap of 1,000,000 (`tests/review_g5_cap.rs`), the write
+that raises the floor now takes under a millisecond and logs 276 bytes
+(it was 133 ms and 1.7 MB); no write logs more than one state record and
+64 deletes beside its own. Reading is unchanged: `since` over the whole
+journal 37-98 ms at 300,000-400,000 entries, for the last commit 9-19 ms,
+`changed` for 1,000 ids 0.2-0.7 ms, `changed_any` with nothing changed
+3-5 ms (it reads every entry of the kind; knowing the newest position
+held would answer it at once, but keeping that exact means a write per
+change, which is what this slice took out).

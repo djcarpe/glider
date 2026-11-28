@@ -939,6 +939,45 @@ fn changes(run: &mut Run) -> Result<(), String> {
         );
         run.run("DROP EXTENSION changes", &[])?;
     }
+    // At a small cap the journal sweeps all the time: node sets over every
+    // node in 1,000-write transactions, then single writes, timing the
+    // slowest one and the log bytes of the largest.
+    run.run("CREATE EXTENSION changes", &[])?;
+    let cap = (n / 5).max(1_000);
+    run.run(&format!("CALL changes.cap(entries: {cap})"), &[])?;
+    round += 1;
+    let (rate, log) = write_pass(&mut run.g, "node set", n, COMMIT_EVERY, round, &mut edges)?;
+    let (mut slowest, mut biggest) = (0f64, 0u64);
+    let floor0 = glider::ext::changes::oldest(&run.g)
+        .map(|f| f.0)
+        .unwrap_or(0);
+    let nodes = run.g.node_count() as u64;
+    let t0 = Instant::now();
+    for i in 0..SINGLE.min(n) {
+        let before = run.g.log_end();
+        let t = Instant::now();
+        run.g
+            .set_node_prop(1 + (i * 7919) % nodes, "cy", Value::Int(i as i64))
+            .map_err(|e| e.to_string())?;
+        slowest = slowest.max(t.elapsed().as_secs_f64() * 1e6);
+        biggest = biggest.max(run.g.log_end() - before);
+    }
+    let single = SINGLE.min(n) as f64 / t0.elapsed().as_secs_f64();
+    let s = glider::ext::changes::status(&run.g).ok_or("no journal")?;
+    run.emit(
+        "changes.cap",
+        Obj::new()
+            .u("cap", cap)
+            .u("writes", n)
+            .u("per_s", rate as u64)
+            .raw("log_bytes_per_write", &format!("{log:.1}"))
+            .u("single_per_s", single as u64)
+            .raw("single_slowest_us", &format!("{slowest:.0}"))
+            .u("single_biggest_log_bytes", biggest)
+            .u("entries", s.entries)
+            .b("floor_rose", s.floor > floor0),
+    );
+    run.run("DROP EXTENSION changes", &[])?;
     Ok(())
 }
 

@@ -758,38 +758,52 @@ fn since_lists_exactly_what_changed_between_any_two_commit_boundaries() {
 #[test]
 fn a_small_cap_forgets_the_oldest_and_refuses_what_it_no_longer_holds() {
     let mut g = Graph::memory();
-    let (_, answered, refused) = workload(&mut g, 0x1234_5678, 120, Some(40), "cap 40");
+    let (_, answered, refused) = workload(&mut g, 0x1234_5678, 160, Some(64), "cap 64");
     let s = changes::status(&g).unwrap();
-    assert!(s.entries <= 40, "{} entries past the cap", s.entries);
-    assert_eq!(s.cap, 40);
+    assert!(s.entries <= 64, "{} entries past the cap", s.entries);
+    assert_eq!(s.cap, 64);
     assert!(
         answered > 100 && refused > 100,
         "{answered} answered, {refused} refused"
     );
     // The cap survives CLEAR, and lowering it forgets at once.
     q(&mut g, "CLEAR");
-    assert_eq!(changes::status(&g).unwrap().cap, 40);
-    for i in 0..30 {
+    assert_eq!(changes::status(&g).unwrap().cap, 64);
+    q(&mut g, "CALL changes.cap(entries: 400)");
+    for i in 0..200 {
         q(&mut g, &format!("CREATE (:C {{i: {i}}})"));
     }
     let held = changes::status(&g).unwrap().entries;
-    assert!(held > 16 && held <= 40, "{held}");
-    let r = q(&mut g, "CALL changes.cap(entries: 16)");
+    assert!(held > 64 && held <= 400, "{held}");
+    let r = q(&mut g, "CALL changes.cap(entries: 64)");
     let m = r.message.unwrap();
-    assert!(m.contains(&format!("{} forgotten", held - 16)), "{m}");
+    assert!(m.contains(&format!("{} forgotten", held - 64)), "{m}");
     let s = changes::status(&g).unwrap();
-    assert_eq!((s.entries, s.cap, s.why), (16, 16, changes::Floor::Cap));
-    let e = query::execute(&mut g, "CALL changes.cap(entries: 15)")
+    assert_eq!((s.entries, s.cap, s.why), (64, 64, changes::Floor::Cap));
+    let e = query::execute(&mut g, "CALL changes.cap(entries: 63)")
         .err()
         .unwrap();
-    assert!(e.to_string().contains("at least 16"), "{e}");
-    // Past the cap, a write forgets the oldest down to half of it, and
-    // the journal never holds more than the cap.
-    for i in 0..200 {
+    assert!(e.to_string().contains("at least 64"), "{e}");
+    // Past three quarters of the cap, writes sweep the journal a slice at a
+    // time and raise the floor; it never holds more than the cap, and no
+    // write looks at more than SWEEP entries or rewrites the state with
+    // more than one record's worth of log.
+    let mut floors = 0;
+    for i in 0..600 {
+        let before = (g.log_end(), changes::oldest(&g).unwrap().0);
         q(&mut g, &format!("CREATE (:D {{i: {i}}})-[:DD]->(:D)"));
         let n = changes::status(&g).unwrap().entries;
-        assert!(n <= 16, "{n} entries past the cap of 16");
+        assert!(n <= 64, "{n} entries past the cap of 64");
+        // A statement of three writes: each logs its record and at most
+        // one state record and SWEEP deletes.
+        assert!(
+            g.log_end() - before.0 < 3 * 1_600,
+            "{} log bytes",
+            g.log_end() - before.0
+        );
+        floors += usize::from(changes::oldest(&g).unwrap().0 != before.1);
     }
+    assert!(floors > 5, "the floor rose {floors} times");
 }
 
 #[test]
@@ -1179,15 +1193,15 @@ fn check_run_finds_what_is_wrong_with_the_journal_and_nothing_when_it_is_sound()
             change,
         })
     };
-    q(&mut g, "CALL changes.cap(entries: 16)");
+    q(&mut g, "CALL changes.cap(entries: 64)");
     // A put for a node that does not exist, an edge entry past the log's
     // end, a key that does not decode, and more entries than the cap.
     let mut puts = vec![
         entry(Kind::Node, ghost, end, Change::Put),
-        entry(Kind::Edge, ghost, end + 1000, Change::Drop),
+        entry(Kind::Edge, ghost, end + 100_000_000, Change::Drop),
         (vec![1, 9], b"junk".to_vec()),
     ];
-    for i in 0..20 {
+    for i in 0..80 {
         puts.push(entry(Kind::Node, ghost + 1 + i, end, Change::Drop));
     }
     g.ext_write(changes::NS, puts, Vec::new()).unwrap();
@@ -1256,4 +1270,113 @@ fn a_kept_colouring_is_stale_only_when_a_node_or_an_edge_changed_given_the_journ
     assert!(fresh(&mut g));
     q(&mut g, "DROP EXTENSION changes");
     assert!(!fresh(&mut g));
+}
+
+/// Defence in depth, whatever the engine does about images: a journal (and
+/// a kept colouring) holding positions past the database's, built here by
+/// copying the derived keyspaces of a graph further along into one that is
+/// not, never answers as if nothing had changed; it starts again from the
+/// current position, and its cap holds.
+#[test]
+fn a_journal_holding_positions_past_the_databases_refuses_and_starts_again() {
+    let mut ahead = Graph::memory();
+    q(&mut ahead, "CREATE EXTENSION changes");
+    q(&mut ahead, "CALL changes.cap(entries: 100)");
+    q(&mut ahead, "CREATE EXTENSION structure");
+    for i in 0..300 {
+        q(
+            &mut ahead,
+            &format!("CREATE (:S {{i: {i}}})-[:H]->(:W {{i: {i}}})"),
+        );
+    }
+    q(&mut ahead, "CALL structure.colors(depth: 2, store: 'c')");
+    let far = ahead.revision();
+
+    let mut g = Graph::memory();
+    q(&mut g, "CREATE EXTENSION changes");
+    q(&mut g, "CREATE EXTENSION structure");
+    for i in 0..20 {
+        q(
+            &mut g,
+            &format!("CREATE (:S {{i: {i}}})-[:H]->(:W {{i: {i}}})"),
+        );
+    }
+    // Overwrite both keyspaces with the ones further along.
+    for ns in [changes::NS, "structure"] {
+        let gone: Vec<Vec<u8>> = keyspace(&g, ns).into_iter().map(|(k, _)| k).collect();
+        g.ext_write(ns, Vec::new(), gone).unwrap();
+        g.ext_write(ns, keyspace(&ahead, ns), Vec::new()).unwrap();
+    }
+    let now = g.revision();
+    assert!(now < far, "{now} is not behind {far}");
+    let fresh = |g: &mut Graph| q(g, "CALL structure.stored()").rows[0][2] == Value::Bool(true);
+    assert!(
+        !fresh(&mut g),
+        "a colouring kept past the database's position is stale"
+    );
+    // Asked about its own revision, or one it never reached: no answer.
+    for r in [now, far] {
+        assert!(!changes::answers(&g, r));
+        let e = changes::since(&g, r, &[], None, 100)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("cannot answer"), "{e}");
+        assert_eq!(changes::changed(&g, r, Kind::Node, &[1, 2, 3]), None);
+        assert_eq!(changes::changed_any(&g, r, Kind::Edge), None);
+    }
+    // An entry past the database's position alone (with a sound state) is
+    // refused as well.
+    let mut h = Graph::memory();
+    q(&mut h, "CREATE EXTENSION changes");
+    q(&mut h, "CREATE (:A)");
+    let r = h.revision();
+    let (k, v) = changes::encode_entry(&changes::Entry {
+        revision: r + 1_000_000,
+        kind: Kind::Node,
+        id: 1,
+        change: Change::Put,
+    });
+    h.ext_write(changes::NS, vec![(k, v)], Vec::new()).unwrap();
+    let r = h.revision();
+    assert!(changes::since(&h, r, &[], None, 100).is_err());
+    assert_eq!(changes::changed(&h, r, Kind::Node, &[1]), None);
+    assert_eq!(changes::changed_any(&h, r, Kind::Node), None);
+
+    // Writes start it again: it forgets what it held a slice a write,
+    // answering nothing meanwhile, then answers exactly from where it is
+    // empty, and never holds more than its cap.
+    let mut restarted = None;
+    for i in 0..400 {
+        q(&mut g, &format!("CREATE (:N {{i: {i}}})"));
+        let s = changes::status(&g).unwrap();
+        assert!(
+            s.entries <= s.cap,
+            "{} entries past the cap of {}",
+            s.entries,
+            s.cap
+        );
+        if restarted.is_none() && changes::answers(&g, g.revision()) {
+            assert_eq!(s.why, changes::Floor::Reset);
+            restarted = Some(g.revision());
+        }
+    }
+    restarted.expect("the journal started again");
+    let base = g.revision();
+    assert!(changes::answers(&g, base));
+    q(&mut g, "CREATE (:Late)");
+    let late = q(&mut g, "MATCH (n:Late) RETURN id(n)").rows[0][0]
+        .as_i64()
+        .unwrap() as u64;
+    assert_eq!(
+        changes::changed(&g, base, Kind::Node, &[late, 1]),
+        Some(vec![true, false])
+    );
+    let (list, _) = changes::since(&g, base, &[], None, 100).unwrap();
+    assert_eq!(list.len(), 1, "{list:?}");
+    assert!(
+        derived_findings(&mut g).is_empty(),
+        "{:?}",
+        derived_findings(&mut g)
+    );
 }

@@ -326,9 +326,15 @@ the same journal as the source.
   are not listed for it.
 - `since` reads every entry of the kinds asked for, whatever the
   revision: about 50 ms for 300,000 entries. `changed` for given ids is
-  one lookup an id. When the journal is more than half full, the write
-  that reaches its next count does the counting and trimming and is
-  slower than the rest.
+  one lookup an id. `changed_any` (and so a kept colouring's freshness)
+  reads every entry of the kind when nothing changed: a few milliseconds
+  for a few hundred thousand entries.
+- Past three quarters of the cap, each write also looks at 64 entries of
+  the journal and rewrites its state, until the sweep ends; that is the
+  cap's whole cost, spread over writes.
+- The journal refuses to answer while it holds a position past the
+  database's (a revision from another line of history, or a copy of a
+  later state), and starts again with the next writes.
 
 ## `check`: is the graph whole
 

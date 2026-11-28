@@ -39,17 +39,21 @@
 //!
 //! **Bounds.** The journal holds at most `cap` entries (default
 //! [`DEFAULT_CAP`], at least [`MIN_CAP`]). Without a count it cannot see
-//! the cap coming one write at a time, so the state (`s`, written only by
-//! install, `CLEAR`, `release`, `cap` and upkeep) says from which log
-//! position on it must look again: every entry costs at least
-//! [`MIN_ENTRY_LOG`] bytes of its own records, so after counting `n`
-//! entries at position p the journal cannot pass the cap before
-//! p + MIN_ENTRY_LOG x (cap - n - MAX_PER_WRITE). The write that reaches
-//! that position first counts the entries (one scan), forgets those at or
-//! below the floor, and when it holds more than half the cap raises the
-//! floor and forgets the oldest down to half. Raising the floor is what
-//! makes forgetting safe: `since(R)` with R below the floor is an error
-//! that says why and names the floor, never a partial list.
+//! the cap coming one write at a time, so the state (`s`) names a log
+//! position, `look_at`: every entry costs at least [`MIN_ENTRY_LOG`] bytes
+//! of its own record and a write makes at most [`MAX_PER_WRITE`], so after
+//! counting at most `n` entries at position p the journal cannot pass three
+//! quarters of the cap before p + MIN_ENTRY_LOG x (3/4 cap - n - 5). From
+//! there each write takes one step of a sweep ([`SWEEP`] entries: forget
+//! those at or below the floor, count the rest, rewrite the state); a
+//! sweep ends below the cap, and at its end the floor rises when more than
+//! half the cap may be held. No write pays more than one step. Raising the
+//! floor is what makes forgetting safe: `since(R)` with R below the floor
+//! is an error that says why and names the floor, never a partial list.
+//!
+//! **Positions past the database's.** The journal never answers while its
+//! state, its floor or an entry it reads lies past [`Graph::log_end`], or
+//! for a revision past it; the next write starts it again ([`Mode::Purging`]).
 //!
 //! **Keys** (keyspace `changes`): `!cap` -> the cap (configuration, so it
 //! survives `CLEAR`); `s` -> the state ([`State`]); every other key is an
@@ -71,8 +75,12 @@ pub const NS: &str = "changes";
 /// Entries the journal holds when no cap was set.
 pub const DEFAULT_CAP: u64 = 1_000_000;
 
-/// The smallest cap.
-pub const MIN_CAP: u64 = 16;
+/// The smallest cap: with it, a sweep started at three quarters of the
+/// cap ends below it (see the module documentation).
+pub const MIN_CAP: u64 = 64;
+
+/// Entries a write looks at, at most, while the journal sweeps or purges.
+pub const SWEEP: usize = 64;
 
 /// The most entries one write makes: an edge moved by a replayed `EdgeAdd`
 /// over an existing id, itself and four endpoints.
@@ -272,46 +280,147 @@ impl Floor {
     }
 }
 
-/// The journal's state: one record, rewritten only by install, `CLEAR`,
-/// `release`, `cap` and upkeep, never by an ordinary write.
+/// What the journal is doing about its bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Recording; nothing to do until the log reaches `look_at`.
+    Idle,
+    /// Recording, and walking its entries [`SWEEP`] at a time per write:
+    /// forgetting those at or below the floor, counting the rest.
+    Sweeping,
+    /// Positions went back below what it held: recording nothing,
+    /// forgetting every entry [`SWEEP`] at a time per write, answering
+    /// nothing until it starts again at the position where it is empty.
+    Purging,
+}
+
+/// Buckets of the revision histogram a sweep keeps to choose a new floor.
+pub const SWEEP_BUCKETS: usize = 16;
+
+/// The journal's state: one record, rewritten by install, `CLEAR`,
+/// `release`, `cap`, and by a write only when it starts a sweep, takes a
+/// sweep's step or ends one (and once when positions are found to have
+/// gone back). An ordinary write never rewrites it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct State {
     pub cap: u64,
     /// The oldest revision it answers for: `since(R)` needs R >= floor.
     pub floor: u64,
     pub why: Floor,
-    /// The log position from which the next write counts the entries.
+    /// The log position from which the next write starts a sweep.
     pub look_at: u64,
+    /// The log position at which this record was written: never above the
+    /// database's, unless positions went back.
+    pub at: u64,
+    pub mode: Mode,
+    /// The current sweep: where it started, how many writes it has taken,
+    /// how many entries above the floor it counted, the last key it looked
+    /// at, and the counted entries' revisions over (floor, start].
+    pub sweep_start: u64,
+    pub sweep_writes: u64,
+    pub sweep_live: u64,
+    pub cursor: Option<[u8; 10]>,
+    pub cursor_len: u8,
+    pub hist: [u64; SWEEP_BUCKETS],
 }
+
+const STATE_LEN: usize = 1 + 8 * 5 + 1 + 1 + 8 * 3 + 1 + 10 + 8 * SWEEP_BUCKETS;
 
 impl State {
     fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(26);
-        out.push(2u8);
-        out.extend_from_slice(&self.cap.to_be_bytes());
-        out.extend_from_slice(&self.floor.to_be_bytes());
+        let mut out = Vec::with_capacity(STATE_LEN);
+        out.push(3u8);
+        for v in [
+            self.cap,
+            self.floor,
+            self.look_at,
+            self.at,
+            self.sweep_start,
+        ] {
+            out.extend_from_slice(&v.to_be_bytes());
+        }
         out.push(self.why.byte());
-        out.extend_from_slice(&self.look_at.to_be_bytes());
+        out.push(match self.mode {
+            Mode::Idle => 0,
+            Mode::Sweeping => 1,
+            Mode::Purging => 2,
+        });
+        for v in [self.sweep_writes, self.sweep_live, 0] {
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+        out.push(if self.cursor.is_some() {
+            self.cursor_len
+        } else {
+            0xff
+        });
+        out.extend_from_slice(&self.cursor.unwrap_or([0; 10]));
+        for h in self.hist {
+            out.extend_from_slice(&h.to_be_bytes());
+        }
         out
     }
 
     fn decode(b: &[u8]) -> Option<State> {
-        if b.len() != 26 || b[0] != 2 {
+        if b.len() != STATE_LEN || b[0] != 3 {
             return None;
+        }
+        let mode = match b[42] {
+            0 => Mode::Idle,
+            1 => Mode::Sweeping,
+            2 => Mode::Purging,
+            _ => return None,
+        };
+        let cl = b[67];
+        let cursor = (cl != 0xff).then(|| b[68..78].try_into().unwrap());
+        if cl != 0xff && cl > 10 {
+            return None;
+        }
+        let mut hist = [0u64; SWEEP_BUCKETS];
+        for (i, h) in hist.iter_mut().enumerate() {
+            *h = u64_at(b, 78 + 8 * i);
         }
         Some(State {
             cap: u64_at(b, 1),
             floor: u64_at(b, 9),
-            why: Floor::of(b[17])?,
-            look_at: u64_at(b, 18),
+            look_at: u64_at(b, 17),
+            at: u64_at(b, 25),
+            sweep_start: u64_at(b, 33),
+            why: Floor::of(b[41])?,
+            mode,
+            sweep_writes: u64_at(b, 43),
+            sweep_live: u64_at(b, 51),
+            cursor,
+            cursor_len: if cl == 0xff { 0 } else { cl },
+            hist,
         })
     }
 
-    /// Where to look again after counting `n` entries at `pos`.
+    /// The point from which a sweep must start so that the journal, after
+    /// counting at most `n` entries at log position `pos`, stays under the
+    /// cap through the sweep (see the module documentation).
     fn next_look(&mut self, pos: u64, n: u64) {
-        let room = self.cap.saturating_sub(n + MAX_PER_WRITE);
+        let room = sweep_threshold(self.cap).saturating_sub(n + MAX_PER_WRITE);
         self.look_at = pos.saturating_add(MIN_ENTRY_LOG * room);
     }
+
+    fn cursor_key(&self) -> Option<Vec<u8>> {
+        self.cursor.map(|c| c[..self.cursor_len as usize].to_vec())
+    }
+
+    fn idle(&mut self) {
+        self.mode = Mode::Idle;
+        self.sweep_start = 0;
+        self.sweep_writes = 0;
+        self.sweep_live = 0;
+        self.cursor = None;
+        self.cursor_len = 0;
+        self.hist = [0; SWEEP_BUCKETS];
+    }
+}
+
+/// Where a sweep starts: three quarters of the cap.
+fn sweep_threshold(cap: u64) -> u64 {
+    cap / 4 * 3
 }
 
 /// What `status` reports.
@@ -403,17 +512,31 @@ fn cap_config(g: &Graph) -> u64 {
         .unwrap_or(DEFAULT_CAP)
 }
 
-/// A fresh state at the log's end, knowing nothing before it, that looks
-/// again once the journal could hold the cap.
+/// A fresh state at the log's end, knowing nothing before it, that sweeps
+/// once the journal could hold three quarters of the cap.
 fn fresh(g: &Graph, why: Floor) -> State {
     let mut s = State {
         cap: cap_config(g),
         floor: g.log_end(),
         why,
         look_at: 0,
+        at: g.log_end(),
+        mode: Mode::Idle,
+        sweep_start: 0,
+        sweep_writes: 0,
+        sweep_live: 0,
+        cursor: None,
+        cursor_len: 0,
+        hist: [0; SWEEP_BUCKETS],
     };
     s.next_look(g.log_end(), 0);
     s
+}
+
+/// The state record, written with `at` set to the log's end.
+fn state_put(g: &Graph, s: &mut State) -> (Vec<u8>, Vec<u8>) {
+    s.at = g.log_end();
+    (STATE_KEY.to_vec(), s.encode())
 }
 
 fn state(g: &Graph) -> Option<State> {
@@ -467,14 +590,16 @@ pub fn state_of(g: &Graph) -> Option<State> {
 /// is not installed.
 pub fn status(g: &Graph) -> Option<Status> {
     let s = state_of(g)?;
-    let (mut entries, mut bytes) = (0u64, 0u64);
+    let (mut entries, mut bytes, mut looked) = (0u64, 0u64, 0u64);
     g.ext_scan(NS, b"", &mut |k, v| {
+        looked += 1;
         if is_entry_key(k) {
             entries += 1;
         }
         bytes += (NS.len() + 1 + k.len() + v.len()) as u64;
         true
     });
+    step(looked).ok()?;
     Some(Status {
         entries,
         bytes,
@@ -491,9 +616,44 @@ pub fn oldest(g: &Graph) -> Option<(u64, Floor)> {
 }
 
 /// Whether the journal is installed and can answer for `since`: every
-/// change after it is still listed.
+/// change after it is still listed. Never when `since` is above the
+/// database's position (it comes from another line of history), when the
+/// journal's state was written at a position above it (positions went
+/// back: an image of a later state, or a copy), or while it purges.
 pub fn answers(g: &Graph, since: u64) -> bool {
-    state_of(g).is_some_and(|s| since >= s.floor)
+    refusal(g, since).is_none()
+}
+
+/// Why the journal cannot answer for `since`, if it cannot.
+fn refusal(g: &Graph, since: u64) -> Option<String> {
+    let Some(s) = state_of(g) else {
+        return Some(if installed(g) {
+            "the change journal's state does not decode; CALL check.run(checks: [\"derived\"]) reports it, and DROP EXTENSION changes then CREATE EXTENSION changes starts it again".into()
+        } else {
+            "extension 'changes' is not installed in this database; run CREATE EXTENSION changes"
+                .into()
+        });
+    };
+    let now = g.log_end();
+    if s.mode == Mode::Purging || s.at > now || s.floor > now {
+        return Some(format!(
+            "the change journal cannot answer: it holds positions past this database's ({now}), so positions here went back (a copy of a later state, or another line of history); it is forgetting them and starts again with the next writes. Rebuild what was derived from a scan of the graph, then ask from the revision CALL changes.status() reports"
+        ));
+    }
+    if since > now {
+        return Some(format!(
+            "the change journal cannot answer for revision {since}: this database is at {now}, so that revision belongs to another line of history or a later state of a copy. Rebuild what was derived from a scan of the graph"
+        ));
+    }
+    if since < s.floor {
+        return Some(format!(
+            "the change journal cannot answer for revision {since}: {}; it answers for revision {} and later. Rebuild what was derived from a scan of the graph, then ask CALL changes.since(revision: {}) or later",
+            s.why.why(s.floor, s.cap),
+            s.floor,
+            s.floor
+        ));
+    }
+    None
 }
 
 /// The latest change to one id of `kind`, if the journal holds one.
@@ -509,10 +669,16 @@ pub fn changed(g: &Graph, since: u64, kind: Kind, ids: &[u64]) -> Option<Vec<boo
     if !answers(g, since) {
         return None;
     }
+    let now = g.log_end();
     let mut out = Vec::with_capacity(ids.len());
     for &id in ids {
-        out.push(entry(g, kind, id).is_some_and(|e| e.revision > since));
+        match entry(g, kind, id) {
+            // A position past the database's: positions went back.
+            Some(e) if e.revision > now => return None,
+            e => out.push(e.is_some_and(|e| e.revision > since)),
+        }
     }
+    step(ids.len() as u64).ok()?;
     Some(out)
 }
 
@@ -523,16 +689,19 @@ pub fn changed_any(g: &Graph, since: u64, kind: Kind) -> Option<bool> {
     if !answers(g, since) {
         return None;
     }
+    let now = g.log_end();
     let mut found = false;
+    let mut past = false;
     let mut looked = 0u64;
     walk(g, &[kind], None, &mut |_, e| {
         looked += 1;
         // An entry that does not decode might be anything.
         found = e.map_or(true, |e| e.revision > since);
+        past = e.is_some_and(|e| e.revision > now);
         !found
     });
     step(looked).ok()?;
-    Some(found)
+    (!past).then_some(found)
 }
 
 /// The entries changed after revision `since`, by kind then id, starting
@@ -546,26 +715,15 @@ pub fn since(
     after: Option<(Kind, u64)>,
     limit: usize,
 ) -> Result<(Vec<Entry>, bool)> {
-    let Some(s) = state_of(g) else {
-        return Err(Error::Msg(if installed(g) {
-            "the change journal's state does not decode; CALL check.run(checks: [\"derived\"]) reports it, and DROP EXTENSION changes then CREATE EXTENSION changes starts it again".into()
-        } else {
-            "extension 'changes' is not installed in this database; run CREATE EXTENSION changes"
-                .into()
-        }));
-    };
-    if since < s.floor {
-        return Err(Error::Msg(format!(
-            "the change journal cannot answer for revision {since}: {}; it answers for revision {} and later. Rebuild what was derived from a scan of the graph, then ask CALL changes.since(revision: {}) or later",
-            s.why.why(s.floor, s.cap),
-            s.floor,
-            s.floor
-        )));
+    if let Some(why) = refusal(g, since) {
+        return Err(Error::Msg(why));
     }
+    let now = g.log_end();
     let start = after.map(|(k, id)| entry_key(k, id));
     let mut out = Vec::new();
     let mut more = false;
     let mut bad = false;
+    let mut past = false;
     let mut looked = 0u64;
     walk(g, kinds, start.as_deref(), &mut |_, e| {
         looked += 1;
@@ -573,6 +731,10 @@ pub fn since(
             bad = true;
             return false;
         };
+        if e.revision > now {
+            past = true;
+            return false;
+        }
         if e.revision <= since {
             return true;
         }
@@ -584,6 +746,11 @@ pub fn since(
         true
     });
     step(looked)?;
+    if past {
+        return Err(Error::Msg(format!(
+            "the change journal cannot answer: it holds a change at a position past this database's ({now}), so positions here went back; it forgets what it holds and starts again with the next writes. Rebuild what was derived from a scan of the graph"
+        )));
+    }
     if bad {
         return Err(Error::Msg(
             "the change journal holds an entry that does not decode; CALL check.run(checks: [\"derived\"]) names it".into(),
@@ -594,37 +761,169 @@ pub fn since(
 
 // --------------------------------------------------------------- recording
 
-/// Record `entries` (kind, id, change) at the log's end, in one write;
-/// first, when the log has reached the state's `look_at`, count and trim.
+/// Record `entries` (kind, id, change) at the log's end, in one write,
+/// with this write's share of the journal's upkeep: at most [`SWEEP`]
+/// entries looked at and forgotten, and the state rewritten, only while it
+/// sweeps or purges.
 fn note(g: &mut Graph, entries: &[(Kind, u64, Change)]) -> Result<()> {
     let rev = g.log_end();
-    let mut s = match state(g) {
-        Some(s) => s,
-        None => {
-            let s = fresh(g, Floor::Reset);
-            g.ext_write(NS, vec![(STATE_KEY.to_vec(), s.encode())], Vec::new())?;
-            s
+    let mut s = state(g).unwrap_or_else(|| {
+        let mut s = fresh(g, Floor::Reset);
+        // Unreadable or missing: start again, answering nothing before.
+        s.mode = Mode::Purging;
+        s
+    });
+    let mut dels: Vec<Vec<u8>> = Vec::new();
+    let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(entries.len() + 1);
+    let mut rewrite = false;
+    if s.mode != Mode::Purging && (s.at > rev || s.floor > rev) {
+        // Positions went back below what the journal holds: forget it all,
+        // a slice per write, and answer nothing meanwhile.
+        s.idle();
+        s.mode = Mode::Purging;
+        rewrite = true;
+    }
+    match s.mode {
+        Mode::Purging => {
+            let after = s.cursor_key();
+            let (keys, ended) = slice(g, after.as_deref());
+            dels.extend(keys.iter().map(|(k, _)| k.clone()));
+            if ended {
+                // Empty (this write's deletes included): start again here.
+                // This write's own changes lie at or below the new floor.
+                let cap = s.cap;
+                s = fresh(g, Floor::Reset);
+                s.cap = cap;
+                s.next_look(g.log_end(), 0);
+            } else {
+                set_cursor(&mut s, keys.last().map(|(k, _)| k.as_slice()));
+            }
+            puts.push(state_put(g, &mut s));
+            return g.ext_write(NS, puts, dels);
         }
-    };
-    if rev >= s.look_at {
-        let keep = s.cap / 2;
-        upkeep(g, &mut s, keep)?;
+        Mode::Idle if rev >= s.look_at => {
+            s.mode = Mode::Sweeping;
+            s.sweep_start = rev;
+            s.sweep_writes = 0;
+            s.sweep_live = 0;
+            s.cursor = None;
+            s.hist = [0; SWEEP_BUCKETS];
+            sweep_step(g, &mut s, rev, &mut dels);
+            rewrite = true;
+        }
+        Mode::Sweeping => {
+            sweep_step(g, &mut s, rev, &mut dels);
+            rewrite = true;
+        }
+        Mode::Idle => {}
     }
     step(entries.len() as u64)?;
-    let puts = entries
-        .iter()
-        .map(|&(kind, id, change)| (entry_key(kind, id), entry_value(rev, change)))
-        .collect();
-    g.ext_write(NS, puts, Vec::new())
+    for &(kind, id, change) in entries {
+        puts.push((entry_key(kind, id), entry_value(rev, change)));
+    }
+    if rewrite {
+        puts.push(state_put(g, &mut s));
+    }
+    g.ext_write(NS, puts, dels)
 }
 
-/// Count the entries, forget those at or below the floor, and when more
-/// than `keep` remain past it raise the floor and forget the oldest down
-/// to `keep` or fewer; then write the state with where to look again.
+fn set_cursor(s: &mut State, key: Option<&[u8]>) {
+    match key {
+        Some(k) if k.len() <= 10 => {
+            let mut c = [0u8; 10];
+            c[..k.len()].copy_from_slice(k);
+            s.cursor = Some(c);
+            s.cursor_len = k.len() as u8;
+        }
+        // Not an entry key (none longer is written); restart from the top.
+        _ => {
+            s.cursor = None;
+            s.cursor_len = 0;
+        }
+    }
+}
+
+/// The next [`SWEEP`] entries after `after`, and whether they are the last.
+fn slice(g: &Graph, after: Option<&[u8]>) -> (Vec<(Vec<u8>, Option<Entry>)>, bool) {
+    let mut out = Vec::with_capacity(SWEEP);
+    let mut ended = true;
+    walk(g, &[], after, &mut |k, e| {
+        if out.len() == SWEEP {
+            ended = false;
+            return false;
+        }
+        out.push((k.to_vec(), e));
+        true
+    });
+    let _ = step(out.len() as u64);
+    (out, ended)
+}
+
+/// One write's step of a sweep: look at the next [`SWEEP`] entries,
+/// forget those at or below the floor, count the rest; at the end, raise
+/// the floor if more than half the cap may be held, and say when to sweep
+/// again.
+fn sweep_step(g: &Graph, s: &mut State, rev: u64, dels: &mut Vec<Vec<u8>>) {
+    let after = s.cursor_key();
+    let (keys, ended) = slice(g, after.as_deref());
+    s.sweep_writes += 1;
+    let lo = s.floor;
+    let width = (s.sweep_start.saturating_sub(lo) / SWEEP_BUCKETS as u64) + 1;
+    for (k, e) in &keys {
+        match e {
+            Some(e) if e.revision <= s.floor => dels.push(k.clone()),
+            Some(e) => {
+                s.sweep_live += 1;
+                if e.revision <= s.sweep_start {
+                    let b = ((e.revision - lo - 1) / width) as usize;
+                    s.hist[b.min(SWEEP_BUCKETS - 1)] += 1;
+                }
+            }
+            // Kept and counted; check.run names it.
+            None => s.sweep_live += 1,
+        }
+    }
+    if !ended {
+        set_cursor(s, keys.last().map(|(k, _)| k.as_slice()));
+        return;
+    }
+    // Entries written during the sweep may lie behind its cursor: count
+    // each write's most.
+    let held = s.sweep_live + MAX_PER_WRITE * s.sweep_writes;
+    let keep = s.cap / 2;
+    let mut again = false;
+    if held > keep {
+        let need = held - keep;
+        let (mut cum, mut cut) = (0u64, s.sweep_start);
+        for (b, c) in s.hist.iter().enumerate() {
+            cum += c;
+            if cum >= need {
+                cut = (lo + (b as u64 + 1) * width).min(s.sweep_start);
+                break;
+            }
+        }
+        if cut > s.floor {
+            s.floor = cut;
+            s.why = Floor::Cap;
+        }
+        // Sweep again at once, to forget what is now below the floor.
+        again = true;
+    }
+    s.idle();
+    if again {
+        s.look_at = rev;
+    } else {
+        s.next_look(rev, held);
+    }
+}
+
+/// `cap`'s immediate trim: count the entries, forget those at or below the
+/// floor, and when more than `keep` remain raise the floor and forget the
+/// oldest down to `keep` or fewer; then write the state, idle. The whole
+/// journal in one call, which is what the caller of `cap` asked for.
 /// Returns how many were forgotten.
-fn upkeep(g: &mut Graph, s: &mut State, keep: u64) -> Result<u64> {
+fn trim_now(g: &mut Graph, s: &mut State, keep: u64) -> Result<u64> {
     let mut gone = forget_below(g, s.floor, u64::MAX)?;
-    // Count what is left, with a histogram of revisions above the floor.
     let (mut n, mut hi) = (0u64, s.floor);
     walk(g, &[], None, &mut |_, e| {
         n += 1;
@@ -660,9 +959,10 @@ fn upkeep(g: &mut Graph, s: &mut State, keep: u64) -> Result<u64> {
         gone += more;
         n -= more;
     }
-    // Counted from before the state's own record: earlier, so safe.
+    s.idle();
     s.next_look(g.log_end(), n);
-    g.ext_write(NS, vec![(STATE_KEY.to_vec(), s.encode())], Vec::new())?;
+    let put = state_put(g, s);
+    g.ext_write(NS, vec![put], Vec::new())?;
     Ok(gone)
 }
 
@@ -860,7 +1160,8 @@ fn release_proc(g: &mut Graph, a: &Args) -> Result<QueryResult> {
     if below > s.floor {
         s.floor = below;
         s.why = Floor::Released;
-        g.ext_write(NS, vec![(STATE_KEY.to_vec(), s.encode())], Vec::new())?;
+        let put = state_put(g, &mut s);
+        g.ext_write(NS, vec![put], Vec::new())?;
     }
     let gone = forget_below(g, s.floor, limit)?;
     let left = gone == limit && forget_below_count(g, s.floor) > 0;
@@ -881,14 +1182,16 @@ fn release_proc(g: &mut Graph, a: &Args) -> Result<QueryResult> {
 
 /// Whether any entry at or below `below` is left (1) or not (0).
 fn forget_below_count(g: &Graph, below: u64) -> u64 {
-    let mut found = 0;
+    let (mut found, mut looked) = (0, 0u64);
     walk(g, &[], None, &mut |_, e| {
+        looked += 1;
         if e.is_some_and(|e| e.revision <= below) {
             found = 1;
             return false;
         }
         true
     });
+    let _ = step(looked);
     found
 }
 
@@ -909,7 +1212,7 @@ fn cap_proc(g: &mut Graph, a: &Args) -> Result<QueryResult> {
     )?;
     let mut s = state_or_err(g)?;
     s.cap = cap;
-    let gone = upkeep(g, &mut s, cap)?;
+    let gone = trim_now(g, &mut s, cap)?;
     let mut out = QueryResult::message(format!(
         "the journal holds at most {cap} entries; {gone} forgotten, it answers for revision {} and later",
         s.floor
@@ -941,8 +1244,9 @@ impl Extension for Changes {
         }
     }
     fn install(&self, g: &mut Graph) -> Result<()> {
-        let s = fresh(g, Floor::Installed);
-        g.ext_write(NS, vec![(STATE_KEY.to_vec(), s.encode())], Vec::new())
+        let mut s = fresh(g, Floor::Installed);
+        let put = state_put(g, &mut s);
+        g.ext_write(NS, vec![put], Vec::new())
     }
     fn wants_writes(&self, _g: &Graph) -> bool {
         true
@@ -1021,8 +1325,9 @@ impl Extension for Changes {
             step(dels.len() as u64)?;
             g.ext_write(NS, Vec::new(), dels)?;
         }
-        let s = fresh(g, Floor::Cleared);
-        g.ext_write(NS, vec![(STATE_KEY.to_vec(), s.encode())], Vec::new())
+        let mut s = fresh(g, Floor::Cleared);
+        let put = state_put(g, &mut s);
+        g.ext_write(NS, vec![put], Vec::new())
     }
     fn check(&self, g: &Graph, probe: &mut super::check::Probe) -> Result<bool> {
         check_journal(g, probe)
@@ -1073,7 +1378,7 @@ fn check_journal(g: &Graph, probe: &mut super::check::Probe) -> Result<bool> {
                 seen_state = true;
                 match State::decode(&v) {
                     None => probe.found("bad_record", "state", "the journal's state does not decode; DROP EXTENSION changes and CREATE EXTENSION changes start the journal again"),
-                    Some(s) if s.floor > end => probe.found("future", "state", format!("the journal's floor {} is past the log's end at {end}", s.floor)),
+                    Some(s) if s.floor > end || s.at > end => probe.found("future", "state", format!("the journal's floor {} or the position {} its state was written at is past the log's end at {end}", s.floor, s.at)),
                     Some(_) => {}
                 }
             } else if !(k == CAP_KEY && v.len() == 8) {
@@ -1125,12 +1430,22 @@ mod tests {
 
     #[test]
     fn records_read_back_as_written_and_keys_sort_by_kind_then_id() {
-        let s = State {
+        let mut s = State {
             cap: 9,
             floor: 1234,
             why: Floor::Cap,
             look_at: 77,
+            at: 5,
+            mode: Mode::Sweeping,
+            sweep_start: 1200,
+            sweep_writes: 3,
+            sweep_live: 40,
+            cursor: None,
+            cursor_len: 0,
+            hist: [7; SWEEP_BUCKETS],
         };
+        assert_eq!(State::decode(&s.encode()), Some(s));
+        set_cursor(&mut s, Some(&[1, 2, 0, 9]));
         assert_eq!(State::decode(&s.encode()), Some(s));
         let mut keys = Vec::new();
         for kind in Kind::ALL {
