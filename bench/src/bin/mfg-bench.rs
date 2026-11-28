@@ -1,7 +1,7 @@
 //! mfg-bench: the baseline over a manufacturing graph from `mfg-gen`.
 //!
 //!   mfg-bench --data DIR [--tiers memory,file] [--budgets 250,1000,4000]
-//!             [--only stats,retrieve,check,structure,changes,...] [--out FILE] [--label NAME] [--detail]
+//!             [--only stats,retrieve,check,structure,templates,changes,...] [--out FILE] [--label NAME] [--detail]
 //!
 //! Loads DIR/graph.jsonl into glider (in memory, and as a file in DIR), then
 //! runs each measurement in [`MEASURES`] and appends one JSON object per
@@ -37,6 +37,7 @@ const MEASURES: &[(&str, Measure)] = &[
     ("communities", communities),
     ("check", check),
     ("structure", structure),
+    ("templates", templates),
     ("changes", changes),
 ];
 
@@ -788,6 +789,323 @@ fn structure(run: &mut Run) -> Result<(), String> {
             .u("rss_before_mb", before)
             .u("rss_added_mb", added)
             .raw("sizes", &format!("[{}]", dist.join(","))),
+    );
+    Ok(())
+}
+
+/// A statement with parameters, timed, with the memory it added.
+fn measured_with(
+    run: &mut Run,
+    src: &str,
+    params: &[(String, Value)],
+) -> Result<(QueryResult, f64, u64, u64), String> {
+    let (before, _) = rss_mb();
+    reset_peak();
+    let (r, ms) = run.run(src, params)?;
+    let (_, peak) = rss_mb();
+    Ok((r, ms, before, peak.saturating_sub(before)))
+}
+
+fn cell(r: &QueryResult, row: usize, name: &str) -> Value {
+    let c = r.columns.iter().position(|c| c == name).unwrap_or(0);
+    r.rows
+        .get(row)
+        .and_then(|x| x.get(c))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn num(v: &Value) -> i64 {
+    v.as_i64().unwrap_or(0)
+}
+
+/// Every `(template, root)` that `templates(instances: '*')` lists, read in
+/// slices of the row cap.
+fn all_instances(
+    run: &mut Run,
+    args: &str,
+) -> Result<(std::collections::BTreeMap<String, BTreeSet<u64>>, f64, u64), String> {
+    let mut sets = std::collections::BTreeMap::new();
+    let mut after = 0usize;
+    let mut ms = 0.0;
+    let mut calls = 0;
+    loop {
+        let (r, t) = run.run(
+            &format!(
+                "CALL structure.templates({args}, instances: '*', grouped: true, after: {after})"
+            ),
+            &[],
+        )?;
+        ms += t;
+        calls += 1;
+        if r.rows.is_empty() {
+            return Ok((sets, ms, calls));
+        }
+        after += shapes::instance_sets(&r.rows, &mut sets);
+    }
+}
+
+/// `templates`: station templates scored against the designs; every
+/// repeated shape and the ones nested in what the plan keeps; the long
+/// hierarchy path and the chains; the plan of the whole graph, kept, and
+/// of one station and one line, alone and with the kept dictionary;
+/// every instance of the kept dictionary expanded and compared with the
+/// graph.
+fn templates(run: &mut Run) -> Result<(), String> {
+    run.run("CREATE EXTENSION IF NOT EXISTS structure", &[])?;
+    let types = shapes::types_arg(shapes::TEMPLATE_TYPES);
+    let hier = format!("types: {types}");
+    // Station templates against the designs.
+    let stations_args = format!("{hier}, labels: ['Station']");
+    let (r, ms, before, added) = measured(
+        run,
+        &format!("CALL structure.templates({stations_args}, limit: 1)"),
+    )?;
+    let (sets, list_ms, calls) = all_instances(run, &stations_args)?;
+    let rec = shapes::template_recovery(&sets, run.stations);
+    run.emit(
+        "structure.templates",
+        Obj::new()
+            .s("what", "design recovery")
+            .i("ms", ms as i64)
+            .u("rss_before_mb", before)
+            .u("rss_added_mb", added)
+            .s("message", r.message.as_deref().unwrap_or(""))
+            .u("templates", rec.templates as u64)
+            .u("designs", rec.designs as u64)
+            .u("designs_eligible", rec.eligible as u64)
+            .u("designs_recovered", rec.recovered as u64)
+            .u("deviated", rec.deviated as u64)
+            .u("deviated_in_design", rec.deviated_in_design as u64)
+            .u("deviation_templates", rec.other_templates as u64)
+            .b("exact", rec.exact())
+            .i("instances_ms", list_ms as i64)
+            .u("instances_calls", calls),
+    );
+    // Every repeated shape, by root label.
+    let (r, ms, before, added) = measured(
+        run,
+        &format!("CALL structure.templates({hier}, limit: 10000)"),
+    )?;
+    let mut by_label: std::collections::BTreeMap<String, (u64, u64, u64)> = Default::default();
+    for i in 0..r.rows.len() {
+        let e = by_label.entry(cell(&r, i, "root").to_string()).or_default();
+        e.0 += 1;
+        e.1 += num(&cell(&r, i, "instances")) as u64;
+        e.2 = e.2.max(num(&cell(&r, i, "nodes")) as u64);
+    }
+    let labels: Vec<String> = by_label
+        .iter()
+        .map(|(l, (t, n, m))| format!("[\"{l}\",{t},{n},{m}]"))
+        .collect();
+    run.emit(
+        "structure.templates",
+        Obj::new()
+            .s("what", "all shapes")
+            .i("ms", ms as i64)
+            .u("rss_before_mb", before)
+            .u("rss_added_mb", added)
+            .u("templates", r.rows.len() as u64)
+            .raw("by_root", &format!("[{}]", labels.join(",")))
+            .s("message", r.message.as_deref().unwrap_or("")),
+    );
+    // Path patterns and chains.
+    let (r, ms, before, added) = measured(run, &format!("CALL structure.paths({hier}, limit: 5)"))?;
+    run.emit(
+        "structure.paths",
+        Obj::new()
+            .s("what", "patterns")
+            .i("ms", ms as i64)
+            .u("rss_before_mb", before)
+            .u("rss_added_mb", added)
+            .s("top", &cell(&r, 0, "path").to_string())
+            .u("top_hops", num(&cell(&r, 0, "hops")) as u64)
+            .u("top_paths", num(&cell(&r, 0, "paths")) as u64)
+            .b("top_maximal", cell(&r, 0, "maximal") == Value::Bool(true))
+            .s("message", r.message.as_deref().unwrap_or("")),
+    );
+    let (r, ms, _, _) = measured(
+        run,
+        &format!("CALL structure.paths({hier}, kind: 'chains')"),
+    )?;
+    run.emit(
+        "structure.paths",
+        Obj::new()
+            .s("what", "chains")
+            .i("ms", ms as i64)
+            .u("chains_first_slice", r.rows.len() as u64)
+            .s("first", &cell(&r, 0, "path").to_string()),
+    );
+    // The whole graph, planned and kept.
+    let (r, ms, before, added) = measured(
+        run,
+        &format!("CALL structure.plan({hier}, store: 'mfg', limit: 10000)"),
+    )?;
+    let chosen: Vec<usize> = (1..r.rows.len())
+        .filter(|&i| cell(&r, i, "chosen") == Value::Bool(true))
+        .collect();
+    let kind = |i: usize| cell(&r, i, "kind").to_string();
+    let t_chosen = chosen.iter().filter(|&&i| kind(i) == "template").count();
+    let p_chosen = chosen.iter().filter(|&&i| kind(i) == "pattern").count();
+    let nested = chosen
+        .iter()
+        .filter(|&&i| num(&cell(&r, i, "nested_in")) > 0)
+        .count();
+    let nested_uses: i64 = chosen
+        .iter()
+        .filter(|&&i| num(&cell(&r, i, "nested_in")) > 0)
+        .map(|&i| num(&cell(&r, i, "uses")))
+        .sum();
+    let (kept, _) = run.run("CALL structure.dictionaries()", &[])?;
+    let stored = num(&cell(&kept, 0, "stored_bytes"));
+    run.emit(
+        "structure.plan",
+        Obj::new()
+            .s("what", "whole graph")
+            .i("kept_stored_bytes", stored)
+            .i("ms", ms as i64)
+            .u("rss_before_mb", before)
+            .u("rss_added_mb", added)
+            .i("plain_bytes", num(&cell(&r, 0, "plain_bytes")))
+            .i("plain_tokens", num(&cell(&r, 0, "plain_tokens")))
+            .i("compact_bytes", num(&cell(&r, 0, "use_bytes")))
+            .i("compact_tokens", num(&cell(&r, 0, "use_tokens")))
+            .i("dictionary_bytes", num(&cell(&r, 0, "define_bytes")))
+            .i("dictionary_tokens", num(&cell(&r, 0, "define_tokens")))
+            .i("saving_tokens", num(&cell(&r, 0, "saving_tokens")))
+            .i("uses", num(&cell(&r, 0, "uses")))
+            .u("templates_chosen", t_chosen as u64)
+            .u("templates_nested", nested as u64)
+            .i("nested_standalone_uses", nested_uses)
+            .u("patterns_chosen", p_chosen as u64)
+            .u("candidates", r.rows.len() as u64 - 1)
+            .s("dictionary", &cell(&r, 0, "id").to_string()),
+    );
+    // One station and one line: alone, and with the kept dictionary.
+    let station = run
+        .stations
+        .iter()
+        .find(|s| !s.deviated)
+        .map(|s| s.id)
+        .ok_or("no station")?;
+    let mut line = None;
+    run.g
+        .for_each_adj(station, glider::graph::Dir::In, None, |a| {
+            line = Some(a.other);
+        });
+    let line = line.ok_or("a station with no line")?;
+    let below = &shapes::TEMPLATE_TYPES[4..];
+    let mut line_types = vec!["HAS_STATION"];
+    line_types.extend_from_slice(below);
+    // A few hundred nodes scattered over the graph: ids from a fixed
+    // stream, spread over the whole id range.
+    let top = run.g.node_ids().last().copied().unwrap_or(1);
+    let mut z = 0x9e37_79b9_7f4a_7c15u64;
+    let mut scattered: Vec<u64> = Vec::new();
+    while scattered.len() < 300 {
+        z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut x = z;
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        let id = 1 + (x ^ (x >> 31)) % top;
+        if run.g.node_shared(id).is_some() {
+            scattered.push(id);
+        }
+    }
+    for (what, nodes) in [
+        ("one station", shapes::subtree(&run.g, station, below)),
+        ("one line", shapes::subtree(&run.g, line, &line_types)),
+        ("300 scattered nodes", scattered),
+    ] {
+        let ids = Value::List(nodes.iter().map(|&n| Value::Int(n as i64)).collect());
+        let params = vec![("nodes".to_string(), ids)];
+        let (alone, ms_alone, _, _) = measured_with(
+            run,
+            &format!("CALL structure.plan({hier}, nodes: $nodes, limit: 1)"),
+            &params,
+        )?;
+        // With the kept dictionary, from the selection alone: five runs.
+        let mut times = Vec::new();
+        let (mut kept, mut added) = (None, 0);
+        for _ in 0..5 {
+            let (r, ms, _, add) = measured_with(
+                run,
+                "CALL structure.plan(dictionary: 'mfg', nodes: $nodes, text: 'compact', limit: 1)",
+                &params,
+            )?;
+            times.push(ms);
+            added = added.max(add);
+            kept = Some(r);
+        }
+        let kept = kept.unwrap();
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        // The same selection found over the whole graph: the same text.
+        let (whole, ms_whole, _, _) = measured_with(
+            run,
+            "CALL structure.plan(dictionary: 'mfg', nodes: $nodes, text: 'compact', limit: 1, find: 'graph')",
+            &params,
+        )?;
+        let same = cell(&kept, 0, "text") == cell(&whole, 0, "text");
+        run.emit(
+            "structure.plan",
+            Obj::new()
+                .s("what", what)
+                .u("nodes", nodes.len() as u64)
+                .i("plain_bytes", num(&cell(&alone, 0, "plain_bytes")))
+                .i("plain_tokens", num(&cell(&alone, 0, "plain_tokens")))
+                .i("alone_bytes", num(&cell(&alone, 0, "use_bytes")))
+                .i("alone_tokens", num(&cell(&alone, 0, "use_tokens")))
+                .b(
+                    "alone_chosen",
+                    cell(&alone, 0, "chosen") == Value::Bool(true),
+                )
+                .i("kept_bytes", num(&cell(&kept, 0, "use_bytes")))
+                .i("kept_tokens", num(&cell(&kept, 0, "use_tokens")))
+                .i("kept_uses", num(&cell(&kept, 0, "uses")))
+                .i("ms_alone", ms_alone as i64)
+                .raw("ms_kept_min", &format!("{:.2}", times[0]))
+                .raw("ms_kept_median", &format!("{:.2}", times[2]))
+                .u("kept_rss_added_mb", added)
+                .i("ms_whole_graph_path", ms_whole as i64)
+                .b("same_text_as_whole_graph_path", same),
+        );
+    }
+    // Every instance of the kept dictionary, expanded and compared.
+    let (sets, list_ms, calls) = all_instances(run, "dictionary: 'mfg'")?;
+    let (before, _) = rss_mb();
+    reset_peak();
+    let t = Instant::now();
+    let (mut roots, mut exact, mut expand_calls) = (0usize, 0usize, 0u64);
+    for (id, members) in &sets {
+        let members: Vec<u64> = members.iter().copied().collect();
+        for chunk in members.chunks(1000) {
+            let list = Value::List(chunk.iter().map(|&n| Value::Int(n as i64)).collect());
+            let (r, _) = run.run(
+                &format!("CALL structure.expand(of: '{id}', root: $roots, dictionary: 'mfg')"),
+                &[("roots".to_string(), list)],
+            )?;
+            expand_calls += 1;
+            let (n, x) = shapes::expansion_exact(&run.g, &r);
+            roots += n;
+            exact += x;
+        }
+    }
+    let ms = t.elapsed().as_secs_f64() * 1e3;
+    let (_, peak) = rss_mb();
+    run.emit(
+        "structure.expand",
+        Obj::new()
+            .s("what", "every instance of the kept dictionary")
+            .u("templates", sets.len() as u64)
+            .u("instances", roots as u64)
+            .u("exact", exact as u64)
+            .b("all_exact", roots == exact)
+            .i("ms", ms as i64)
+            .u("calls", expand_calls)
+            .u("rss_before_mb", before)
+            .u("rss_added_mb", peak.saturating_sub(before))
+            .i("list_ms", list_ms as i64)
+            .u("list_calls", calls),
     );
     Ok(())
 }

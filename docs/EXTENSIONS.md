@@ -524,3 +524,251 @@ rows, byte for byte, in memory and from a file.
 - The edges of one node are read once per round; a colouring at depth `d`
   reads the adjacency `d` times.
 - Measured on the manufacturing graph: `bench/KNOWLEDGE.md`, "Structure".
+
+### Templates: a repeated shape said once
+
+A model given a plant as text spends its budget on the same station written
+out forty times. Templates write each repeated shape once and each
+occurrence as a short reference with only what is its own. A template is a
+way of writing nodes down, never a replacement for them: every instance
+keeps every node, edge and value it has, and `expand` gives them back.
+
+```
+CALL structure.templates(types: ["HAS_LINE", "HAS_STATION", "HAS_SIDE", "HAS_LOCATION", "HAS_ELEMENT", "HAS_INSTRUCTION"], labels: ["Station"])
+CALL structure.templates(types: [...], instances: "<template id>", after: 0, limit: 100)
+CALL structure.templates(types: [...], instances: "*")             every instance of every template
+CALL structure.expand(of: "<template id>", root: [242, 282], types: [...])
+CALL structure.paths(types: [...])                                 label and type sequences, with counts
+CALL structure.paths(types: [...], kind: "chains")                 runs with one way in and one way out
+CALL structure.expand(of: "chain:1705", types: [...])
+CALL structure.plan(types: [...], text: "compact", store: "plant")
+CALL structure.plan(dictionary: "plant", nodes: [242, 243, ...], text: "compact")
+CALL structure.dictionaries()
+CALL structure.drop(dictionary: "plant")
+```
+
+**What a template is.** The edges of `types:`, followed in `dir:` (`out`,
+from parent to child, by default; or `in`), make a hierarchy: a node
+belongs to the node that one such edge comes from, when exactly one does.
+The *shape* under a node is the node and everything that belongs to it,
+down the hierarchy, with every edge going out of those nodes. An edge to a
+node of the shape is internal and is written by position (`.4`); any other
+is a reference to a shared node and is written by its handle (`n83`), so a
+tool used by forty stations is referred to, not copied. Roots are nodes of
+`labels:` (every node when not given) whose shape has `min_nodes:` (2) to
+`max_nodes:` (4096) nodes; a template is a shape that `min_count:` (2) or
+more roots have exactly: the same labels, property keys, positions, edges
+and referred nodes, compared in full. Across its instances, a property that
+always has the same value is a constant; a text value that is always the
+root's value of the same key (or its first N bytes) followed by the same
+text is derived (`code=~"-WE01"`); anything else is a slot (`$`), which each
+use fills, in the order the definition is read. Values are compared exactly
+(`1` and `1.0` differ, unlike colours): a template gives back what was
+stored.
+
+`structure.templates` rows: `rank, template, root` (its root's label),
+`nodes, edges, slots, instances, plain_tokens` (of its instances written
+plainly), `saving_bytes, saving_tokens` (estimated, as if it were used for
+all its instances alone) and `definition`, largest estimated saving first.
+`instances:` lists a template's instances (`template, root, handle,
+slots`), or with `"*"` every template's (with `grouped: true`, one row
+per template, `template, instances, roots`, up to 100,000 roots a call);
+`dictionary:` lists a kept
+dictionary's templates as the graph has them now. A template id is a hash
+of its definition, with referred nodes by identity value or content, so the
+same data under other ids has the same templates.
+
+**Expansion.** `structure.expand(of: <template>, root: <id or list>)`
+rebuilds each instance from the definition and its slot values alone,
+after checking in full that the root has exactly the template's shape,
+constants and derivations; a root that does not is refused ("is not an
+instance of template ..."). Rows are `kind` (`node` or `edge`), `id`,
+`labels`, `type`, `from`, `to`, `props` (a list of `[key, value]`) and
+`root`. Without `dictionary:` the templates are found again with the same
+arguments as `templates`; with it, they are the kept dictionary's. At most
+1,000 roots a call.
+
+**Deviations.** A station that differs from its design (a tool missing,
+an element more) has another shape, so it is never an instance of the
+design's template. It is written plainly, with the smaller templates of
+the parts it shares with its design (a side, a location, an element) used
+where they make it shorter. Stations that deviate in the same way are
+instances of a template of their own.
+
+**Paths.** `structure.paths` counts the label and type sequences that
+paths follow from the nodes of `labels:` (or from the nodes no followed
+edge reaches), up to `max_hops:` (12): rows `rank, pattern, path, hops,
+paths, ends, maximal`, longest maximal patterns first. Counting merges the
+paths that reach one node along one sequence, so it costs nodes times
+sequences, not paths. `kind: "chains"` lists runs of nodes that each have
+one followed edge in and one out, between two that do not: `chain` (named
+`chain:<first interior id>`), `pattern, path, hops, from, to, interior,
+nodes`; `expand(of: "chain:<id>")` gives the interior nodes and the run's
+edges.
+
+**The notation, `glider-compact/1`.** This is the whole of it: a reader
+with a text and, when the text names one, its dictionary needs nothing
+else (`tests/structure_notation.rs` decodes from this description alone).
+
+*Lines.* A text is lines. The first is the header:
+`# glider-compact/1`, then ` dictionary <hash>` when the text is written
+with a dictionary, then ` identity <k1>, <k2>` when nodes are named by
+identity. Other lines starting with `#` are comments (the legend, `# body`).
+A dictionary is a legend line, definitions and patterns; a text that
+carries its dictionary has it after the header and before `# body`, and a
+text written with a kept dictionary has only the header and the body.
+
+*Names and values.* A label, key or type is bare when it is `[A-Za-z_]`
+then `[A-Za-z0-9_]*`, otherwise in backticks with a backtick doubled. A
+value is `null`, `true`, `false`, an integer in digits, a float with a point
+or an exponent (`1.0`, `-0.5`, `1e300`, `NaN`, `inf`, `-inf`), a JSON string,
+or a list `[a, b]` (comma and one space).
+
+*Handles.* `n12` is the node with id 12. With `identity` in the header,
+`@code="P01-S1"` is the one node whose identity key `code` has that value:
+its identity key is the first of the header's keys it has, the handle names
+it with its value, and its card leaves that property off (the handle
+carries it). A node that has none of the keys, or whose value another node
+of the text has under the same key, is written `n<id>` and keeps every
+property on its card, so a handle names exactly one node.
+
+*Plain blocks.* One per node: a card `handle:Label:Other k=v ...` (labels
+sorted, properties by key rank then name), then its outgoing edges, by
+type: `handle -TYPE-> h1, h2` for the edges without properties (targets
+sorted by handle), then `handle -TYPE{k=v, ...}-> h` one line per edge with
+properties. Parallel edges are listed as often as they exist.
+
+*Definitions.* `Tn #<16 hex>` and then lines that start with a space. A
+node line is ` .k:Label k=spec ...` (positions in preorder, `.1` the root,
+numbered consecutively). A spec is a value (a constant), `$` (a slot), or a
+derivation `~"x"` (the value of the same key at the root of the definition
+the line belongs to, then `x`) or `~N"x"` (its first N bytes, then `x`). A
+nested line ` .k=Tm` says that positions `.k` to `.k+size(Tm)-1` are `Tm`'s
+nodes in `Tm`'s order, with `Tm`'s edges between them and from them (its
+targets shifted by `k-1`); `k=spec` pairs after it give values of `Tm`'s
+root where `Tm` has a slot, and a `~` there refers to the root of the
+definition the line is in, while every derivation inside `Tm` refers to
+`Tm`'s root (here, `.k`). Edge lines ` .k -TYPE-> t1, t2` and
+` .k -TYPE{k=spec, ...}-> t` follow the node lines; a target is a position
+`.m` or a handle. A definition writes every edge of its nodes that no nested
+template it uses has: under `dir: "in"` that includes a nested root's edge
+to its owner.
+
+*Slots.* A definition's slots, in order: its node lines top to bottom, each
+line's `$` left to right, where a nested line contributes the nested
+template's slots in that template's own order, less those the line gives;
+then its edge lines top to bottom, each line's `$` left to right.
+
+*Uses.* `Tn ids v1 v2 ...`: the template's name, then which nodes these
+are, then one value per slot, separated by single spaces. Without
+`identity`, ids are every position's node id in position order, as `n`
+followed by comma-separated ids and runs (`n242..244,247` is 242, 243, 244,
+247). With `identity`, only the positions whose node is written by id are
+listed, as `.k=n<id>` separated by commas (`.5=n246,.7=n248`), or nothing
+when there are none; every other node's handle is `@key=value` from its
+values as the use gives them. Edges of the use's nodes that are not the
+template's (under `dir: "in"`, the root's edge to its owner) are written
+after the use line as plain edge lines.
+
+*Chains and patterns.* `Pn #<16 hex> -T1-> (:L1) -T2-> ... -Tk->` (or
+`<-T-` steps under `dir: "in"`) is a pattern: edge types with the labels
+of the nodes between them. `a -Pn-> b [x y]` in a node's block is the run
+`a -T1-> x -T2-> y -T3-> b` (for a `<-T-` step the edge goes the other
+way), every edge without properties; those edges are not written again.
+
+```
+# glider-compact/1 dictionary 0f472ec37f752451c3de9ff727ef1bcb
+# .k: a template's k-th node in preorder, ...
+T1 #1a78f86e1f72f9c0
+ .1:WorkElement name="Check tailgate fit" code=$ seq=12 std_time_seconds=$
+ .2:WorkInstruction title="Examine tailgate fit" number=$ revision="A" scope="local" text="Examine the tailgate fit to 9 mm. ..."
+ .1 -FOLLOWS-> n179
+ .1 -HAS_INSTRUCTION{from=$}-> .2
+ .1 -USES_TOOL-> n24, n59
+T36 #ea11ab640dbe7e2c
+ .1:Side name="Left" code=$
+ .2=T31 code=~"1"
+ .11:WorkLocation name="Tailgate post" code=~"3"
+ .12=T11 code=~16"WE08"
+ ...
+P1 #3b1c... -HAS_ELEMENT-> (:WorkElement) -HAS_INSTRUCTION->
+# body
+n241:Line name="Line 1 Battery tray" code="P01-S1-L1" rate_per_hour=26
+n241 -HAS_STATION-> n242, n282, n322
+T39 n242..244,247..248,... "Station 010 Battery tray torque cell" "P01-S1-L1-ST010" "2024-01-30" 1 50 22 "WI-000001-02A" ...
+n1459 -P1-> n1707 [n1705 n1706]
+```
+
+Here `.2=T31 code=~"1"` says positions `.2` on are `T31`'s and gives
+`T31`'s root `code` as `T36`'s root code followed by `1`. With every node
+identified, a text is the same for the same data under other ids.
+
+**The plan.** `structure.plan` writes the part of the graph asked for (the
+whole graph, or `nodes:`) plainly and with templates and chain patterns, and
+keeps what makes it shorter in tokens (`by: "bytes"` to count bytes).
+Larger templates are chosen first, each when its uses save more than its
+definition costs; then templates are nested in chosen definitions where
+that is shorter; then further uses are added where a use is shorter than
+what it replaces; then chains. Both texts are then written and measured,
+and when the compact one is not shorter nothing is chosen. Rows: first the
+`total` (`id` the dictionary's hash; `define_*` the dictionary,
+`use_*` the compact text, `plain_*` the plain text, `saving_*` their
+difference, exactly; `text` the text asked for with `text: "compact"`,
+`"plain"` or `"dictionary"`), then each candidate (`kind` `template` or
+`pattern`, `chosen`, `uses`, `nested_in`, the cost of defining it once,
+of its uses, of the plain text they replace, and its saving). `lambda:` is
+accepted for candidates that leave something out; there are none, so it
+weighs nothing and nothing is ever left out.
+
+**Kept dictionaries.** `store: "<name>"` keeps the chosen dictionary in the
+extension's keyspace: its definitions, its text, the revision it was made
+at, the arguments, the code version (`structure-templates/1`) and the hash
+that names its text. `plan(dictionary: "<name>")` writes with it without
+repeating it (the text's first line names it by hash), so many answers can
+share one dictionary given to a model once. An occurrence is written as a
+use only when it agrees with the definition in everything the definition
+says, including the handles of the nodes it refers to, so a stale
+dictionary costs uses, never truth. `structure.dictionaries()` lists them (`name,
+revision, fresh, hash, templates, patterns, bytes, tokens, code, args`);
+`fresh: "require"` refuses a stale one; `structure.drop(dictionary:)`
+forgets one; `stored_bytes` counts every record kept for one. Freshness
+works as for colourings: with the `changes` journal installed, a
+dictionary is stale only when a node or an edge changed since; without it,
+any write but the extension's own makes it stale. Keeping or dropping
+either leaves the other fresh. With nothing chosen, `store:` keeps a
+dictionary of the legend alone, and `text: "dictionary"` returns it.
+
+Which nodes are instances is never kept: a selection works it out from the
+graph as it is now (ownership from each node's own edges, each candidate
+root's shape hashed and matched in full against the kept definition), so a
+node changed since the dictionary was made is written plainly unless it
+still matches exactly, and nothing is written from a membership that may
+no longer hold. A definition also says how it names the nodes it refers
+to; an occurrence whose referred node is named otherwise now (a tool whose
+code changed) is written plainly. Beside the definitions a dictionary keeps an index of each
+template's root shape and id (about 50 bytes a template), so a selection
+reads only the definitions its shapes can use.
+
+**Bounds.** The hierarchy's state is 56 bytes a node, within half of
+`algorithm_memory()` and spilling past it; candidates are grouped by
+external sorts; only roots whose shape repeats are walked, each at most
+`max_nodes:` nodes. At most 100,000 templates a call (narrow with
+`labels:`, `types:` or larger `min_count:`/`min_nodes:`), and 10,000 rows,
+continued with `after:`.
+
+### Limits of templates
+
+- Finding templates reads the whole graph (a template's constants are what
+  is the same across all its instances), so `templates`, `plan` without a
+  kept dictionary, `plan(dictionary:)` without `nodes:`, `expand` without
+  `dictionary:` and `templates(dictionary:)` are whole-graph calls. A
+  selection written with a kept dictionary, `plan(dictionary:, nodes:)`,
+  reads only the selection, the owners above it and the definitions it can
+  use: milliseconds at a million nodes. `expand(dictionary:)` reads only the
+  shapes under its roots. `find: "graph"` makes a selection's plan find its
+  instances over the whole graph instead (the same text, for checking).
+- A deviating station is written plainly with its parts' templates; a
+  template plus a list of differences is not built.
+- Sibling nodes are numbered by content, not by id, so a use's id list
+  folds into runs only where the two orders agree.
+- Measured on the manufacturing graph: `bench/KNOWLEDGE.md`, "Templates".

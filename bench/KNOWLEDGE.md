@@ -162,7 +162,7 @@ second:
 
 ```
 mfg-bench --data DIR [--tiers memory,file] [--budgets 250,1000,4000]
-          [--only stats,retrieve,pagerank,communities,check,structure,changes] [--out FILE] [--label NAME] [--detail]
+          [--only stats,retrieve,pagerank,communities,check,structure,templates,changes] [--out FILE] [--label NAME] [--detail]
 ```
 
 For each tier it imports `graph.jsonl` with the streaming importer, then runs
@@ -185,6 +185,11 @@ every measurement in `MEASURES`, appending JSON lines to
 | `changes.write` | per `write` (`node set`: a property set on node `1 + i mod nodes`; `edge add` between pseudo-random nodes; `edge delete` of those edges), `journal` (installed or not), `round`: `writes`, `per_commit`, `per_s`, `log_bytes_per_write` (revision moved / writes): 100,000 writes (or the node count when smaller) committed every 1,000, then 10,000 committed one by one. Rounds alternate without and with the journal, twice |
 | `changes.read` | after each round with the journal: `entries`, `bytes`, `bytes_per_entry` (from `changes.status`), `since_rows`, `since_calls`, `since_all_ms` (every entry since the install, by statement, 10,000 a call), `since_tail_rows` / `since_tail_ms` (the last commit), `changed_us` (`changes::changed` for 1,000 node ids), `changed_any_us` |
 | `changes.cap` | at a cap of a fifth of the writes (at least 1,000), so the journal sweeps throughout: `writes`, `per_s`, `log_bytes_per_write` for node sets in 1,000-write transactions; then 10,000 single writes: `single_per_s`, `single_slowest_us`, `single_biggest_log_bytes`; `entries` held after, `floor_rose` |
+
+| `structure.templates` | over `HAS_PLANT` ... `HAS_INSTRUCTION` outwards: `what: "design recovery"` (roots of `Station`): `templates`, `designs`, `designs_eligible` (two or more stations without a deviation), `designs_recovered` (exactly one template's instances), `deviated`, `deviated_in_design` (deviated stations among a design's template's instances: must be 0), `deviation_templates`, `exact`, `instances_ms`/`instances_calls` to list every instance; `what: "all shapes"` (every root): `templates`, `by_root` as `[label, templates, instances, largest]` |
+| `structure.paths` | `what: "patterns"`: the first pattern (`top`, `top_hops`, `top_paths`, `top_maximal`); `what: "chains"`: chains in the first slice |
+| `structure.plan` | `what: "whole graph"`, kept as `mfg`: `plain_*`, `compact_*`, `dictionary_*` (bytes and tokens), `saving_tokens`, `uses`, `templates_chosen`, `templates_nested`, `nested_standalone_uses`, `patterns_chosen`, `candidates`, `kept_stored_bytes`; `what: "one station"` / `"one line"` / `"300 scattered nodes"` (the first station without a deviation and its line, with everything below; ids from a fixed stream): `plain_*`, `alone_*` (planned with its dictionary inline), `kept_*` and `kept_uses` (written with the kept dictionary, not repeated), `ms_alone`, `ms_kept_min`, `ms_kept_median` (of five), `kept_rss_added_mb`, `ms_whole_graph_path` and `same_text_as_whole_graph_path` (`find: "graph"`) |
+| `structure.expand` | every instance of the kept dictionary, expanded 1,000 roots a call and compared with the graph: `templates`, `instances`, `exact`, `all_exact`, `ms`, `calls`, memory, `list_ms`/`list_calls` |
 
 A later slice adds a measurement by writing `fn(&mut Run) -> Result<(),
 String>` and adding it to `MEASURES`: `Run` gives the loaded graph, the
@@ -393,137 +398,137 @@ classes of two and 454,510 alone. A class is a candidate, as `check`'s are:
 two stations of one design are two stations, and a duplicate pair is for a
 person or a rule to decide on; nothing is merged.
 
-## Change tracking: `changes`
+## Templates: a repeated shape said once
 
-`mfg-bench --only changes`, release build, on a shared, busy machine
-(load 5-7 on 8 cores). The first version of the journal (`before`: an
-index by revision beside every entry and a state record rewritten on
-every write) and this one (`after`: one blind put per changed id) were
-run back to back by the same harness; lines labelled
-`g5-changes-before` and `g5-changes-after` in `bench/results/mfg.jsonl`.
-(The lines labelled `g5-changes` are the first version's first
-measurement, committed every 10,000 writes.) Each cell: writes a second
-with the journal as a share of without it (median of two rounds each),
-and in brackets the log bytes a write with it as a multiple of without.
+Measured on the graphs without faults (`n<size>-s1`), release build, one
+run each on a shared machine (`mfg-bench --only templates`; lines labelled
+`g8-templates`). The hierarchy is `HAS_PLANT` ... `HAS_INSTRUCTION`,
+outwards; tools, parts, standards and dependencies are references and
+internal edges of the shapes. Every count, byte and token below is the same
+on both tiers; times are memory / file, in ms unless marked.
 
-Transactions of 1,000 writes (100,000 writes, or the node count):
+**Designs.** Templates of stations, against the truth:
 
-| dataset | tier | node set, before | after | edge add, before | after | edge delete, before | after |
-|---|---|---|---|---|---|---|---|
-| n10000-s1 | memory | 0.32 (7.9x) | 0.41 (2.6x) | 0.32 (11.7x) | 0.48 (3.6x) | 0.19 (26x) | 0.25 (6.1x) |
-| n10000-s1 | file | 0.26 (7.9x) | 0.41 (2.6x) | 0.23 (11.7x) | 0.48 (3.6x) | 0.15 (26x) | 0.33 (6.1x) |
-| n100000-s1 | memory | 0.26 (7.5x) | 0.38 (2.5x) | 0.36 (11.0x) | 0.56 (3.6x) | 0.24 (26x) | 0.44 (6.4x) |
-| n100000-s1 | file | 0.25 (7.5x) | 0.44 (2.5x) | 0.40 (11.0x) | 0.69 (3.6x) | 0.25 (26x) | 0.56 (6.4x) |
-| n1000000-s1 | memory | 0.22 (7.5x) | 0.44 (2.5x) | 0.42 (9.7x) | 0.65 (3.5x) | 0.31 (24x) | 0.50 (6.1x) |
-| n1000000-s1 | file | 0.31 (7.5x) | 0.46 (2.5x) | 0.50 (9.7x) | 0.67 (3.5x) | 0.33 (24x) | 0.50 (6.1x) |
+| dataset | stations | designs | recovered | deviated | deviated in a design's template | other station templates |
+|---|---|---|---|---|---|---|
+| n10000-s1 | 328 | 6 | **6 of 6** | 39 | 0 | 2 |
+| n100000-s1 | 2,949 | 17 | **17 of 17** | 350 | 0 | 37 |
+| n1000000-s1 | 28,795 | 24 | **24 of 24** | 3,600 | 0 | 292 |
 
-One write a transaction (10,000 writes):
+Every design is a template whose instances are exactly its stations
+without a recorded deviation, and no deviating station is an instance of
+its design's template. The other station templates are stations that
+deviate the same way (the same tool missing from the same element), which
+are alike and say so exactly.
 
-| dataset | tier | node set, before | after | edge add, before | after | edge delete, before | after |
-|---|---|---|---|---|---|---|---|
-| n10000-s1 | memory | 0.28 (6.6x) | 0.32 (2.1x) | 0.38 (9.5x) | 0.50 (2.9x) | 0.28 (16x) | 0.49 (4.0x) |
-| n10000-s1 | file | 0.35 (6.6x) | 0.52 (2.1x) | 0.44 (9.5x) | 0.63 (2.9x) | 0.40 (16x) | 0.59 (4.0x) |
-| n100000-s1 | memory | 0.27 (6.6x) | 0.39 (2.1x) | 0.39 (9.0x) | 0.60 (2.9x) | 0.38 (16x) | 0.53 (4.2x) |
-| n100000-s1 | file | 0.32 (6.6x) | 0.71 (2.1x) | 0.37 (9.0x) | 0.76 (2.9x) | 0.38 (16x) | 0.57 (4.2x) |
-| n1000000-s1 | memory | 0.27 (6.6x) | 0.25 (2.1x) | 0.51 (7.8x) | 0.61 (2.9x) | 0.45 (15x) | 0.54 (4.1x) |
-| n1000000-s1 | file | 0.32 (6.6x) | 0.43 (2.1x) | 0.47 (7.8x) | 0.63 (2.9x) | 0.39 (15x) | 0.56 (4.1x) |
+**Smaller shapes.** With every node a possible root: 51 templates at 10k
+(9 of sides, 9 of locations, 25 of work elements with their instructions,
+8 of stations), 219 at 100k, 878 at 1M. The plan nests them in station
+definitions (`.k=Tm`) and uses them on their own for the parts of
+deviating stations they fit: 31 of the 41 chosen templates at 10k are
+nested in others (107 uses on their own), 94 of 149 at 100k (764), 151 of
+467 at 1M (15,800).
 
-Log bytes a write, the same at every size: node set 20 without, 151
-before, 52 after (one write a transaction: 28, 186, 59); edge add 28,
-305, 98 (37, 331, 107); edge delete 13, 341, 84 (22, 350, 93). Without
-the journal, the 100k memory rates were 477k node sets, 119k edge adds and
-177k edge deletes a second in 1,000-write transactions, and 232k, 57k and
-61k one a transaction.
+**The long path.** The first pattern at every size is the whole hierarchy,
+`(:Enterprise) -HAS_PLANT-> (:Plant) -HAS_SHOP-> (:Shop) -HAS_LINE-> (:Line)
+-HAS_STATION-> (:Station) -HAS_SIDE-> (:Side) -HAS_LOCATION->
+(:WorkLocation) -HAS_ELEMENT-> (:WorkElement) -HAS_INSTRUCTION->
+(:WorkInstruction)`, 8 hops, followed by 4,075 / 45,272 / 454,308 paths:
+one per local instruction. Chains (`-HAS_ELEMENT-> (:WorkElement)
+-HAS_INSTRUCTION->` from a location through an element with one
+instruction, or a station with one side) are chosen only where writing them
+as one hop pays: 1, 4 and 6 patterns.
 
-Reading, after one round of 3 x N writes:
+**Bytes and tokens**, plain against planned:
 
-| | 10k | 100k | 1M |
-|---|---|---|---|
-| entries | 39,971 | 300,815 | 408,198 |
-| bytes an entry, before / after | 54 / 16.5 | 54 / 17.6 | 54 / 17.8 |
-| `since` over every entry, 10,000 a call, before / after | 5 / 5-6 ms | 38 / 38-42 ms | 51-61 / 50-52 ms |
-| `since` for the last commit, before / after | 0.01 / 1.0-1.3 ms | 0.01 / 7.8-8.3 ms | 0.01 / 10.6-10.8 ms |
-| `changes::changed`, 1,000 ids | 0.25-0.37 ms | 0.29-0.31 ms | 0.29-0.51 ms |
-| `changes::changed_any` when nothing changed, before / after | < 1 µs / 0.5-0.7 ms | < 1 µs / 2.8-3.1 ms | ~1 µs / 2.9 ms |
-
-What it says:
-
-- **Writing less per change paid off by about half.** With one blind put
-  per changed id and nothing else, node writes run at 0.38-0.46 of their
-  speed in 1,000-write transactions (first version 0.22-0.32), edge adds
-  at 0.48-0.69 (0.23-0.50) and edge deletes at 0.25-0.56 (0.15-0.33). The
-  log grows 2.5 times a node write's bytes (7.5 before), 3.5 times an edge
-  add's (11) and 6 times an edge delete's (26).
-- **The targets were 60% for node writes, 50% for edge writes, and about 3
-  times the log bytes.** Edge adds meet them (0.48-0.69, 3.5x). Node
-  writes do not (best 0.46), nor do edge delete bytes (6x), and edge delete
-  speed is at 0.5 only from 100k nodes up. What stands in the way,
-  measured with a hook that does nothing on a 100,000-node memory graph:
-  that hook alone leaves node writes at about 0.70 of their speed (the
-  engine builds the node's before and after images and wraps every hooked
-  write in a unit, G4), and one entry is one insert into the extension tree,
-  about as dear as the node property set it describes (about 0.9 µs
-  against 1.1 µs). The read of the journal's state that keeps the cap
-  costs about 0.5 µs more. An edge delete logs 13 bytes, and the smallest
-  entry is 15 bytes in the log, three of them (the edge and both ends)
-  with namespace and lengths about 63.
-- **Why not once per transaction.** Gathering the ids a transaction
-  touched and writing them at commit would save the per-write record and
-  merge repeated ids, but not the tree insert per entry nor the hook's own
-  cost, so it cannot bring node writes to 0.6 either. Only packing a
-  transaction's ids into one value would, and then `changed` for a set of
-  ids, which the vector slice depends on, becomes a scan of the journal.
-  So this slice does not change the commit path.
-- **Reads got slower where expected.** With no index by revision, `since`
-  scans the entries of the kinds asked for whatever the revision: the
-  whole journal in slices costs what it did (about 7-8 million entries a
-  second), but the last commit's changes now take 8-11 ms at 300,000-400,000
-  entries instead of 0.01 ms, and `changed_any` with nothing changed takes
-  3 ms. `changed` for 1,000 ids is unchanged at about 0.3 ms.
-- **A database without the journal pays nothing.** The engine did not
-  change.
-
-### After the review (`g5-changes-review`)
-
-The review found that one write paid for the whole cap: at the default
-cap the write that trimmed took 133 ms and logged 1.7 MB. Now the cap is
-paid a slice at a time (docs/DERIVED.md, "The cap"), and the measurement
-was run again by the same harness (`mfg-bench --only changes --label
-g5-changes-review`, same busy machine).
-
-Ordinary writes, with the journal far from its cap, are where they were
-(share of write speed kept, log bytes as a multiple of without):
-
-| dataset | tier | per transaction | node set | edge add | edge delete |
+| dataset | part | plain | planned, dictionary inline | with the kept dictionary | dictionary |
 |---|---|---|---|---|---|
-| n10000-s1 | memory | 1,000 | 0.39 (2.6x) | 0.47 (3.9x) | 0.25 (6.9x) |
-| n100000-s1 | memory | 1,000 | 0.55 (2.5x) | 0.66 (3.8x) | 0.34 (7.2x) |
-| n100000-s1 | file | 1,000 | 0.67 (2.5x) | 0.57 (3.8x) | 0.33 (7.2x) |
-| n1000000-s1 | memory | 1,000 | 0.42 (2.5x) | 0.63 (3.8x) | 0.47 (7.1x) |
-| n1000000-s1 | file | 1,000 | 0.36 (2.5x) | 0.62 (3.8x) | 0.48 (7.1x) |
-| n100000-s1 | memory | 1 | 0.56 (2.1x) | 0.61 (2.9x) | 0.41 (4.4x) |
-| n1000000-s1 | memory | 1 | 0.25 (6.8x) | 0.59 (2.9x) | 0.51 (4.1x) |
+| n10000-s1 | whole graph (10,055 nodes) | 2.59 MB, 950,841 tokens | 514 KB, 218,539 (23%) | | 50.2 KB, 18,296 |
+| n10000-s1 | one station (40 nodes) | 10,514 B, 3,734 | not shorter: plain | 905 B, 441 (12%) | |
+| n10000-s1 | one line (345 nodes) | 90,056 B, 31,947 | 21,113 tokens (66%) | 13,896 B, 5,919 (19%) | |
+| n100000-s1 | whole graph (103,004) | 28.8 MB, 10,395,457 | 4.70 MB, 2,042,312 (20%) | | 311 KB, 113,304 |
+| n100000-s1 | one station (18) | 4,893 B, 1,770 | plain | 480 B, 223 (13%) | |
+| n100000-s1 | one line (361) | 100,826 B, 35,821 | 20,999 tokens (59%) | 13,318 B, 5,827 (16%) | |
+| n1000000-s1 | whole graph (1,023,660) | 291 MB, 103,283,695 | 42.0 MB, 18,305,853 (18%) | | 1.67 MB, 610,908 |
+| n1000000-s1 | one station (8) | 1,889 B, 683 | plain | 263 B, 109 (16%) | |
+| n1000000-s1 | one line (447) | 126,292 B, 45,525 | 31,439 tokens (69%) | 10,310 B, 5,034 (11%) | |
 
-(The 1M single node sets ran while the journal was sweeping, so each
-rewrote the state: 6.8x.)
+(After the review fixes the legend is longer, so dictionaries grew by
+0.4 KB; "planned, dictionary inline" for a line is in tokens. Percentages
+are of the plain tokens; "one station" is the first station
+without a deviation, a different design at each size.) The whole graph
+written with templates takes a fifth of the tokens, measured by writing
+both. A single station planned alone is not shorter: a dictionary for one
+instance costs more than it saves, so nothing is chosen. With the kept
+dictionary given to the model once, a station is one use line and a line a
+tenth to a fifth of its plain text: that is the case `context`'s compact
+form (G16) is for.
 
-Sweeping all the time (`changes.cap`, the cap a fifth of the writes):
+**Expansion.** Every instance of the kept dictionary (2,149 / 18,903 /
+192,865 instances of 41 / 149 / 467 templates, nested ones included)
+expanded and compared with the graph, node, edge and value: **all exact**,
+at every size, on both tiers.
 
-| dataset | tier | cap | node sets/s, 1,000 a transaction | log bytes a write | single writes/s | slowest single write | largest single write's log |
+**Time and memory** of the calls (the graph already loaded), memory /
+file, and the resident memory added in memory:
+
+| dataset | station templates | all shapes | patterns | plan, whole graph | one station planned alone (ms) / with the kept dictionary (ms) | expand, every instance | list every instance (calls) |
 |---|---|---|---|---|---|---|---|
-| n10000-s1 | memory | 2,011 | 171k | 98 | 91k | 64 µs | 1,108 B |
-| n10000-s1 | file | 2,011 | 166k | 98 | 68k | 72 µs | 1,108 B |
-| n100000-s1 | memory | 20,000 | 155k | 101 | 69k | 106 µs | 1,174 B |
-| n100000-s1 | file | 20,000 | 141k | 101 | 40k | 349 µs | 1,174 B |
-| n1000000-s1 | memory | 20,000 | 141k | 101 | 41k | 572 µs | 1,175 B |
-| n1000000-s1 | file | 20,000 | 83k | 101 | 29k | 184 µs | 1,175 B |
+| n10000-s1 | 196 / 204 | 408 / 519 | 30 / 19 | 544 / 546, +1 MB | 364 / 2.6 | 286 / 361, 41 calls | 581 / 570 (2) |
+| n100000-s1 | 2,632 / 2,096 | 5,175 / 5,508 | 232 / 237 | 6,489 / 6,652, +12 MB | 5,042 / 2.2 | 4,337 / 3,899, 149 calls | 7,788 / 7,277 (2) |
+| n1000000-s1 | 23.6 / 24.2 s | 50.4 / 48.5 s | 2.5 / 2.6 s | 80 / 79 s, +115 MB | 48 s / 2.0 ms | 49 / 45 s, 570 calls | 121 / 114 s (3) |
 
-At the default cap of 1,000,000 (`tests/review_g5_cap.rs`), the write
-that raises the floor now takes under a millisecond and logs 276 bytes
-(it was 133 ms and 1.7 MB); no write logs more than one state record and
-64 deletes beside its own. Reading is unchanged: `since` over the whole
-journal 37-98 ms at 300,000-400,000 entries, for the last commit 9-19 ms,
-`changed` for 1,000 ids 0.2-0.7 ms, `changed_any` with nothing changed
-3-5 ms (it reads every entry of the kind; knowing the newest position
-held would answer it at once, but keeping that exact means a write per
-change, which is what this slice took out).
+Finding templates is a whole-graph computation, about 50 µs a node at 1M
+with every node a root: the forest (56 bytes a node), then a walk of every
+root whose forest shape repeats, twice more for each group's members, with
+their plain and compact text priced. A plan adds nesting, the chains and
+writing both texts in full (291 MB and 42 MB at 1M, counted, not kept). A
+plan of a few nodes without a kept dictionary costs what finding templates
+costs; with one, it reads only the selection (below). Expansion reads only
+the shape under each root (about 0.25 ms an instance). The whole-graph
+plan times are from three runs on a shared machine (78-87 s, 109-131 s and
+79-80 s at 1M; the last after the review fixes).
+The memory is the per-node state and the sorts, inside half and a quarter
+of `algorithm_memory()`, spilling past them
+(`forest_state_spills_past_its_budget_with_the_same_hashes`,
+`state_spills_past_the_memory_budget_and_nothing_changes`).
+
+**A selection written with the kept dictionary** (`plan(dictionary:
+"mfg", nodes: [...], text: "compact")`), the call an agent waits on: it
+reads the selection, the owners above it, the dictionary's shape index and
+the definitions the selection can use, never the rest of the graph. Best
+and median of five calls in ms, memory / file; "same" is whether the text
+equals, byte for byte, what the whole-graph path (`find: "graph"`, its time
+in the last column, memory tier) writes for the same selection:
+
+| dataset | selection | nodes | plain tokens | kept tokens | uses | ms | same | whole-graph path |
+|---|---|---|---|---|---|---|---|---|
+| n10000-s1 | one station | 40 | 3,734 | 441 | 1 | 2.6 / 2.6 | yes | 282 ms |
+| n10000-s1 | one line | 345 | 31,947 | 5,919 | 17 | 17 / 17 | yes | 278 ms |
+| n10000-s1 | 300 scattered nodes | 300 | 27,975 | 27,809 | 1 | 6.9 / 7.5 | yes | 289 ms |
+| n100000-s1 | one station | 18 | 1,770 | 223 | 1 | 2.2 / 2.3 | yes | 3.4 s |
+| n100000-s1 | one line | 361 | 35,821 | 5,827 | 17 | 23 / 26 | yes | 3.4 s |
+| n100000-s1 | 300 scattered nodes | 300 | 30,636 | 30,636 | 0 | 13 / 12 | yes | 3.5 s |
+| n1000000-s1 | one station | 8 | 683 | 109 | 1 | 2.0 / 2.1 | yes | 35.8 s |
+| n1000000-s1 | one line | 447 | 45,525 | 5,034 | 13 | 47 / 42 | yes | 35.8 s |
+| n1000000-s1 | 300 scattered nodes | 300 | 29,946 | 29,946 | 0 | 15 / 19 | yes | 36.4 s |
+
+The time follows the selection (about 0.05 ms a selected node in memory,
+up to 0.2 ms on the file tier for the pages of a line not yet read), not
+the graph: a station takes 2-3 ms at 10k and at 1M. No memory is added
+that the resident size shows. Scattered nodes are mostly not whole
+instances (a node without the rest of its shape is written plainly), so
+their text is the plain text. Nothing about which node is in which
+instance is kept: it is worked out from the selection each call and every
+use is matched in full, so a node changed since the dictionary was made is
+written as it is now. What the dictionary keeps for this is an index of
+root shapes and ids, about 50 bytes a template (24 KB of the 7.0 MB that
+the kept dictionary `mfg` takes at 1M, all its records counted:
+`stored_bytes`; 214 KB at 10k, 1.37 MB at 100k, 7.1 MB at 1M).
+
+**Read back from the text alone.** The compact text of the whole graph,
+by id and by identity (`["code", "number"]`, which names every node there
+uniquely), decoded with the decoder written from the documented notation
+(`tests/structure_notation.rs`), is exactly the graph at 10k, 100k and 1M
+(1,023,660 nodes and 2,435,930 edges; the 1M check is run on demand with
+`GLIDER_NOTATION_SIZES=n1000000-s1`, 267 s).

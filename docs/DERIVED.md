@@ -640,7 +640,7 @@ What is true now, and what this slice decided where the plan was open:
   text, which the truth lists as look-alikes. No choice of keys separates
   them; that is why these are candidates and nothing is merged.
 
-## `structure`: sameness and repetition (colours and classes *built*)
+## `structure`: sameness and repetition (colours, classes, templates, path patterns, plan and expand *built*)
 
 Graphs made by people repeat themselves. A plant has forty stations built
 the same way; each has two sides, each side its work locations, each
@@ -691,9 +691,9 @@ CALL structure.expand(of: <class, template or pattern>)
   principle applied with the real serializer as the code, so the saving it
   reports is the saving a caller sees.
 
-What is true now (G7: colours and classes; templates, path patterns,
-quotient, plan and expand are G8 and G9). The user-facing description is
-in `docs/EXTENSIONS.md`.
+What is true now for colours and classes (G7; templates, path patterns,
+plan and expand are G8, below; the quotient is G9). The user-facing
+description is in `docs/EXTENSIONS.md`.
 
 - **Procedures.** `structure.colors`, `structure.classes`,
   `structure.read`, `structure.stored`, `structure.drop`
@@ -778,6 +778,191 @@ in `docs/EXTENSIONS.md`.
   `WorkInstruction` are exactly the planted duplicates, none of the
   look-alikes, at every size. A colouring of the 1M-node graph at depth 4
   takes 3.5-4 s and adds about 50 MB.
+
+What is true now for templates, path patterns, plan and expand (G8). The
+code is `src/ext/structure/` (`templates.rs`, `paths.rs`, `plan.rs`,
+`notation.rs`), its surface the procedure list in `src/ext/structure.rs`;
+the user-facing description is in `docs/EXTENSIONS.md`, "Templates".
+
+- **Procedures.** `structure.templates`, `structure.expand`,
+  `structure.paths`, `structure.plan`, `structure.dictionaries`, and
+  `structure.drop(dictionary:)` beside `drop(name:)`.
+- **The hierarchy.** The edges of `types:` in `dir:` (`out` or `in`;
+  `both` is refused, a hierarchy has a direction). A node is *owned* by
+  the node a followed edge reaches it from when exactly one does and it is
+  not itself; owners that go round in a circle are cut, so ownership is a
+  forest. Decided here: a node reached by two followed edges belongs to
+  neither and is shared, so it is written as a reference.
+- **A shape** is a root, everything it owns down the forest, and every edge
+  going out of those nodes: internal by position, or a reference to the
+  node outside. Under `dir: "in"` the root's edge to its owner belongs to
+  the owner and is written beside a use. Positions are preorder; siblings
+  are ordered by edge type, then a hash of their shape, then their own
+  values, then a hash of everything below them, then id (only fully alike
+  siblings reach the id), so the same data under other ids is numbered the
+  same and siblings line up alike in every instance.
+- **Instances are exact.** Roots are grouped by a 128-bit hash of the shape
+  (labels, keys, positions, edges, referred node ids) and every member is
+  compared with the first in full, so no instance rests on hash odds.
+  Values are compared type-exactly (`1` is not `1.0`): a template gives
+  back what was stored, where colours equate what the engine equates.
+  Constants are the same in every instance; a text value is *derived*
+  (`~"x"`, `~N"x"`) when in every instance it is the root's value of the
+  same key, whole or its first N bytes, then the same text; everything
+  else is a slot.
+- **Template ids** hash the definition with referred nodes by identity
+  value, or by labels and values without one: content only (D7). Two
+  templates that refer to different nodes alike in content would share an
+  id; the later ones (by first instance) get `.2`, `.3`.
+- **Nesting.** A definition may use another template for one of its parts
+  (`.k=Tm`); the nested root keeps the values the outer definition derives
+  for it (`.3=T5 code=~16"WE01"`), so nesting rarely adds a slot.
+- **Deviations (point 3 of the brief): written plainly.** A station that
+  differs from its design has another shape, so it is not an instance of
+  the design's template; it is written plainly, with the smaller templates
+  of the parts it shares with its design used where they shorten it.
+  Template plus a list of differences was not built. Stations that deviate
+  the same way are instances of their own template, which says exactly
+  what they have.
+- **Expand** rebuilds each instance from the definition and its slot values
+  alone, after checking the root's shape, constants and derivations in
+  full, from the forest under the root alone (it does not read the rest of
+  the graph). Instances plus everything they do not cover are the graph,
+  node for node, edge for edge, value for value: shown on random forests
+  with internal edges, references, parallel edges, edge properties, mutated
+  copies and noise, both directions, for any set of templates
+  (`on_random_graphs_instances_and_what_they_do_not_cover_are_the_graph`),
+  and for every instance of a kept dictionary on the manufacturing graph.
+- **Paths.** Patterns are counted level by level from the start nodes
+  (`labels:`, or nodes no followed edge reaches), merging the paths that
+  reach one node along one sequence into a count, so the cost is nodes
+  times sequences per level; at most 100,000 sequences a call. Chains are
+  runs of nodes with exactly one followed edge in and one out, no
+  self-loop, named by their first interior node; a circle of such nodes has
+  no ends and is not a chain.
+- **The notation `glider-compact/1`** (`notation.rs`): `context`'s cards and
+  edge lines, in full and in a fixed order, one block per node (its card and
+  its outgoing edges). The token estimate counts nothing across a newline,
+  so a text's bytes and tokens are exactly the sum of its blocks, and a
+  choice is priced on the blocks it changes. Definitions, uses, nested uses
+  and chain uses are written as `docs/EXTENSIONS.md` shows. A text says its
+  version on its first line, and the hash of its dictionary when it has one.
+  A decoder in `tests/structure_templates.rs` reads plain and compact text,
+  with or without the dictionary inline, back into exactly the graph
+  (`the_compact_text_reads_back_as_the_graph_node_for_node_and_edge_for_edge`).
+- **The plan** decides by tokens (or bytes): templates largest first, each
+  chosen when its uses that are shorter than their plain blocks save more
+  than its definition (a chosen instance never has a chosen instance
+  inside); nesting smallest first, where the outer definition and its uses
+  get shorter by more than a not yet chosen inner definition costs; further
+  uses of chosen templates; then chain patterns. Both texts are then
+  written and measured; the reported saving is plain minus compact, and the
+  rows add up to it exactly
+  (`the_plans_saving_is_exactly_plain_minus_compact_as_written`); when the
+  compact text is not shorter nothing is chosen and it is the plain text
+  (`a_candidate_that_does_not_pay_for_itself_is_not_used`). The choice is
+  greedy, not optimal. `lambda:` is accepted and recorded; no candidate
+  here leaves anything out.
+- **Kept dictionaries (D3, D4).** Keyspace `structure`, beside the
+  colourings: `d<name>` (revision, code `structure-templates/1`, arguments,
+  the hash of the dictionary's text, counts, the hierarchy), `s<name>`
+  (each template's root shape and id), `t<name>\0<i>`
+  (each definition), `p<name>\0<i>` (each chain pattern), `x<name>\0<i>`
+  (the text, in chunks). Freshness is the colourings': with the change
+  journal installed and able to answer, stale exactly when a node or an
+  edge changed since; otherwise the conservative stretch of the
+  extension's own writes, so keeping or dropping a dictionary or a
+  colouring leaves the others fresh
+  (`a_kept_dictionary_is_stale_only_when_a_node_or_an_edge_changed_given_the_journal`). A text written with a kept dictionary
+  names it by hash and does not repeat it; every use is matched against
+  the graph in full, the handles of the nodes a definition refers to as
+  well, so a stale dictionary costs uses, never truth.
+  `check.run` reports kept records that do not decode.
+- **A selection with a kept dictionary is local.** `plan(dictionary:,
+  nodes:)` builds the forest over the selection alone (`Forest::part`:
+  each node's owner from its own edges, followed upwards once to cut
+  circles, hashes bottom-up over the nodes whose whole shape is selected),
+  reads the dictionary's shape index (`s<name>`: root shape and id per
+  template, ~50 bytes each, 23 KB at 1M), decodes only the definitions
+  whose shapes occur, matches each candidate root in full, and writes. Its
+  cost is the selection, its edges and the owners above it; the text and
+  rows are byte for byte those of the whole-graph path (`find: "graph"`;
+  `a_selection_written_with_a_kept_dictionary_is_the_text_the_whole_graph_path_writes`).
+  Membership is derived, never kept: a node changed since is written from
+  the graph as it is now (plainly, unless it still matches exactly), the
+  call says the dictionary is stale, and `fresh: "require"` refuses it.
+  Whole-graph calls: `templates`, `paths`, `plan` without a kept
+  dictionary or without `nodes:`, `expand` without `dictionary:`,
+  `templates(dictionary:)`. Local: `plan(dictionary:, nodes:)`,
+  `expand(dictionary:)` (the shapes under its roots), `dictionaries()`,
+  `drop(dictionary:)`. A dictionary kept inside a `begin()` block goes
+  with its rollback and stays with its commit
+  (`a_dictionary_kept_inside_a_transaction_block_goes_with_a_rollback_and_stays_with_a_commit`).
+- **Handles name one node (review, finding 4).** With `identity:`, a node
+  is written `@key="value"`, its first identity key and that key's value,
+  and the header says ` identity k1, k2`; a node without one, or whose
+  (key, value) another node of the text's scope has, is written `n<id>`
+  with the property kept on its card. The scope is the nodes the text
+  writes and the nodes their edges reach (the whole graph for a
+  whole-graph text); its shared pairs are found by an external sort. A use
+  lists by position (`.5=n246`) the nodes it writes by id.
+- **A use states only what is true (findings 3, 1, 2).** A kept definition
+  records how it names each node it refers to; an occurrence is a use only
+  when that handle is the node's handle in this text now, besides its shape
+  and values matching in full, so a stale dictionary costs uses, never
+  truth. A nested template's edges are matched to the outer one's (not
+  counted), and the outer definition writes every edge the nested one does
+  not have (under `dir: "in"` the nested root's edge to its owner). A chain
+  is written only when every node whose block it changes (where its use
+  goes and the source of each of its edges) is written plainly, so no edge
+  is written twice. The compact text reads back as the graph for every
+  direction (`fuzz_compact_text_reads_back_as_the_graph`, in
+  `tests/structure_notation.rs`: 300 random graphs per direction, by
+  tokens and bytes, by id and by identity, in memory and from a file).
+- **Priced as written (finding 6).** A candidate is priced with the longest
+  name it can get (`T99` among up to 99 templates; a kept template's own
+  name), so once named it costs at most its price, and every chosen row's
+  saving is at least 1 in the measure asked for. Chain patterns likewise.
+- **The same answer (D7).** Template ids are content-only always. With
+  `identity:` naming a property every node has (or a list: the first a node
+  has wins, `["code", "number"]` on the manufacturing graph), the
+  dictionary, the plan's rows and the compact text are byte for byte the
+  same for the same data under other ids
+  (`the_same_data_under_other_ids_has_the_same_templates_dictionary_and_plan`);
+  without it, uses carry ids and their lengths can differ. Chains are tried
+  and their uses written in the order of their handles, so chain patterns
+  are the same too (finding 5). Both tiers give the same bytes.
+- **Bounds (D6).** Ids, owners, sizes and the two hashes are 56 bytes a
+  node (and 16 more while they are built) in `StateVec`s within half of
+  `algorithm_memory()`, spilling past it
+  (`forest_state_spills_past_its_budget_with_the_same_hashes`); candidate
+  roots are grouped by external sorts in a quarter of it; only roots whose
+  forest shape repeats are walked, each at most `max_nodes:` (4,096)
+  nodes; instance roots and their costs are `StateVec`s; the plan's marks
+  per node are `StateVec`s. In memory and not spilling: the definitions
+  (at most 100,000 templates a call, refused past it), the plan's chain
+  state, a `nodes:` part (given by the caller), the text when `text:` asks
+  for it. Rows at most 10,000 a call, continued with `after:`. Finding
+  templates is a whole-graph computation, so a slice bounds what is
+  returned, not the work.
+- **Budgets (G2).** Every loop over nodes, edges, candidates and instances
+  calls `step(n)` in `src/ext/structure.rs`.
+- **Left for later.** `context.retrieve(format: "compact")` (G16) writing
+  with these; template plus differences for deviations; numbering siblings
+  so that id lists fold into longer runs.
+- **On the manufacturing graph** (`bench/KNOWLEDGE.md`, "Templates";
+  `bench/tests/mfg_templates.rs`): at 10k, 100k and 1M nodes, on both
+  tiers, every design is a template whose instances are exactly its
+  stations without a deviation (6, 17 and 24 of them) and no deviating
+  station is an instance of its design's; side, location and element
+  templates are found and nested (151 of 467 chosen at 1M); the 8-hop
+  hierarchy path is the first pattern; the whole graph planned takes 18-23%
+  of its plain tokens (103M to 18.3M at 1M, dictionary 0.6M), a station
+  written with the kept dictionary 12-16%; every instance of the kept
+  dictionary (192,865 at 1M) expands exactly. A plan of the 1M graph takes
+  78-131 s and 115 MB; a station written with the kept dictionary takes
+  2-3 ms at every size, 300 scattered nodes 15-17 ms at 1M, the same text
+  as the whole-graph path.
 
 Built-in algorithms gain three names beside the existing ones:
 `CALL louvain()` (communities by modularity, deterministic, with levels),
@@ -945,7 +1130,7 @@ tests, and adds its section to `docs/EXTENSIONS.md` and its numbers to
 | G5 | `changes` (*built*) | G1, G4 |
 | G6 | `check` (*built*) | G1 |
 | G7 | `structure`: colours, classes (*built*) | G2 |
-| G8 | `structure`: templates, path patterns, plan, expand | G7 |
+| G8 | `structure`: templates, path patterns, plan, expand (*built*) | G7 |
 | G9 | `structure`: quotient; `louvain`, `ppr`, `steiner` | G2 |
 | G10 | `vector`: spaces, storage, exact search, staleness | G1, G5 |
 | G11 | `embed`: fastrp, propagate, pool, edges | G10 |
