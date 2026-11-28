@@ -156,6 +156,20 @@ Each statement is a transaction: it commits whole, or on an error leaves no
 trace. `BEGIN` groups the statements that follow into one transaction;
 `COMMIT` makes it durable, `ROLLBACK` discards it. `COMPACT` checkpoints.
 
+`STATS` reports counts, sizes and two numbers that name the database's
+state: `generation`, its lineage (the id its replicas are filed under), and
+`revision`, which grows with every committed transaction that changed
+something, and not with a statement that changed nothing, a rollback, a
+checkpoint, `COMPACT`, a reopen or a read (it may grow when a transaction's
+writes cancel out). It is durable, survives a crash, and a replica restored
+to the same point reports the same one. A restored copy that is then
+written to is a new line of history and may come to share a pair with its
+source, so a cache outside the database should treat a restore as a new
+source. A library caller has `Graph::revision()` and `Graph::generation()`.
+Anything computed from a graph can record the revision it was computed at
+and later ask, cheaply, whether the graph has moved since
+([`docs/DERIVED.md`](docs/DERIVED.md), "Revision").
+
 ### Indexes
 
 `INDEX ON :Person(email)` builds a sorted index over that label/property pair.
@@ -319,6 +333,11 @@ graph with a 1 GiB cache), which is being tracked down.
 numbers. A 100 GB B+tree (`pagebench`) was built in 15 minutes at 1.1 GB of
 RAM, answered cold point lookups in 0.5 ms (1.35 disk reads each), scanned at
 450 MB/s, and recovered from 50 kill -9s in a row.
+
+[`bench/KNOWLEDGE.md`](bench/KNOWLEDGE.md) describes a generated
+manufacturing graph (plants to work instructions, stations built from a few
+designs) that comes with its own truth and questions with known answers, and
+the baseline retrieval and algorithm numbers measured on it.
 
 `glider bench <n>` runs a quick synthetic benchmark on your own hardware.
 

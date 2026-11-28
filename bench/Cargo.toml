@@ -18,6 +18,18 @@ glider = { path = ".." }
 [lints]
 workspace = true
 
+[lib]
+name = "glider_bench"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mfg-gen"
+path = "src/bin/mfg-gen.rs"
+
+[[bin]]
+name = "mfg-bench"
+path = "src/bin/mfg-bench.rs"
+
 [[bin]]
 name = "ldbc-gen"
 path = "src/bin/ldbc-gen.rs"

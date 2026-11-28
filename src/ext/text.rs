@@ -426,3 +426,391 @@ pub fn search(
     out.truncate(top);
     (out, read, matched)
 }
+
+// ------------------------------------------------------------------- check
+
+/// Where [`check`] is: its phase, what it has counted, and the last key it
+/// looked at.
+#[derive(Default)]
+struct Checking {
+    phase: u8,
+    /// From the nodes: documents, total length, postings a rebuild makes.
+    docs: u64,
+    total: u64,
+    postings: u64,
+    /// From the index: postings stored; of those a rebuild makes, how many
+    /// are missing; postings of nodes the index does not cover.
+    stored: u64,
+    missing: u64,
+    orphans: u64,
+    /// Postings of the term the cursor is in.
+    run: u64,
+    key: Option<Vec<u8>>,
+}
+
+impl Checking {
+    fn encode(&self) -> Vec<u8> {
+        let mut out = vec![self.phase];
+        for v in [
+            self.docs,
+            self.total,
+            self.postings,
+            self.stored,
+            self.missing,
+            self.orphans,
+            self.run,
+        ] {
+            put_varint(&mut out, v);
+        }
+        if let Some(k) = &self.key {
+            out.push(1);
+            out.extend_from_slice(k);
+        } else {
+            out.push(0);
+        }
+        out
+    }
+
+    fn decode(b: &[u8]) -> Option<Checking> {
+        let mut r = Reader::new(b.get(1..)?);
+        let mut c = Checking {
+            phase: b[0],
+            ..Checking::default()
+        };
+        for v in [
+            &mut c.docs,
+            &mut c.total,
+            &mut c.postings,
+            &mut c.stored,
+            &mut c.missing,
+            &mut c.orphans,
+            &mut c.run,
+        ] {
+            *v = r.varint().ok()?;
+        }
+        let rest = &r.buf[r.pos..];
+        c.key = match rest.first()? {
+            0 => None,
+            _ => Some(rest[1..].to_vec()),
+        };
+        Some(c)
+    }
+
+    fn next_phase(&mut self) {
+        self.phase += 1;
+        self.key = None;
+        self.run = 0;
+    }
+}
+
+const CHECK_BATCH: usize = 512;
+
+/// A node's terms as a rebuild would index them; None when not covered.
+fn expected(g: &Graph, c: &Config, id: u64) -> Option<(HashMap<String, u32>, u32)> {
+    g.node(id)?;
+    doc_terms(c, &g.node_labels(id), &g.node_props(id))
+}
+
+/// The nodes the index covers, after `after`, in id order, a batch at a
+/// time.
+fn covered_after(g: &Graph, c: &Config, after: Option<u64>) -> Vec<u64> {
+    let from = after.map_or(0, |a| a + 1);
+    if c.labels.is_empty() {
+        return g.nodes_from(from, CHECK_BATCH);
+    }
+    let mut ids = Vec::new();
+    let mut horizon = u64::MAX;
+    for l in c.labels.iter().filter_map(|l| g.strings.lookup(l)) {
+        let batch = g.label_members_from(l, from, CHECK_BATCH);
+        if batch.len() == CHECK_BATCH {
+            horizon = horizon.min(*batch.last().unwrap());
+        }
+        ids.extend(batch);
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids.retain(|&i| i <= horizon);
+    ids
+}
+
+fn term_list(terms: &[&str]) -> String {
+    let mut s: Vec<String> = terms.iter().take(3).map(|t| format!("'{t}'")).collect();
+    if terms.len() > 3 {
+        s.push(format!("and {} more", terms.len() - 3));
+    }
+    s.join(", ")
+}
+
+/// Up to a batch of keys of `prefix` after `after`, with their values.
+fn ext_batch(g: &Graph, prefix: &[u8], after: Option<&[u8]>) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut out = Vec::new();
+    g.ext_scan_after(NS, prefix, after, &mut |k, v| {
+        out.push((k.to_vec(), v.to_vec()));
+        out.len() < CHECK_BATCH
+    });
+    out
+}
+
+/// The term and node of a posting key.
+fn posting_parts(k: &[u8]) -> Option<(&[u8], u64)> {
+    if k.len() < 10 || k[k.len() - 9] != 0 {
+        return None;
+    }
+    let node = u64::from_be_bytes(k[k.len() - 8..].try_into().ok()?);
+    Some((&k[1..k.len() - 9], node))
+}
+
+/// Check the index against what a rebuild over the graph would write, and
+/// say which nodes and terms differ. In phases, each a walk in key order:
+/// the covered nodes (every posting and length a rebuild makes is there);
+/// the lengths (each is a covered node's); the postings (each term's count
+/// is its document frequency, each node is covered); the document
+/// frequencies (each has postings); the totals; and, only when the counts
+/// say the index holds postings a rebuild would not make for nodes it does
+/// cover, the postings again to name them. Writes nothing.
+pub fn check(g: &Graph, c: &Config, probe: &mut crate::ext::check::Probe) -> Result<()> {
+    let mut st = match probe.after() {
+        Some(b) => Checking::decode(b).unwrap_or_default(),
+        None => Checking::default(),
+    };
+    macro_rules! look {
+        () => {
+            if !probe.look()? {
+                probe.stop_at(st.encode());
+                return Ok(());
+            }
+        };
+    }
+    loop {
+        match st.phase {
+            0 => loop {
+                let after = st
+                    .key
+                    .as_deref()
+                    .and_then(|k| k.try_into().ok())
+                    .map(u64::from_be_bytes);
+                let ids = covered_after(g, c, after);
+                if ids.is_empty() {
+                    break;
+                }
+                for id in ids {
+                    look!();
+                    if let Some((tf, len)) = expected(g, c, id) {
+                        st.docs += 1;
+                        st.total += len as u64;
+                        st.postings += tf.len() as u64;
+                        let mut terms: Vec<(&String, &u32)> = tf.iter().collect();
+                        terms.sort();
+                        let (mut missing, mut differ) = (Vec::new(), Vec::new());
+                        for (t, &f) in terms {
+                            match g.ext_get(NS, &posting_key(t, id)) {
+                                None => missing.push(t.as_str()),
+                                Some(v) if varint(&v) != f as u64 => differ.push(t.as_str()),
+                                Some(_) => {}
+                            }
+                        }
+                        st.missing += missing.len() as u64;
+                        let stored = g.ext_get(NS, &len_key(id)).map(|b| varint(&b));
+                        let mut why = Vec::new();
+                        if !missing.is_empty() {
+                            why.push(format!("no postings for {}", term_list(&missing)));
+                        }
+                        if !differ.is_empty() {
+                            why.push(format!("other frequencies for {}", term_list(&differ)));
+                        }
+                        match stored {
+                            None => why.push(format!("no length (a rebuild writes {len})")),
+                            Some(s) if s != len as u64 => {
+                                why.push(format!("length {s} where a rebuild writes {len}"))
+                            }
+                            Some(_) => {}
+                        }
+                        if !why.is_empty() {
+                            probe.found(
+                                "stale_node",
+                                format!("n{id}"),
+                                format!("the text index differs for n{id}: {}", why.join("; ")),
+                            );
+                        }
+                    }
+                    st.key = Some(id.to_be_bytes().to_vec());
+                }
+            },
+            1 => loop {
+                let batch = ext_batch(g, b"l", st.key.as_deref());
+                if batch.is_empty() {
+                    break;
+                }
+                for (k, _) in batch {
+                    look!();
+                    if let Some(id) = k
+                        .get(1..9)
+                        .and_then(|b| b.try_into().ok())
+                        .map(u64::from_be_bytes)
+                    {
+                        if g.node(id).is_none() {
+                            probe.found(
+                                "gone_node",
+                                format!("n{id}"),
+                                format!("the text index holds n{id}, which does not exist"),
+                            );
+                        } else if expected(g, c, id).is_none() {
+                            probe.found(
+                                "uncovered_node",
+                                format!("n{id}"),
+                                format!("the text index holds n{id}, which it does not cover (a rebuild leaves it out)"),
+                            );
+                        }
+                    }
+                    st.key = Some(k);
+                }
+            },
+            2 => {
+                let df_check = |probe: &mut crate::ext::check::Probe, term: &[u8], n: u64| {
+                    let t = String::from_utf8_lossy(term);
+                    let df = g.ext_get(NS, &df_key(&t)).map(|b| varint(&b));
+                    if df != Some(n) {
+                        probe.found(
+                            "document_frequency",
+                            t.to_string(),
+                            format!(
+                                "the text index counts term '{t}' in {} documents; it has {n} postings",
+                                df.unwrap_or(0)
+                            ),
+                        );
+                    }
+                };
+                loop {
+                    let batch = ext_batch(g, b"p", st.key.as_deref());
+                    if batch.is_empty() {
+                        break;
+                    }
+                    for (k, _) in batch {
+                        look!();
+                        if let Some((term, node)) = posting_parts(&k) {
+                            let prev = st.key.as_deref().and_then(posting_parts).map(|p| p.0);
+                            if prev != Some(term) {
+                                if let Some(p) = prev {
+                                    df_check(probe, p, st.run);
+                                }
+                                st.run = 0;
+                            }
+                            st.run += 1;
+                            st.stored += 1;
+                            if g.ext_get(NS, &len_key(node)).is_none()
+                                && expected(g, c, node).is_none()
+                            {
+                                st.orphans += 1;
+                                let t = String::from_utf8_lossy(term);
+                                let why = if g.node(node).is_none() {
+                                    "which does not exist"
+                                } else {
+                                    "which it does not cover"
+                                };
+                                probe.found(
+                                    "orphan_posting",
+                                    format!("n{node}"),
+                                    format!("the text index lists n{node} under '{t}', {why}"),
+                                );
+                            }
+                        }
+                        st.key = Some(k);
+                    }
+                }
+                if let Some(p) = st
+                    .key
+                    .as_deref()
+                    .and_then(posting_parts)
+                    .map(|p| p.0.to_vec())
+                {
+                    df_check(probe, &p, st.run);
+                }
+            }
+            3 => loop {
+                let batch = ext_batch(g, b"f", st.key.as_deref());
+                if batch.is_empty() {
+                    break;
+                }
+                for (k, _) in batch {
+                    look!();
+                    let t = String::from_utf8_lossy(&k[1..]).to_string();
+                    let mut prefix = vec![b'p'];
+                    prefix.extend_from_slice(&k[1..]);
+                    prefix.push(0);
+                    let mut any = false;
+                    g.ext_scan(NS, &prefix, &mut |_, _| {
+                        any = true;
+                        false
+                    });
+                    if !any {
+                        let df = g.ext_get(NS, &k).map(|b| varint(&b)).unwrap_or(0);
+                        probe.found(
+                            "document_frequency",
+                            t.clone(),
+                            format!("the text index counts term '{t}' in {df} documents; it has no postings"),
+                        );
+                    }
+                    st.key = Some(k);
+                }
+            },
+            4 => {
+                let (docs, total) = stats(g);
+                if (docs, total) != (st.docs, st.total) {
+                    probe.found(
+                        "statistics",
+                        NS,
+                        format!(
+                            "the text index counts {docs} documents of total length {total}; a rebuild counts {} and {}",
+                            st.docs, st.total
+                        ),
+                    );
+                }
+                let accounted = st.postings - st.missing.min(st.postings) + st.orphans;
+                if st.stored == accounted {
+                    return Ok(());
+                }
+            }
+            5 => {
+                // Some covered node holds a posting a rebuild would not
+                // write. Find them; the last few nodes' terms are kept.
+                let mut cache: Vec<(u64, Option<HashMap<String, u32>>)> = Vec::new();
+                loop {
+                    let batch = ext_batch(g, b"p", st.key.as_deref());
+                    if batch.is_empty() {
+                        break;
+                    }
+                    for (k, _) in batch {
+                        look!();
+                        if let Some((term, node)) = posting_parts(&k) {
+                            let terms = match cache.iter().position(|(n, _)| *n == node) {
+                                Some(i) => &cache[i].1,
+                                None => {
+                                    if cache.len() == 64 {
+                                        cache.remove(0);
+                                    }
+                                    cache.push((node, expected(g, c, node).map(|(tf, _)| tf)));
+                                    &cache.last().unwrap().1
+                                }
+                            };
+                            let t = String::from_utf8_lossy(term);
+                            // Nodes it does not cover were named above.
+                            if let Some(tf) = terms {
+                                if !tf.contains_key(t.as_ref()) {
+                                    probe.found(
+                                        "extra_posting",
+                                        format!("n{node}"),
+                                        format!("the text index lists n{node} under '{t}', which n{node} does not contain"),
+                                    );
+                                }
+                            }
+                        }
+                        st.key = Some(k);
+                    }
+                }
+                return Ok(());
+            }
+            _ => return Ok(()),
+        }
+        st.next_phase();
+    }
+}

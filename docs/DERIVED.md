@@ -38,11 +38,18 @@ tests cite them.
   one thing. A procedure writes a node property only when the caller names
   it with `write:`, as the built-in algorithms already do.
 - **D2. A database has a revision.** `revision` is a 64-bit number that grows
-  with every committed transaction that changed something, and with nothing
-  else: not with an empty commit, a checkpoint, a reopen or a restore. It is
-  durable. A replica that has replayed the same transactions reports the same
-  revision. With `generation` (the lineage) it names one state of one
-  database. A build that predates revisions must not be able to leave it
+  with every committed transaction that changed something: it never stays
+  still across a change. It does not grow with an empty commit, a write that
+  changes nothing, a checkpoint, a reopen or a restore; it may also grow when
+  a transaction's operations cancel each other out. It is durable. A replica
+  that has replayed the same transactions reports the same revision. With
+  `generation` (the lineage) it names one state along one line of history:
+  the engine has one writer per lineage, but a copy that is restored and then
+  written to is a second line, and can share a pair with its source or with
+  another copy. Derived data kept inside the database is restored with its
+  copy and carries on with it, so it stays right; a consumer outside the
+  database that keys what it keeps by the pair must treat a restore as a new
+  source. A build that predates revisions must not be able to leave it
   behind: either that build advances it too, or it refuses the file.
 - **D3. Derived data says what it was derived from.** Every derived record
   carries the revision it was computed at, and every named set of them (an
@@ -79,16 +86,83 @@ tests cite them.
   as before, with two exceptions that are improvements: `STATS` reports the
   revision, and `CALL` honours the statement budget.
 
-## Revision
+## Revision (*built*)
 
-`STATS` gains `revision` and `generation`. `Graph::revision()` is the same
-number for a library caller.
+`STATS` reports `revision` (an integer) and `generation` (32 hex digits, all
+zeros for a memory graph that has no log). `Graph::revision()` is the same
+number for a library caller; it reads a field and costs nothing.
 
-The write-ahead log's committed position already has most of the properties
-D2 asks for on a file: it only moves when a transaction wrote records, it is
-durable, and older builds move it as well. An in-memory graph without a log
-has no such position. The slice that builds this decides the mechanism; D2 is
-the test.
+**The revision is the committed position of the write-ahead log**: the byte
+offset just past the last committed transaction's marker. No new field is
+stored and the file format is unchanged.
+
+- *Grows with every change.* Every change goes through one logged operation,
+  and a transaction that logged anything writes a commit marker, so the
+  position moves forward. Positions are bytes, so the number is not dense.
+  The test is per operation, not per transaction: a statement that sets a
+  value and sets it back, or `CALL context.index()` over an index that is
+  already current, moves the revision although nothing ends up different.
+  The guarantee runs one way: if the state changed, the revision moved.
+- *Holds for everything else.* An operation that would change nothing (a
+  property set to the value it has, compared exactly, so `1` and `1.0`
+  differ; an absent property or label removed; a label or an index that is
+  already there; an extension writing what it holds) is no longer written to
+  the log, and a node write that changed nothing calls no extension hooks.
+  (A property set to its own value still rewrites the record, so the page
+  cache sees the same accesses it always did; only the log is spared.)
+  A commit that logged nothing writes no marker. A rollback or a failed
+  statement cuts the log back to the last commit. Checkpoints, `COMPACT`,
+  closing and reopening and reads do not write to the log. `CLEAR` always
+  counts as a change.
+- *Durable.* A checkpoint records the position in the superblock and reopen
+  resumes there, whether or not any log segment is left; recovery after a
+  crash ends at the last commit marker.
+- *The same on a replica.* Replicas, file or memory, are made of a base taken
+  at a log position and the log shipped after it, at the same positions, so
+  a restore reports the position it replayed to: the source's revision at
+  that point, and an earlier one for an earlier point.
+- *Memory graphs.* With a log (`enable_log`), the revision is that log's
+  position. Without one, the graph counts the bytes a log would have written
+  for the same transactions, so it reports the same revision a logged graph
+  or a file reports for the same history, and a log enabled later starts
+  there instead of at 0, so enabling a log does not move the revision back. That number lives and dies with the graph object: it is as durable
+  as the graph is, which is not at all. A graph loaded from a file's image
+  (`Graph::from_bytes`) has no lineage and starts at 0.
+- *Bulk load* builds a new file without the log. It checkpoints the loaded
+  pages, then logs one record (the id counters it set) and checkpoints
+  again, so a loaded database is past 0. A crash between the two reopens the
+  loaded data at revision 0, as a load did before revisions (and an
+  interrupted load is to be deleted and run again); a crash never leaves the
+  empty file past 0.
+- *Older builds cannot leave it behind.* They log every operation they
+  apply, including the ones that change nothing, commit with a marker, keep
+  the position in the superblock across checkpoints, and carry it through
+  segment deletion and `CLEAR` exactly as this build does. Their revision
+  may grow where this build's would not, which D2 allows. Their migration
+  and bulk load create new files with new generations. So no format bump
+  was needed.
+
+With `generation`, `(generation, revision)` names one committed state along
+one line of history. A restore keeps the source's generation and its log
+positions, so a copy restored to a point and then written to carries on at
+the source's positions: once it is written to, it is a second line, and it
+can reach a pair the source (or another copy) also reaches with different
+data. What is guaranteed around a restore:
+
+- the restored copy reports the revision of the point restored to, and its
+  first change takes it past that point;
+- derived data kept inside the database (an extension's keyspace, anything a
+  later slice stores beside the graph) is restored with the copy and follows
+  the copy's own writes, so inside one database it agrees with that
+  database's graph whatever happens to the source;
+- a consumer outside the database that keys what it keeps by the pair must
+  treat a restored database as a new source, and must not assume a pair it
+  has seen on one copy means the same state on another.
+
+Left open: a restored database could take a new generation at its first
+change, which would make the pair unique across copies. That changes what
+replication does after a restore and is a decision for the owner, not for
+this slice.
 
 ## Budgets for procedures (*built*, G2)
 
@@ -213,28 +287,97 @@ CALL changes.release(below: 1500)                 forget changes at or below a r
 - Its cost on a write is one extension record. It is measured in the
   benchmark and stated here.
 
-## `check`: is the graph whole
+## `check`: is the graph whole (*built*)
 
-`glider <db> verify` checks pages and trees. Nothing checks the graph those
-trees hold. `CALL check.run()` does, and repairs nothing:
+`glider <db> verify` checks pages and trees. Nothing checked the graph those
+trees hold. `CALL check.run()` (`CREATE EXTENSION check`) does, and repairs
+nothing (D1): it writes no node, edge or extension record, and the revision
+is the same afterwards, whatever it finds. Its user-facing description is
+in `docs/EXTENSIONS.md`.
 
 | check | what it finds |
 |---|---|
 | `endpoints` | an edge whose source or target node does not exist |
-| `adjacency` | an edge missing from either endpoint's adjacency, or an adjacency entry with no edge |
+| `adjacency` | an edge missing from either endpoint's adjacency or listed there with the wrong far end; an adjacency entry with no edge, or one that is not its edge's (another node, type or direction) |
 | `membership` | a label or type membership entry without its record, or a record missing from its membership |
-| `counters` | label, type and index counts that differ from what a scan counts; id counters behind an existing id |
-| `indexes` | a property index entry that does not match the node, or a node missing from an index it belongs in |
-| `derived` | an extension's derived state older than the changes to its sources, or referring to ids that are gone |
-| `duplicates` | parallel edges with the same endpoints, type and properties; nodes of a label that agree on the properties named in `keys:` |
-| `orphans` | nodes with no edges, optionally of given labels |
-| `required` | nodes of a label lacking an edge the caller says they must have (`label:`, `type:`, `dir:`) |
+| `counters` | label, type, node, edge and index counts (entries and distinct values) that differ from what a scan counts; node, edge and index id counters behind an existing id |
+| `indexes` | a property index entry that does not match the node (gone, without the label or key, under another value), or a node missing from an index it belongs in |
+| `derived` | each installed extension's own check of its derived state: anything that differs from what a rebuild would make, including ids that are gone |
+| `duplicates` | parallel edges with the same endpoints, type and properties; nodes of `label:` that agree on every property in `keys:` |
+| `orphans` | nodes with no edges, optionally of given `labels:` |
+| `required` | nodes of `label:` lacking an edge of `type:` in `dir:` |
 
-It yields `check, severity, kind, id, detail`, takes `checks:` to run a
-subset, `after:` and `limit:` to run in slices, and ends with a summary row
-per check. The first five are faults in the database. The rest are facts
-about the data that an application may or may not consider faults, so they
-run only when asked for.
+What is true now, and what this slice decided where the plan was open:
+
+- **Which run.** With no `checks:`, the first six run: `derived` counts as a
+  check of the database, since derived data that disagrees with its graph
+  is a fault of the database, not a fact about the data. The last three run
+  only when named. Checks always run in the order of the table.
+- **Rows.** `check, severity, kind, id, detail`. Severity is `fault` for the
+  database's checks, `candidate` for the data's, `info` for an installed
+  extension that cannot be checked (not available in this build, or no
+  `check` method), and `summary` for the row that ends each check (`kind`
+  `done` or `partial`, `detail` `{"records":N,"problems":M}`). `id` is a
+  handle (`n12`, `e12`) or the name of the label, type, index, counter or
+  term at fault. Within a check, rows come in the order its walks meet
+  them: trees in key order, so nodes and edges ascending by id (D7).
+- **The extension's half.** `Extension::check(g, probe) -> Result<bool>` is
+  the new optional trait method (default: `false`, "cannot check"). The
+  `context` text index implements it as a comparison with a rebuild that
+  does not rebuild: covered nodes in id order (every posting and length a
+  rebuild writes is there and equal), lengths (each a covered node's),
+  postings term by term (each term's count is its document frequency, each
+  posting's node is covered), document frequencies (each has postings), the
+  totals, and only when the counts show extra postings on covered nodes, a
+  second walk of the postings to name them. A node is named once where it
+  can be: a node deleted below the hooks is named by its length entry, not
+  by each of its postings.
+- **Staleness by comparison, not by revision.** "Derived state older than
+  the changes to its sources" is found by comparing it with the graph,
+  which finds staleness of any age. Comparing revisions needs derived
+  records that carry one (D3), which the text index does not yet; a later
+  slice that adds them can make `derived` cheaper, not more right.
+- **Duplicates.** Naming `duplicates` always runs its parallel-edge half;
+  the node half runs with `label:` and `keys:`. Edge properties are
+  compared exactly, by key; node values as an index compares them (`1`
+  equals `1.0`). Nodes lacking any of the keys are not compared. A group of
+  more than two is reported as each later member against the first.
+- **Slices (D6).** `limit:` caps the records a call looks at and 10,000 the
+  rows it returns; past either the call ends with a `partial` summary whose
+  `id` is a cursor (`check:phase:key:carry`), which `after:` takes back.
+  Running counts (members of the label being counted, entries of the index
+  being counted, the text index's totals) travel in the cursor, so a call
+  holds nothing between slices, and the slices' rows together are exactly
+  one whole run's (`slices_together_report_exactly_what_one_whole_run_reports`,
+  with limits of 1, 2, 7, 50 and 1000 records). Memory per call is a few
+  batches of records; the parallel edges of one node and the members of a
+  label for node duplicates go through an external sort in half of `algorithm_memory()`
+  (64 KiB at least), spilling past it. The node half of `duplicates` sorts
+  again at every slice, so a slice bounds what it reports, not what it
+  reads.
+- **Budgets (G2).** Every record a check looks at passes through one
+  function, `Run::look` in `src/ext/check.rs` (and `Probe::look` for an
+  extension's records); each already returns a `Result`, so counting a
+  statement step per record is one line in each.
+- **How faults were planted in tests** (`tests/check.rs`), since the graph
+  API cannot write one: a bulk load from a source that breaks its contract
+  (an edge to a node it never lists) for `endpoints`; for `adjacency`,
+  `membership`, `counters` and `indexes`, the database file opened with the
+  storage layer below the graph (`storage::db::Db`) and one tree entry or
+  counter deleted, added or changed there, then reopened (the same file
+  loaded into memory gives the same rows); for `derived`,
+  `Graph::ext_write` into the `context` keyspace and writes through
+  `Graph::apply_op`, which runs no hooks.
+- **On the manufacturing graph** (`bench/tests/mfg_check.rs`, and
+  `mfg-bench`'s `check` measurement in `bench/KNOWLEDGE.md`): the database
+  checks find nothing; `orphans` and parallel edges are exactly the planted
+  faults; `duplicates` of `Tool` and `Part` on the properties the truth
+  says their duplicates agree on are exactly the planted pairs and no
+  look-alike. For `WorkInstruction` on `text, revision, scope` the planted
+  pairs are found among thousands of other candidates: the same design
+  element's local instruction at every station of the design is the same
+  text, which the truth lists as look-alikes. No choice of keys separates
+  them; that is why these are candidates and nothing is merged.
 
 ## `structure`: sameness and repetition
 
@@ -391,6 +534,9 @@ note. The benchmark below decides, and its results are recorded in
 
 ## Benchmark
 
+*Built (G3): the generator, its truth and questions, and the harness's
+skeleton with today's baseline. Described in `bench/KNOWLEDGE.md`.*
+
 `bench/` gains a generator for a manufacturing graph and a harness over it.
 
 The graph: plants, shops, lines, stations, sides, work locations, work
@@ -413,6 +559,28 @@ Measured, at several sizes, against that truth:
 - change tracking: write throughput with and without `changes`;
 - integrity: time for `check.run` and that planted faults are all found.
 
+What is true now:
+
+- `mfg-gen --nodes N --seed S [--faults]` writes `graph.jsonl`,
+  `truth.jsonl` and `questions.jsonl`, streaming: the generator holds the
+  catalogue, the designs and one record per line, under 10 MB at ten million
+  nodes. The output is byte-identical for the same arguments (a checksum is
+  pinned in a test, and is the same on Rust 1.74 and current stable).
+- Node and edge ids are written in order from 1, so the truth and questions
+  name ids that an import into an empty database reproduces; `code` and
+  `number` properties identify nodes across databases, for `identity:` (D7).
+- Decided here: one station in eight deviates from its design, by one extra
+  work element or one missing tool; designs are 3 for a few hundred nodes,
+  growing with the square root of the station count to 24; planted
+  duplicates are not used by work elements (they hang off the catalogue
+  exactly as their originals do), so only their properties and their
+  neighbours, not their degree, give them away; look-alikes include the
+  same design element's instruction at two stations, which is identical text
+  under a different number and must never be merged (D1).
+- `mfg-bench` records load, `STATS`, `context.retrieve` from anchors and from
+  words at three budgets, `pagerank` and `communities`, on both tiers;
+  a measurement is added by adding a function to its `MEASURES` list.
+
 ## Slices
 
 Each is one pull request against the branch that carries this note, with its
@@ -426,7 +594,7 @@ tests, and adds its section to `docs/EXTENSIONS.md` and its numbers to
 | G3 | the manufacturing generator and the harness's skeleton | |
 | G4 | edge and bulk write hooks (D5) | |
 | G5 | `changes` | G1, G4 |
-| G6 | `check` | G1 |
+| G6 | `check` (*built*) | G1 |
 | G7 | `structure`: colours, classes, duplicates in `check` | G2 |
 | G8 | `structure`: templates, path patterns, plan, expand | G7 |
 | G9 | `structure`: quotient; `louvain`, `ppr`, `steiner` | G2 |

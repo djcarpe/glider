@@ -1947,6 +1947,14 @@ fn run(g: &mut Graph, stmt: Stmt) -> Result<QueryResult> {
                     Value::Text("log_bytes".into()),
                     Value::Int(s.log_bytes as i64),
                 ],
+                vec![
+                    Value::Text("revision".into()),
+                    Value::Int(s.revision.min(i64::MAX as u64) as i64),
+                ],
+                vec![
+                    Value::Text("generation".into()),
+                    Value::Text(crate::replica::generation_name(&s.generation)),
+                ],
             ];
             if let Some((used, max)) = s.memory {
                 rows.push(vec![
