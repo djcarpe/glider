@@ -1808,6 +1808,12 @@ fn execute_stmt(g: &mut Graph, stmt: Stmt) -> Result<QueryResult> {
             return Err(Error::Msg(why.to_string()));
         }
     }
+    // Run by a procedure on the database its statement runs on, BEGIN,
+    // COMMIT and ROLLBACK would split that statement: refused before they
+    // touch anything (autocommit included).
+    if matches!(stmt, Stmt::Begin | Stmt::Commit | Stmt::Rollback) {
+        g.refuse_inside_statement(stmt.op())?;
+    }
     // STATS reports the damage itself; everything else must not return
     // results computed from an image that failed a checksum along the way.
     let reports_damage = matches!(stmt, Stmt::Stats);
@@ -1841,35 +1847,14 @@ fn execute_stmt(g: &mut Graph, stmt: Stmt) -> Result<QueryResult> {
 /// committed: a block is spent, a transaction opened by assigning
 /// `autocommit` goes on in a new one.
 fn atomically<R>(g: &mut Graph, f: impl FnOnce(&mut Graph) -> Result<R>) -> Result<R> {
-    thread_local! {
-        static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-        /// Set by a statement run inside another (by a procedure) that
-        /// failed, or panicked, after it had written: what failed and why.
-        /// The outermost statement then fails as a whole, whatever the
-        /// procedure did with the error.
-        static INNER_FAILED: std::cell::RefCell<Option<String>> =
-            const { std::cell::RefCell::new(None) };
-    }
-    struct Nested;
-    impl Drop for Nested {
-        fn drop(&mut self) {
-            let left = DEPTH.with(|d| {
-                d.set(d.get().saturating_sub(1));
-                d.get()
-            });
-            if left == 0 {
-                INNER_FAILED.with(|f| f.borrow_mut().take());
-            }
-        }
-    }
-    let outermost = DEPTH.with(|d| {
-        d.set(d.get() + 1);
-        d.get() == 1
-    });
+    // Nesting is per database: a statement a procedure runs on another
+    // database is that database's outermost, committed or rolled back
+    // under its own rules.
+    g.statement_depth += 1;
+    let outermost = g.statement_depth == 1;
     if outermost {
-        INNER_FAILED.with(|f| f.borrow_mut().take());
+        g.inner_failed = None;
     }
-    let _nested = Nested;
     let auto = g.autocommit;
     let before = g.uncommitted();
     g.autocommit = false;
@@ -1877,6 +1862,7 @@ fn atomically<R>(g: &mut Graph, f: impl FnOnce(&mut Graph) -> Result<R>) -> Resu
     // autocommit off and the statement's writes pending.
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(g)));
     g.restore_autocommit(auto);
+    g.statement_depth -= 1;
     let wrote = g.uncommitted() != before;
     let r = match r {
         Ok(r) => r,
@@ -1884,17 +1870,16 @@ fn atomically<R>(g: &mut Graph, f: impl FnOnce(&mut Graph) -> Result<R>) -> Resu
             // A panic is a failure of the statement it unwinds through:
             // what it wrote goes, before the panic goes on.
             if !outermost {
-                if wrote {
-                    let what = statement_text();
-                    INNER_FAILED.with(|f| {
-                        f.borrow_mut()
-                            .get_or_insert_with(|| format!("{what} panicked after writing"));
-                    });
+                if wrote && g.inner_failed.is_none() {
+                    g.inner_failed = Some(format!("{} panicked after writing", statement_text()));
                 }
-            } else if auto {
-                let _ = g.rollback_txn();
-            } else if wrote {
-                let _ = g.abandon(Error::Msg("a statement panicked".into()));
+            } else {
+                g.inner_failed = None;
+                if auto {
+                    let _ = g.rollback_txn();
+                } else if wrote {
+                    let _ = g.abandon(Error::Msg("a statement panicked".into()));
+                }
             }
             std::panic::resume_unwind(panic)
         }
@@ -1905,15 +1890,13 @@ fn atomically<R>(g: &mut Graph, f: impl FnOnce(&mut Graph) -> Result<R>) -> Resu
         // A failure after writing cannot be undone here (there are no
         // savepoints): the outermost statement fails as a whole.
         if let (Err(e), true) = (&r, wrote) {
-            let what = statement_text();
-            INNER_FAILED.with(|f| {
-                f.borrow_mut()
-                    .get_or_insert_with(|| format!("{what} failed after writing: {e}"));
-            });
+            if g.inner_failed.is_none() {
+                g.inner_failed = Some(format!("{} failed after writing: {e}", statement_text()));
+            }
         }
         return r;
     }
-    let inner = INNER_FAILED.with(|f| f.borrow_mut().take());
+    let inner = g.inner_failed.take();
     let failed_inside = inner.is_some();
     let r = match inner {
         Some(why) => Err(Error::Msg(format!(

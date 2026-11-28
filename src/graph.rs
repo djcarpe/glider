@@ -1070,6 +1070,16 @@ pub struct Graph {
     /// How many write hooks are running: while any is, the graph itself
     /// may not be written, only extension keyspaces.
     in_hook: u32,
+    /// How many statements are running on this database now: more than
+    /// one when a procedure runs a statement on the database it was called
+    /// on (see `query::atomically`). Per database, not per thread: a
+    /// statement a procedure runs on another database is that database's
+    /// outermost.
+    pub(crate) statement_depth: u32,
+    /// Set by a statement run inside another on this database that failed
+    /// or panicked after writing: what failed and why. The outermost
+    /// statement on this database then fails as a whole.
+    pub(crate) inner_failed: Option<String>,
     /// A transaction block opened with [`Graph::begin`] (or `BEGIN`) is
     /// open: one the engine can see start, and so can mark spent.
     block: bool,
@@ -1142,6 +1152,8 @@ impl Graph {
             tel_id: crate::telemetry::next_db_id(),
             hooks: None,
             in_hook: 0,
+            statement_depth: 0,
+            inner_failed: None,
             block: false,
             spent: None,
         })
@@ -2087,6 +2099,20 @@ impl Graph {
         Ok(())
     }
 
+    /// Refuse transaction control while a statement runs on this database
+    /// (a procedure calling it on the graph it was called on): it would
+    /// commit or undo part of that statement, which is all or nothing.
+    pub(crate) fn refuse_inside_statement(&self, what: &str) -> Result<()> {
+        if self.statement_depth > 0 {
+            return Err(Error::Msg(format!(
+                "{what} cannot run inside a statement on the same database: a statement \
+                 commits or rolls back as a whole when it ends; a procedure may run \
+                 transaction control only on another database"
+            )));
+        }
+        Ok(())
+    }
+
     /// Open a transaction block: autocommit off until [`Graph::commit`] or
     /// [`Graph::rollback`] ends it (as `BEGIN` does for statements). This
     /// is the way to open a transaction: if the engine has to roll a block
@@ -2097,6 +2123,7 @@ impl Graph {
     /// transaction was rolled back, and the caller carries on in a new one.
     /// Assigning `autocommit` does not end a block opened here.
     pub fn begin(&mut self) -> Result<()> {
+        self.refuse_inside_statement("BEGIN")?;
         if let Some(why) = self.spent() {
             return Err(Error::Msg(why.to_string()));
         }
@@ -2112,6 +2139,7 @@ impl Graph {
     /// [`Graph::spent`]) nothing is committed and this is an error that
     /// says why.
     pub fn commit(&mut self) -> Result<()> {
+        self.refuse_inside_statement("COMMIT")?;
         if self.block {
             self.block = false;
             self.autocommit = true;
@@ -2137,6 +2165,7 @@ impl Graph {
     /// Abandon everything since the last commit. A block opened with
     /// [`Graph::begin`] ends here, spent or not.
     pub fn rollback(&mut self) -> Result<()> {
+        self.refuse_inside_statement("ROLLBACK")?;
         if self.block {
             self.block = false;
             self.autocommit = true;
