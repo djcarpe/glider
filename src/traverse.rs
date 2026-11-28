@@ -11,10 +11,20 @@
 //! identical. Each takes a cap on how many nodes it may remember; past it
 //! they give up and return `None`, and the caller falls back to the
 //! whole-graph algorithm, whose memory is bounded by spilling.
+//!
+//! Each node taken up counts one step against the running statement's
+//! budget, and each edge scanned another ([`crate::meter`]), passed on in
+//! batches by a [`Tally`] and all of them by the time a walk returns, so
+//! many short walks count as much as one long one. A hub's scan stops with
+//! the statement. Once the
+//! budget is spent a walk ends where it is (as if it had finished, not as
+//! if it had outgrown its cap, so no whole-graph fallback starts) and the
+//! statement fails with the budget's error.
 
 use std::collections::VecDeque;
 
 use crate::graph::Graph;
+use crate::meter::Tally;
 use crate::types::{id_map, id_set, Dir};
 
 /// One visited node: its id, hops from the start, and the node it was
@@ -49,8 +59,10 @@ pub fn bfs(
         depth: 0,
         parent: None,
     });
+    let mut tally = Tally::new();
     while let Some(v) = q.pop_front() {
-        if !f(v) {
+        if tally.spent(1) || !f(v) {
+            tally.flush();
             return Some(());
         }
         if max_depth.is_some_and(|m| v.depth >= m) {
@@ -58,6 +70,10 @@ pub fn bfs(
         }
         let mut over = false;
         g.for_each_adj_while(v.node, dir, etype, |a| {
+            // a hub's scan stops with the statement
+            if tally.spent(1) {
+                return false;
+            }
             if seen.insert(a.other) {
                 if seen.len() > cap {
                     over = true;
@@ -72,9 +88,11 @@ pub fn bfs(
             true
         });
         if over {
+            tally.flush();
             return None;
         }
     }
+    tally.flush();
     Some(())
 }
 
@@ -95,21 +113,32 @@ pub fn dfs(
         parent: None,
     }];
     let mut next = Vec::new();
+    let mut tally = Tally::new();
     while let Some(v) = stack.pop() {
+        if tally.spent(1) {
+            tally.flush();
+            return Some(());
+        }
         if !seen.insert(v.node) {
             continue;
         }
         if seen.len() > cap || stack.len() > cap {
+            tally.flush();
             return None;
         }
         if !f(v) {
+            tally.flush();
             return Some(());
         }
         if max_depth.is_some_and(|m| v.depth >= m) {
             continue;
         }
         next.clear();
-        g.for_each_adj(v.node, dir, etype, |a| {
+        g.for_each_adj_while(v.node, dir, etype, |a| {
+            // a hub's scan stops with the statement
+            if tally.spent(1) {
+                return false;
+            }
             if !seen.contains(&a.other) {
                 next.push(Visit {
                     node: a.other,
@@ -117,9 +146,11 @@ pub fn dfs(
                     parent: Some(v.node),
                 });
             }
+            true
         });
         stack.extend(next.drain(..).rev());
     }
+    tally.flush();
     Some(())
 }
 
@@ -150,6 +181,7 @@ pub fn shortest_path(
     bwd.insert(to, u64::MAX);
     let mut ff = vec![from];
     let mut bf = vec![to];
+    let mut tally = Tally::new();
     while !ff.is_empty() && !bf.is_empty() {
         let forward = ff.len() <= bf.len();
         let (frontier, seen, other, d) = if forward {
@@ -160,7 +192,14 @@ pub fn shortest_path(
         let mut next = Vec::new();
         let mut meet = None;
         for &v in frontier.iter() {
+            if tally.spent(1) {
+                tally.flush();
+                return Some(None);
+            }
             g.for_each_adj_while(v, d, etype, |a| {
+                if tally.spent(1) {
+                    return false;
+                }
                 if seen.contains_key(&a.other) {
                     return true;
                 }
@@ -176,6 +215,7 @@ pub fn shortest_path(
                 break;
             }
             if fwd_len(seen, other) > cap {
+                tally.flush();
                 return None;
             }
         }
@@ -192,10 +232,12 @@ pub fn shortest_path(
                 path.push(x);
                 x = bwd[&x];
             }
+            tally.flush();
             return Some(Some(path));
         }
         *frontier = next;
     }
+    tally.flush();
     Some(None)
 }
 

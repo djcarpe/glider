@@ -314,6 +314,13 @@ edge list is sorted externally. Results are identical either way — a test
 runs every algorithm both ways, and against the previous engine's
 implementation bit for bit. `tier: "mem"` or `tier: "ooc"` forces one.
 
+**Bounded in time.** A statement's budget (`QueryLimits::max_millis` and
+`max_steps`) holds for `CALL` as it does for a query: every algorithm, walk
+and extension procedure counts one step per node and per edge it looks at,
+and stops with the statement's error within a few milliseconds of the
+budget. A stopped `CALL
+pagerank(write: "rank")` has written no `rank`; the statement rolls back.
+
 ## Performance
 
 [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) compares glider with SQLite (a

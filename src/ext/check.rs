@@ -169,7 +169,8 @@ impl Probe {
     /// Count one record about to be looked at. False: this slice is full;
     /// do not look at it, call [`stop_at`](Probe::stop_at) and return.
     pub fn look(&mut self) -> Result<bool> {
-        // G2 (statement budgets): one statement step per record goes here.
+        // one statement step per record (the statement budget)
+        crate::meter::step()?;
         if self.left == 0 || self.findings.len() >= self.rows_left {
             return Ok(false);
         }
@@ -335,7 +336,8 @@ enum Flow {
 impl Run<'_> {
     /// Count one record about to be looked at. False: the slice is full.
     fn look(&mut self) -> Result<bool> {
-        // G2 (statement budgets): one statement step per record goes here.
+        // one statement step per record (the statement budget)
+        crate::meter::step()?;
         if self.left == 0 || self.rows.len() >= MAX_ROWS {
             return Ok(false);
         }

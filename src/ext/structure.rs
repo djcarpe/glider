@@ -191,11 +191,13 @@ impl Extension for Structure {
     }
 }
 
-/// G2 (statement budgets): one statement step per node or edge looked at
-/// goes here, the only place this extension's loops count.
+/// One statement step per node or edge looked at ([`crate::meter`]): the
+/// only place this extension's loops count, but for the scans of one
+/// node's edges, which count each edge as they go so that a hub's stops
+/// with the statement.
 #[inline]
-fn step(_n: u64) -> Result<()> {
-    Ok(())
+fn step(n: u64) -> Result<()> {
+    crate::meter::steps(n)
 }
 
 // ------------------------------------------------------------- the hash
@@ -709,22 +711,28 @@ fn compute(g: &Graph, ca: &ColorArgs) -> Result<Colouring> {
             let id = ids.get(v);
             let mut sum = 0u128;
             let mut edges = 0u64;
+            let mut tally = crate::meter::Tally::new();
             for &(tag, d) in sides(ca.dir) {
-                g.for_each_adj(id, d, None, |a| {
+                g.for_each_adj_while(id, d, None, |a| {
+                    if tally.spent(1) {
+                        return false;
+                    }
                     let Some(Some(th)) = types.get(a.etype as usize) else {
-                        return;
+                        return true;
                     };
                     let Some(p) = index_of(&mut ids, len, a.other) else {
-                        return;
+                        return true;
                     };
                     elem[0] = tag;
                     elem[1..17].copy_from_slice(&th.to_be_bytes());
                     elem[17..].copy_from_slice(&colour_bytes(cur.get(p)));
                     sum = sum.wrapping_add(sip128(&elem));
                     edges += 1;
+                    true
                 });
             }
-            step(1 + edges)?;
+            tally.flush();
+            step(1)?;
             node[0] = b'r';
             node[1..17].copy_from_slice(&colour_bytes(cur.get(v)));
             node[17..25].copy_from_slice(&edges.to_be_bytes());
@@ -1298,32 +1306,44 @@ impl Neighbours<'_> {
         let mut sum = 0u128;
         let mut n = 0u64;
         let mut e = [0u8; 13];
+        let mut tally = crate::meter::Tally::new();
         for &(tag, d) in sides(self.dir) {
-            g.for_each_adj(id, d, None, |a| {
+            g.for_each_adj_while(id, d, None, |a| {
+                if tally.spent(1) {
+                    return false;
+                }
                 if !matches!(self.types.get(a.etype as usize), Some(Some(_))) {
-                    return;
+                    return true;
                 }
                 e[0] = tag;
                 e[1..5].copy_from_slice(&a.etype.to_be_bytes());
                 e[5..].copy_from_slice(&a.other.to_be_bytes());
                 sum = sum.wrapping_add(sip128(&e));
                 n += 1;
+                true
             });
         }
+        tally.flush();
         (sum, n)
     }
 
     /// The same multiset, sorted, in full.
     fn list(&self, g: &Graph, id: u64) -> Vec<(u8, u32, u64)> {
         let mut v = Vec::new();
+        let mut tally = crate::meter::Tally::new();
         for &(tag, d) in sides(self.dir) {
-            g.for_each_adj(id, d, None, |a| {
+            g.for_each_adj_while(id, d, None, |a| {
+                if tally.spent(1) {
+                    return false;
+                }
                 if matches!(self.types.get(a.etype as usize), Some(Some(_))) {
                     v.push((tag, a.etype, a.other));
                 }
+                true
             });
         }
-        v.sort_unstable();
+        tally.flush();
+        crate::meter::sort(&mut v);
         v
     }
 }
@@ -1537,7 +1557,7 @@ fn by_neighbours(
             return Ok(());
         }
         let (sum, n) = nb.hash(g, id);
-        step(1 + n)?;
+        step(1)?;
         let mut k = sip128(&own).to_be_bytes().to_vec();
         k.extend_from_slice(&sum.to_be_bytes());
         k.extend_from_slice(&n.to_be_bytes());

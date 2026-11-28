@@ -179,21 +179,200 @@ change, which would make the pair unique across copies. That changes what
 replication does after a restore and is a decision for the owner, not for
 this slice.
 
-## Budgets for procedures
+## Budgets for procedures (*built*, G2)
 
-Today the statement budget (`max_millis`, `max_steps`) is checked only while
-matching patterns. `CALL pagerank()` and `CALL context.retrieve()` run to
-their end whatever the caller asked for, and an extension procedure does not
-get the spilling memory budget the built-in algorithms get.
+The statement budget (`QueryLimits::max_millis`, `max_steps`) holds for every
+`CALL` as it does for a query, and an extension procedure gets the spilling
+memory budget a built-in algorithm gets.
 
-After this slice:
+**What a step is.** One node or one edge looked at, whether it turns out to
+matter or not. In a query: a candidate checked, an edge scanned, a neighbour
+looked at, a combination of pattern parts tried (as before). In a `CALL`: a
+node an algorithm or walk takes up, each edge it follows, each node a scan
+reads, each per-node array entry a pass goes over, each node a result is
+written back to, each result row; in the text index a posting read or
+written; in `check.run` a record; in label propagation each label compared.
+An extension function evaluated for a row is one step. The same call takes
+the same steps on the in-memory and the paged tier (tested for every
+algorithm): the algorithms count, the views do not, and building a
+projection counts its nodes, a page of 4,096 at a time, on both tiers. The
+edges the in-memory build reads are not steps, since the paged view reads
+none; the build looks at the meter every 4,096 of them, so a time budget
+still bounds it, but a step budget bounds it only by its nodes.
 
-- every loop over nodes or edges in an algorithm, a walk or an extension
-  procedure counts steps against the statement budget, and stops with the
-  same `statement stopped` error a query gets;
-- an extension procedure runs with the same memory budget and spill directory
-  as a built-in algorithm, without asking;
-- an extension has a public way to count a step.
+**The meter** is `src/meter.rs` (public as `glider::meter`, re-exported as
+`glider::ext::{step, steps, spent, check, stopped}`). It is per thread, set
+around a statement by `execute_capped` and `Cursor::open`. `steps(n)` is one
+thread-local decrement of a credit of at most 256 steps; when the credit is
+used up the meter is looked at, the clock read, and more credit handed out.
+Tight loops count into a local `meter::Tally`, which passes steps on 256 at
+a time and the rest when the loop is done (`flush`), so no step is dropped
+however the work is cut up: 50,000 walks of a few steps each count as one
+long walk would. Once the budget is spent the statement is *stopped*, and
+stays stopped:
+every later count fails, so code that could not return the error where it
+noticed (a callback, an extension function, an algorithm with no `Result`)
+stops at its next count. The statement checks at its end and fails with the
+budget's error whatever the procedure returned. The error is the one a query
+gets, word for word (`statement stopped: it took more than its budget of N
+matching steps`, `... ran past its time budget of N ms`), so callers that
+match on it need no change.
+
+**The bound.** The work between two looks at the meter (and the clock) is a
+fixed number of steps whatever a node's degree: at most 256 counted steps,
+or 4,096 entries of a scan that is not counted step by step. Concretely:
+counting goes through a `Tally` (256 at a time); the paged view (which
+reads a hub's list from the tree 4,096 entries at a time), `Csr::targets`,
+the in-memory projection build,
+the reverse projection, the paged degree, a sort of a neighbour list
+(`meter::sort`: runs of 4,096 sorted, then merged, looking between), the
+intersection of two hubs' lists in `triangles` and k-core's pass over one
+node's neighbours all look at the meter every 4,096 entries; passes over
+every node (pagerank's sums, the components scan, the topological sorts',
+k-core's, label propagation's and MST's setup, closeness's distances, the
+normalisation in betweenness) count 4,096 nodes at a time; the walks, the
+context walk, `structure`'s scans and `neighbors` count each edge as they
+read it and stop the scan. `Csr::each` is the exception that keeps its
+loop as it was (a look at the meter in it cost pagerank a tenth, by keeping
+the callback from being inlined): the algorithms' callbacks count each edge,
+and once the statement is stopped they pass over the rest of a hub's list
+doing nothing, a few nanoseconds an entry. A stop noticed inside a callback
+sticks to its tally, so the loop around the callback stops at its next
+count. Three things
+are not cut: allocating or resetting a per-node array (`StateVec::new` and
+`fill`, at memory speed, per source in betweenness and closeness), the
+external sort's work inside one push when a 64 MB run fills (MST), and the
+merge set up by its `finish`. Measured with 50 ms budgets
+(`tests/statement_budget.rs`): on a 200,000-node, 1,000,000-edge graph,
+50.0 to 51.8 ms for pagerank and betweenness (hours unbounded), a whole-graph
+BFS by the local walk and by the paged projection (0.35 s), `context.retrieve`
+(2.5 s) and `context.index` (1.5 s); on one hub with 1.5 million edges, every
+procedure that reaches it (BFS on both tiers, `neighbors`, `subgraph`, MST on
+both tiers, k-core, triangles, clustering, communities, paged pagerank,
+degree on both tiers, betweenness, `context.retrieve`, `structure.colors`
+and `structure.classes`) within 300 ms, almost all at 50 to 52 ms (MST on
+the paged tier took 1.3 s before the hub was cut up).
+
+**Leaving nothing behind.** A stopped statement rolls back like any failed
+one: a stopped `CALL pagerank(write: "rank")` has written no `rank` (tested at
+every point it can stop, computing or writing), a stopped `context.index()`
+leaves no index, and nothing a write hook wrote for the stopped statement
+is left (`tests/budget_blocks.rs`). Inside the caller's transaction, a
+stopped statement that had written anything is one more failure the engine
+rolls back (`Graph::abandon`, the rule G4 set for failed writes and hooks):
+a block opened with `BEGIN` or `Graph::begin()` is spent, so the error says
+the transaction was rolled back, later statements and writes are refused,
+`COMMIT` says nothing was committed, and the next block starts clean; a
+transaction opened by assigning `autocommit` goes on in a new one. Only the
+outermost statement does this, and it does it for the statements it runs
+too (below). A stopped statement that had written nothing leaves the
+transaction open. A
+stopped algorithm returns early with partial state that nothing uses; a
+stopped projection build returns an empty projection; a stopped local walk
+ends as if finished, so no whole-graph fallback starts. The memory and spill
+files it held are freed when it returns (`tests/procedure_memory.rs`).
+
+**Memory for extensions.** `ext::call` runs the procedure inside
+`ooc::with_budget(g.algorithm_memory(), g.temp_dir(), ...)`, so `StateVec`,
+`SpillQueue` and `SpillStack` spill to `<db>-tmp/` past `work_mem` exactly as
+they do for `CALL pagerank()`. `with_budget` puts the thread's budget and
+spill directory back however the procedure ends, a panic included, as the
+meter's guard does for the meter: on a pool of threads shared by many
+databases, one database's failure changes nothing for the next call.
+
+**Statements inside statements.** A statement a procedure runs (through
+`execute_capped` or `execute`) is bounded by the outer statement's budget as
+well as by any of its own: the tighter step count and the earlier deadline
+hold. When it returns, the outer meter carries on with the inner steps
+counted; an inner statement stopped by the outer budget stops the outer one
+too. The transaction belongs to the outermost statement: an inner one never
+commits or rolls back on its own, and so a statement is all or nothing
+however deep it runs. An inner statement that fails after it has written
+anything (an error, its own budget, the outer budget, a panic) records what
+failed in a thread-local slot as it returns or unwinds; the outermost
+statement reads the slot when the procedure returns and, whatever the
+procedure did with the error, fails as a whole ("statement failed as a
+whole: a statement it ran, `<its text>` failed after writing: <why>") and is
+rolled back under the rule of its kind of transaction: in autocommit nothing
+remains, a block is spent, a transaction opened by assigning `autocommit`
+goes on in a new one. An inner statement that fails before writing anything
+leaves nothing to undo, and the procedure may handle its error. A panic is a
+failure of the statement it unwinds through, in every kind of transaction:
+if the statement had written, it is rolled back (and a block spent) before
+the panic goes on, so a caller that catches it cannot commit part of it
+(`tests/statement_atomic.rs`). Before this, on the base too, a procedure
+that swallowed an inner failure, or a caller that caught a panic inside a
+transaction, could commit half a statement.
+
+**Two databases.** Nesting belongs to the database a statement runs on (the
+depth and the failure record are fields of the `Graph`, not of the
+thread). A statement a procedure on database A runs on database B is B's
+outermost statement: it commits or rolls back on B under B's rules for its
+kind of transaction, and its failure is B's alone, reported to the
+procedure that ran it. A's statement fails as a whole only when a statement
+on A itself, run inside it, failed after writing (a procedure on A running
+one on B running one on A again counts: that last one is inside A's
+statement). The time and step budget is the caller's patience, not a
+property of a database, so A's budget bounds the work A's statement starts
+on B too: spent on B, it stops B's statement (rolled back on B) and A's
+(rolled back on A). Of what is kept per thread, the meter (one budget for
+the whole call chain), the memory budget and spill directory (scoped to the
+procedure or algorithm running, put back on return and unwind) and the
+statement's text (for naming a failed inner statement) are rightly per
+thread; the statement nesting and the inner-failure record had to become
+per database, and the hook state, autocommit and blocks already were
+(`tests/two_databases.rs`, `tests/cross_database.rs`).
+
+**Transaction control inside a statement.** `BEGIN`, `COMMIT` and `ROLLBACK`
+run as a statement by a procedure on the database its statement runs on,
+and `Graph::begin`, `commit` and `rollback` called on it, are refused with
+an error that says so: they would split the statement, which commits or
+rolls back as a whole when it ends. On another database they run as usual.
+
+**What `max_steps` does not bound.** Building the in-memory projection
+counts only its nodes, so that both tiers count the same steps: a
+`max_steps` budget does not limit how many edges that build reads (a test
+read all of 3,000,000 edges under `max_steps: 200`). Where `max_steps` is
+the only budget, as on wasm32, the build is bounded only by the graph; a
+time budget stops it within 4,096 edges.
+
+**Without a budget** nothing changes: no result differs (every existing test
+passes untouched, and every algorithm on every tier answers byte for byte the
+same under a budget it does not reach), and counting costs one thread-local
+decrement per count. Measured with `bench/src/bin/algobench.rs` on a shared,
+busy machine, the algorithms themselves (`CORE=1`: the engine's code against
+a copy of the code before this slice, on one in-memory projection,
+interleaved run by run, fastest of 40 runs, pinned to one core; the same code
+raced against itself differs by under 2%):
+
+| graph | pagerank (20 iterations) | BFS, whole graph | components |
+|---|---|---|---|
+| 200,000 nodes, 1,200,000 edges | −2.2 to −2.9% | +0.1 to +3.1% | +5.0 to +7.9% |
+
+That race runs a copy of the old code inside the new build. Across builds
+(the base engine and this one, the same harness, interleaved, best of 20)
+the numbers move more than the change does: the old code's copy, the same
+source in both, ran pagerank in 129 ms in both builds but BFS in 43 ms in
+one and 23 to 31 ms in the other. Read that way, base → head: pagerank over
+a `Csr` 120 → 126 ms (+5%), over the projection a `CALL` uses 224 → 231 ms
+(+3%), BFS 43 → 23 to 32 ms, components 28 → 27 to 38 ms.
+
+End to end through `CALL` (projection build included), the before and after
+builds differ by less than the machine's noise (±10% between runs). Two
+things the first version got wrong, for whoever counts in a hot loop next:
+giving `Tally` a `Drop` that passed on its remainder made pagerank 2.3 times
+slower (the drop flag and the call kept the count out of registers), and
+counting each node of a pass that does a constant amount per node cost
+pagerank 4 to 7%; such passes are counted at once.
+
+**wasm.** There is no clock on wasm32, so `max_millis` is not kept there, for
+procedures as for queries; `max_steps` is kept everywhere.
+
+**Not covered.** `CREATE EXTENSION`'s install hook and `on_node_write` are
+part of a write and bounded by it, not by the meter. `utils::Digraph` is Rust
+API only, not reachable from a statement. Cancelling from another thread,
+progress reports and slicing a procedure with `after:`/`limit:` are later
+slices.
 
 ## Write hooks for edges and bulk paths
 
@@ -522,7 +701,13 @@ What is true now, and what this slice decided where the plan was open:
 - **Bounds (D6).** `since` returns at most 10,000 rows a call, continued
   with `after:` (the message gives it); `release` and `cap` forget 4,096
   entries a write. Every loop passes through `step(n)` in
-  `src/ext/changes.rs`, the one place G2 is to count. A write reads the
+  `src/ext/changes.rs`, which counts it against the statement budget (G2,
+  built); the walks and the status count also look at the meter every
+  4,096 entries. A stopped `cap` or `release` forgets nothing, a write
+  stopped while its hook is making room leaves the journal as it was and
+  the next write makes room as before (`tests/journal_budget.rs`), and the
+  hooks inside a statement a procedure runs, on either database, follow the
+  same rules as in an outermost one (`tests/two_databases.rs`). A write reads the
   state (one lookup) and writes one record; deleting or recreating a node
   also looks up its adjacency entry; upkeep is as above. `since` scans
   the entries of the kinds asked for in key order, so a full pass in
@@ -614,10 +799,11 @@ What is true now, and what this slice decided where the plan was open:
   (64 KiB at least), spilling past it. The node half of `duplicates` sorts
   again at every slice, so a slice bounds what it reports, not what it
   reads.
-- **Budgets (G2).** Every record a check looks at passes through one
+- **Budgets (G2, built).** Every record a check looks at passes through one
   function, `Run::look` in `src/ext/check.rs` (and `Probe::look` for an
-  extension's records); each already returns a `Result`, so counting a
-  statement step per record is one line in each.
+  extension's records), and each counts one statement step: `check.run`
+  stops on the statement's time and step budget like any procedure
+  (`every_algorithm_stops_on_a_step_budget` runs it too).
 - **How faults were planted in tests** (`tests/check.rs`), since the graph
   API cannot write one: a bulk load from a source that breaks its contract
   (an edge to a node it never lists) for `endpoints`; for `adjacency`,
@@ -766,10 +952,11 @@ in `docs/EXTENSIONS.md`.
   call, continued with `after:`. A colouring computed in the call is a
   whole-graph computation, so its slices bound what is returned; a kept
   colouring is read in true slices.
-- **Budgets (G2).** Every loop over nodes or edges calls one function,
-  `step(n)` in `src/ext/structure.rs` (per node and per node's edges in a
-  round, per node counted, kept, written or classed); counting a statement
-  step there is a one-line change.
+- **Budgets (G2, built).** Every loop over nodes or edges calls one
+  function, `step(n)` in `src/ext/structure.rs` (per node and per node's
+  edges in a round, per node counted, kept, written or classed), which
+  counts it against the statement budget; the scans of one node's edges
+  count each edge as they go, so a hub's stops with the statement.
 - **On the manufacturing graph** (`bench/KNOWLEDGE.md`, "Structure";
   `bench/tests/mfg_structure.rs`): with the hierarchy and catalogue edge
   types outwards and no properties, depth 4 recovers every design and sets

@@ -61,3 +61,7 @@ path = "src/bin/hotbench.rs"
 [[bin]]
 name = "memprobe"
 path = "src/bin/memprobe.rs"
+
+[[bin]]
+name = "algobench"
+path = "src/bin/algobench.rs"

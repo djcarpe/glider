@@ -869,3 +869,226 @@ fn the_index_survives_crashes_clears_and_drops() {
     }
     cleanup(&path);
 }
+
+// ------------------------------------------------------------------ budgets
+
+/// An extension written outside the crate that keeps the statement's
+/// budget the public way: it counts what it looks at with
+/// `glider::ext::steps` and returns the error it gets back.
+struct Budgeted;
+
+impl glider::ext::Extension for Budgeted {
+    fn name(&self) -> &str {
+        "budgeted"
+    }
+    fn version(&self) -> &str {
+        "0.1"
+    }
+    fn summary(&self) -> &str {
+        "test extension that keeps the statement budget"
+    }
+    fn procedures(&self) -> &[glider::ext::Spec] {
+        &[
+            glider::ext::Spec {
+                name: "scan",
+                args: "(rounds)",
+                doc: "looks at every node, rounds times",
+            },
+            glider::ext::Spec {
+                name: "rank",
+                args: "()",
+                doc: "runs pagerank and ignores how it ended",
+            },
+            glider::ext::Spec {
+                name: "state",
+                args: "(n)",
+                doc: "makes a per-node array of n entries",
+            },
+        ]
+    }
+    fn functions(&self) -> &[glider::ext::Spec] {
+        &[glider::ext::Spec {
+            name: "heavy",
+            args: "(x)",
+            doc: "x, after looking at 10,000 things",
+        }]
+    }
+    fn call(&self, g: &mut Graph, p: &str, a: &glider::ext::Args) -> glider::Result<QueryResult> {
+        match p {
+            "scan" => {
+                let mut seen = 0i64;
+                for _ in 0..a.usize("rounds", 1) {
+                    let mut from = 0;
+                    loop {
+                        let page = g.nodes_from(from, 512);
+                        let Some(&last) = page.last() else { break };
+                        for _id in &page {
+                            glider::ext::step()?;
+                            seen += 1;
+                        }
+                        from = last + 1;
+                    }
+                }
+                Ok(QueryResult::table(
+                    vec!["seen".into()],
+                    vec![vec![Value::Int(seen)]],
+                ))
+            }
+            "rank" => {
+                // counts nothing itself; the algorithm does, and stops
+                let p = g.projection(glider::Dir::Out, None, None, glider::graph::Tier::Auto);
+                let pr = glider::algo::pagerank(&p, 0.85, 1_000_000, 0.0);
+                Ok(QueryResult::message(format!(
+                    "{} iterations",
+                    pr.iterations
+                )))
+            }
+            _ => {
+                let n = a.usize("n", 1).max(1);
+                let mut v = glider::ooc::StateVec::new(n, 0u64);
+                v.set(n - 1, 1);
+                Ok(QueryResult::table(
+                    vec!["spilled".into(), "budget".into(), "dir".into()],
+                    vec![vec![
+                        Value::Bool(v.is_spilled()),
+                        glider::ooc::budget_left()
+                            .map(|b| Value::Int(b as i64))
+                            .unwrap_or(Value::Null),
+                        Value::from(glider::ooc::temp_dir().display().to_string()),
+                    ]],
+                ))
+            }
+        }
+    }
+    fn eval(&self, _: &Graph, _: &str, args: &[glider::ext::Arg]) -> Value {
+        // a function cannot return the error: it counts, and the statement
+        // stops at its next step
+        if glider::ext::spent(10_000) {
+            return Value::Null;
+        }
+        match args.first() {
+            Some(glider::ext::Arg::Value(v)) => v.clone(),
+            _ => Value::Null,
+        }
+    }
+}
+
+fn budgeted(nodes: usize) -> Graph {
+    glider::ext::register(std::sync::Arc::new(Budgeted));
+    let mut g = Graph::memory();
+    g.autocommit = false;
+    let mut prev = None;
+    for i in 0..nodes {
+        let id = g
+            .add_node(&["N".into()], vec![("i".into(), Value::Int(i as i64))])
+            .unwrap();
+        if let Some(p) = prev {
+            g.add_edge(p, id, "NEXT", vec![]).unwrap();
+        }
+        prev = Some(id);
+    }
+    g.commit().unwrap();
+    g.autocommit = true;
+    q(&mut g, "CREATE EXTENSION budgeted");
+    g
+}
+
+fn limits(millis: Option<u64>, steps: Option<u64>) -> query::QueryLimits {
+    query::QueryLimits {
+        max_millis: millis,
+        max_steps: steps,
+        ..Default::default()
+    }
+}
+
+fn capped_err(g: &mut Graph, src: &str, l: query::QueryLimits) -> String {
+    match query::execute_capped(g, src, &[], l) {
+        Ok(r) => panic!("{src}: expected to be stopped, got {:?}", r.rows),
+        Err(e) => e.to_string(),
+    }
+}
+
+#[test]
+fn an_extension_procedure_counts_its_steps_and_stops_on_the_budget() {
+    let mut g = budgeted(2_000);
+    let r = q(&mut g, "CALL budgeted.scan(rounds: 2)");
+    assert_eq!(r.rows, vec![vec![Value::Int(4_000)]]);
+    let e = capped_err(
+        &mut g,
+        "CALL budgeted.scan(rounds: 1000000)",
+        limits(None, Some(10_000)),
+    );
+    assert!(e.contains("budget of 10000 matching steps"), "{e}");
+    let t = std::time::Instant::now();
+    let e = capped_err(
+        &mut g,
+        "CALL budgeted.scan(rounds: 1000000)",
+        limits(Some(50), None),
+    );
+    assert!(e.contains("time budget of 50 ms"), "{e}");
+    assert!(t.elapsed() < std::time::Duration::from_millis(300));
+    // without a budget nothing stops it
+    let r = query::execute_capped(
+        &mut g,
+        "CALL budgeted.scan(rounds: 3)",
+        &[],
+        query::QueryLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(r.rows, vec![vec![Value::Int(6_000)]]);
+}
+
+#[test]
+fn an_extension_that_ignores_a_stop_still_fails_its_statement() {
+    let mut g = budgeted(2_000);
+    let e = capped_err(&mut g, "CALL budgeted.rank()", limits(None, Some(100_000)));
+    assert!(e.contains("budget of 100000 matching steps"), "{e}");
+    let e = capped_err(&mut g, "CALL budgeted.rank()", limits(Some(50), None));
+    assert!(e.contains("time budget of 50 ms"), "{e}");
+}
+
+#[test]
+fn extension_functions_count_against_the_budget_row_by_row() {
+    let mut g = budgeted(200);
+    let src = "MATCH (n:N) RETURN budgeted.heavy(n.i)";
+    assert_eq!(q(&mut g, src).rows.len(), 200);
+    let e = capped_err(&mut g, src, limits(None, Some(100_000)));
+    assert!(e.contains("budget of 100000 matching steps"), "{e}");
+    // and one that counts nothing itself still counts a step a row
+    let src = "MATCH (n:N) RETURN echo.twice(n.i)";
+    glider::ext::register(std::sync::Arc::new(Echo));
+    q(&mut g, "CREATE EXTENSION echo");
+    assert_eq!(q(&mut g, src).rows.len(), 200);
+    let e = capped_err(&mut g, src, limits(None, Some(300)));
+    assert!(e.contains("matching steps"), "{e}");
+}
+
+#[test]
+fn an_extension_procedure_gets_the_algorithm_memory_budget() {
+    glider::ext::register(std::sync::Arc::new(Budgeted));
+    let path = temp("budgeted-memory");
+    let opts = glider::graph::OpenOptions {
+        work_mem: 64 << 10,
+        ..Default::default()
+    };
+    let mut g = Graph::open_opts(&path, opts).unwrap();
+    q(&mut g, "CREATE EXTENSION budgeted");
+    // 1.6 MB of state against 64 KiB of work_mem: it spills, to the
+    // database's own temporary directory, without asking
+    let r = q(&mut g, "CALL budgeted.state(n: 200000)");
+    assert_eq!(r.rows[0][0], Value::Bool(true), "{:?}", r.rows);
+    assert!(
+        matches!(r.rows[0][1], Value::Int(b) if b <= 64 << 10),
+        "{:?}",
+        r.rows
+    );
+    assert_eq!(
+        r.rows[0][2],
+        Value::from(g.temp_dir().display().to_string())
+    );
+    // and a small array stays in memory
+    let r = q(&mut g, "CALL budgeted.state(n: 1000)");
+    assert_eq!(r.rows[0][0], Value::Bool(false));
+    drop(g);
+    cleanup(&path);
+}

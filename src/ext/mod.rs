@@ -36,6 +36,11 @@ use crate::graph::{Error, Graph, Result};
 use crate::query::QueryResult;
 use crate::value::Value;
 
+/// The statement budget, for extension code: count the nodes and edges a
+/// procedure or function looks at, and stop when told to (see
+/// [`crate::meter`]).
+pub use crate::meter::{check, spent, step, steps, stopped};
+
 /// One procedure an extension offers, for `CALL <ext>.help()` and errors.
 #[derive(Clone, Copy, Debug)]
 pub struct Spec {
@@ -95,8 +100,19 @@ pub trait Extension: Send + Sync {
     /// Run `CALL <name>.<procedure>(args)`. The procedure is one listed by
     /// [`procedures`](Extension::procedures). Runs inside the statement's
     /// transaction: writes commit with it or roll back with it.
+    ///
+    /// It runs within the graph's algorithm memory, as a built-in algorithm
+    /// does: [`crate::ooc::StateVec`] and the other spilling types it makes
+    /// spill to the graph's temporary directory past
+    /// [`Graph::algorithm_memory`]. It keeps the statement's time and step
+    /// budget by counting what it looks at with [`steps`] and returning the
+    /// error that comes back; if it returns normally after a stop, the
+    /// statement fails anyway.
     fn call(&self, g: &mut Graph, procedure: &str, args: &Args) -> Result<QueryResult>;
-    /// Evaluate `<name>.<function>(args)` for one row.
+    /// Evaluate `<name>.<function>(args)` for one row. Each evaluation
+    /// counts one step against the statement's budget; a function that does
+    /// more counts it with [`spent`], and the statement stops at its next
+    /// step.
     fn eval(&self, _g: &Graph, _function: &str, _args: &[Arg]) -> Value {
         Value::Null
     }
@@ -262,12 +278,20 @@ pub fn call(g: &mut Graph, qualified: &str, args: &[(String, Value)]) -> Result<
             ext.name()
         )));
     }
-    ext.call(g, &proc, &Args(args.to_vec()))
+    // The same memory budget and spill directory a built-in algorithm gets.
+    let (budget, tmp) = (g.algorithm_memory(), g.temp_dir());
+    let r = crate::ooc::with_budget(budget, tmp, || ext.call(g, &proc, &Args(args.to_vec())));
+    crate::meter::check()?;
+    r
 }
 
 /// Evaluate an extension function. Installation was checked when the
 /// statement started.
 pub fn eval(g: &Graph, qualified: &str, args: &[Arg]) -> Value {
+    // One step per row; a stop is noticed at the statement's next step.
+    if crate::meter::spent(1) {
+        return Value::Null;
+    }
     match resolve(g, qualified) {
         Ok((ext, f)) => ext.eval(g, &f, args),
         Err(_) => Value::Null,

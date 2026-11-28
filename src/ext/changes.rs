@@ -59,8 +59,10 @@
 //! survives `CLEAR`); `s` -> the state ([`State`]); every other key is an
 //! entry.
 //!
-//! Every loop over entries passes through [`step`], the one place the
-//! statement budget (slice G2) is to be counted.
+//! Every loop over entries passes through [`step`], which counts it
+//! against the statement budget; the walks also look at the meter every
+//! few thousand entries, so a stopped statement ends a walk of the whole
+//! journal early.
 
 use super::{Args, EdgeImage, Extension, NodeImage, Spec};
 use crate::graph::{Error, Graph, Result};
@@ -434,11 +436,14 @@ pub struct Status {
     pub why: Floor,
 }
 
-/// G2 (statement budgets): one statement step per entry looked at goes
-/// here, the only place this extension's loops count.
+/// One statement step per entry looked at ([`crate::meter`]): the only
+/// place this extension's loops count. The walks count after they end, so
+/// [`walk`] also looks at the meter every [`crate::meter::SCAN`] entries
+/// and ends early once the statement is stopped, which bounds a walk of the
+/// whole journal like any other scan.
 #[inline]
-fn step(_n: u64) -> Result<()> {
-    Ok(())
+fn step(n: u64) -> Result<()> {
+    crate::meter::steps(n)
 }
 
 fn u64_at(b: &[u8], at: usize) -> u64 {
@@ -562,6 +567,7 @@ fn walk(
         list.retain(|k| a.first().map_or(true, |&b| k.byte() >= b));
     }
     let mut go = true;
+    let mut seen = 0usize;
     for k in list {
         if !go {
             return;
@@ -569,6 +575,11 @@ fn walk(
         let prefix = [k.byte()];
         let from = after.filter(|a| a.first() == Some(&k.byte()));
         g.ext_scan_after(NS, &prefix, from, &mut |key, v| {
+            seen += 1;
+            if seen % crate::meter::SCAN == 0 && crate::meter::poll() {
+                go = false;
+                return false;
+            }
             go = f(key, decode_entry(key, v));
             go
         });
@@ -597,7 +608,8 @@ pub fn status(g: &Graph) -> Option<Status> {
             entries += 1;
         }
         bytes += (NS.len() + 1 + k.len() + v.len()) as u64;
-        true
+        // a long journal's count stops with the statement
+        looked % crate::meter::SCAN as u64 != 0 || !crate::meter::poll()
     });
     step(looked).ok()?;
     Some(Status {

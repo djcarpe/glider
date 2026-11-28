@@ -30,14 +30,23 @@ pub fn set_spill_shape(block: usize, cached: usize) {
 }
 
 /// Run `f` with at most `bytes` of algorithm state held in memory; arrays
-/// beyond that spill to temporary files under `temp_dir`.
+/// beyond that spill to temporary files under `temp_dir`. However `f`
+/// ends, by returning or by a panic, the thread's budget and directory are
+/// put back as they were.
 pub fn with_budget<R>(bytes: u64, temp_dir: PathBuf, f: impl FnOnce() -> R) -> R {
-    let prev = BUDGET.with(|b| b.replace(Some(bytes)));
-    let prev_dir = TEMP_DIR.with(|d| d.replace(Some(temp_dir)));
-    let r = f();
-    BUDGET.with(|b| b.set(prev));
-    TEMP_DIR.with(|d| *d.borrow_mut() = prev_dir);
-    r
+    struct Restore(Option<u64>, Option<PathBuf>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BUDGET.with(|b| b.set(self.0));
+            let dir = self.1.take();
+            TEMP_DIR.with(|d| *d.borrow_mut() = dir);
+        }
+    }
+    let _restore = Restore(
+        BUDGET.with(|b| b.replace(Some(bytes))),
+        TEMP_DIR.with(|d| d.replace(Some(temp_dir))),
+    );
+    f()
 }
 
 /// Where spill files go: the directory set by [`with_budget`], else the

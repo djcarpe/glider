@@ -25,6 +25,7 @@ pub mod ext;
 pub mod ffi;
 pub mod graph;
 pub mod legacy;
+pub mod meter;
 pub mod ooc;
 mod pread;
 pub mod query;

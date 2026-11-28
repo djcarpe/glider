@@ -1070,6 +1070,16 @@ pub struct Graph {
     /// How many write hooks are running: while any is, the graph itself
     /// may not be written, only extension keyspaces.
     in_hook: u32,
+    /// How many statements are running on this database now: more than
+    /// one when a procedure runs a statement on the database it was called
+    /// on (see `query::atomically`). Per database, not per thread: a
+    /// statement a procedure runs on another database is that database's
+    /// outermost.
+    pub(crate) statement_depth: u32,
+    /// Set by a statement run inside another on this database that failed
+    /// or panicked after writing: what failed and why. The outermost
+    /// statement on this database then fails as a whole.
+    pub(crate) inner_failed: Option<String>,
     /// A transaction block opened with [`Graph::begin`] (or `BEGIN`) is
     /// open: one the engine can see start, and so can mark spent.
     block: bool,
@@ -1142,6 +1152,8 @@ impl Graph {
             tel_id: crate::telemetry::next_db_id(),
             hooks: None,
             in_hook: 0,
+            statement_depth: 0,
+            inner_failed: None,
             block: false,
             spent: None,
         })
@@ -1666,6 +1678,65 @@ impl Graph {
         true
     }
 
+    /// Up to `limit` of a node's adjacency entries (as `for_each_adj` orders
+    /// them) into `out`, starting where an earlier call left off (`None`:
+    /// at the start). Returns where to carry on, or `None` once the list is
+    /// done: for reading a hub's list a piece at a time.
+    pub(crate) fn adj_slice(
+        &self,
+        id: u64,
+        dir: Dir,
+        etype: Option<u32>,
+        resume: Option<(usize, Vec<u8>)>,
+        limit: usize,
+        out: &mut Vec<Adj>,
+    ) -> Option<(usize, Vec<u8>)> {
+        let sides: &[u8] = match dir {
+            Dir::Out => &[OUT],
+            Dir::In => &[IN],
+            Dir::Both => &[OUT, IN],
+        };
+        let first = resume.as_ref().map_or(0, |r| r.0);
+        for (si, &d) in sides.iter().enumerate().skip(first) {
+            let r = (|| -> SResult<Option<(usize, Vec<u8>)>> {
+                let (prefix, n) = adj_prefix(id, d, etype);
+                let prefix = &prefix[..n];
+                let start = match &resume {
+                    Some((rs, k)) if *rs == si => {
+                        let mut k = k.clone();
+                        k.push(0);
+                        k
+                    }
+                    _ => prefix.to_vec(),
+                };
+                let mut c = ADJ.seek(self.pager(), &start)?;
+                while let Some((k, v)) = c.next()? {
+                    if !k.starts_with(prefix) {
+                        break;
+                    }
+                    let v = match v {
+                        crate::storage::btree::Val::Inline(b) => b,
+                        _ => return Err(SError::Corrupt("adjacency value overflowed".into())),
+                    };
+                    let other = codec::Reader::new(v).varint().map_err(SError::Corrupt)?;
+                    out.push(Adj {
+                        edge: adj_edge(k),
+                        other,
+                        etype: adj_type(k),
+                    });
+                    if out.len() >= limit {
+                        return Ok(Some((si, k.to_vec())));
+                    }
+                }
+                Ok(None)
+            })();
+            if let Some(next) = self.note(r) {
+                return Some(next);
+            }
+        }
+        None
+    }
+
     /// How many adjacency entries a node has in `dir`, optionally of one
     /// type. Counts keys without decoding them.
     pub fn degree_of(&self, id: u64, dir: Dir, etype: Option<u32>) -> usize {
@@ -2028,6 +2099,20 @@ impl Graph {
         Ok(())
     }
 
+    /// Refuse transaction control while a statement runs on this database
+    /// (a procedure calling it on the graph it was called on): it would
+    /// commit or undo part of that statement, which is all or nothing.
+    pub(crate) fn refuse_inside_statement(&self, what: &str) -> Result<()> {
+        if self.statement_depth > 0 {
+            return Err(Error::Msg(format!(
+                "{what} cannot run inside a statement on the same database: a statement \
+                 commits or rolls back as a whole when it ends; a procedure may run \
+                 transaction control only on another database"
+            )));
+        }
+        Ok(())
+    }
+
     /// Open a transaction block: autocommit off until [`Graph::commit`] or
     /// [`Graph::rollback`] ends it (as `BEGIN` does for statements). This
     /// is the way to open a transaction: if the engine has to roll a block
@@ -2038,6 +2123,7 @@ impl Graph {
     /// transaction was rolled back, and the caller carries on in a new one.
     /// Assigning `autocommit` does not end a block opened here.
     pub fn begin(&mut self) -> Result<()> {
+        self.refuse_inside_statement("BEGIN")?;
         if let Some(why) = self.spent() {
             return Err(Error::Msg(why.to_string()));
         }
@@ -2053,6 +2139,7 @@ impl Graph {
     /// [`Graph::spent`]) nothing is committed and this is an error that
     /// says why.
     pub fn commit(&mut self) -> Result<()> {
+        self.refuse_inside_statement("COMMIT")?;
         if self.block {
             self.block = false;
             self.autocommit = true;
@@ -2078,6 +2165,7 @@ impl Graph {
     /// Abandon everything since the last commit. A block opened with
     /// [`Graph::begin`] ends here, spent or not.
     pub fn rollback(&mut self) -> Result<()> {
+        self.refuse_inside_statement("ROLLBACK")?;
         if self.block {
             self.block = false;
             self.autocommit = true;
@@ -2127,7 +2215,7 @@ impl Graph {
     /// Roll back after a failure, and if the caller had a block open (see
     /// [`Graph::begin`]), mark it spent. The error says what happened,
     /// whatever its kind.
-    fn abandon(&mut self, e: Error) -> Error {
+    pub(crate) fn abandon(&mut self, e: Error) -> Error {
         self.rollback_quietly();
         let e = rolled_back(e);
         if self.block {
@@ -3018,11 +3106,38 @@ impl Graph {
 
     /// Flatten into compressed sparse row form for the in-memory algorithm
     /// tier. Holds the whole projection in RAM.
+    ///
+    /// Each node and edge read counts a step against the running
+    /// statement's budget ([`crate::meter`]); once it is spent the build
+    /// stops and the projection is empty, for a statement that is failing
+    /// anyway.
     pub fn csr(&self, dir: Dir, etype: Option<u32>, weight: Option<&str>) -> Csr {
-        let ids = self.node_ids();
+        let empty = || Csr {
+            ids: Vec::new(),
+            pos: id_map(),
+            off: vec![0],
+            adj: Vec::new(),
+            eids: Vec::new(),
+            weights: Vec::new(),
+        };
+        let mut ids = Vec::new();
+        let mut from = 0u64;
+        loop {
+            let page = self.nodes_from(from, 4096);
+            let Some(&last) = page.last() else { break };
+            if crate::meter::spent(page.len() as u64) {
+                return empty();
+            }
+            ids.extend_from_slice(&page);
+            from = last + 1;
+        }
+        let scan = crate::meter::SCAN;
         let mut pos: IdMap<u32> = id_map();
         pos.reserve(ids.len());
         for (i, id) in ids.iter().enumerate() {
+            if i % scan == scan - 1 && crate::meter::poll() {
+                return empty();
+            }
             pos.insert(*id, i as u32);
         }
         let wkey = weight.and_then(|w| self.strings.lookup(w));
@@ -3031,9 +3146,21 @@ impl Graph {
         let mut eids: Vec<u64> = Vec::new();
         let mut w: Vec<f64> = Vec::new();
         off.push(0u32);
+        // The edges read here are not steps (the paged view reads none,
+        // and the same call must take the same steps on both tiers), but
+        // the meter is looked at every `SCAN` of them, hubs included.
+        let mut read = 0usize;
+        let mut stopped = false;
         for id in &ids {
-            self.for_each_adj(*id, dir, etype, |a| {
-                let Some(p) = pos.get(&a.other) else { return };
+            self.for_each_adj_while(*id, dir, etype, |a| {
+                read += 1;
+                if read % scan == 0 && crate::meter::poll() {
+                    stopped = true;
+                    return false;
+                }
+                let Some(p) = pos.get(&a.other) else {
+                    return true;
+                };
                 adj.push(*p);
                 eids.push(a.edge);
                 w.push(match wkey {
@@ -3044,7 +3171,11 @@ impl Graph {
                         .unwrap_or(1.0),
                     None => 1.0,
                 });
+                true
             });
+            if stopped {
+                return empty();
+            }
             off.push(adj.len() as u32);
         }
         Csr {
@@ -3665,11 +3796,20 @@ impl crate::algo::Adjacency for Projection<'_> {
     fn has_negative_weights(&self) -> bool {
         match self {
             Projection::Mem(c, _) => crate::algo::Adjacency::has_negative_weights(c),
-            Projection::Paged(p) => (0..p.len).any(|v| {
-                let mut neg = false;
-                p.each(v, &mut |_, w, _| neg |= w < 0.0);
-                neg
-            }),
+            Projection::Paged(p) => {
+                // every edge counts, as the in-memory scan of weights counts
+                let mut tally = crate::meter::Tally::new();
+                let neg = (0..p.len).any(|v| {
+                    let mut neg = false;
+                    p.each(v, &mut |_, w, _| {
+                        tally.add(1);
+                        neg |= w < 0.0
+                    });
+                    neg || crate::meter::stopped()
+                });
+                tally.flush();
+                neg && !crate::meter::stopped()
+            }
         }
     }
 }
@@ -3697,6 +3837,11 @@ impl<'g> PagedView<'g> {
         'scan: loop {
             let page = g.nodes_from(from, 4096);
             let Some(&last) = page.last() else { break };
+            // a statement out of budget gets an empty view: it is failing
+            if crate::meter::spent(page.len() as u64) {
+                len = 0;
+                break;
+            }
             for id in page {
                 if len == n {
                     break 'scan;
@@ -3746,17 +3891,43 @@ impl<'g> PagedView<'g> {
 
     fn degree(&self, v: usize) -> usize {
         let id = self.ids.borrow_mut().get(v);
+        let scan = crate::meter::SCAN;
         let mut n = 0;
-        self.g.for_each_adj(id, self.dir, self.etype, |_| n += 1);
+        // a hub's count looks at the meter as it goes
+        self.g.for_each_adj_while(id, self.dir, self.etype, |_| {
+            n += 1;
+            n % scan != 0 || !crate::meter::poll()
+        });
         n
     }
 
     fn each(&self, v: usize, f: &mut dyn FnMut(usize, f64, u64)) {
         let id = self.ids.borrow_mut().get(v);
-        let mut list: Vec<(u64, u64)> = Vec::new();
-        self.g
-            .for_each_adj(id, self.dir, self.etype, |a| list.push((a.other, a.edge)));
-        for (other, edge) in list {
+        // A hub's list is read and handed on a piece at a time, looking at
+        // the meter between pieces.
+        let mut list = Vec::new();
+        let mut resume = None;
+        loop {
+            list.clear();
+            resume = self.g.adj_slice(
+                id,
+                self.dir,
+                self.etype,
+                resume,
+                crate::meter::SCAN,
+                &mut list,
+            );
+            self.deliver(&list, f);
+            if resume.is_none() || crate::meter::poll() {
+                return;
+            }
+        }
+    }
+}
+
+impl PagedView<'_> {
+    fn deliver(&self, list: &[Adj], f: &mut dyn FnMut(usize, f64, u64)) {
+        for &Adj { other, edge, .. } in list {
             let Some(t) = self.index_of(other) else {
                 continue;
             };

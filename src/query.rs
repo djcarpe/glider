@@ -1621,11 +1621,18 @@ pub fn edge_value(g: &Graph, id: u64) -> Value {
 /// Caps on one materialized response. Cursor caps apply to each batch.
 ///
 /// `max_millis` and `max_steps` bound the statement itself, not its result:
-/// matching stops with an error, and the graph is released, once the
-/// statement has run that long or taken that many matching steps (a step is
-/// one candidate checked, one edge scanned, one neighbour looked at or one
-/// combination of pattern parts tried, whether it matches or not). `max_millis` needs a clock and is ignored
-/// on wasm32; `max_steps` works everywhere.
+/// the statement stops with an error, rolls back, and the graph is
+/// released, once it has run that long or taken that many steps. A step is
+/// one node or one edge looked at, whether it matters or not: in a query a
+/// candidate checked, an edge scanned, a neighbour looked at or a
+/// combination of pattern parts tried; in a `CALL` (a built-in algorithm, a
+/// walk, an extension procedure) a node taken up or an edge followed; an
+/// extension function evaluated for a row. The same count bounds all of
+/// them ([`crate::meter`]). `max_millis` needs a clock and is ignored on
+/// wasm32; `max_steps` works everywhere, with one gap: building the
+/// in-memory projection of an algorithm counts its nodes only (so that both
+/// tiers count the same steps), so under `max_steps` alone that build reads
+/// every edge of the graph before anything stops it.
 #[derive(Clone, Copy, Debug)]
 pub struct QueryLimits {
     pub max_rows: usize,
@@ -1644,79 +1651,14 @@ impl Default for QueryLimits {
     }
 }
 
-/// The running statement's budget: when it must stop, and how many matching
-/// steps it has left. Set around a statement by [`execute_capped`] and
-/// [`Cursor::open`]; checked by [`tick`] in the matching loops.
-#[derive(Clone, Copy, Debug)]
-struct Meter {
-    #[cfg(not(target_arch = "wasm32"))]
-    deadline: Option<std::time::Instant>,
-    #[cfg(not(target_arch = "wasm32"))]
-    millis: u64,
-    steps_left: u64,
-    steps: u64,
-    ticks: u32,
-}
-thread_local! { static METER: std::cell::Cell<Option<Meter>> = const { std::cell::Cell::new(None) }; }
-pub(crate) struct MeterGuard(Option<Meter>);
-impl Drop for MeterGuard {
-    fn drop(&mut self) {
-        METER.with(|m| m.set(self.0));
-    }
-}
-/// Starts metering the statement about to run on this thread, if `limits`
-/// bound it; the guard puts the previous meter back.
-pub(crate) fn meter(limits: &QueryLimits) -> MeterGuard {
-    let next = if limits.max_millis.is_none() && limits.max_steps.is_none() {
-        None
-    } else {
-        Some(Meter {
-            #[cfg(not(target_arch = "wasm32"))]
-            deadline: limits
-                .max_millis
-                .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms)),
-            #[cfg(not(target_arch = "wasm32"))]
-            millis: limits.max_millis.unwrap_or(0),
-            steps_left: limits.max_steps.unwrap_or(u64::MAX),
-            steps: limits.max_steps.unwrap_or(0),
-            ticks: 0,
-        })
-    };
-    MeterGuard(METER.with(|m| m.replace(next)))
-}
+pub(crate) use crate::meter::meter;
 /// One matching step of the running statement: an error once its budget is
-/// spent. A step is one candidate checked, one edge scanned or one
-/// neighbour looked at, matched or not, so a scan that rejects everything
-/// counts too. The clock is read every 256 steps (a few microseconds of work).
+/// spent (see [`crate::meter`]). A step is one candidate checked, one edge
+/// scanned or one neighbour looked at, matched or not, so a scan that
+/// rejects everything counts too.
 #[inline]
 pub(crate) fn tick() -> Result<()> {
-    METER.with(|cell| {
-        let Some(mut m) = cell.get() else {
-            return Ok(());
-        };
-        if m.steps_left == 0 {
-            return Err(Error::Msg(format!(
-                "statement stopped: it took more than its budget of {} matching steps",
-                m.steps
-            )));
-        }
-        m.steps_left -= 1;
-        m.ticks = m.ticks.wrapping_add(1);
-        #[cfg(not(target_arch = "wasm32"))]
-        if m.ticks % 256 == 0 {
-            if let Some(d) = m.deadline {
-                if std::time::Instant::now() >= d {
-                    cell.set(Some(m));
-                    return Err(Error::Msg(format!(
-                        "statement stopped: it ran past its time budget of {} ms",
-                        m.millis
-                    )));
-                }
-            }
-        }
-        cell.set(Some(m));
-        Ok(())
-    })
+    crate::meter::step()
 }
 thread_local! { static LIMITS: std::cell::Cell<Option<QueryLimits>> = const { std::cell::Cell::new(None) }; }
 struct LimitsGuard(Option<QueryLimits>);
@@ -1818,6 +1760,7 @@ pub fn execute_with(g: &mut Graph, src: &str, params: &[(String, Value)]) -> Res
     if input > g.query_memory() {
         return Err(budget_error());
     }
+    let _text = StatementText::push(src);
     let watch = telemetry::Stopwatch::start();
     let before = g.pager_stats();
     let mut report = telemetry::OpReport {
@@ -1865,6 +1808,12 @@ fn execute_stmt(g: &mut Graph, stmt: Stmt) -> Result<QueryResult> {
             return Err(Error::Msg(why.to_string()));
         }
     }
+    // Run by a procedure on the database its statement runs on, BEGIN,
+    // COMMIT and ROLLBACK would split that statement: refused before they
+    // touch anything (autocommit included).
+    if matches!(stmt, Stmt::Begin | Stmt::Commit | Stmt::Rollback) {
+        g.refuse_inside_statement(stmt.op())?;
+    }
     // STATS reports the damage itself; everything else must not return
     // results computed from an image that failed a checksum along the way.
     let reports_damage = matches!(stmt, Stmt::Stats);
@@ -1889,22 +1838,85 @@ fn execute_stmt(g: &mut Graph, stmt: Stmt) -> Result<QueryResult> {
 
 /// A statement is one transaction: all of it commits, or (on an error)
 /// none of it. Inside BEGIN it joins the open transaction instead.
+///
+/// A statement stopped by its budget fails as a whole, even when the code
+/// that ran out could not return the error itself (an extension function,
+/// a callback): see [`crate::meter::check`]. Inside the caller's
+/// transaction, a stopped statement that had written something rolls it
+/// back as any failure there does, so that nothing it half-wrote can be
+/// committed: a block is spent, a transaction opened by assigning
+/// `autocommit` goes on in a new one.
 fn atomically<R>(g: &mut Graph, f: impl FnOnce(&mut Graph) -> Result<R>) -> Result<R> {
+    // Nesting is per database: a statement a procedure runs on another
+    // database is that database's outermost, committed or rolled back
+    // under its own rules.
+    g.statement_depth += 1;
+    let outermost = g.statement_depth == 1;
+    if outermost {
+        g.inner_failed = None;
+    }
     let auto = g.autocommit;
+    let before = g.uncommitted();
     g.autocommit = false;
     // A panic (in an extension, say) must not leave the handle with
     // autocommit off and the statement's writes pending.
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(g)));
     g.restore_autocommit(auto);
+    g.statement_depth -= 1;
+    let wrote = g.uncommitted() != before;
     let r = match r {
         Ok(r) => r,
         Err(panic) => {
-            if auto {
-                let _ = g.rollback_txn();
+            // A panic is a failure of the statement it unwinds through:
+            // what it wrote goes, before the panic goes on.
+            if !outermost {
+                if wrote && g.inner_failed.is_none() {
+                    g.inner_failed = Some(format!("{} panicked after writing", statement_text()));
+                }
+            } else {
+                g.inner_failed = None;
+                if auto {
+                    let _ = g.rollback_txn();
+                } else if wrote {
+                    let _ = g.abandon(Error::Msg("a statement panicked".into()));
+                }
             }
             std::panic::resume_unwind(panic)
         }
     };
+    // the budget's error, rather than whatever a stopped procedure said
+    let r = crate::meter::check().and(r);
+    if !outermost {
+        // A failure after writing cannot be undone here (there are no
+        // savepoints): the outermost statement fails as a whole.
+        if let (Err(e), true) = (&r, wrote) {
+            if g.inner_failed.is_none() {
+                g.inner_failed = Some(format!("{} failed after writing: {e}", statement_text()));
+            }
+        }
+        return r;
+    }
+    let inner = g.inner_failed.take();
+    let failed_inside = inner.is_some();
+    let r = match inner {
+        Some(why) => Err(Error::Msg(format!(
+            "statement failed as a whole: a statement it ran, {why}"
+        ))),
+        None => r,
+    };
+    // Failed after writing inside the caller's transaction, by its budget
+    // or by a statement it ran: the engine rolls the transaction back, as
+    // for any failure there (Graph::abandon). A block (BEGIN, Graph::begin)
+    // is then spent; a transaction opened by assigning `autocommit`
+    // carries on in a new one.
+    if !auto && g.uncommitted() != before {
+        if let Err(e) = r {
+            if crate::meter::stopped() || failed_inside {
+                return Err(g.abandon(e));
+            }
+            return Err(e);
+        }
+    }
     if !auto || g.uncommitted() == 0 {
         return r;
     }
@@ -1918,6 +1930,36 @@ fn atomically<R>(g: &mut Graph, f: impl FnOnce(&mut Graph) -> Result<R>) -> Resu
             Err(e)
         }
     }
+}
+
+thread_local! {
+    /// The text of the statement running on this thread, innermost last,
+    /// for saying which inner statement failed.
+    static STATEMENT: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+struct StatementText;
+impl StatementText {
+    fn push(src: &str) -> StatementText {
+        let mut s: String = src.trim().chars().take(120).collect();
+        if s.len() < src.trim().len() {
+            s.push('…');
+        }
+        STATEMENT.with(|st| st.borrow_mut().push(s));
+        StatementText
+    }
+}
+impl Drop for StatementText {
+    fn drop(&mut self) {
+        STATEMENT.with(|st| st.borrow_mut().pop());
+    }
+}
+
+fn statement_text() -> String {
+    STATEMENT.with(|st| match st.borrow().last() {
+        Some(s) => format!("`{s}`"),
+        None => "a statement".into(),
+    })
 }
 
 fn run(g: &mut Graph, stmt: Stmt) -> Result<QueryResult> {
@@ -4378,6 +4420,9 @@ fn call_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result
     let budget = g.algorithm_memory();
     let tmp = g.temp_dir();
     let r = crate::ooc::with_budget(budget, tmp, || run_algorithm(g, name, args));
+    // A stopped algorithm returns early with partial state; whatever it
+    // made of that, the statement fails with the budget's error.
+    crate::meter::check()?;
     if r.is_ok() {
         if let Some(e) = g.integrity_error() {
             return Err(Error::Msg(format!("storage error during algorithm: {e}")));
@@ -4385,6 +4430,20 @@ fn call_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result
     }
     r
 }
+
+/// Result rows of a procedure, one step each: a row reads its node's or
+/// edge's label, and a procedure may return a hub's worth of them.
+trait CountedRows: Iterator<Item = Vec<Value>> + Sized {
+    fn counted(self) -> Result<Vec<Vec<Value>>> {
+        let mut out = Vec::new();
+        for row in self {
+            crate::meter::step()?;
+            out.push(row);
+        }
+        Ok(out)
+    }
+}
+impl<I: Iterator<Item = Vec<Value>>> CountedRows for I {}
 
 /// Per-node results, streamed: written back when `write:` is given, and the
 /// top rows (all of them without `top:`) returned, highest first.
@@ -4410,6 +4469,7 @@ fn scalar_rows(
     let better = |x: &(u64, f64), y: &(u64, f64)| y.1.total_cmp(&x.1).then_with(|| x.0.cmp(&y.0));
     let mut keep: Vec<(u64, f64)> = Vec::new();
     for i in 0..n {
+        crate::meter::step()?;
         let id = ids.get(i);
         let v = value(i);
         if let Some(prop) = &write {
@@ -4430,7 +4490,7 @@ fn scalar_rows(
     let rows: Vec<Vec<Value>> = keep
         .into_iter()
         .map(|(id, v)| vec![Value::Int(id as i64), label_of(g, id), as_value(v)])
-        .collect();
+        .counted()?;
     Ok(QueryResult::table(
         vec!["id".into(), "node".into(), col.into()],
         rows,
@@ -4518,6 +4578,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
             let p = proj!(dir, weight.as_deref());
             let mut deg = StateVec::new(p.len(), 0u64);
             for v in 0..p.len() {
+                crate::meter::step()?;
                 deg.set(v, p.degree(v) as u64);
             }
             let ids = p.into_ids();
@@ -4586,6 +4647,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                 if let Some(found) =
                     crate::traverse::shortest_path(g, from, to, dir, etype, walk_cap(g))
                 {
+                    crate::meter::check()?;
                     return Ok(match found {
                         None => QueryResult::message("no path"),
                         Some(path) => {
@@ -4600,7 +4662,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                                         label_of(g, id),
                                     ]
                                 })
-                                .collect();
+                                .counted()?;
                             let mut r = QueryResult::table(
                                 vec!["step".into(), "id".into(), "node".into()],
                                 rows,
@@ -4625,6 +4687,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
             } else {
                 algo::bfs_paths(&p, s)
             };
+            crate::meter::check()?;
             match paths.path_to(t) {
                 None => Ok(QueryResult::message("no path")),
                 Some(path) => {
@@ -4635,7 +4698,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                             let id = p.id(*v);
                             vec![Value::Int(i as i64), Value::Int(id as i64), label_of(g, id)]
                         })
-                        .collect();
+                        .counted()?;
                     let mut r =
                         QueryResult::table(vec!["step".into(), "id".into(), "node".into()], rows);
                     r.message = Some(format!(
@@ -4670,6 +4733,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                 |x: &(u64, f64), y: &(u64, f64)| x.1.total_cmp(&y.1).then_with(|| x.0.cmp(&y.0));
             let mut keep: Vec<(u64, f64)> = Vec::new();
             for i in 0..ids.len() {
+                crate::meter::step()?;
                 let d = dist.get(i);
                 if !d.is_finite() {
                     continue;
@@ -4692,7 +4756,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
             let rows = keep
                 .into_iter()
                 .map(|(id, d)| vec![Value::Int(id as i64), label_of(g, id), Value::Float(d)])
-                .collect();
+                .counted()?;
             Ok(QueryResult::table(
                 vec!["id".into(), "node".into(), "distance".into()],
                 rows,
@@ -4728,6 +4792,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                     algo::dfs_each(&p, s, depth, &mut keep);
                 }
             }
+            crate::meter::check()?;
             let rows = visits
                 .into_iter()
                 .map(|v| {
@@ -4741,7 +4806,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                             .unwrap_or(Value::Null),
                     ]
                 })
-                .collect();
+                .counted()?;
             Ok(QueryResult::table(
                 vec!["id".into(), "node".into(), "depth".into(), "parent".into()],
                 rows,
@@ -4751,10 +4816,23 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
             let from = a
                 .u64("from")
                 .ok_or_else(|| Error::Msg("neighbors needs from:".into()))?;
-            let rows: Vec<Vec<Value>> = g
-                .neighbors(from, dir, etype)
+            // read as far as `top`, a step per entry, a hub's list stopping
+            // with the statement
+            let top = a.top();
+            let mut list = Vec::new();
+            let mut tally = crate::meter::Tally::new();
+            tally.add(1);
+            g.for_each_adj_while(from, dir, etype, |adj| {
+                if list.len() >= top || tally.spent(1) {
+                    return false;
+                }
+                list.push(adj);
+                true
+            });
+            tally.flush();
+            crate::meter::check()?;
+            let rows: Vec<Vec<Value>> = list
                 .into_iter()
-                .take(a.top())
                 .map(|adj| {
                     vec![
                         Value::Int(adj.other as i64),
@@ -4763,7 +4841,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                         Value::Int(adj.edge as i64),
                     ]
                 })
-                .collect();
+                .counted()?;
             Ok(QueryResult::table(
                 vec!["id".into(), "node".into(), "type".into(), "edge".into()],
                 rows,
@@ -4793,6 +4871,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                 }
                 true
             });
+            crate::meter::check()?;
             if done.is_some() {
                 return Ok(QueryResult::table(
                     vec!["id".into(), "node".into(), "depth".into()],
@@ -4804,6 +4883,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                 .index_of(from)
                 .ok_or_else(|| Error::Msg("from: must be an existing node id".into()))?;
             let reach = algo::k_hop(&p, s, a.u32("depth", 2));
+            crate::meter::check()?;
             let rows = reach
                 .into_iter()
                 .take(a.top())
@@ -4811,7 +4891,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                     let id = p.id(v);
                     vec![Value::Int(id as i64), label_of(g, id), Value::Int(d as i64)]
                 })
-                .collect();
+                .counted()?;
             Ok(QueryResult::table(
                 vec!["id".into(), "node".into(), "depth".into()],
                 rows,
@@ -4819,7 +4899,9 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
         }
         "toposort" | "topo" => {
             let p = proj!(dir, weight.as_deref());
-            match algo::topological_sort(&p) {
+            let order = algo::topological_sort(&p);
+            crate::meter::check()?;
+            match order {
                 None => Err(Error::Msg("graph has a cycle: no topological order".into())),
                 Some(mut order) => {
                     let rows = (0..order.len())
@@ -4828,7 +4910,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                             let id = p.id(order.get(i) as usize);
                             vec![Value::Int(i as i64), Value::Int(id as i64), label_of(g, id)]
                         })
-                        .collect();
+                        .counted()?;
                     Ok(QueryResult::table(
                         vec!["position".into(), "id".into(), "node".into()],
                         rows,
@@ -4849,6 +4931,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
             // Shallowest first, then lower id: the order the levels run in.
             let mut keep: Vec<(u64, u64)> = Vec::new();
             for i in 0..ids.len() {
+                crate::meter::step()?;
                 let (id, lv) = (ids.get(i), level.get(i));
                 if let Some(prop) = &write {
                     g.set_node_prop(id, prop, Value::Int(lv as i64))?;
@@ -4873,14 +4956,16 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                         Value::Int(lv as i64),
                     ]
                 })
-                .collect();
+                .counted()?;
             let mut r = QueryResult::table(vec!["id".into(), "node".into(), "level".into()], rows);
             r.message = Some(format!("{} levels", count));
             Ok(r)
         }
         "reduce" | "reduction" => {
             let p = proj!(dir, weight.as_deref());
-            let Some(edges) = algo::transitive_reduction(&p) else {
+            let reduced = algo::transitive_reduction(&p);
+            crate::meter::check()?;
+            let Some(edges) = reduced else {
                 return Err(Error::Msg(
                     "graph has a cycle: no transitive reduction".into(),
                 ));
@@ -4898,7 +4983,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                         Value::Text(g.edge_type_name(*eid).unwrap_or("").to_string()),
                     ]
                 })
-                .collect();
+                .counted()?;
             let mut r = QueryResult::table(
                 vec!["edge".into(), "from".into(), "to".into(), "type".into()],
                 rows,
@@ -4908,7 +4993,9 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
         }
         "cycle" | "cycles" => {
             let p = proj!(dir, weight.as_deref());
-            match algo::find_cycle(&p) {
+            let cycle = algo::find_cycle(&p);
+            crate::meter::check()?;
+            match cycle {
                 None => Ok(QueryResult::message("no cycle found")),
                 Some(cycle) => {
                     let rows = cycle
@@ -4918,7 +5005,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                             let id = p.id(v);
                             vec![Value::Int(i as i64), Value::Int(id as i64), label_of(g, id)]
                         })
-                        .collect();
+                        .counted()?;
                     Ok(QueryResult::table(
                         vec!["step".into(), "id".into(), "node".into()],
                         rows,
@@ -4929,6 +5016,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
         "mst" => {
             let p = proj!(Dir::Both, weight.as_deref());
             let (edges, total) = algo::minimum_spanning_forest(&p);
+            crate::meter::check()?;
             drop(p);
             let rows: Vec<Vec<Value>> = edges
                 .iter()
@@ -4942,7 +5030,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                         Value::Text(g.edge_type_name(*eid).unwrap_or("").to_string()),
                     ]
                 })
-                .collect();
+                .counted()?;
             let mut r = QueryResult::table(
                 vec!["edge".into(), "from".into(), "to".into(), "type".into()],
                 rows,
@@ -4994,6 +5082,7 @@ fn local_walk(
             return Ok(None);
         }
     }
+    crate::meter::check()?;
     let rows = visits
         .into_iter()
         .map(|v| {
@@ -5006,7 +5095,7 @@ fn local_walk(
                     .unwrap_or(Value::Null),
             ]
         })
-        .collect();
+        .counted()?;
     Ok(Some(QueryResult::table(
         vec!["id".into(), "node".into(), "depth".into(), "parent".into()],
         rows,

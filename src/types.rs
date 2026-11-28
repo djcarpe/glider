@@ -241,11 +241,27 @@ impl Csr {
     }
 
     /// Reverse adjacency, for algorithms that need to walk backwards.
+    /// Looks at the statement's meter every [`crate::meter::SCAN`] edges;
+    /// stopped, it returns what it has, consistent but incomplete.
     pub fn reversed(&self) -> Csr {
         let n = self.len();
+        let scan = crate::meter::SCAN;
         let mut counts = vec![0u32; n + 1];
-        for &t in &self.adj {
-            counts[t as usize + 1] += 1;
+        for piece in self.adj.chunks(scan) {
+            if crate::meter::poll() {
+                // a statement out of budget: no edges at all
+                return Csr {
+                    ids: self.ids.clone(),
+                    pos: self.pos.clone(),
+                    off: vec![0; n + 1],
+                    adj: Vec::new(),
+                    eids: Vec::new(),
+                    weights: Vec::new(),
+                };
+            }
+            for &t in piece {
+                counts[t as usize + 1] += 1;
+            }
         }
         for i in 0..n {
             counts[i + 1] += counts[i];
@@ -254,8 +270,13 @@ impl Csr {
         let mut adj = vec![0u32; self.adj.len()];
         let mut eids = vec![0u64; self.adj.len()];
         let mut weights = vec![0.0f64; self.adj.len()];
-        for v in 0..n {
+        let mut moved = 0usize;
+        'fill: for v in 0..n {
             for i in self.range(v) {
+                moved += 1;
+                if moved % scan == 0 && crate::meter::poll() {
+                    break 'fill;
+                }
                 let t = self.adj[i] as usize;
                 let slot = cursor[t] as usize;
                 adj[slot] = v as u32;

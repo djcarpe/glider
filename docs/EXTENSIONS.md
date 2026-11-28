@@ -145,6 +145,75 @@ state with the graph for `CALL check.run()` (below). The built-in `context`
 extension (`src/ext/context.rs`, `src/ext/text.rs`) uses all of them and is
 the worked example.
 
+### Budgets
+
+A procedure runs under the same two budgets as a built-in algorithm, and has
+nothing to set up for either.
+
+- **Memory.** `call` runs inside the graph's algorithm memory
+  (`Graph::algorithm_memory()`, `work_mem` for a file). The spilling types in
+  `glider::ooc` (`StateVec`, `SpillQueue`, `SpillStack`) stay in memory while
+  they fit and spill to the database's own temporary directory
+  (`Graph::temp_dir()`, `<db>-tmp/` for a file) past it, exactly as they do
+  for `CALL pagerank()`. Use them for anything sized by the graph.
+- **Time and steps.** The statement's `max_millis` and `max_steps` hold for a
+  procedure as for a query. A *step* is one node or one edge looked at,
+  whether it turns out to matter or not. Count them and return the error you
+  get back:
+
+  ```rust
+  for id in page {
+      ext::step()?;          // one node
+      // ... look at it, and at its edges:
+      ext::steps(edges)?;    // one per edge
+  }
+  ```
+
+  `ext::steps` is one thread-local decrement, and never fails outside a
+  metered statement. In a loop too tight even for that, count into a local
+  `glider::meter::Tally` (`tally.spent(n)` is true once the statement must
+  stop), which passes the steps on 256 at a time; call `tally.flush()` when
+  the loop is done, or the last few are not counted. In a callback that
+  cannot return an error, `ext::spent(n)` counts and says whether to stop;
+  the stop sticks, so the next `steps` returns the error. A scan that is
+  long but not counted step by step calls `glider::meter::poll()` every few
+  thousand entries, and `glider::meter::sort` sorts a long list the same way.
+- **Functions** cannot return an error. Each evaluation counts one step by
+  itself; one that does more counts it with `ext::spent(n)`, and the
+  statement stops at its next step.
+
+Built-in algorithms and walks called from a procedure (`glider::algo::pagerank`
+over `g.projection(...)`, `glider::traverse::bfs`) count their own steps, every
+one of them, however many calls the work is cut into. A statement a procedure
+runs with `query::execute_capped` is bounded by the outer statement's budget
+too, and its steps count against it. A statement is all or nothing however
+deep it runs: if one a procedure runs fails after it has written anything,
+the outermost statement fails as a whole and is rolled back, whatever the
+procedure does with the error; one that fails before writing may be
+handled. This is per database: a statement a procedure runs on another
+database is that database's own, committed or rolled back there, and its
+failure is reported to the procedure only (the caller's budget still bounds
+it). A procedure may not run `BEGIN`, `COMMIT` or `ROLLBACK`, or call
+`begin`, `commit` or `rollback`, on the database it was called on. A procedure that panics leaves the
+thread's budgets as they were. A procedure that carries on after
+a stop, or returns normally from one, still fails: the statement ends with
+the budget's error whatever the procedure returned, and rolls back, so a
+procedure stopped part-way has written nothing, and nothing its write hooks
+wrote for it is left either. Inside the caller's transaction, a stopped
+statement that had written anything is a failure the engine rolls back,
+under the same rule as a failed hook: a block opened with `BEGIN` or
+`Graph::begin()` is spent (the error says the transaction was rolled back,
+later statements are refused, `COMMIT` says nothing was committed), and a
+transaction opened by assigning `autocommit` goes on in a new one. A
+stopped statement that had written nothing leaves the transaction open. A
+panic through a procedure and a hook together leaves the thread's budgets,
+the meter, autocommit and the hook state as they were.
+
+`max_millis` needs a clock, so it is not kept on wasm32, for procedures as for
+queries; `max_steps` is kept everywhere, except that building an algorithm's
+in-memory projection counts its nodes only, so under `max_steps` alone that
+build reads every edge of the graph.
+
 ## `context`: graph retrieval for language models
 
 A model asked about a knowledge graph needs a small, relevant, faithful slice
@@ -261,6 +330,10 @@ under 300 MB.
 - `CALL context.index()` builds in one transaction, and its log holds every
   posting until the next checkpoint (about 0.5 GiB for the 8.6M postings in
   the benchmark).
+- Every `context` procedure keeps the statement budget: a step is a node
+  scanned, pushed or admitted, an edge looked at, or a posting read or
+  written by the text index. `context.index()` stopped by its budget leaves
+  no index (it builds in one transaction).
 
 ## `changes`: which nodes and edges changed
 
