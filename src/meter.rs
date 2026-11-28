@@ -31,6 +31,11 @@ use std::cell::Cell;
 /// Steps handed out between two looks at the meter (and the clock).
 pub const CHUNK: u64 = 256;
 
+/// Entries a long scan (one node's neighbour list, a sort of one) goes
+/// through between two [`poll`]s: what bounds the work between two looks
+/// at the meter whatever a node's degree.
+pub const SCAN: usize = 4096;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stop {
     Steps,
@@ -76,20 +81,46 @@ thread_local! {
     static CREDIT: Cell<u64> = const { Cell::new(u64::MAX) };
 }
 
-/// Puts the previous meter back when the statement ends.
-pub(crate) struct MeterGuard(Option<Meter>);
+/// Puts the previous meter back when the statement ends, however it ends
+/// (a return, an error, a panic), with the steps the statement took counted
+/// against it.
+pub(crate) struct MeterGuard {
+    prev: Option<Meter>,
+    /// Steps the statement's own meter started with.
+    start: u64,
+}
 
 impl Drop for MeterGuard {
     fn drop(&mut self) {
-        METER.with(|m| m.set(self.0));
-        CREDIT.with(|c| c.set(if self.0.is_some() { 0 } else { u64::MAX }));
+        let credit = CREDIT.with(|c| c.get());
+        let inner = METER.with(|m| m.get());
+        let prev = self.prev.map(|mut p| {
+            if let Some(i) = inner {
+                // what the inner statement used is the outer one's too
+                let left = i.steps_left.saturating_add(credit.min(CHUNK));
+                let used = self.start.saturating_sub(left);
+                p.steps_left = p.steps_left.saturating_sub(used);
+                if i.stopped == Some(Stop::Steps) && p.steps_left == 0 && p.stopped.is_none() {
+                    p.stopped = Some(Stop::Steps);
+                }
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            if p.stopped.is_none() && p.deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                p.stopped = Some(Stop::Time);
+            }
+            p
+        });
+        METER.with(|m| m.set(prev));
+        CREDIT.with(|c| c.set(if prev.is_some() { 0 } else { u64::MAX }));
     }
 }
 
-/// Starts metering the statement about to run on this thread, if `limits`
-/// bound it; the guard puts the previous meter back.
+/// Starts metering the statement about to run on this thread; the guard
+/// puts the previous meter back. A statement started inside another (a
+/// procedure running a query) is bounded by both budgets, the tighter of
+/// each, and what it uses is counted against the outer statement too.
 pub(crate) fn meter(limits: &QueryLimits) -> MeterGuard {
-    let next = if limits.max_millis.is_none() && limits.max_steps.is_none() {
+    let own = if limits.max_millis.is_none() && limits.max_steps.is_none() {
         None
     } else {
         Some(Meter {
@@ -105,15 +136,36 @@ pub(crate) fn meter(limits: &QueryLimits) -> MeterGuard {
         })
     };
     // The outer meter gets back the credit it had handed out.
-    let credit = CREDIT.with(|c| c.replace(if next.is_some() { 0 } else { u64::MAX }));
-    let prev = METER.with(|m| {
-        let prev = m.replace(next);
-        prev.map(|mut p| {
-            p.steps_left = p.steps_left.saturating_add(credit);
-            p
-        })
+    let credit = CREDIT.with(|c| c.get());
+    let prev = METER.with(|m| m.get()).map(|mut p| {
+        p.steps_left = p.steps_left.saturating_add(credit.min(CHUNK));
+        p
     });
-    MeterGuard(prev)
+    let next = match (prev, own) {
+        (None, own) => own,
+        (Some(p), None) => Some(p),
+        (Some(p), Some(mut o)) => {
+            if p.steps_left < o.steps_left {
+                o.steps_left = p.steps_left;
+                o.steps = p.steps;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(pd) = p.deadline {
+                if !matches!(o.deadline, Some(od) if od <= pd) {
+                    o.deadline = Some(pd);
+                    o.millis = p.millis;
+                }
+            }
+            o.stopped = p.stopped;
+            Some(o)
+        }
+    };
+    METER.with(|m| m.set(next));
+    CREDIT.with(|c| c.set(if next.is_some() { 0 } else { u64::MAX }));
+    MeterGuard {
+        prev,
+        start: next.map_or(0, |n| n.steps_left),
+    }
 }
 
 /// Counts `n` steps against the running statement: an error once its
@@ -141,6 +193,60 @@ pub fn steps(n: u64) -> Result<()> {
     }
 }
 
+/// Looks at the meter and the clock without counting anything: true once
+/// the statement must stop. For work that is not steps but can be long (a
+/// scan that only counts), every few thousand entries.
+pub fn poll() -> bool {
+    let k = CREDIT.with(|c| c.get());
+    if k == u64::MAX {
+        return false;
+    }
+    refill(0).is_err()
+}
+
+/// Sorts `list`, looking at the meter every [`SCAN`] entries when it is
+/// long (a hub's neighbours): runs of `SCAN` sorted, then merged pairwise.
+/// Once the statement is stopped the list is left part-sorted; nothing
+/// uses it then. Short lists are sorted as `sort_unstable` would.
+pub fn sort<T: Ord + Copy>(list: &mut Vec<T>) {
+    if list.len() <= SCAN {
+        list.sort_unstable();
+        return;
+    }
+    for (i, run) in list.chunks_mut(SCAN).enumerate() {
+        if i > 0 && poll() {
+            return;
+        }
+        run.sort_unstable();
+    }
+    let mut width = SCAN;
+    let mut buf: Vec<T> = Vec::with_capacity(list.len());
+    while width < list.len() {
+        buf.clear();
+        let mut lo = 0;
+        while lo < list.len() {
+            let mid = (lo + width).min(list.len());
+            let hi = (lo + 2 * width).min(list.len());
+            let (mut i, mut j) = (lo, mid);
+            while i < mid || j < hi {
+                if buf.len() % SCAN == SCAN - 1 && poll() {
+                    return;
+                }
+                if j >= hi || (i < mid && list[i] <= list[j]) {
+                    buf.push(list[i]);
+                    i += 1;
+                } else {
+                    buf.push(list[j]);
+                    j += 1;
+                }
+            }
+            lo = hi;
+        }
+        std::mem::swap(list, &mut buf);
+        width *= 2;
+    }
+}
+
 /// One step: [`steps`]`(1)`.
 #[inline]
 pub fn step() -> Result<()> {
@@ -158,9 +264,10 @@ pub fn spent(n: u64) -> bool {
 /// Steps counted in a local variable and passed to the meter [`CHUNK`] at a
 /// time, for loops too tight to count each step through the thread-local
 /// meter. A stop is noticed when a batch is passed, so at most `CHUNK`
-/// steps (plus the last count) go by after the budget is spent. The fewer
-/// than `CHUNK` steps still in it when it goes out of scope are not passed
-/// on: a `Drop` that did so cost a tight loop a third of its speed.
+/// steps (plus the last count) go by after the budget is spent. Call
+/// [`Tally::flush`] when the work is done, so that the last fewer than
+/// `CHUNK` are counted too: it has no `Drop` that would do it, because one
+/// cost a tight loop more than half its speed.
 #[derive(Debug, Default)]
 pub struct Tally(u64);
 
@@ -176,11 +283,13 @@ impl Tally {
         self.0 >= CHUNK && self.flush()
     }
 
-    /// Counts `n` steps without asking whether to stop (inside a callback;
-    /// the next [`Tally::spent`] asks).
+    /// Counts `n` steps where nothing can stop on the answer (inside a
+    /// callback): a stop sticks, and is noticed by the next
+    /// [`Tally::spent`], the meter's next count, or the scan that called
+    /// back ([`poll`]).
     #[inline]
     pub fn add(&mut self, n: u64) {
-        self.0 += n;
+        self.spent(n);
     }
 
     /// Passes the steps counted so far to the meter; true once the
@@ -188,7 +297,13 @@ impl Tally {
     #[cold]
     #[inline(never)]
     pub fn flush(&mut self) -> bool {
-        spent(std::mem::take(&mut self.0))
+        let stop = spent(std::mem::take(&mut self.0));
+        if stop {
+            // so that every later count asks again, and hears it: a stop
+            // noticed in a callback is seen by the loop around it
+            self.0 = CHUNK;
+        }
+        stop
     }
 }
 

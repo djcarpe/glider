@@ -1827,6 +1827,20 @@ fn execute_stmt(g: &mut Graph, stmt: Stmt) -> Result<QueryResult> {
 /// statement that had written something rolls the open transaction back,
 /// so that nothing it half-wrote can be committed.
 fn atomically<R>(g: &mut Graph, f: impl FnOnce(&mut Graph) -> Result<R>) -> Result<R> {
+    thread_local! { static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
+    struct Nested;
+    impl Drop for Nested {
+        fn drop(&mut self) {
+            DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        }
+    }
+    // a statement run by a procedure inside another statement leaves the
+    // transaction to the outer one
+    let outermost = DEPTH.with(|d| {
+        d.set(d.get() + 1);
+        d.get() == 1
+    });
+    let _nested = Nested;
     let auto = g.autocommit;
     let before = g.uncommitted();
     g.autocommit = false;
@@ -1834,7 +1848,7 @@ fn atomically<R>(g: &mut Graph, f: impl FnOnce(&mut Graph) -> Result<R>) -> Resu
     // the budget's error, rather than whatever a stopped procedure said
     let r = crate::meter::check().and(r);
     g.autocommit = auto;
-    if !auto && g.uncommitted() != before && crate::meter::stopped() {
+    if outermost && !auto && g.uncommitted() != before && crate::meter::stopped() {
         if let Err(e) = r {
             g.rollback()?;
             g.autocommit = true;
@@ -4324,6 +4338,20 @@ fn call_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result
     r
 }
 
+/// Result rows of a procedure, one step each: a row reads its node's or
+/// edge's label, and a procedure may return a hub's worth of them.
+trait CountedRows: Iterator<Item = Vec<Value>> + Sized {
+    fn counted(self) -> Result<Vec<Vec<Value>>> {
+        let mut out = Vec::new();
+        for row in self {
+            crate::meter::step()?;
+            out.push(row);
+        }
+        Ok(out)
+    }
+}
+impl<I: Iterator<Item = Vec<Value>>> CountedRows for I {}
+
 /// Per-node results, streamed: written back when `write:` is given, and the
 /// top rows (all of them without `top:`) returned, highest first.
 fn scalar_rows(
@@ -4369,7 +4397,7 @@ fn scalar_rows(
     let rows: Vec<Vec<Value>> = keep
         .into_iter()
         .map(|(id, v)| vec![Value::Int(id as i64), label_of(g, id), as_value(v)])
-        .collect();
+        .counted()?;
     Ok(QueryResult::table(
         vec!["id".into(), "node".into(), col.into()],
         rows,
@@ -4541,7 +4569,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                                         label_of(g, id),
                                     ]
                                 })
-                                .collect();
+                                .counted()?;
                             let mut r = QueryResult::table(
                                 vec!["step".into(), "id".into(), "node".into()],
                                 rows,
@@ -4577,7 +4605,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                             let id = p.id(*v);
                             vec![Value::Int(i as i64), Value::Int(id as i64), label_of(g, id)]
                         })
-                        .collect();
+                        .counted()?;
                     let mut r =
                         QueryResult::table(vec!["step".into(), "id".into(), "node".into()], rows);
                     r.message = Some(format!(
@@ -4635,7 +4663,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
             let rows = keep
                 .into_iter()
                 .map(|(id, d)| vec![Value::Int(id as i64), label_of(g, id), Value::Float(d)])
-                .collect();
+                .counted()?;
             Ok(QueryResult::table(
                 vec!["id".into(), "node".into(), "distance".into()],
                 rows,
@@ -4685,7 +4713,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                             .unwrap_or(Value::Null),
                     ]
                 })
-                .collect();
+                .counted()?;
             Ok(QueryResult::table(
                 vec!["id".into(), "node".into(), "depth".into(), "parent".into()],
                 rows,
@@ -4695,11 +4723,23 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
             let from = a
                 .u64("from")
                 .ok_or_else(|| Error::Msg("neighbors needs from:".into()))?;
-            let list = g.neighbors(from, dir, etype);
-            crate::meter::steps(1 + list.len() as u64)?;
+            // read as far as `top`, a step per entry, a hub's list stopping
+            // with the statement
+            let top = a.top();
+            let mut list = Vec::new();
+            let mut tally = crate::meter::Tally::new();
+            tally.add(1);
+            g.for_each_adj_while(from, dir, etype, |adj| {
+                if list.len() >= top || tally.spent(1) {
+                    return false;
+                }
+                list.push(adj);
+                true
+            });
+            tally.flush();
+            crate::meter::check()?;
             let rows: Vec<Vec<Value>> = list
                 .into_iter()
-                .take(a.top())
                 .map(|adj| {
                     vec![
                         Value::Int(adj.other as i64),
@@ -4708,7 +4748,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                         Value::Int(adj.edge as i64),
                     ]
                 })
-                .collect();
+                .counted()?;
             Ok(QueryResult::table(
                 vec!["id".into(), "node".into(), "type".into(), "edge".into()],
                 rows,
@@ -4758,7 +4798,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                     let id = p.id(v);
                     vec![Value::Int(id as i64), label_of(g, id), Value::Int(d as i64)]
                 })
-                .collect();
+                .counted()?;
             Ok(QueryResult::table(
                 vec!["id".into(), "node".into(), "depth".into()],
                 rows,
@@ -4777,7 +4817,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                             let id = p.id(order.get(i) as usize);
                             vec![Value::Int(i as i64), Value::Int(id as i64), label_of(g, id)]
                         })
-                        .collect();
+                        .counted()?;
                     Ok(QueryResult::table(
                         vec!["position".into(), "id".into(), "node".into()],
                         rows,
@@ -4823,7 +4863,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                         Value::Int(lv as i64),
                     ]
                 })
-                .collect();
+                .counted()?;
             let mut r = QueryResult::table(vec!["id".into(), "node".into(), "level".into()], rows);
             r.message = Some(format!("{} levels", count));
             Ok(r)
@@ -4850,7 +4890,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                         Value::Text(g.edge_type_name(*eid).unwrap_or("").to_string()),
                     ]
                 })
-                .collect();
+                .counted()?;
             let mut r = QueryResult::table(
                 vec!["edge".into(), "from".into(), "to".into(), "type".into()],
                 rows,
@@ -4872,7 +4912,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                             let id = p.id(v);
                             vec![Value::Int(i as i64), Value::Int(id as i64), label_of(g, id)]
                         })
-                        .collect();
+                        .counted()?;
                     Ok(QueryResult::table(
                         vec!["step".into(), "id".into(), "node".into()],
                         rows,
@@ -4897,7 +4937,7 @@ fn run_algorithm(g: &mut Graph, name: &str, args: &[(String, Value)]) -> Result<
                         Value::Text(g.edge_type_name(*eid).unwrap_or("").to_string()),
                     ]
                 })
-                .collect();
+                .counted()?;
             let mut r = QueryResult::table(
                 vec!["edge".into(), "from".into(), "to".into(), "type".into()],
                 rows,
@@ -4962,7 +5002,7 @@ fn local_walk(
                     .unwrap_or(Value::Null),
             ]
         })
-        .collect();
+        .counted()?;
     Ok(Some(QueryResult::table(
         vec!["id".into(), "node".into(), "depth".into(), "parent".into()],
         rows,
