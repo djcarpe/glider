@@ -14,7 +14,9 @@
 //!
 //! Each node taken up counts one step against the running statement's
 //! budget, and each edge scanned another ([`crate::meter`]), passed on in
-//! batches by a [`Tally`]. Once the
+//! batches by a [`Tally`] and all of them by the time a walk returns, so
+//! many short walks count as much as one long one. A hub's scan stops with
+//! the statement. Once the
 //! budget is spent a walk ends where it is (as if it had finished, not as
 //! if it had outgrown its cap, so no whole-graph fallback starts) and the
 //! statement fails with the budget's error.
@@ -59,19 +61,19 @@ pub fn bfs(
     });
     let mut tally = Tally::new();
     while let Some(v) = q.pop_front() {
-        if tally.spent(1) {
-            return Some(());
-        }
-        if !f(v) {
+        if tally.spent(1) || !f(v) {
+            tally.flush();
             return Some(());
         }
         if max_depth.is_some_and(|m| v.depth >= m) {
             continue;
         }
         let mut over = false;
-        let mut edges = 0u64;
         g.for_each_adj_while(v.node, dir, etype, |a| {
-            edges += 1;
+            // a hub's scan stops with the statement
+            if tally.spent(1) {
+                return false;
+            }
             if seen.insert(a.other) {
                 if seen.len() > cap {
                     over = true;
@@ -85,11 +87,12 @@ pub fn bfs(
             }
             true
         });
-        tally.add(edges);
         if over {
+            tally.flush();
             return None;
         }
     }
+    tally.flush();
     Some(())
 }
 
@@ -113,24 +116,29 @@ pub fn dfs(
     let mut tally = Tally::new();
     while let Some(v) = stack.pop() {
         if tally.spent(1) {
+            tally.flush();
             return Some(());
         }
         if !seen.insert(v.node) {
             continue;
         }
         if seen.len() > cap || stack.len() > cap {
+            tally.flush();
             return None;
         }
         if !f(v) {
+            tally.flush();
             return Some(());
         }
         if max_depth.is_some_and(|m| v.depth >= m) {
             continue;
         }
         next.clear();
-        let mut edges = 0u64;
-        g.for_each_adj(v.node, dir, etype, |a| {
-            edges += 1;
+        g.for_each_adj_while(v.node, dir, etype, |a| {
+            // a hub's scan stops with the statement
+            if tally.spent(1) {
+                return false;
+            }
             if !seen.contains(&a.other) {
                 next.push(Visit {
                     node: a.other,
@@ -138,10 +146,11 @@ pub fn dfs(
                     parent: Some(v.node),
                 });
             }
+            true
         });
-        tally.add(edges);
         stack.extend(next.drain(..).rev());
     }
+    tally.flush();
     Some(())
 }
 
@@ -184,11 +193,13 @@ pub fn shortest_path(
         let mut meet = None;
         for &v in frontier.iter() {
             if tally.spent(1) {
+                tally.flush();
                 return Some(None);
             }
-            let mut edges = 0u64;
             g.for_each_adj_while(v, d, etype, |a| {
-                edges += 1;
+                if tally.spent(1) {
+                    return false;
+                }
                 if seen.contains_key(&a.other) {
                     return true;
                 }
@@ -200,11 +211,11 @@ pub fn shortest_path(
                 next.push(a.other);
                 true
             });
-            tally.add(edges);
             if meet.is_some() {
                 break;
             }
             if fwd_len(seen, other) > cap {
+                tally.flush();
                 return None;
             }
         }
@@ -221,10 +232,12 @@ pub fn shortest_path(
                 path.push(x);
                 x = bwd[&x];
             }
+            tally.flush();
             return Some(Some(path));
         }
         *frontier = next;
     }
+    tally.flush();
     Some(None)
 }
 

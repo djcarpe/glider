@@ -804,10 +804,14 @@ impl Walk {
             Dir::In => &[(Dir::In, false)],
             Dir::Both => &[(Dir::Out, true), (Dir::In, false)],
         };
-        let mut edges = 0u64;
+        // every edge scanned counts, followed or not; a hub's scan stops
+        // with the statement
+        let mut tally = crate::meter::Tally::new();
         for &(d, outgoing) in sides {
             let go = g.for_each_adj_while(id, d, self.etype, |a| {
-                edges += 1;
+                if tally.spent(1) {
+                    return false;
+                }
                 if self.edge_ok(a.etype) {
                     out.push((a.edge, a.other, a.etype, outgoing));
                 }
@@ -817,8 +821,7 @@ impl Walk {
                 break;
             }
         }
-        // every edge scanned counts, followed or not
-        crate::meter::spent(edges);
+        tally.flush();
     }
 }
 
@@ -1558,8 +1561,17 @@ fn paths(g: &mut Graph, a: &Args) -> Result<QueryResult> {
     // than one through a hub everything touches.
     let mut deg: IdMap<usize> = id_map();
     let mut degree = |id: u64| {
-        *deg.entry(id)
-            .or_insert_with(|| g.degree_of(id, Dir::Both, None))
+        *deg.entry(id).or_insert_with(|| {
+            // counted, and a hub's count stops with the statement
+            let mut tally = crate::meter::Tally::new();
+            let mut n = 0;
+            g.for_each_adj_while(id, Dir::Both, None, |_| {
+                n += 1;
+                !tally.spent(1)
+            });
+            tally.flush();
+            n
+        })
     };
     meet.sort_by_key(|&m| (degree(m), m));
 

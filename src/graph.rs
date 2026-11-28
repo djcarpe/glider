@@ -1620,6 +1620,65 @@ impl Graph {
         true
     }
 
+    /// Up to `limit` of a node's adjacency entries (as `for_each_adj` orders
+    /// them) into `out`, starting where an earlier call left off (`None`:
+    /// at the start). Returns where to carry on, or `None` once the list is
+    /// done: for reading a hub's list a piece at a time.
+    pub(crate) fn adj_slice(
+        &self,
+        id: u64,
+        dir: Dir,
+        etype: Option<u32>,
+        resume: Option<(usize, Vec<u8>)>,
+        limit: usize,
+        out: &mut Vec<Adj>,
+    ) -> Option<(usize, Vec<u8>)> {
+        let sides: &[u8] = match dir {
+            Dir::Out => &[OUT],
+            Dir::In => &[IN],
+            Dir::Both => &[OUT, IN],
+        };
+        let first = resume.as_ref().map_or(0, |r| r.0);
+        for (si, &d) in sides.iter().enumerate().skip(first) {
+            let r = (|| -> SResult<Option<(usize, Vec<u8>)>> {
+                let (prefix, n) = adj_prefix(id, d, etype);
+                let prefix = &prefix[..n];
+                let start = match &resume {
+                    Some((rs, k)) if *rs == si => {
+                        let mut k = k.clone();
+                        k.push(0);
+                        k
+                    }
+                    _ => prefix.to_vec(),
+                };
+                let mut c = ADJ.seek(self.pager(), &start)?;
+                while let Some((k, v)) = c.next()? {
+                    if !k.starts_with(prefix) {
+                        break;
+                    }
+                    let v = match v {
+                        crate::storage::btree::Val::Inline(b) => b,
+                        _ => return Err(SError::Corrupt("adjacency value overflowed".into())),
+                    };
+                    let other = codec::Reader::new(v).varint().map_err(SError::Corrupt)?;
+                    out.push(Adj {
+                        edge: adj_edge(k),
+                        other,
+                        etype: adj_type(k),
+                    });
+                    if out.len() >= limit {
+                        return Ok(Some((si, k.to_vec())));
+                    }
+                }
+                Ok(None)
+            })();
+            if let Some(next) = self.note(r) {
+                return Some(next);
+            }
+        }
+        None
+    }
+
     /// How many adjacency entries a node has in `dir`, optionally of one
     /// type. Counts keys without decoding them.
     pub fn degree_of(&self, id: u64, dir: Dir, etype: Option<u32>) -> usize {
@@ -2714,9 +2773,13 @@ impl Graph {
             ids.extend_from_slice(&page);
             from = last + 1;
         }
+        let scan = crate::meter::SCAN;
         let mut pos: IdMap<u32> = id_map();
         pos.reserve(ids.len());
         for (i, id) in ids.iter().enumerate() {
+            if i % scan == scan - 1 && crate::meter::poll() {
+                return empty();
+            }
             pos.insert(*id, i as u32);
         }
         let wkey = weight.and_then(|w| self.strings.lookup(w));
@@ -2725,11 +2788,21 @@ impl Graph {
         let mut eids: Vec<u64> = Vec::new();
         let mut w: Vec<f64> = Vec::new();
         off.push(0u32);
-        let mut tally = crate::meter::Tally::new();
+        // The edges read here are not steps (the paged view reads none,
+        // and the same call must take the same steps on both tiers), but
+        // the meter is looked at every `SCAN` of them, hubs included.
+        let mut read = 0usize;
+        let mut stopped = false;
         for id in &ids {
-            let before = adj.len();
-            self.for_each_adj(*id, dir, etype, |a| {
-                let Some(p) = pos.get(&a.other) else { return };
+            self.for_each_adj_while(*id, dir, etype, |a| {
+                read += 1;
+                if read % scan == 0 && crate::meter::poll() {
+                    stopped = true;
+                    return false;
+                }
+                let Some(p) = pos.get(&a.other) else {
+                    return true;
+                };
                 adj.push(*p);
                 eids.push(a.edge);
                 w.push(match wkey {
@@ -2740,11 +2813,12 @@ impl Graph {
                         .unwrap_or(1.0),
                     None => 1.0,
                 });
+                true
             });
-            off.push(adj.len() as u32);
-            if tally.spent((adj.len() - before) as u64) {
+            if stopped {
                 return empty();
             }
+            off.push(adj.len() as u32);
         }
         Csr {
             ids,
@@ -3364,11 +3438,20 @@ impl crate::algo::Adjacency for Projection<'_> {
     fn has_negative_weights(&self) -> bool {
         match self {
             Projection::Mem(c, _) => crate::algo::Adjacency::has_negative_weights(c),
-            Projection::Paged(p) => (0..p.len).any(|v| {
-                let mut neg = false;
-                p.each(v, &mut |_, w, _| neg |= w < 0.0);
-                neg
-            }),
+            Projection::Paged(p) => {
+                // every edge counts, as the in-memory scan of weights counts
+                let mut tally = crate::meter::Tally::new();
+                let neg = (0..p.len).any(|v| {
+                    let mut neg = false;
+                    p.each(v, &mut |_, w, _| {
+                        tally.add(1);
+                        neg |= w < 0.0
+                    });
+                    neg || crate::meter::stopped()
+                });
+                tally.flush();
+                neg && !crate::meter::stopped()
+            }
         }
     }
 }
@@ -3450,17 +3533,43 @@ impl<'g> PagedView<'g> {
 
     fn degree(&self, v: usize) -> usize {
         let id = self.ids.borrow_mut().get(v);
+        let scan = crate::meter::SCAN;
         let mut n = 0;
-        self.g.for_each_adj(id, self.dir, self.etype, |_| n += 1);
+        // a hub's count looks at the meter as it goes
+        self.g.for_each_adj_while(id, self.dir, self.etype, |_| {
+            n += 1;
+            n % scan != 0 || !crate::meter::poll()
+        });
         n
     }
 
     fn each(&self, v: usize, f: &mut dyn FnMut(usize, f64, u64)) {
         let id = self.ids.borrow_mut().get(v);
-        let mut list: Vec<(u64, u64)> = Vec::new();
-        self.g
-            .for_each_adj(id, self.dir, self.etype, |a| list.push((a.other, a.edge)));
-        for (other, edge) in list {
+        // A hub's list is read and handed on a piece at a time, looking at
+        // the meter between pieces.
+        let mut list = Vec::new();
+        let mut resume = None;
+        loop {
+            list.clear();
+            resume = self.g.adj_slice(
+                id,
+                self.dir,
+                self.etype,
+                resume,
+                crate::meter::SCAN,
+                &mut list,
+            );
+            self.deliver(&list, f);
+            if resume.is_none() || crate::meter::poll() {
+                return;
+            }
+        }
+    }
+}
+
+impl PagedView<'_> {
+    fn deliver(&self, list: &[Adj], f: &mut dyn FnMut(usize, f64, u64)) {
+        for &Adj { other, edge, .. } in list {
             let Some(t) = self.index_of(other) else {
                 continue;
             };
