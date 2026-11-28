@@ -854,8 +854,8 @@ What is true now, and what this slice decided where the plan was open:
   it does not refuse. All vectors of one call carry the same revision,
   `log_end()` before the call's single record (the journal's convention).
   A hash given and equal to the stored one rewrites only the metadata:
-  the vector is recorded as current at the new revision, about 60 log
-  bytes against about 1,600 for a 384-dimension vector; the vector may
+  the vector is recorded as current at the new revision, 90 log
+  bytes against 1,650 for a 384-dimension vector (the call's whole record); the vector may
   then be `null` (an unchanged hash with no vector, or a vector with no
   matching hash, is refused). The hash is trusted: a different vector
   passed with the same hash is not stored.

@@ -162,7 +162,8 @@ second:
 
 ```
 mfg-bench --data DIR [--tiers memory,file] [--budgets 250,1000,4000]
-          [--only stats,retrieve,pagerank,communities,check,structure,changes] [--out FILE] [--label NAME] [--detail]
+          [--only stats,retrieve,pagerank,communities,check,structure,changes,vector] [--dims 64,384,768]
+          [--out FILE] [--label NAME] [--detail]
 ```
 
 For each tier it imports `graph.jsonl` with the streaming importer, then runs
@@ -185,6 +186,11 @@ every measurement in `MEASURES`, appending JSON lines to
 | `changes.write` | per `write` (`node set`: a property set on node `1 + i mod nodes`; `edge add` between pseudo-random nodes; `edge delete` of those edges), `journal` (installed or not), `round`: `writes`, `per_commit`, `per_s`, `log_bytes_per_write` (revision moved / writes): 100,000 writes (or the node count when smaller) committed every 1,000, then 10,000 committed one by one. Rounds alternate without and with the journal, twice |
 | `changes.read` | after each round with the journal: `entries`, `bytes`, `bytes_per_entry` (from `changes.status`), `since_rows`, `since_calls`, `since_all_ms` (every entry since the install, by statement, 10,000 a call), `since_tail_rows` / `since_tail_ms` (the last commit), `changed_us` (`changes::changed` for 1,000 node ids), `changed_any_us` |
 | `changes.cap` | at a cap of a fifth of the writes (at least 1,000), so the journal sweeps throughout: `writes`, `per_s`, `log_bytes_per_write` for node sets in 1,000-write transactions; then 10,000 single writes: `single_per_s`, `single_slowest_us`, `single_biggest_log_bytes`; `entries` held after, `floor_rose` |
+| `vector.bytes` | per `dims`: the same vectors as a list property on 10,000 nodes (`list_log_per_vector`, `list_db_growth_per_vector`, `list_per_s`), and as a space over every node (`space_bytes_per_vector`, `space_bytes_per_dim` from `vector.spaces()`, `put_log_per_vector`, `put_db_growth_per_vector`) |
+| `vector.put` | `vectors`, `per_call` (1,000, with a source hash each), `ms`, `per_s`, through statements |
+| `vector.search` | per `candidates` (`all`, or `WorkInstruction`): `scored`, `queries`, `ms_p50`, `ms_max`, `scored_per_s` (the statement, staleness counts included), `scan_ms_p50` / `scan_scored_per_s` (the Rust `vector::search` scan alone), `rss_before_mb`, `rss_added_mb` |
+| `vector.stale` | after a property set on 100 nodes: `rows`, `calls` (slices of 1,000), `ms` for the whole list |
+| `vector.drop` | `ms` |
 
 A later slice adds a measurement by writing `fn(&mut Run) -> Result<(),
 String>` and adding it to `MEASURES`: `Run` gives the loaded graph, the
@@ -527,3 +533,72 @@ journal 37-98 ms at 300,000-400,000 entries, for the last commit 9-19 ms,
 3-5 ms (it reads every entry of the kind; knowing the newest position
 held would answer it at once, but keeping that exact means a write per
 change, which is what this slice took out).
+
+## Vectors: `vector`
+
+`mfg-bench --only vector`, release build, one run each on a shared, busy
+machine (load 5-7 on 8 cores); lines labelled `g10-vector` in
+`bench/results/mfg.jsonl`. Seeded synthetic vectors (uniform in [-1, 1)),
+one per node, cosine, with the change journal installed; the 1M memory
+tier was run at 64 and 384 dimensions only (768 would hold 3.2 GB of
+vectors in memory beside the graph on a machine with about 11 GB free).
+
+**Bytes.** A vector costs 4 bytes a dimension and 48 beside (two records,
+keys with their namespace), plus its hash (16 bytes in the run): 5.00
+bytes a dimension at 64, 4.17 at 384, 4.08 at 768. The same vectors as a
+list property log 9.2-9.9 bytes a dimension (631, 3,524 and 6,987 bytes a
+vector against the space's 325, 1,605 and 3,141), the same at every size.
+The memory tier's pages grow 386, 1,739 and 3,381 bytes a vector for the
+space against 1,140, 4,370 and 16,384 for the list property. (Growth of a
+file is not a per-vector figure: freed pages are reused, so it reads 0 at
+some sizes.)
+
+**Put**, through statements, 1,000 vectors a call: 28-40k vectors a second
+at 64 dimensions, 5-8k at 384, 2.5-3.6k at 768, at every size and on both
+tiers. The time goes into passing 1,000 lists of floats through a
+statement; the store itself is one extension record a call.
+
+**Search**, top 10, every vector scored. `ms` is the statement (which also
+counts the space's stale, missing and unknown vectors: one metadata read
+and one journal lookup a vector, plus the label's members); `scan` the
+Rust `vector::search` alone.
+
+| dataset | tier | dims | ms p50 | scan ms p50 | scored/s (statement) | scored/s (scan) | `WorkInstruction` only, ms p50 |
+|---|---|---|---|---|---|---|---|
+| n10000-s1 | memory | 64 | 10 | 1.8 | 1.0M | 5.6M | 11 |
+| n10000-s1 | memory | 384 | 12 | 5.6 | 0.8M | 1.8M | 15 |
+| n10000-s1 | memory | 768 | 16 | 9.5 | 0.6M | 1.1M | 19 |
+| n100000-s1 | memory | 64 | 136 | 20 | 0.8M | 5.3M | 102 |
+| n100000-s1 | memory | 384 | 179 | 83 | 0.6M | 1.2M | 139 |
+| n100000-s1 | memory | 768 | 187 | 97 | 0.6M | 1.1M | 202 |
+| n100000-s1 | file | 64 | 112 | 18 | 0.9M | 5.7M | 82 |
+| n100000-s1 | file | 384 | 178 | 82 | 0.6M | 1.3M | 127 |
+| n100000-s1 | file | 768 | 166 | 100 | 0.6M | 1.0M | 207 |
+| n1000000-s1 | memory | 64 | 744 | 111 | 1.4M | 9.2M | 828 |
+| n1000000-s1 | memory | 384 | 1,457 | 552 | 0.7M | 1.9M | 1,078 |
+| n1000000-s1 | file | 64 | 693 | 114 | 1.5M | 9.0M | 807 |
+| n1000000-s1 | file | 384 | 2,452 | 1,803 | 0.4M | 0.6M | 2,983 |
+| n1000000-s1 | file | 768 | 4,216 | 3,300 | 0.2M | 0.3M | 3,614 |
+
+(The 10k file tier is in the results file and agrees with the memory tier.)
+Resident memory did not grow during any search (`rss_added_mb` 0 at every
+size): the heap holds ten candidates and the scan a page at a time. At 1M
+vectors of 768 dimensions on the file tier the process stayed at 1.2 GB
+resident while the space held 3.2 GB.
+
+What this says: the scan runs at about 1-2 million 384-dimension vectors a
+second from memory and 0.6 million from a file larger than its cache, so
+exact search answers in about 0.1 s at 100k vectors and 0.5-3.3 s at a
+million. Counting staleness is the larger cost at low dimensions (0.6 s of
+0.74 s at 1M x 64): it reads every vector's metadata and journal entry. A
+label restriction reads candidates one by one through the label index,
+which is slower per vector than the scan, so it pays only when the label
+is a small part of the space. Whether an approximate index is needed
+(G17) depends on the sizes that matter; at a million vectors, exact search
+is seconds, not milliseconds.
+
+**Staleness after a small change** (100 nodes' properties set): `stale`
+lists exactly those 100, in 1 call at 10k, 2 at 100k and 15 at 1M (it
+looks at at most 100,000 records a call): 15-20 ms at 10k, 120-210 ms at
+100k, 1.2-1.7 s for the whole list at 1M. Dropping a space of 1M vectors
+takes 1-2 s in memory and 34 s on the file tier at 384-768 dimensions.
