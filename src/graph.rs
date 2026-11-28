@@ -383,6 +383,9 @@ type Indexes = HashMap<(u32, u32), IndexDef>;
 struct Schema<'a> {
     strings: &'a mut Interner,
     indexes: &'a mut Indexes,
+    /// A string was added to the catalog: a change, even when the op that
+    /// named it changed nothing else.
+    interned: bool,
 }
 
 fn load_schema(p: &Pager) -> SResult<(Interner, Indexes)> {
@@ -430,6 +433,7 @@ impl Schema<'_> {
         }
         let id = self.strings.intern(s);
         CATALOG.put(p, &cat_key(b'S', id), s.as_bytes())?;
+        self.interned = true;
         Ok(id)
     }
 
@@ -594,10 +598,31 @@ fn set_prop(props: &mut Vec<(u32, Value)>, key: u32, value: Value) {
     }
 }
 
+/// Whether two values are the same value, not merely equal: `1` and `1.0`
+/// compare equal but are different values to store.
+fn same_value(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Null, Value::Null) => true,
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Int(x), Value::Int(y)) => x == y,
+        (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
+        (Value::Text(x), Value::Text(y)) => x == y,
+        (Value::List(_), Value::List(_)) => {
+            let (mut x, mut y) = (Vec::new(), Vec::new());
+            codec::put_value(&mut x, a);
+            codec::put_value(&mut y, b);
+            x == y
+        }
+        _ => false,
+    }
+}
+
 /// Apply one op to the trees. The single implementation of every mutation:
-/// the API calls it, and so does recovery.
-fn apply(p: &Pager, sch: &mut Schema<'_>, op: &Op) -> SResult<()> {
-    match op {
+/// the API calls it, and so does recovery. Returns whether the op changed
+/// anything besides interning a string (which [`Schema::interned`]
+/// records): an op that changes nothing writes nothing and is not logged.
+fn apply(p: &Pager, sch: &mut Schema<'_>, op: &Op) -> SResult<bool> {
+    let changed = match op {
         Op::NodeAdd { id, labels, props } => {
             let mut lids = Vec::with_capacity(labels.len());
             for l in labels {
@@ -624,10 +649,11 @@ fn apply(p: &Pager, sch: &mut Schema<'_>, op: &Op) -> SResult<()> {
             if *id >= p.meta(M_NEXT_NODE) {
                 p.set_meta(M_NEXT_NODE, id + 1);
             }
+            true
         }
         Op::NodeDel { id } => {
             let Some((labels, run)) = node_record(p, *id)? else {
-                return Ok(());
+                return Ok(false);
             };
             // Detach, a batch at a time: never modify the adjacency tree
             // while a cursor is walking it.
@@ -664,6 +690,7 @@ fn apply(p: &Pager, sch: &mut Schema<'_>, op: &Op) -> SResult<()> {
             }
             NODES.delete(p, &node_key(*id))?;
             p.set_meta(M_NODES, p.meta(M_NODES).saturating_sub(1));
+            true
         }
         Op::EdgeAdd {
             id,
@@ -673,7 +700,7 @@ fn apply(p: &Pager, sch: &mut Schema<'_>, op: &Op) -> SResult<()> {
             props,
         } => {
             if !NODES.contains(p, &node_key(*from))? || !NODES.contains(p, &node_key(*to))? {
-                return Ok(());
+                return Ok(false);
             }
             let t = sch.intern(p, etype)?;
             let mut pids = Vec::with_capacity(props.len());
@@ -691,89 +718,99 @@ fn apply(p: &Pager, sch: &mut Schema<'_>, op: &Op) -> SResult<()> {
             if *id >= p.meta(M_NEXT_EDGE) {
                 p.set_meta(M_NEXT_EDGE, id + 1);
             }
+            true
         }
-        Op::EdgeDel { id } => {
-            remove_edge(p, *id)?;
-        }
+        Op::EdgeDel { id } => remove_edge(p, *id)?,
         Op::NodeSet { id, key, value } => {
             let k = sch.intern(p, key)?;
             let Some((labels, run)) = node_record(p, *id)? else {
-                return Ok(());
+                return Ok(false);
             };
             let old = props_of(&run)?;
+            // A value set to itself is still written, so that the pages are
+            // touched as they always were; it is only not a change.
+            let same = get_prop(&old, k).is_some_and(|v| same_value(v, value));
             let mut new = old.clone();
             set_prop(&mut new, k, value.clone());
             store_node(p, sch, *id, Some((&labels, &old)), &labels, &new)?;
+            !same
         }
         Op::NodeUnset { id, key } => {
             let Some(k) = sch.strings.lookup(key) else {
-                return Ok(());
+                return Ok(false);
             };
             let Some((labels, run)) = node_record(p, *id)? else {
-                return Ok(());
+                return Ok(false);
             };
             let old = props_of(&run)?;
             if get_prop(&old, k).is_none() {
-                return Ok(());
+                return Ok(false);
             }
             let new: Vec<_> = old.iter().filter(|(pk, _)| *pk != k).cloned().collect();
             store_node(p, sch, *id, Some((&labels, &old)), &labels, &new)?;
+            true
         }
         Op::EdgeSet { id, key, value } => {
             let k = sch.intern(p, key)?;
             let Some((from, to, t, run)) = edge_record(p, *id)? else {
-                return Ok(());
+                return Ok(false);
             };
             let mut props = props_of(&run)?;
+            let same = get_prop(&props, k).is_some_and(|v| same_value(v, value));
             set_prop(&mut props, k, value.clone());
             EDGES.put(p, &node_key(*id), &encode_edge(from, to, t, &props))?;
+            !same
         }
         Op::EdgeUnset { id, key } => {
             let Some(k) = sch.strings.lookup(key) else {
-                return Ok(());
+                return Ok(false);
             };
             let Some((from, to, t, run)) = edge_record(p, *id)? else {
-                return Ok(());
+                return Ok(false);
             };
             let mut props = props_of(&run)?;
             let before = props.len();
             props.retain(|(pk, _)| *pk != k);
-            if props.len() != before {
-                EDGES.put(p, &node_key(*id), &encode_edge(from, to, t, &props))?;
+            if props.len() == before {
+                return Ok(false);
             }
+            EDGES.put(p, &node_key(*id), &encode_edge(from, to, t, &props))?;
+            true
         }
         Op::LabelAdd { id, label } => {
             let l = sch.intern(p, label)?;
             let Some((labels, run)) = node_record(p, *id)? else {
-                return Ok(());
+                return Ok(false);
             };
             if labels.contains(&l) {
-                return Ok(());
+                return Ok(false);
             }
             let props = props_of(&run)?;
             let mut new = labels.clone();
             new.push(l);
             store_node(p, sch, *id, Some((&labels, &props)), &new, &props)?;
+            true
         }
         Op::LabelDel { id, label } => {
             let Some(l) = sch.strings.lookup(label) else {
-                return Ok(());
+                return Ok(false);
             };
             let Some((labels, run)) = node_record(p, *id)? else {
-                return Ok(());
+                return Ok(false);
             };
             if !labels.contains(&l) {
-                return Ok(());
+                return Ok(false);
             }
             let props = props_of(&run)?;
             let new: Vec<u32> = labels.iter().copied().filter(|x| *x != l).collect();
             store_node(p, sch, *id, Some((&labels, &props)), &new, &props)?;
+            true
         }
         Op::IndexAdd { label, key } => {
             let l = sch.intern(p, label)?;
             let k = sch.intern(p, key)?;
             if sch.indexes.contains_key(&(l, k)) {
-                return Ok(());
+                return Ok(false);
             }
             let id = p.meta(M_NEXT_INDEX) as u32;
             p.set_meta(M_NEXT_INDEX, id as u64 + 1);
@@ -794,40 +831,58 @@ fn apply(p: &Pager, sch: &mut Schema<'_>, op: &Op) -> SResult<()> {
                     }
                 }
             }
+            true
         }
         Op::IndexDel { label, key } => {
             let (Some(l), Some(k)) = (sch.strings.lookup(label), sch.strings.lookup(key)) else {
-                return Ok(());
+                return Ok(false);
             };
             let Some(def) = sch.indexes.remove(&(l, k)) else {
-                return Ok(());
+                return Ok(false);
             };
             delete_prefix(p, PROPS, &def.id.to_be_bytes())?;
             CATALOG.delete(p, &cat_key2(b'I', l, k))?;
+            true
         }
         Op::Counters {
             next_node,
             next_edge,
         } => {
-            p.set_meta(M_NEXT_NODE, p.meta(M_NEXT_NODE).max(*next_node));
-            p.set_meta(M_NEXT_EDGE, p.meta(M_NEXT_EDGE).max(*next_edge));
+            let (n, e) = (p.meta(M_NEXT_NODE), p.meta(M_NEXT_EDGE));
+            if *next_node <= n && *next_edge <= e {
+                return Ok(false);
+            }
+            p.set_meta(M_NEXT_NODE, n.max(*next_node));
+            p.set_meta(M_NEXT_EDGE, e.max(*next_edge));
+            true
         }
         Op::ExtensionAdd { name, version } => {
+            if CATALOG.get(p, &ext_key(name))?.as_deref() == Some(version.as_bytes()) {
+                return Ok(false);
+            }
             CATALOG.put(p, &ext_key(name), version.as_bytes())?;
+            true
         }
         Op::ExtensionDel { name } => {
-            CATALOG.delete(p, &ext_key(name))?;
+            let installed = CATALOG.delete(p, &ext_key(name))?;
             let mut prefix = name.as_bytes().to_vec();
             prefix.push(0);
-            delete_prefix(p, EXT, &prefix)?;
+            delete_prefix(p, EXT, &prefix)? || installed
         }
         Op::ExtWrite { puts, dels } => {
+            // Once something has changed, the rest need not be looked at.
+            let mut changed = false;
             for k in dels {
-                EXT.delete(p, k)?;
+                changed |= EXT.delete(p, k)?;
             }
             for (k, v) in puts {
+                if !changed && EXT.get(p, k)?.as_deref() == Some(v.as_slice()) {
+                    continue;
+                }
+                changed = true;
                 EXT.put(p, k, v)?;
             }
+            changed
         }
         // Like index definitions, installed extensions survive a CLEAR.
         Op::Clear => {
@@ -846,9 +901,10 @@ fn apply(p: &Pager, sch: &mut Schema<'_>, op: &Op) -> SResult<()> {
             }
             p.set_meta(M_NODES, 0);
             p.set_meta(M_EDGES, 0);
+            true
         }
-    }
-    Ok(())
+    };
+    Ok(changed)
 }
 
 /// Under CLEAR, extensions lose what they derived from the data and keep
@@ -883,8 +939,10 @@ fn clear_ext_data(p: &Pager) -> SResult<()> {
     }
 }
 
-/// Delete every key with `prefix`, a batch at a time.
-fn delete_prefix(p: &Pager, t: Tree, prefix: &[u8]) -> SResult<()> {
+/// Delete every key with `prefix`, a batch at a time. Returns whether there
+/// were any.
+fn delete_prefix(p: &Pager, t: Tree, prefix: &[u8]) -> SResult<bool> {
+    let mut any = false;
     loop {
         let mut batch = Vec::new();
         {
@@ -897,8 +955,9 @@ fn delete_prefix(p: &Pager, t: Tree, prefix: &[u8]) -> SResult<()> {
             }
         }
         if batch.is_empty() {
-            return Ok(());
+            return Ok(any);
         }
+        any = true;
         for k in batch {
             t.delete(p, &k)?;
         }
@@ -923,7 +982,12 @@ fn replay(p: &Pager, sch: &mut Option<(Interner, Indexes)>, rec: &[u8]) -> SResu
         *sch = Some(load_schema(p)?);
     }
     let (strings, indexes) = sch.as_mut().expect("loaded");
-    apply(p, &mut Schema { strings, indexes }, &op)
+    let mut sch = Schema {
+        strings,
+        indexes,
+        interned: false,
+    };
+    apply(p, &mut sch, &op).map(|_| ())
 }
 
 /// Rewrite the adjacency tree in the current layout from the edge records,
@@ -1000,9 +1064,49 @@ pub struct Graph {
     last_edge: std::sync::Mutex<Option<std::sync::Arc<EdgeRef>>>,
     /// Identifies this graph to the telemetry exporter's registry.
     tel_id: u64,
-    /// Installed extensions that maintain state on node writes; computed
-    /// on first write, forgotten whenever installs or config may change.
-    hooks: Option<Vec<std::sync::Arc<dyn crate::ext::Extension>>>,
+    /// Installed extensions that maintain state on writes; computed on
+    /// first write, forgotten whenever installs or config may change.
+    hooks: Option<Hooks>,
+    /// How many write hooks are running: while any is, the graph itself
+    /// may not be written, only extension keyspaces.
+    in_hook: u32,
+    /// A transaction block opened with [`Graph::begin`] (or `BEGIN`) is
+    /// open: one the engine can see start, and so can mark spent.
+    block: bool,
+    /// Set when the engine rolled back the open block because a write or a
+    /// hook failed: the explanation every further write, statement and
+    /// COMMIT in it is refused with, until the caller ends the block.
+    spent: Option<String>,
+}
+
+type Ext = std::sync::Arc<dyn crate::ext::Extension>;
+
+/// The error for a failure that took the caller's open transaction with it.
+fn rolled_back(e: Error) -> Error {
+    const NOTE: &str = "(the transaction was rolled back)";
+    let add = |m: String| {
+        if m.ends_with(NOTE) {
+            m
+        } else {
+            format!("{m} {NOTE}")
+        }
+    };
+    match e {
+        Error::Msg(m) => Error::Msg(add(m)),
+        Error::Full(m) => Error::Full(add(m)),
+        Error::Io(io) => Error::Io(std::io::Error::new(io.kind(), add(io.to_string()))),
+    }
+}
+
+/// Who follows writes in this database.
+#[derive(Clone, Default)]
+struct Hooks {
+    /// `wants_writes`: told about node writes.
+    node: Vec<Ext>,
+    /// `wants_edge_writes`: told about edge writes.
+    edge: Vec<Ext>,
+    /// Either: told about bulk writes.
+    any: Vec<Ext>,
 }
 
 impl Drop for Graph {
@@ -1037,6 +1141,9 @@ impl Graph {
             last_edge: std::sync::Mutex::new(None),
             tel_id: crate::telemetry::next_db_id(),
             hooks: None,
+            in_hook: 0,
+            block: false,
+            spent: None,
         })
     }
 
@@ -1168,8 +1275,11 @@ impl Graph {
 
     /// Copy everything from a legacy-engine graph into this one, keeping
     /// ids: nodes, edges, indexes and id counters. Commits as it goes, so
-    /// memory stays bounded by the source graph, not the copy.
+    /// memory stays bounded by the source graph, not the copy. Each record
+    /// goes through [`apply_op`](Graph::apply_op), so installed extensions
+    /// hear about it.
     pub fn import_legacy(&mut self, old: &crate::legacy::graph::Graph) -> Result<()> {
+        self.refuse_in_block("a legacy import")?;
         let auto = self.autocommit;
         self.autocommit = false;
         let r = (|| -> Result<()> {
@@ -1178,19 +1288,19 @@ impl Graph {
             }
             let mut n = 0u64;
             for id in old.node_ids() {
-                self.exec(Op::NodeAdd {
+                self.apply_op(Op::NodeAdd {
                     id,
                     labels: old.node_labels(id),
                     props: old.node_props(id),
                 })?;
                 n += 1;
                 if n % 50_000 == 0 {
-                    self.commit()?;
+                    self.commit_txn()?;
                 }
             }
             for id in old.edge_ids() {
                 let Some(e) = old.edge(id) else { continue };
-                self.exec(Op::EdgeAdd {
+                self.apply_op(Op::EdgeAdd {
                     id,
                     from: e.from,
                     to: e.to,
@@ -1199,7 +1309,7 @@ impl Graph {
                 })?;
                 n += 1;
                 if n % 50_000 == 0 {
-                    self.commit()?;
+                    self.commit_txn()?;
                 }
             }
             let (next_node, next_edge) = crate::legacy::image::ImageSource::next_ids(old);
@@ -1207,9 +1317,9 @@ impl Graph {
                 next_node,
                 next_edge,
             })?;
-            self.commit()
+            self.commit_txn()
         })();
-        self.autocommit = auto;
+        self.restore_autocommit(auto);
         r
     }
 
@@ -1902,9 +2012,61 @@ impl Graph {
         self.uncommitted
     }
 
+    /// Refuse an operation that has to commit on its own while a block
+    /// opened with [`Graph::begin`] (or `BEGIN`) is open: it would commit
+    /// the block's pending writes before the block's COMMIT, and a block
+    /// that then failed would report "nothing was committed" about writes
+    /// that are durable. In a transaction opened by assigning `autocommit`
+    /// these operations commit what is pending, as they always did.
+    pub(crate) fn refuse_in_block(&self, what: &str) -> Result<()> {
+        if self.block && !self.autocommit {
+            return Err(Error::Msg(format!(
+                "{what} commits on its own, so it cannot run inside a transaction block; \
+                 end the block with COMMIT or ROLLBACK first"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Open a transaction block: autocommit off until [`Graph::commit`] or
+    /// [`Graph::rollback`] ends it (as `BEGIN` does for statements). This
+    /// is the way to open a transaction: if the engine has to roll a block
+    /// back because a write or a write hook failed inside it, the block is
+    /// spent ([`Graph::spent`]) and nothing more can go into it or commit
+    /// from it. A transaction opened by assigning `autocommit = false`
+    /// keeps the older behaviour: the failing call's error says the
+    /// transaction was rolled back, and the caller carries on in a new one.
+    /// Assigning `autocommit` does not end a block opened here.
+    pub fn begin(&mut self) -> Result<()> {
+        if let Some(why) = self.spent() {
+            return Err(Error::Msg(why.to_string()));
+        }
+        self.block = true;
+        self.spent = None;
+        self.autocommit = false;
+        Ok(())
+    }
+
     /// Make the open transaction durable (per the sync mode) and visible as
-    /// the committed state.
+    /// the committed state. A block opened with [`Graph::begin`] ends here
+    /// (autocommit back on); if the engine rolled it back (see
+    /// [`Graph::spent`]) nothing is committed and this is an error that
+    /// says why.
     pub fn commit(&mut self) -> Result<()> {
+        if self.block {
+            self.block = false;
+            self.autocommit = true;
+            if let Some(why) = self.spent.take() {
+                self.rollback_quietly();
+                return Err(Error::Msg(format!("nothing was committed: {why}")));
+            }
+        }
+        self.commit_txn()
+    }
+
+    /// Commit the open transaction without ending a block: for the engine's
+    /// own intermediate commits (imports in slices, autocommit).
+    pub(crate) fn commit_txn(&mut self) -> Result<()> {
         if let Err(e) = self.db.commit() {
             self.rollback_quietly();
             return Err(e.into());
@@ -1913,8 +2075,19 @@ impl Graph {
         Ok(())
     }
 
-    /// Abandon everything since the last commit.
+    /// Abandon everything since the last commit. A block opened with
+    /// [`Graph::begin`] ends here, spent or not.
     pub fn rollback(&mut self) -> Result<()> {
+        if self.block {
+            self.block = false;
+            self.autocommit = true;
+        }
+        self.spent = None;
+        self.rollback_txn()
+    }
+
+    /// Roll back the open transaction without ending a block.
+    pub(crate) fn rollback_txn(&mut self) -> Result<()> {
         self.forget_reads();
         self.hooks = None;
         self.db.rollback()?;
@@ -1933,17 +2106,78 @@ impl Graph {
         self.uncommitted = 0;
     }
 
+    /// Why the caller's open transaction can no longer be committed: the
+    /// engine rolled it back when a write or a write hook failed inside it.
+    /// Writes, statements and COMMIT are refused with this until the caller
+    /// ends the transaction (ROLLBACK, or a COMMIT that reports the error).
+    pub fn spent(&self) -> Option<&str> {
+        if !self.block || self.autocommit {
+            return None;
+        }
+        self.spent.as_deref()
+    }
+
+    /// Put autocommit back after an internal transaction (a statement, an
+    /// import, a batch). Back to on, no transaction of the caller's is open,
+    /// so none can be spent.
+    pub(crate) fn restore_autocommit(&mut self, auto: bool) {
+        self.autocommit = auto;
+    }
+
+    /// Roll back after a failure, and if the caller had a block open (see
+    /// [`Graph::begin`]), mark it spent. The error says what happened,
+    /// whatever its kind.
+    fn abandon(&mut self, e: Error) -> Error {
+        self.rollback_quietly();
+        let e = rolled_back(e);
+        if self.block {
+            self.spent = Some(format!(
+                "the open transaction was rolled back by an earlier error ({e}); \
+                 end it with ROLLBACK and run its writes again"
+            ));
+        }
+        e
+    }
+
     fn maybe_commit(&mut self) -> Result<()> {
         if self.autocommit {
-            self.commit()
+            self.commit_txn()
         } else {
             Ok(())
         }
     }
 
-    /// Log and apply one op. A failure rolls the whole open transaction
+    /// Apply and log one op. A failure rolls the whole open transaction
     /// back, so nothing is left half-done.
     fn exec(&mut self, op: Op) -> Result<()> {
+        self.exec_changed(op).map(|_| ())
+    }
+
+    /// [`Graph::exec`], saying whether the op changed anything. An op that
+    /// changed nothing is not logged, so it moves neither the log nor the
+    /// revision ([`Graph::revision`]); replaying the log without it gives
+    /// the same state, since it did nothing.
+    fn exec_changed(&mut self, op: Op) -> Result<bool> {
+        if let Some(why) = self.spent() {
+            return Err(Error::Msg(why.to_string()));
+        }
+        if self.in_hook > 0
+            && !matches!(
+                op,
+                Op::ExtWrite { .. }
+                    | Op::ExtensionAdd { .. }
+                    | Op::ExtensionDel { .. }
+                    | Op::IndexAdd { .. }
+                    | Op::IndexDel { .. }
+                    | Op::Counters { .. }
+            )
+        {
+            return Err(Error::Msg(
+                "a write hook may write only extension keyspaces (Graph::ext_write); \
+                 it may not write a node, an edge, a label or a property, nor clear the graph"
+                    .into(),
+            ));
+        }
         // Checked before anything is logged, so a refused value leaves the
         // transaction exactly as it was. Every value written passes here
         // (statements, the API, imports; recovery replays only what once
@@ -1961,24 +2195,28 @@ impl Graph {
             crate::value::check_depth(v).map_err(Error::Msg)?;
         }
         self.forget_reads();
-        let rec = op_record(&op);
-        let r = self.db.log(&rec).and_then(|_| {
-            let mut sch = Schema {
-                strings: &mut self.strings,
-                indexes: &mut self.indexes,
-            };
-            apply(self.db.pager(), &mut sch, &op)
-        });
-        if let Err(e) = r {
-            self.rollback_quietly();
-            let e: Error = e.into();
-            return Err(match e {
-                Error::Full(m) => Error::Full(format!("{m} (the transaction was rolled back)")),
-                other => other,
+        let mut sch = Schema {
+            strings: &mut self.strings,
+            indexes: &mut self.indexes,
+            interned: false,
+        };
+        // Applied first, logged after: a failure of either rolls the
+        // transaction back, pages and log together, so the order is free.
+        let r = apply(self.db.pager(), &mut sch, &op)
+            .map(|changed| changed || sch.interned)
+            .and_then(|changed| {
+                if changed {
+                    self.db.log(&op_record(&op))?;
+                }
+                Ok(changed)
             });
-        }
+        let changed = match r {
+            Ok(c) => c,
+            Err(e) => return Err(self.abandon(e.into())),
+        };
         self.uncommitted += 1;
-        self.maybe_commit()
+        self.maybe_commit()?;
+        Ok(changed)
     }
 
     fn node_exists(&self, id: u64) -> bool {
@@ -2189,6 +2427,23 @@ impl Graph {
         })();
         let _ = std::fs::remove_dir_all(&tmp);
         r?;
+        // The load went around the log. Its pages are made durable first;
+        // then one record of what it set (the id counters, which replay
+        // leaves as they are) moves the log, and the revision with it, past
+        // the empty database the file began as, and a second checkpoint
+        // folds that record in. A crash between the two reopens the loaded
+        // pages at revision 0, as a load did before revisions; never the
+        // empty file past 0.
+        g.db.commit()?;
+        g.db.checkpoint()?;
+        let (next_node, next_edge) = (
+            g.db.pager().meta(M_NEXT_NODE),
+            g.db.pager().meta(M_NEXT_EDGE),
+        );
+        g.db.log(&op_record(&Op::Counters {
+            next_node,
+            next_edge,
+        }))?;
         g.db.commit()?;
         g.db.checkpoint()?;
         (g.strings, g.indexes) = load_schema(g.db.pager())?;
@@ -2198,10 +2453,31 @@ impl Graph {
     // ---------------------------------------------------------- mutations
 
     /// Apply one logged operation with its explicit ids: for loaders and
-    /// migrations that must reproduce ids exactly.
+    /// migrations that must reproduce ids exactly. Write hooks run as they
+    /// do for the matching API call.
     #[doc(hidden)]
     pub fn apply_op(&mut self, op: Op) -> Result<()> {
-        self.exec(op)
+        match op {
+            Op::NodeAdd { id, .. }
+            | Op::NodeSet { id, .. }
+            | Op::NodeUnset { id, .. }
+            | Op::LabelAdd { id, .. }
+            | Op::LabelDel { id, .. } => self.exec_node(id, op),
+            Op::NodeDel { id } => self.delete_node(id).map(|_| ()),
+            Op::EdgeAdd { id, .. }
+            | Op::EdgeDel { id }
+            | Op::EdgeSet { id, .. }
+            | Op::EdgeUnset { id, .. } => self.exec_edge(id, op),
+            Op::Clear => self.clear(),
+            Op::ExtensionAdd { name, version } => self.add_extension(&name, &version),
+            Op::ExtensionDel { name } => self.drop_extension(&name),
+            op @ Op::ExtWrite { .. } => {
+                // Which keys are configuration is not known here.
+                self.hooks = None;
+                self.exec(op)
+            }
+            op @ (Op::IndexAdd { .. } | Op::IndexDel { .. } | Op::Counters { .. }) => self.exec(op),
+        }
     }
 
     pub fn add_node(&mut self, labels: &[String], props: Vec<(String, Value)>) -> Result<u64> {
@@ -2231,29 +2507,63 @@ impl Graph {
             return Err(Error::Msg(format!("no node {}", to)));
         }
         let id = self.pager().meta(M_NEXT_EDGE);
-        self.exec(Op::EdgeAdd {
+        self.exec_edge(
             id,
-            from,
-            to,
-            etype: etype.to_string(),
-            props,
-        })?;
+            Op::EdgeAdd {
+                id,
+                from,
+                to,
+                etype: etype.to_string(),
+                props,
+            },
+        )?;
         Ok(id)
     }
 
+    /// Delete a node and every edge it has. Extensions that follow edge
+    /// writes hear about each edge, then the node.
     pub fn delete_node(&mut self, id: u64) -> Result<bool> {
         if !self.node_exists(id) {
             return Ok(false);
         }
-        self.exec_node(id, Op::NodeDel { id })?;
+        if self.write_hooks().edge.is_empty() {
+            self.exec_node(id, Op::NodeDel { id })?;
+        } else {
+            self.unit(|g| {
+                g.detach(id)?;
+                g.exec_node(id, Op::NodeDel { id })
+            })?;
+        }
         Ok(true)
+    }
+
+    /// Delete a node's edges one at a time through the hooked path, a
+    /// batch at a time: never modify the adjacency tree while walking it.
+    fn detach(&mut self, id: u64) -> Result<()> {
+        loop {
+            let mut batch = Vec::new();
+            self.for_each_adj_while(id, Dir::Both, None, |a| {
+                // A self-loop is listed twice; an entry whose edge is gone
+                // is left for the node's own delete to remove.
+                if (a.other != id || !batch.contains(&a.edge)) && self.edge_exists(a.edge) {
+                    batch.push(a.edge);
+                }
+                batch.len() < BATCH
+            });
+            if batch.is_empty() {
+                return Ok(());
+            }
+            for e in batch {
+                self.exec_edge(e, Op::EdgeDel { id: e })?;
+            }
+        }
     }
 
     pub fn delete_edge(&mut self, id: u64) -> Result<bool> {
         if !self.edge_exists(id) {
             return Ok(false);
         }
-        self.exec(Op::EdgeDel { id })?;
+        self.exec_edge(id, Op::EdgeDel { id })?;
         Ok(true)
     }
 
@@ -2285,18 +2595,24 @@ impl Graph {
         if !self.edge_exists(id) {
             return Err(Error::Msg(format!("no edge {}", id)));
         }
-        self.exec(Op::EdgeSet {
+        self.exec_edge(
             id,
-            key: key.to_string(),
-            value,
-        })
+            Op::EdgeSet {
+                id,
+                key: key.to_string(),
+                value,
+            },
+        )
     }
 
     pub fn unset_edge_prop(&mut self, id: u64, key: &str) -> Result<()> {
-        self.exec(Op::EdgeUnset {
+        self.exec_edge(
             id,
-            key: key.to_string(),
-        })
+            Op::EdgeUnset {
+                id,
+                key: key.to_string(),
+            },
+        )
     }
 
     pub fn add_label(&mut self, id: u64, label: &str) -> Result<()> {
@@ -2370,11 +2686,33 @@ impl Graph {
     /// Keys of extension `ns` starting with `prefix`, in order, until `f`
     /// returns false. Keys are passed without the namespace.
     pub fn ext_scan(&self, ns: &str, prefix: &[u8], f: &mut dyn FnMut(&[u8], &[u8]) -> bool) {
+        self.ext_scan_after(ns, prefix, None, f)
+    }
+
+    /// [`Graph::ext_scan`], starting after the key `after` instead of at
+    /// the start of the prefix: work over a keyspace can then be done in
+    /// slices, each continuing where the last one stopped.
+    pub fn ext_scan_after(
+        &self,
+        ns: &str,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        f: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+    ) {
         let full = Self::ext_full_key(ns, prefix);
+        let from = match after {
+            // The least key greater than `a` is `a` followed by a zero.
+            Some(a) if a >= prefix => {
+                let mut k = Self::ext_full_key(ns, a);
+                k.push(0);
+                k
+            }
+            _ => full.clone(),
+        };
         let skip = ns.len() + 1;
         self.note((|| -> SResult<()> {
             let p = self.pager();
-            let mut c = EXT.seek(p, &full)?;
+            let mut c = EXT.seek(p, &from)?;
             while let Some((k, v)) = c.next()? {
                 if !k.starts_with(&full) {
                     break;
@@ -2422,19 +2760,65 @@ impl Graph {
         })
     }
 
-    fn write_hooks(&mut self) -> Vec<std::sync::Arc<dyn crate::ext::Extension>> {
+    fn write_hooks(&mut self) -> &Hooks {
         if self.hooks.is_none() {
-            let mut hooks = Vec::new();
+            let mut hooks = Hooks::default();
             for (name, _) in self.extensions() {
                 if let Some(e) = crate::ext::find(&name) {
-                    if e.wants_writes(self) {
-                        hooks.push(e);
+                    let (n, ed) = (e.wants_writes(self), e.wants_edge_writes(self));
+                    if n {
+                        hooks.node.push(e.clone());
+                    }
+                    if ed {
+                        hooks.edge.push(e.clone());
+                    }
+                    if n || ed {
+                        hooks.any.push(e);
                     }
                 }
             }
             self.hooks = Some(hooks);
         }
-        self.hooks.clone().unwrap_or_default()
+        self.hooks.get_or_insert_with(Hooks::default)
+    }
+
+    /// Several writes, and the hooks that follow them, as one unit: with
+    /// autocommit on they commit together, and a failure takes all of them
+    /// back. Inside the caller's transaction a failure after something was
+    /// written rolls that whole transaction back and says so: undoing only
+    /// this unit is not possible, and a write must never become durable
+    /// without the hook writes that belong with it.
+    fn unit(&mut self, f: impl FnOnce(&mut Graph) -> Result<()>) -> Result<()> {
+        let auto = self.autocommit;
+        let start = self.uncommitted;
+        self.autocommit = false;
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        self.autocommit = auto;
+        let r = match r {
+            Ok(r) => r,
+            // A hook panicked: take its unit back, as for an error, before
+            // the panic goes on to whoever catches it.
+            Err(panic) => {
+                if auto {
+                    self.rollback_quietly();
+                } else if self.uncommitted > start {
+                    let _ = self.abandon(Error::Msg("a write hook panicked".into()));
+                }
+                std::panic::resume_unwind(panic)
+            }
+        };
+        match r {
+            Ok(()) => self.maybe_commit(),
+            Err(e) if auto => {
+                self.rollback_quietly();
+                Err(e)
+            }
+            Err(e) if self.uncommitted > start => Err(self.abandon(e)),
+            // Nothing was written (a refused value, or a failure that
+            // already rolled the transaction back): the transaction is as
+            // the caller left it.
+            Err(e) => Err(e),
+        }
     }
 
     fn node_image(&self, id: u64) -> Option<crate::ext::NodeImage> {
@@ -2449,31 +2833,67 @@ impl Graph {
     /// with autocommit on they commit together, and a failing hook takes
     /// the write back with it.
     fn exec_node(&mut self, id: u64, op: Op) -> Result<()> {
-        let hooks = self.write_hooks();
-        if hooks.is_empty() {
+        if self.write_hooks().node.is_empty() {
             return self.exec(op);
         }
+        let hooks = self.write_hooks().node.clone();
         let before = self.node_image(id);
-        let auto = self.autocommit;
-        self.autocommit = false;
-        let r = (|| -> Result<()> {
-            self.exec(op)?;
-            let after = self.node_image(id);
-            for h in &hooks {
-                h.on_node_write(self, id, before.as_ref(), after.as_ref())?;
+        self.unit(|g| {
+            // A write that changed nothing has nothing to tell the hooks.
+            if !g.exec_changed(op)? {
+                return Ok(());
             }
-            Ok(())
-        })();
-        self.autocommit = auto;
-        match r {
-            Ok(()) => self.maybe_commit(),
-            Err(e) => {
-                if auto {
-                    self.rollback_quietly();
+            let after = g.node_image(id);
+            // A replayed op on a node that does not exist (it may still
+            // have logged a newly seen name) has nothing to report.
+            if before.is_none() && after.is_none() {
+                return Ok(());
+            }
+            g.in_hooks(|g| {
+                for h in &hooks {
+                    h.on_node_write(g, id, before.as_ref(), after.as_ref())?;
                 }
-                Err(e)
-            }
+                Ok(())
+            })
+        })
+    }
+
+    fn edge_image(&self, id: u64) -> Option<crate::ext::EdgeImage> {
+        let e = self.edge(id)?;
+        Some(crate::ext::EdgeImage {
+            from: e.from,
+            to: e.to,
+            etype: self.strings.name(e.etype).to_string(),
+            props: self.edge_props(id),
+        })
+    }
+
+    /// An edge write and the hooks that follow it, as [`exec_node`] does
+    /// for nodes. A write that touched no edge at all (absent before and
+    /// after) calls nothing.
+    fn exec_edge(&mut self, id: u64, op: Op) -> Result<()> {
+        if self.write_hooks().edge.is_empty() {
+            return self.exec(op);
         }
+        let hooks = self.write_hooks().edge.clone();
+        let before = self.edge_image(id);
+        self.unit(|g| {
+            // A write that changed nothing is not logged, does not move the
+            // revision, and has nothing to tell the hooks.
+            if !g.exec_changed(op)? {
+                return Ok(());
+            }
+            let after = g.edge_image(id);
+            if before.is_none() && after.is_none() {
+                return Ok(());
+            }
+            g.in_hooks(|g| {
+                for h in &hooks {
+                    h.on_edge_write(g, id, before.as_ref(), after.as_ref())?;
+                }
+                Ok(())
+            })
+        })
     }
 
     /// The installed version of an extension, if this database has it.
@@ -2504,15 +2924,49 @@ impl Graph {
         })())
     }
 
+    /// Delete every node and edge, keeping index definitions and installed
+    /// extensions. Extensions that follow writes are told with one
+    /// [`on_bulk_write`](crate::ext::Extension::on_bulk_write).
     pub fn clear(&mut self) -> Result<()> {
-        self.exec(Op::Clear)
+        if self.write_hooks().any.is_empty() {
+            return self.exec(Op::Clear);
+        }
+        let hooks = self.write_hooks().any.clone();
+        // CLEAR always counts as a change, on an empty graph too: it resets
+        // the id counters and wipes derived data. It is logged, moves the
+        // revision and is reported.
+        self.unit(|g| {
+            g.exec(Op::Clear)?;
+            g.in_hooks(|g| {
+                for h in &hooks {
+                    h.on_bulk_write(g, crate::ext::BulkWrite::Clear)?;
+                }
+                Ok(())
+            })
+        })
+    }
+
+    /// Run write hooks: while they run, only extension keyspaces may be
+    /// written, so a hook can never set off hooks again.
+    /// The count is restored on every way out, a panic included, so a
+    /// handle whose embedder catches panics stays writable.
+    fn in_hooks(&mut self, f: impl FnOnce(&mut Graph) -> Result<()>) -> Result<()> {
+        self.in_hook += 1;
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        self.in_hook -= 1;
+        match r {
+            Ok(r) => r,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 
     /// Reclaim space: folds the log into the pages. (Pages freed by deletes
-    /// are reused by later writes; the file does not shrink.)
+    /// are reused by later writes; the file does not shrink.) It commits
+    /// what is pending, so it is refused inside a [`Graph::begin`] block.
     pub fn compact(&mut self) -> Result<u64> {
+        self.refuse_in_block("COMPACT")?;
         let before = self.file_len();
-        self.commit()?;
+        self.commit_txn()?;
         self.db.checkpoint()?;
         Ok(before)
     }
@@ -2554,6 +3008,8 @@ impl Graph {
             prewarmed: ps.prewarmed,
             page_size: self.pager().page_size() as u64,
             log_bytes: self.db.log_since_checkpoint(),
+            revision: self.revision(),
+            generation: self.generation(),
             integrity_error: None,
         }
     }
@@ -2648,6 +3104,29 @@ impl Graph {
             ));
         }
         Ok(self.db.enable_log(cap)?)
+    }
+
+    /// Which committed state of its lineage ([`Graph::generation`]) the
+    /// graph is in: a number that grows with every committed transaction
+    /// that changed something and with nothing else — not with an empty or
+    /// rolled-back transaction, a write that changed nothing, a checkpoint,
+    /// a reopen or a read. It is the committed position of the write-ahead
+    /// log, so it is durable with the log, recovered with it, and the same
+    /// on a replica restored to the same point. A memory graph without a
+    /// log counts what a log would have written, and lives only as long as
+    /// the graph does. Cheap: no I/O. See docs/DERIVED.md, "Revision".
+    pub fn revision(&self) -> u64 {
+        self.db.revision()
+    }
+
+    /// Where the log ends, counting the open transaction's records:
+    /// [`Graph::revision`] when nothing is pending, and past it while a
+    /// transaction has logged something. Each logged operation adds its
+    /// record (`store::Op::encode_record`) and a frame of
+    /// `storage::log::FRAME_BYTES`, and a commit adds one more frame, so
+    /// derived data can say which revision its own write will commit at.
+    pub fn log_end(&self) -> u64 {
+        self.db.log_end()
     }
 
     /// The graph's lineage: the generation its replicas are filed under. A
@@ -2808,6 +3287,102 @@ impl Graph {
         Ok(n)
     }
 
+    // ------------------------------------------ raw reads, for `check`
+    //
+    // `ext::check` asks whether the trees agree with each other, so it has
+    // to read them as stored, not through the views above (which skip what
+    // cannot be). These read and never write; they are not an API.
+
+    /// Up to `max` entries of `tree` whose keys start with `prefix` and are
+    /// greater than `after` (from the prefix's start when None), in key
+    /// order, values loaded; the batch also ends once it holds `max_bytes`.
+    #[doc(hidden)]
+    pub fn raw_batch(
+        &self,
+        tree: RawTree,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        max: usize,
+        max_bytes: usize,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.note((|| -> SResult<Vec<(Vec<u8>, Vec<u8>)>> {
+            let p = self.pager();
+            let from = match after {
+                // The least key greater than `a` is `a` followed by a zero.
+                Some(a) if a >= prefix => {
+                    let mut f = a.to_vec();
+                    f.push(0);
+                    f
+                }
+                _ => prefix.to_vec(),
+            };
+            let mut out = Vec::new();
+            let mut bytes = 0usize;
+            let mut c = tree.tree().seek(p, &from)?;
+            while let Some((k, v)) = c.next()? {
+                if !k.starts_with(prefix) || out.len() >= max.max(1) || bytes >= max_bytes {
+                    break;
+                }
+                let v = v.load(p)?.into_owned();
+                bytes += k.len() + v.len();
+                out.push((k.to_vec(), v));
+            }
+            Ok(out)
+        })())
+    }
+
+    /// One entry of `tree`, as stored.
+    #[doc(hidden)]
+    pub fn raw_get(&self, tree: RawTree, key: &[u8]) -> Option<Vec<u8>> {
+        self.note(tree.tree().get(self.pager(), key))
+    }
+
+    /// The counters kept beside the trees.
+    #[doc(hidden)]
+    pub fn raw_meta(&self) -> RawMeta {
+        let p = self.pager();
+        RawMeta {
+            next_node: p.meta(M_NEXT_NODE),
+            next_edge: p.meta(M_NEXT_EDGE),
+            nodes: p.meta(M_NODES),
+            edges: p.meta(M_EDGES),
+            next_index: p.meta(M_NEXT_INDEX),
+        }
+    }
+
+    /// Property index definitions as `(index id, label, key)`, by id.
+    #[doc(hidden)]
+    pub fn raw_indexes(&self) -> Vec<(u32, u32, u32)> {
+        let mut v: Vec<_> = self
+            .indexes
+            .iter()
+            .map(|(&(l, k), d)| (d.id, l, k))
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// The key prefix an index stores `v` under, and whether it was cut to
+    /// fit a key (a node id follows it in the entry).
+    #[doc(hidden)]
+    pub fn raw_index_prefix(&self, index: u32, v: &Value) -> (Vec<u8>, bool) {
+        idx_prefix(self.pager(), index, v)
+    }
+
+    /// A node record's labels and properties; None when it does not decode.
+    #[doc(hidden)]
+    pub fn raw_decode_node(bytes: &[u8]) -> Option<(Vec<u32>, Vec<(u32, Value)>)> {
+        let (labels, run) = decode_node(bytes).ok()?;
+        Some((labels, props_of(&run).ok()?))
+    }
+
+    /// An edge record's source, target, type and properties.
+    #[doc(hidden)]
+    pub fn raw_decode_edge(bytes: &[u8]) -> Option<(u64, u64, u32, Vec<(u32, Value)>)> {
+        let (from, to, t, run) = decode_edge(bytes).ok()?;
+        Some((from, to, t, props_of(&run).ok()?))
+    }
+
     /// Page-cache and transaction statistics.
     pub fn pager_stats(&self) -> pager::Stats {
         self.pager().stats()
@@ -2905,7 +3480,50 @@ pub struct Stats {
     pub page_size: u64,
     /// Log a crash right now would replay.
     pub log_bytes: u64,
+    /// [`Graph::revision`].
+    pub revision: u64,
+    /// [`Graph::generation`].
+    pub generation: [u8; 16],
     pub integrity_error: Option<String>,
+}
+
+/// The trees [`Graph::raw_batch`] reads, laid out as the module
+/// documentation says.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawTree {
+    Catalog,
+    Nodes,
+    Edges,
+    Adj,
+    Labels,
+    Types,
+    Props,
+}
+
+impl RawTree {
+    fn tree(self) -> Tree {
+        match self {
+            RawTree::Catalog => CATALOG,
+            RawTree::Nodes => NODES,
+            RawTree::Edges => EDGES,
+            RawTree::Adj => ADJ,
+            RawTree::Labels => LABELS,
+            RawTree::Types => TYPES,
+            RawTree::Props => PROPS,
+        }
+    }
+}
+
+/// The counters [`Graph::raw_meta`] reads.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawMeta {
+    pub next_node: u64,
+    pub next_edge: u64,
+    pub nodes: u64,
+    pub edges: u64,
+    pub next_index: u64,
 }
 
 // ------------------------------------------------------ algorithm projections

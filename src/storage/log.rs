@@ -88,6 +88,10 @@ fn list_segments(dir: &Path) -> io::Result<Vec<u64>> {
     Ok(v)
 }
 
+/// What a frame adds around its payload: the kind, the length and the
+/// checksum. A commit marker is a frame with no payload.
+pub const FRAME_BYTES: u64 = 9;
+
 fn frame(out: &mut Vec<u8>, kind: u8, payload: &[u8]) {
     let start = out.len();
     out.push(kind);
@@ -327,6 +331,11 @@ impl Wal {
 
     pub fn committed_lsn(&self) -> u64 {
         self.committed
+    }
+
+    /// Position just past the last record written, committed or not.
+    pub fn end_lsn(&self) -> u64 {
+        self.lsn
     }
 
     /// Bytes of log since `lsn`.
@@ -627,6 +636,11 @@ impl MemLog {
     /// Position just past the last commit marker.
     pub fn committed_lsn(&self) -> u64 {
         self.committed
+    }
+
+    /// Position just past the last record appended, committed or not.
+    pub fn end_lsn(&self) -> u64 {
+        self.lsn
     }
 
     pub fn cap(&self) -> u64 {

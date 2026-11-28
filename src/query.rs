@@ -1857,6 +1857,14 @@ pub fn execute_with(g: &mut Graph, src: &str, params: &[(String, Value)]) -> Res
 }
 
 fn execute_stmt(g: &mut Graph, stmt: Stmt) -> Result<QueryResult> {
+    // In a transaction the engine already rolled back, only ending it is
+    // allowed: nothing run after the failure may commit as if it were the
+    // whole transaction.
+    if !matches!(stmt, Stmt::Commit | Stmt::Rollback) {
+        if let Some(why) = g.spent() {
+            return Err(Error::Msg(why.to_string()));
+        }
+    }
     // STATS reports the damage itself; everything else must not return
     // results computed from an image that failed a checksum along the way.
     let reports_damage = matches!(stmt, Stmt::Stats);
@@ -1884,18 +1892,29 @@ fn execute_stmt(g: &mut Graph, stmt: Stmt) -> Result<QueryResult> {
 fn atomically<R>(g: &mut Graph, f: impl FnOnce(&mut Graph) -> Result<R>) -> Result<R> {
     let auto = g.autocommit;
     g.autocommit = false;
-    let r = f(g);
-    g.autocommit = auto;
+    // A panic (in an extension, say) must not leave the handle with
+    // autocommit off and the statement's writes pending.
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(g)));
+    g.restore_autocommit(auto);
+    let r = match r {
+        Ok(r) => r,
+        Err(panic) => {
+            if auto {
+                let _ = g.rollback_txn();
+            }
+            std::panic::resume_unwind(panic)
+        }
+    };
     if !auto || g.uncommitted() == 0 {
         return r;
     }
     match r {
         Ok(v) => {
-            g.commit()?;
+            g.commit_txn()?;
             Ok(v)
         }
         Err(e) => {
-            let _ = g.rollback();
+            let _ = g.rollback_txn();
             Err(e)
         }
     }
@@ -1990,6 +2009,14 @@ fn run(g: &mut Graph, stmt: Stmt) -> Result<QueryResult> {
                     Value::Text("log_bytes".into()),
                     Value::Int(s.log_bytes as i64),
                 ],
+                vec![
+                    Value::Text("revision".into()),
+                    Value::Int(s.revision.min(i64::MAX as u64) as i64),
+                ],
+                vec![
+                    Value::Text("generation".into()),
+                    Value::Text(crate::replica::generation_name(&s.generation)),
+                ],
             ];
             if let Some((used, max)) = s.memory {
                 rows.push(vec![
@@ -2066,12 +2093,15 @@ fn run(g: &mut Graph, stmt: Stmt) -> Result<QueryResult> {
             Ok(QueryResult::message("graph cleared"))
         }
         Stmt::Begin => {
-            g.autocommit = false;
+            g.begin()?;
             Ok(QueryResult::message("transaction open (autocommit off)"))
         }
         Stmt::Commit => {
-            g.commit()?;
+            // COMMIT ends the block whatever happens; a spent block reports
+            // that nothing was committed.
+            let r = g.commit();
             g.autocommit = true;
+            r?;
             Ok(QueryResult::message("committed"))
         }
         Stmt::Rollback => {
@@ -5009,6 +5039,7 @@ fn label_of(g: &Graph, id: u64) -> Value {
 
 /// Load JSON Lines: one `{"type":"node"|"edge", ...}` object per line.
 pub fn import_jsonl(g: &mut Graph, text: &str) -> Result<(usize, usize)> {
+    g.refuse_in_block("a JSON Lines import")?;
     let was_auto = g.autocommit;
     g.autocommit = false;
     let result = import_lines(g, text);
@@ -5018,7 +5049,7 @@ pub fn import_jsonl(g: &mut Graph, text: &str) -> Result<(usize, usize)> {
     if result.is_err() && was_auto {
         let _ = g.rollback();
     }
-    g.autocommit = was_auto;
+    g.restore_autocommit(was_auto);
     result
 }
 
@@ -5076,10 +5107,10 @@ fn import_lines(g: &mut Graph, text: &str) -> Result<(usize, usize)> {
             }
         }
         if (nodes + edges) % 20_000 == 0 {
-            g.commit()?;
+            g.commit_txn()?;
         }
     }
-    g.commit()?;
+    g.commit_txn()?;
     Ok((nodes, edges))
 }
 

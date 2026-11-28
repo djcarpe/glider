@@ -34,12 +34,74 @@ functions work in any expression as `<extension>.<function>(...)`.
   Keys starting with `!` are configuration and survive `CLEAR`; everything
   else counts as derived from the data and is wiped with it. `DROP EXTENSION`
   deletes the whole keyspace.
-- **Extensions can follow writes.** An extension whose `wants_writes` says so
-  has `on_node_write` called after every node write made through the graph
-  API (queries included), inside the same transaction, with the node before
-  and after. What it writes in response is logged, so recovery and replicas
-  replay the result without running the hook again. Bulk loads do not call
-  hooks; an extension rebuilds from a scan instead (`CALL context.index()`).
+- **Extensions can follow writes.** No change to a node or an edge goes
+  unnoticed by an extension that asks:
+  - `wants_writes` → `on_node_write(id, before, after)` after every node
+    write (labels and properties before and after; `None` for absent);
+  - `wants_edge_writes` → `on_edge_write(id, before, after)` after every
+    edge add, delete, property set and unset (endpoints, type and
+    properties before and after). Deleting a node reports each of its edges
+    first, then the node;
+  - either → `on_bulk_write(BulkWrite::Clear)` after every `CLEAR`, an
+    empty graph's too (it resets the id counters, so it always counts as a
+    change). Keys not starting with `!` are already wiped.
+
+  Every path calls them: statements (including `CALL` procedures that
+  write, `BEGIN` blocks and `execute_batch`), the graph API, JSON Lines
+  imports, `Graph::apply_op` (replayed operations with explicit ids),
+  `Graph::import_legacy` and `migrate`. They run inside the writing
+  transaction. What a hook writes is logged, so crash recovery and replicas
+  replay the result without running the hook again.
+
+  A hook may write only extension keyspaces (`Graph::ext_write`). A node,
+  edge, label or property write, or a `CLEAR`, attempted from inside any
+  hook is refused with an error saying so, which fails the statement like
+  any hook failure; so a hook never sets off hooks again.
+
+  A hook that returns an error fails the write: with autocommit on the
+  statement rolls back; with autocommit off the whole open transaction
+  rolls back, and the error ends with "(the transaction was rolled back)"
+  whatever its kind. Open a transaction with `BEGIN` or `Graph::begin()`
+  and end it with `COMMIT`/`ROLLBACK` or `commit()`/`rollback()`: such a
+  block is then spent (`Graph::spent()`): every further write and
+  statement in it is refused with that explanation, and `COMMIT` answers
+  "nothing was committed: ..." and ends the block, so nothing run after the
+  failure can commit as if it were the whole transaction. The same holds
+  when the engine itself rolls back an open block (a memory graph past
+  `max_memory`, a storage error). A spent state never reaches the next
+  block. A transaction opened by assigning `autocommit = false` keeps the
+  older behaviour: the failing call's error says the transaction was
+  rolled back, and the caller carries on in a new one. Inside a `begin()`
+  block, operations that commit on their own (`import_jsonl`,
+  `import_jsonl_from`, `import_legacy`, `COMPACT`, `execute_batch`) are
+  refused until the block ends; in a field-opened transaction they commit
+  what is pending, as before. Do not assign `autocommit` inside a
+  `begin()` block: it does not end the block, but the next write then
+  autocommits, taking the block's earlier writes with it.
+
+  A hook that panics leaves the handle usable: the open transaction is
+  rolled back (the caller's earlier pending writes too) and autocommit and
+  the hook state restored before the panic goes on, so an embedder that
+  catches panics can keep the handle. Inside a `begin()` block the block
+  is spent with the reason; in a field-opened transaction the panic is the
+  only report.
+
+  An extension that does not ask is never called, and costs nothing. A
+  write that changes nothing (a property set to the value it has, an unset
+  of an absent property, a label it already has, a delete of what is not
+  there) is not logged, does not move the revision and calls no hook. A
+  hook is never called with nothing before and nothing after. The revision
+  moving does not mean a hook was called: a replayed operation on a record
+  that does not exist may still log a newly seen name.
+
+  `Graph::bulk_load` only builds a new database, so no extension is
+  installed in what it writes; one installed afterwards builds from a scan
+  (`CALL context.index()`).
+- **Extensions can tell whether the graph has moved.** `Graph::revision()`
+  (and `revision` in `STATS`) grows with every committed change, including
+  an extension's own writes, and with nothing else. Record it beside derived
+  state; if it is the same later, nothing has changed since
+  ([`DERIVED.md`](DERIVED.md), "Revision").
 
 ### Writing one
 
@@ -77,9 +139,11 @@ ext::register(Arc::new(Geo));
 
 Optional hooks: `install` / `uninstall` / `upgrade(from)` run in the
 transaction of `CREATE` / `DROP` / `ALTER EXTENSION`; `wants_writes` and
-`on_node_write` maintain derived state. The built-in `context` extension
-(`src/ext/context.rs`, `src/ext/text.rs`) uses all of them and is the
-worked example.
+`on_node_write`, `wants_edge_writes` and `on_edge_write`, and
+`on_bulk_write` maintain derived state; `check(g, probe)` compares that
+state with the graph for `CALL check.run()` (below). The built-in `context`
+extension (`src/ext/context.rs`, `src/ext/text.rs`) uses all of them and is
+the worked example.
 
 ## `context`: graph retrieval for language models
 
@@ -190,9 +254,273 @@ under 300 MB.
 - The text index is lexical (lowercased words, plural `s` dropped, no other
   stemming, a short English stopword list). Semantic search over embeddings
   is not part of it; pass the ids from your own vector search as `seeds:`.
-- Write hooks see node writes only; edge properties are not indexed.
-- Bulk loads (`Graph::bulk_load`, `migrate`) bypass hooks: run
-  `CALL context.index()` after one.
+- The text index follows node writes only; edge properties are not indexed.
+- A database made by `Graph::bulk_load` has nothing installed: install the
+  extension and run `CALL context.index()` after it. `migrate`, imports
+  and replayed operations keep the index current like any other write.
 - `CALL context.index()` builds in one transaction, and its log holds every
   posting until the next checkpoint (about 0.5 GiB for the 8.6M postings in
   the benchmark).
+
+## `changes`: which nodes and edges changed
+
+Things derived from a graph and kept (a text index, a colouring, vectors an
+application paid a model to make) need to know what to recompute after the
+graph changes. The revision only says that *something* did. `changes`
+says exactly which nodes and edges did, since a revision.
+
+```
+CREATE EXTENSION changes
+CALL changes.since(revision: 1042)                         ids changed after it, by kind then id
+CALL changes.since(revision: 1042, kinds: ["node"], limit: 1000, after: "node:7")
+CALL changes.status()                                      oldest, why, entries, bytes, cap, revision
+CALL changes.release(below: 1500)                          forget changes at or below a revision
+CALL changes.cap(entries: 100000)                          the most entries it holds (default 1,000,000)
+```
+
+Rows of `since` are `revision, kind, id, change`: `kind` is `node`, `edge`
+or `adjacency` (the edges at a node: one added, removed or altered at either
+end), `change` is what happened to it last, `put` (it exists, with what the
+graph holds now) or `drop` (it is gone). An id appears once per kind, with
+its latest change; old values are not kept. Rows come by kind (node,
+edge, adjacency), then id; at most 10,000 a call (`limit:` lowers it), and the
+message gives the `after:` to continue with.
+
+**How to use it.** Read `revision` (from `STATS` or `Graph::revision()`)
+when you derive something, and keep it beside what you derived. Later, ask
+`since` for that revision: what it lists is exactly what was written by the
+transactions committed since, by any path (statements, the API, imports,
+replayed operations), and nothing else. Recompute those ids, and keep the
+revision you did it at. Rolled-back work never appears.
+
+**When it cannot answer.** The journal is bounded: the cap forgets the
+oldest entries, `release` forgets entries at or below a revision, and it
+knows nothing from before it was installed or before a `CLEAR`. Asking for
+an older revision is an error that says why and names the oldest revision
+it answers for: rebuild from a scan of the graph, then carry on from that
+revision. It never returns a partial list as if it were whole. To set the
+cap from the start, run `CALL changes.cap(entries: N)` in the same
+`BEGIN ... COMMIT` as `CREATE EXTENSION changes`.
+
+**From another extension** (`glider::ext::changes`): `changed(g, since,
+Kind::Node, &ids)` says which of the ids changed, `changed_any(g, since,
+kind)` whether anything of that kind did, `answers(g, since)` whether the
+journal can say; each returns `None` when it cannot, which means "assume
+everything changed". `structure` uses it: with the journal installed, a
+kept colouring is stale only when a node or an edge changed since it was
+computed.
+
+**What it costs**: one extension record a write (an edge write updates the
+edge and its two endpoints), 16-21 bytes an entry in the keyspace, and the
+write throughput measured in `bench/KNOWLEDGE.md`, "Change tracking".
+`check.run` checks it (records that do not decode, a `put` for an id that
+does not exist, an entry past the log's end). Recovery and replicas hold
+the same journal as the source.
+
+### Limits
+
+- A revision is a position in the log, not a counter: entries of one
+  transaction carry different positions between the revision before it and
+  the one it commits at. Ask with revisions read at commit boundaries.
+- A replayed `CLEAR` or any bulk write ends what it can answer for: ids
+  are not listed for it.
+- `since` reads every entry of the kinds asked for, whatever the
+  revision: about 50 ms for 300,000 entries. `changed` for given ids is
+  one lookup an id. `changed_any` (and so a kept colouring's freshness)
+  reads every entry of the kind when nothing changed: a few milliseconds
+  for a few hundred thousand entries.
+- Past three quarters of the cap, each write also looks at 64 entries of
+  the journal and rewrites its state, until the sweep ends; that is the
+  cap's whole cost, spread over writes.
+- The journal refuses to answer while it holds a position past the
+  database's (a revision from another line of history, or a copy of a
+  later state), and starts again with the next writes.
+
+## `check`: is the graph whole
+
+`glider <db> verify` proves that pages and trees are sound. `check` proves
+that the graph those trees hold agrees with itself, and that what
+extensions derived from it still matches it. It reports and never repairs:
+no node, edge or extension record is written, and the revision is the same
+afterwards.
+
+```
+CREATE EXTENSION check
+CALL check.run()                                            the database's own checks
+CALL check.run(checks: ["orphans"], labels: ["Tool", "Part"])
+CALL check.run(checks: ["duplicates"], label: "Tool", keys: ["kind", "maker", "model", "spec"])
+CALL check.run(checks: ["required"], label: "Station", type: "HAS_SIDE", dir: "out")
+CALL check.run(limit: 100000)                               a slice; continue with after:
+```
+
+| check | finds | severity |
+|---|---|---|
+| `endpoints` | an edge whose source or target node does not exist | fault |
+| `adjacency` | an edge missing from an endpoint's adjacency, an entry naming the wrong far end, an entry with no edge or another edge's | fault |
+| `membership` | a node or edge not listed under its label or type, a label or type entry without its record | fault |
+| `counters` | a label, type, node, edge or index count that differs from a scan; a node, edge or index id counter that would hand out an id in use | fault |
+| `indexes` | an index entry that does not match its node (gone, relabelled, another value), a covered node missing from an index | fault |
+| `derived` | each installed extension's own check of its derived data (`context`: its text index against a rebuild) | fault |
+| `duplicates` | parallel edges with the same endpoints, type and properties; with `label:` and `keys:`, nodes of the label equal on every key | candidate |
+| `orphans` | nodes with no edges, of `labels:` when given | candidate |
+| `required` | nodes of `label:` with no edge of `type:` in `dir:` (`out`, `in`, `both`; default `out`) | candidate |
+
+With no `checks:` the first six run; the last three run only when named,
+because what they find are facts about the data that an application may or
+may not call faults. Candidates are for a person or a rule to decide on:
+two tools that agree on kind, maker, model and specification may be one
+tool entered twice or two of the same tool.
+
+Rows are `check, severity, kind, id, detail`. `id` is `n12` for a node,
+`e12` for an edge (the handles `context` uses and accepts back), or names
+the label (`:Tool`), type, index (`:Tool(code)`), counter or term at fault;
+`detail` says what is wrong in a sentence. An extension's findings have its
+name in `kind` (`context.stale_node`). An extension that does not implement
+`check` gets one `info` row saying so. Each check ends with a summary row:
+`severity: "summary"`, `kind: "done"` (or `"partial"`), `detail`
+`{"records":N,"problems":M}`. Checks run in the order of the table, each
+walking its trees in key order, so the same database gives the same rows
+every time and on both tiers.
+
+**Slices.** `limit:` caps the records one call looks at; a call also stops
+once it holds 10,000 rows. A call that stops ends with a `partial` summary
+whose `id` is a cursor: call again with `after:` set to it and the same
+other arguments, and the next call carries on from the next record. Slices
+together report exactly the rows of one whole run, and their counts add up
+to it. A call holds a few batches of records, plus an external sort within
+`algorithm_memory()` for the parallel edges of a hub and for node
+duplicates. A cursor is a position, not a snapshot: a caller who writes
+between slices gets an answer about a mix of states.
+
+**For extensions.** `Extension::check(&self, g, probe) -> Result<bool>`
+compares what the extension keeps with what a rebuild would make: call
+`probe.look()?` before each record (false: the slice is full; call
+`probe.stop_at(cursor)` and return), `probe.found(kind, id, detail)` for
+each difference, and resume from `probe.after()`. Return `false` when there
+is nothing the extension knows how to check. The `context` text index
+checks, without rebuilding: every covered node's postings and length are
+there, every length belongs to a covered node, each term's postings match
+its document frequency and belong to covered nodes, the totals match, and
+only when the counts show postings a rebuild would not make for nodes it
+does cover, walks the postings again to name those nodes.
+
+### Limits
+
+- The node half of `duplicates` sorts the label's members by their key
+  values again at every slice: a slice bounds the rows and records it
+  reports, not the reading. Nodes missing any key are not compared; values
+  compare as the index compares them (`1` equals `1.0`).
+- It checks what the caller names. Constraints declared in a schema
+  (uniqueness, required properties) are not part of it.
+- Staleness of derived data is found by comparison with the graph, not by
+  revisions: the text index records none yet (D3 is a later slice).
+- Measured on the manufacturing graph: `bench/KNOWLEDGE.md`, "Integrity".
+
+## `structure`: which nodes are the same shape
+
+Graphs made by people repeat themselves: forty stations built to one
+design, each with the same sides, locations, work elements and tools.
+`structure` says which nodes have the same surroundings. It reports and
+never merges: two stations of one design are two stations, and nothing
+here adds, deletes, connects or relabels a node.
+
+```
+CREATE EXTENSION structure
+CALL structure.colors(depth: 4, types: ["HAS_SIDE", "HAS_LOCATION", "HAS_ELEMENT", "USES_TOOL"], dir: "out")
+CALL structure.colors(depth: "stable", labels: ["Station"], summary: true)
+CALL structure.colors(depth: 4, labels: ["Station"], store: "designs")
+CALL structure.read(name: "designs", fresh: "require", after: 0, limit: 1000)
+CALL structure.classes(by: "neighbours", labels: ["Tool"], keys: ["kind", "maker", "model", "spec"], types: ["SUPPLIED_BY"])
+CALL structure.classes(by: "colors", colors: "designs")
+CALL structure.stored()
+CALL structure.drop(name: "designs")
+```
+
+**Colours.** `structure.colors` gives every node (of `labels:`, when given)
+a colour, Weisfeiler-Lehman style: two nodes have the same colour at
+`depth: d` exactly when their surroundings out to `d` hops cannot be told
+apart by their labels, the values of the properties named in `props:`
+(none by default, so names and codes do not make every node unique), and
+the types, directions and number of their edges of `types:` (every type
+by default) in `dir:` (`out` by default, `in`, or `both`, which counts the
+two directions apart). `depth: 0` is labels and properties alone; the
+default is 3. `depth: "stable"` refines until the partition stops
+changing, at most `max_depth:` rounds (32 by default), and says where it
+stopped or that it hit the cap. Rows are `id, color` (and `identity` with
+`identity: "<key>"`), in id order; `summary: true` gives instead one row
+per depth: `depth, colors` (over every node) `, selected` (over the nodes
+asked about).
+
+A colour depends on content only: labels, types and property keys count by
+name and values by content (`1` equals `1.0`), never by id, so the same data
+loaded under other ids gets the same colours, matched through `identity:`.
+Colours are 128-bit hashes (SipHash-2-4 under a fixed key) written as 32 hex
+digits. Equal surroundings always have equal colours. Different ones share
+a colour only by a hash collision: under 1.5e-21 for any two of a billion
+nodes at one depth (below 1e-9 if some node has a single neighbour repeated
+about 2^40 times).
+
+**Classes.** `structure.classes` groups interchangeable nodes, largest
+class first. `by: "neighbours"` (the default) groups nodes with the same
+labels, the same values on `keys:` (an absent key counts as a value) and
+exactly the same neighbours: the same multiset of (direction, edge type,
+node) over `types:` in `dir:`. It is exact: candidates found by hashing are
+compared in full. `by: "colors"` groups by colour, from a kept colouring
+(`colors: "<name>"`) or one computed in the call from the colour arguments.
+Rows are `class, size, first, members` (and `identities` with
+`identity:`), members by id or by identity value, at most `members:` (1,000)
+listed per class; ties between classes of one size go to the smallest first
+member (`neighbours`) or the smaller colour (`colors`). Only classes of
+`min_size:` (2) or more are listed; `summary: true` gives the size
+distribution instead (`size, classes`). The message says it plainly: the
+members are distinct nodes that the structure cannot tell apart, not one
+thing.
+
+What `keys:` and `types:` to give decides what "the same" means. On the
+manufacturing benchmark a planted duplicate tool hangs off the same supplier
+as its original but no work element uses it, so the edges that come in from
+users are left out (`types: ["SUPPLIED_BY"], dir: "out"`); a work
+element's own instruction is told apart from the same text at another
+station of the design by the element it belongs to
+(`types: ["APPLIES_TO", "ISSUED_BY", "HAS_INSTRUCTION"], dir: "both"`).
+
+**Kept colourings.** `store: "<name>"` keeps a colouring in the extension's
+keyspace with the revision it was computed at, its arguments and the
+version of the code that computed it (`CODE`, `structure-colors/1`).
+`structure.read(name:)` reads it back in slices and says whether the
+database has moved since; with `fresh: "require"` a moved database is an
+error (`classes(by: "colors", colors:)` takes `fresh:` too).
+`structure.stored()` lists them (`name, revision, fresh, depth, stable,
+nodes, colors, code, args`), `structure.drop(name:)` forgets one. Only the
+extension's own writes do not count as a move, so keeping or dropping one
+colouring leaves the others fresh; a write to any node, edge, index or other
+extension makes them all stale, whether or not it touched what they
+describe; with `changes` installed (and able to answer for the
+colouring's revision), only a change to a node or an edge does. `write: "<key>"` also sets the colour as a text property on each
+node (refused for a key in `props:`, which would change what it records).
+Without `store:` or `write:` nothing is written and the revision does not
+move. A kept colouring is derived data: `CLEAR` and `DROP EXTENSION` remove
+it, and `check.run` reports only records of it that do not decode (going
+stale is expected, and reported by `read`).
+
+**Slices and memory.** At most 10,000 rows a call (`limit:` lowers it);
+continue with `after:` (the last id for colours, the last class number for
+classes), as the message says. Colours are a whole-graph computation, so a
+slice of a colouring computed in the call bounds what it returns, not the
+work; read a kept colouring to slice the work too. Per-node state (41 bytes
+a node) is held within half of `algorithm_memory()` and spills to temporary
+files past it; distinct colours are counted and classes formed by external
+sorts in a quarter of it. The same database and arguments give the same
+rows, byte for byte, in memory and from a file.
+
+### Limits
+
+- Colours are computed for every node, also when `labels:` asks about a
+  few; `labels:` chooses what is reported and kept.
+- Staleness is by revision, not by comparison: any change makes a kept
+  colouring stale, including one it does not depend on, unless `changes`
+  is installed, when only node and edge changes do (one to a node or an
+  edge the colouring does not reach still does).
+- The edges of one node are read once per round; a colouring at depth `d`
+  reads the adjacency `d` times.
+- Measured on the manufacturing graph: `bench/KNOWLEDGE.md`, "Structure".

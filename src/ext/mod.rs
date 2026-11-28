@@ -24,7 +24,10 @@
 //! `<name>.<function>(...)` in any expression, in every database that
 //! installs it.
 
+pub mod changes;
+pub mod check;
 pub mod context;
+pub mod structure;
 pub mod text;
 
 use std::sync::{Arc, OnceLock, RwLock};
@@ -58,6 +61,25 @@ pub struct NodeImage {
     pub props: Vec<(String, Value)>,
 }
 
+/// An edge as a write hook sees it, before or after the write.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EdgeImage {
+    pub from: u64,
+    pub to: u64,
+    pub etype: String,
+    pub props: Vec<(String, Value)>,
+}
+
+/// A write that may have changed anything, reported to
+/// [`Extension::on_bulk_write`] instead of one call per record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BulkWrite {
+    /// `CLEAR` (or [`Graph::clear`]): the graph is now empty, and the
+    /// extension's keys that do not start with `!` are already gone.
+    Clear,
+}
+
 /// What an extension implements. Only `name`, `version`, `summary`,
 /// `procedures` and `call` are required.
 pub trait Extension: Send + Sync {
@@ -84,12 +106,17 @@ pub trait Extension: Send + Sync {
     fn wants_writes(&self, _g: &Graph) -> bool {
         false
     }
-    /// Called after every node write made through the graph API (queries
-    /// included), in the same transaction, with the node before and after
-    /// (`None`: absent). Writes it makes — usually [`Graph::ext_write`] —
-    /// are logged like any other, so recovery and replicas replay them
-    /// without running the hook again. Bulk loads do not call it; an
-    /// extension rebuilds from a scan instead.
+    /// Whether [`on_edge_write`](Extension::on_edge_write) should run in
+    /// this database. Asked when `wants_writes` is.
+    fn wants_edge_writes(&self, _g: &Graph) -> bool {
+        false
+    }
+    /// Called after every node write, in the same transaction, with the
+    /// node before and after (`None`: absent). Every path that changes a
+    /// node calls it: queries, the graph API, imports, `apply_op`. Writes
+    /// it makes — usually [`Graph::ext_write`] — are logged like any other,
+    /// so recovery and replicas replay them without running the hook
+    /// again. An error fails the write and rolls the statement back.
     fn on_node_write(
         &self,
         _g: &mut Graph,
@@ -97,6 +124,28 @@ pub trait Extension: Send + Sync {
         _before: Option<&NodeImage>,
         _after: Option<&NodeImage>,
     ) -> Result<()> {
+        Ok(())
+    }
+    /// Called after every edge write when
+    /// [`wants_edge_writes`](Extension::wants_edge_writes) says so: an add,
+    /// a delete, a property set or unset, and each edge that goes with a
+    /// deleted node (before the node's own call), by every path that makes
+    /// them. Same transaction, logging and failure rules as
+    /// [`on_node_write`](Extension::on_node_write).
+    fn on_edge_write(
+        &self,
+        _g: &mut Graph,
+        _id: u64,
+        _before: Option<&EdgeImage>,
+        _after: Option<&EdgeImage>,
+    ) -> Result<()> {
+        Ok(())
+    }
+    /// Called, for an extension that wants node or edge writes, after a
+    /// write that may have changed anything and reports no records of its
+    /// own (see [`BulkWrite`]), in the same transaction. Derived state
+    /// must be rebuilt, or marked as needing it, here.
+    fn on_bulk_write(&self, _g: &mut Graph, _what: BulkWrite) -> Result<()> {
         Ok(())
     }
     /// Run once by `CREATE EXTENSION`, in the same transaction that records
@@ -113,11 +162,26 @@ pub trait Extension: Send + Sync {
     fn upgrade(&self, _g: &mut Graph, _from: &str) -> Result<()> {
         Ok(())
     }
+    /// Check what this extension derives from the graph against the graph,
+    /// for `CALL check.run()`: report through `probe` every record that
+    /// differs from what a rebuild would make, writing nothing. Returns
+    /// false when it does not know how (the default), which `check.run`
+    /// reports as unchecked. See [`check::Probe`] for working in slices.
+    fn check(&self, _g: &Graph, _probe: &mut check::Probe) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 fn registry() -> &'static RwLock<Vec<Arc<dyn Extension>>> {
     static REGISTRY: OnceLock<RwLock<Vec<Arc<dyn Extension>>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| RwLock::new(vec![Arc::new(context::Context) as Arc<dyn Extension>]))
+    REGISTRY.get_or_init(|| {
+        RwLock::new(vec![
+            Arc::new(changes::Changes) as Arc<dyn Extension>,
+            Arc::new(check::Check),
+            Arc::new(context::Context),
+            Arc::new(structure::Structure),
+        ])
+    })
 }
 
 /// Make an extension available to every graph in this process. One with the
