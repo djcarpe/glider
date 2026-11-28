@@ -525,6 +525,14 @@ fn a_stopped_write_inside_a_transaction_rolls_it_back() {
     let err = err.to_string();
     assert!(err.contains("matching steps"), "{err}");
     assert!(err.contains("rolled back"), "{err}");
+    // the block is spent, as for any failure the engine rolls back: only
+    // ending it is allowed, and COMMIT says nothing was committed
+    assert!(g.spent().is_some());
+    let commit = query::execute(&mut g, "COMMIT").err().expect("refused");
+    assert!(
+        commit.to_string().contains("nothing was committed"),
+        "{commit}"
+    );
     assert!(g.autocommit, "the transaction is over");
     assert_eq!(
         count(&mut g, "MATCH (m:Mark) RETURN count(m)"),
