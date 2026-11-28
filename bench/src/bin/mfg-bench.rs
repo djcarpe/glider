@@ -1,7 +1,7 @@
 //! mfg-bench: the baseline over a manufacturing graph from `mfg-gen`.
 //!
 //!   mfg-bench --data DIR [--tiers memory,file] [--budgets 250,1000,4000]
-//!             [--only stats,retrieve,check,structure,...] [--out FILE] [--label NAME] [--detail]
+//!             [--only stats,retrieve,check,structure,changes,...] [--out FILE] [--label NAME] [--detail]
 //!
 //! Loads DIR/graph.jsonl into glider (in memory, and as a file in DIR), then
 //! runs each measurement in [`MEASURES`] and appends one JSON object per
@@ -37,6 +37,7 @@ const MEASURES: &[(&str, Measure)] = &[
     ("communities", communities),
     ("check", check),
     ("structure", structure),
+    ("changes", changes),
 ];
 
 type Measure = fn(&mut Run) -> Result<(), String>;
@@ -792,6 +793,148 @@ fn structure(run: &mut Run) -> Result<(), String> {
 }
 
 // -------------------------------------------------------------------- main
+
+/// Writes to time with and without the journal: node property sets, edge
+/// adds, edge deletes, committed every `COMMIT_EVERY`.
+const WRITES: u64 = 100_000;
+const COMMIT_EVERY: u64 = 10_000;
+
+/// One timed pass of `n` writes of one kind; returns writes a second and
+/// log bytes a write. `round` makes every value new, so each write changes
+/// something.
+fn write_pass(
+    g: &mut Graph,
+    kind: &str,
+    n: u64,
+    round: u64,
+    edges: &mut Vec<u64>,
+) -> Result<(f64, f64), String> {
+    let nodes = g.node_count() as u64;
+    let rev = g.revision();
+    let t = Instant::now();
+    g.autocommit = false;
+    let mut x = 0x9e37_79b9_7f4a_7c15u64 ^ round;
+    let mut next = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        1 + x % nodes
+    };
+    for i in 0..n {
+        let r = match kind {
+            "node set" => g.set_node_prop(1 + i % nodes, "cx", Value::Int((round * n + i) as i64)),
+            "edge add" => g
+                .add_edge(next(), next(), "CHANGED", vec![])
+                .map(|e| edges.push(e)),
+            _ => g.delete_edge(edges[i as usize]).map(|_| ()),
+        };
+        r.map_err(|e| format!("{kind}: {e}"))?;
+        if (i + 1) % COMMIT_EVERY == 0 {
+            g.commit().map_err(|e| e.to_string())?;
+        }
+    }
+    g.commit().map_err(|e| e.to_string())?;
+    g.autocommit = true;
+    if kind == "edge delete" {
+        edges.clear();
+    }
+    let s = t.elapsed().as_secs_f64();
+    Ok((n as f64 / s, (g.revision() - rev) as f64 / n as f64))
+}
+
+/// `changes`: node and edge write throughput without and with the journal,
+/// alternated (two rounds each), the log bytes a write and the bytes an
+/// entry; then `since` over the whole journal in slices, `since` near its
+/// end, and the questions other extensions ask.
+fn changes(run: &mut Run) -> Result<(), String> {
+    let n = WRITES.min(run.g.node_count() as u64);
+    let mut edges = Vec::with_capacity(n as usize);
+    let mut round = 0u64;
+    for journal in [false, true, false, true] {
+        if journal {
+            run.run("CREATE EXTENSION changes", &[])?;
+            run.run(&format!("CALL changes.cap(entries: {})", 10 * n), &[])?;
+        }
+        let from = run.g.revision();
+        for kind in ["node set", "edge add", "edge delete"] {
+            round += 1;
+            let (rate, log) = write_pass(&mut run.g, kind, n, round, &mut edges)?;
+            run.emit(
+                "changes.write",
+                Obj::new()
+                    .s("write", kind)
+                    .b("journal", journal)
+                    .u("round", round)
+                    .u("writes", n)
+                    .u("per_s", rate as u64)
+                    .raw("log_bytes_per_write", &format!("{log:.1}")),
+            );
+        }
+        if !journal {
+            continue;
+        }
+        let (r, _) = run.run("CALL changes.status()", &[])?;
+        let entries = r.rows[0][2].as_i64().unwrap_or(0) as u64;
+        let bytes = r.rows[0][3].as_i64().unwrap_or(0) as u64;
+        // since over everything, in slices of 10,000, by statement.
+        let t = Instant::now();
+        let (mut rows, mut calls) = (0u64, 0u64);
+        let mut after = String::new();
+        loop {
+            let (r, _) = run.run(&format!("CALL changes.since(revision: {from}{after})"), &[])?;
+            calls += 1;
+            rows += r.rows.len() as u64;
+            match r
+                .message
+                .as_deref()
+                .and_then(|m| m.split("after: '").nth(1))
+            {
+                Some(c) => after = format!(", after: '{}'", c.trim_end_matches('\'')),
+                None => break,
+            }
+        }
+        let all_ms = t.elapsed().as_secs_f64() * 1e3;
+        // since near the end: the last commit's changes.
+        let last = run.g.revision();
+        run.g
+            .set_node_prop(1, "cx", Value::Int(-1))
+            .map_err(|e| e.to_string())?;
+        let (r, tail_ms) = run.run(&format!("CALL changes.since(revision: {last})"), &[])?;
+        // The Rust questions: 1,000 ids, and whether anything changed.
+        let ids: Vec<u64> = (1..=1_000).collect();
+        let t = Instant::now();
+        let hit =
+            glider::ext::changes::changed(&run.g, from, glider::ext::changes::Kind::Node, &ids)
+                .map(|v| v.iter().filter(|c| **c).count())
+                .unwrap_or(0);
+        let changed_us = t.elapsed().as_secs_f64() * 1e6;
+        let t = Instant::now();
+        let any = glider::ext::changes::changed_any(&run.g, last, glider::ext::changes::Kind::Edge);
+        let any_us = t.elapsed().as_secs_f64() * 1e6;
+        run.emit(
+            "changes.read",
+            Obj::new()
+                .u("entries", entries)
+                .u("bytes", bytes)
+                .raw(
+                    "bytes_per_entry",
+                    &format!("{:.1}", bytes as f64 / entries.max(1) as f64),
+                )
+                .u("since_rows", rows)
+                .u("since_calls", calls)
+                .raw("since_all_ms", &format!("{all_ms:.1}"))
+                .u("since_tail_rows", r.rows.len() as u64)
+                .raw("since_tail_ms", &format!("{tail_ms:.2}"))
+                .u("changed_ids", ids.len() as u64)
+                .u("changed_hit", hit as u64)
+                .raw("changed_us", &format!("{changed_us:.0}"))
+                .b("changed_any_edge", any == Some(true))
+                .raw("changed_any_us", &format!("{any_us:.1}")),
+        );
+        run.run("DROP EXTENSION changes", &[])?;
+    }
+    Ok(())
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

@@ -162,7 +162,7 @@ second:
 
 ```
 mfg-bench --data DIR [--tiers memory,file] [--budgets 250,1000,4000]
-          [--only stats,retrieve,pagerank,communities,check,structure] [--out FILE] [--label NAME] [--detail]
+          [--only stats,retrieve,pagerank,communities,check,structure,changes] [--out FILE] [--label NAME] [--detail]
 ```
 
 For each tier it imports `graph.jsonl` with the streaming importer, then runs
@@ -182,6 +182,8 @@ every measurement in `MEASURES`, appending JSON lines to
 
 | `structure.colors` | `what: "colours per depth"`: `depths` as `[depth, colours over every node, colours among stations]` to depth 5; `what: "design recovery"` at depths 1 to 4: the colouring kept (`kept`), read back in slices (`read_ms`, `read_slices`) and scored (`stations`, `station_colours`, `designs`, `designs_whole`, `designs_alone`, `deviated`, `deviated_apart`, `exact`); `what: "stable"`: `depth: "stable"`, its depths and message. Each with `ms`, `rss_before_mb`, `rss_added_mb` |
 | `structure.classes` | `by: "neighbours"` per catalogue label, on the properties its duplicates agree on: `classes`, `planted` / `found` / `hit` / `exact` (pairs, the truth's pairs closed under "duplicate of the same original"), `lookalikes`, `lookalikes_reported`, `sizes` (`[size, classes]`, singletons included); `by: "colors"` over the kept depth-4 colouring of stations: `sizes`. Each with `ms` and memory |
+| `changes.write` | per `write` (`node set`: a property set on node `1 + i mod nodes`; `edge add` between pseudo-random nodes; `edge delete` of those edges), `journal` (installed or not), `round`: `writes` (100,000, or the node count when smaller), `per_s`, `log_bytes_per_write` (revision moved / writes); commits every 10,000. Rounds alternate without and with the journal, twice |
+| `changes.read` | after each round with the journal: `entries`, `bytes`, `bytes_per_entry` (from `changes.status`), `since_rows`, `since_calls`, `since_all_ms` (every entry since the install, by statement, 10,000 a call), `since_tail_rows` / `since_tail_ms` (the last commit), `changed_us` (`changes::changed` for 1,000 node ids), `changed_any_us` |
 
 A later slice adds a measurement by writing `fn(&mut Run) -> Result<(),
 String>` and adding it to `MEASURES`: `Run` gives the loaded graph, the
@@ -389,3 +391,56 @@ enterprise as its original. At 1M the 454,546 instructions fall into 18
 classes of two and 454,510 alone. A class is a candidate, as `check`'s are:
 two stations of one design are two stations, and a duplicate pair is for a
 person or a rule to decide on; nothing is merged.
+
+## Change tracking: `changes`
+
+`mfg-bench --only changes` (lines labelled `g5-changes` in
+`bench/results/mfg.jsonl`), release build, one run per size on a shared,
+busy machine. Writes a second, without the journal / with it, for the two
+rounds of each (the spread between rounds of the same thing is up to about
+40%, so read the ratios, not the digits):
+
+| dataset | tier | node set | edge add | edge delete |
+|---|---|---|---|---|
+| n10000-s1 | memory | 345k, 649k / 116k, 153k | 211k, 256k / 52k, 73k | 356k, 431k / 68k, 73k |
+| n10000-s1 | file | 432k, 618k / 145k, 140k | 252k, 224k / 51k, 64k | 360k, 375k / 66k, 68k |
+| n100000-s1 | memory | 377k, 576k / 126k, 91k | 164k, 154k / 50k, 47k | 278k, 205k / 52k, 50k |
+| n100000-s1 | file | 376k, 528k / 132k, 118k | 147k, 144k / 45k, 47k | 241k, 243k / 46k, 47k |
+| n1000000-s1 | memory | 326k, 552k / 132k, 113k | 90k, 103k / 41k, 44k | 146k, 148k / 28k, 40k |
+| n1000000-s1 | file | 260k, 444k / 88k, 80k | 72k, 86k / 22k, 36k | 90k, 124k / 19k, 33k |
+
+Log bytes a write, the same at every size and on both tiers: a node
+property set 19.8 without, 151 with; an edge add 28-29 without, 281-305
+with; an edge delete 13-14 without, 341 with.
+
+| | 10k | 100k | 1M (memory / file) |
+|---|---|---|---|
+| entries after one round of 3 × N writes | 28,766 | 288,242 | 381,763 |
+| bytes an entry (`changes.status`) | 54 | 54 | 54 |
+| `since` over every entry, 10,000 a call | 3.4-3.9 ms (3 calls) | 36-42 ms (29) | 53-55 / 53-95 ms (39) |
+| `since` for the last commit | 0.01 ms | 0.01 ms | 0.01 ms |
+| `changes::changed`, 1,000 ids | 0.26 ms | 0.30-0.32 ms | 0.30 / 0.51 ms |
+| `changes::changed_any` | < 1 µs | ~1 µs | ~1 µs |
+
+What it says:
+
+- **The journal is not free on writes.** Node writes run at about a third
+  to a quarter of their speed without it, edge writes at a quarter to a
+  fifth (edge deletes on the 1M file tier, the worst case, at about a
+  fifth). That is far more than the 17% the review measured for a hook
+  that does nothing: per edge write the hook reads the state and three
+  entries, checks that both endpoints exist, and writes one record that
+  replaces three `i` entries and three `r` index entries and the 50-byte
+  state, about 280-340 bytes of log against 13-29. The cost is what the
+  revision index and the per-write state cost, not the hook machinery.
+- **Reading is cheap.** `since` streams about 7-8 million entries a second
+  from the revision index; the question a consumer asks after a small
+  change (the last commit) is a hundredth of a millisecond whatever the
+  journal holds, and `changed_any` reads one record.
+- **A database without the journal pays nothing**: the engine is
+  unchanged, and no hook runs (the rounds without the journal after one
+  with it, once it is dropped, are as fast as the first).
+- Cheaper writes would come from not rewriting the state on every write
+  (counting entries only when the cap is near) and from a revision index
+  keyed more compactly; both keep the property and are for a later slice
+  if the cost matters to an application.

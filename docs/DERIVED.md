@@ -339,7 +339,10 @@ The run-to-run spread on this machine was about 25% and the differences
 point both ways: no cost shows above the noise. In the quietest pair the
 difference was under 1%.
 
-## `changes`: which nodes and edges changed
+## `changes`: which nodes and edges changed (*built*)
+
+*Built (G5). Shown by `tests/changes.rs` and `bench/tests/mfg_changes.rs`;
+the user-facing description is in `docs/EXTENSIONS.md`.*
 
 `CREATE EXTENSION changes` starts a journal of *which* nodes and edges
 changed and at what revision. It does not keep old values: the graph has the
@@ -347,20 +350,113 @@ current ones, and that is what a rebuild needs.
 
 ```
 CALL changes.since(revision: 1042, limit: 1000)   ids changed after a revision, oldest change first
-CALL changes.status()                             oldest revision still answerable, entries, bytes
+CALL changes.since(revision: 1042, kinds: ["node"], after: "1100:node:7")
+CALL changes.status()                             oldest revision still answerable, entries, bytes, cap
 CALL changes.release(below: 1500)                 forget changes at or below a revision
+CALL changes.cap(entries: 100000)                 bound the journal
 ```
 
-- An id appears once, with the latest revision at which it changed and what
-  happened to it last (`put` or `drop`). A node whose edges changed is listed
-  as well, as `adjacency`, because much derived data depends on a node's
-  surroundings and not on its properties.
-- The journal is bounded (`cap:` at install, in entries). When the bound
-  forces it to forget, `since` for a revision older than what it still holds
-  says so plainly, and the consumer rebuilds from a scan. It never returns a
-  partial list as if it were whole.
-- Its cost on a write is one extension record. It is measured in the
-  benchmark and stated here.
+What is true now, and what this slice decided where the plan was open:
+
+- **Entries.** For every committed change to a node or an edge, by every
+  path G4 lists, the journal holds one entry per (kind, id): `node`,
+  `edge` or `adjacency`, its latest change (`put`: it exists with what the
+  graph holds; `drop`: it is gone) and the revision of that change. An
+  edge write gives the edge's entry and an `adjacency` entry for each
+  endpoint before and after (four for a replayed `EdgeAdd` that moves an
+  edge). A node property or label change is not an adjacency change. An
+  adjacency entry is `put` while its node exists and `drop` once it is
+  gone: when a node is deleted or appears, its adjacency entry, if it has
+  one, is rewritten with it, so a `put` never names a node that is gone.
+- **The revision an entry carries.** A transaction's final revision is not
+  known while its hooks run, so an entry carries `Graph::log_end()` as the
+  hook saw it: the log position just past the record of the write. Every
+  record of a transaction lies after the revision committed before it and
+  before its commit marker, so a change committed by the transaction that
+  took the database from R1 to R2 carries r with R1 < r < R2. Hence, for a
+  caller reading `revision` at commit boundaries, `since(R1)` taken at R2
+  lists every id written by a transaction committed after R1, at its latest
+  change, and none written at or before R1. Entries come in (revision,
+  kind, id) order, kinds node < edge < adjacency, the same on both tiers.
+  Positions within an open transaction are positions, not revisions any
+  caller can have read; a caller that reads `log_end()` mid-transaction
+  (as `structure` does) gets the same property for that position.
+- **The proof** (`since_lists_exactly_what_changed_between_any_two_commit_boundaries`):
+  a seeded random workload of 220 steps through statements of every kind,
+  the graph API, `begin()` blocks, `BEGIN ... COMMIT`, `execute_batch`,
+  JSON Lines, `apply_op` (new ids, an edge moved to other endpoints, node
+  deletes, `Clear`), `import_legacy`, `CLEAR`, index definitions, writes
+  that change nothing, rolled-back blocks, failing hooks and releases. At
+  every boundary, for every earlier boundary, `since` either answers or
+  refuses; an answer contains every node, edge and adjacency (a node's
+  incident edges, rendered whole) whose exported state differs, nothing
+  that a witness extension did not hear of in between, each id once, in
+  order, with `put` exactly for what exists, and the Rust questions and
+  the statement in slices of 7 and by kind say the same. The same with a
+  cap of 40 entries, and on the file tier with the same revisions and a
+  byte-identical journal. Mutating the journal (its revision, an endpoint,
+  the adjacency rewrite) fails it.
+- **Rolled back.** Entries are extension records in the writing
+  transaction, so a rollback, a failing statement, a failing hook and a
+  block the engine rolled back itself (`Error::Full` past `max_memory`)
+  leave none: the journal's keyspace is byte-identical afterwards.
+- **The floor.** `since(R)` answers when R is at or above the journal's
+  floor and is otherwise an error naming why and the floor ("...; it
+  answers for revision F and later. Rebuild what was derived from a scan of
+  the graph, then ask CALL changes.since(revision: F) or later"). The
+  floor is raised by: installation (to `log_end()` at install, so a
+  `CREATE EXTENSION` in a statement of its own answers for the revision
+  before it, and one after other writes in a block does not); `release`
+  (to `below:`, clamped to the log's end; with `limit:` in slices, each to
+  the last entry it forgot); the cap (to the revision of each entry it
+  pushes out); and `CLEAR` or any other bulk notification (to `log_end()`
+  in its hook: everything before must be rebuilt, and the journal answers
+  exactly from there on). `CLEAR` keeps the cap.
+- **The cap.** In entries, default 1,000,000, at least 8 (one write makes
+  at most five entries, so eviction never forgets what it is writing).
+  `CREATE EXTENSION` takes no arguments, so "set when it is installed"
+  means `CALL changes.cap(entries:)` in the same block as the install;
+  lowering it forgets the oldest entries at once. Past it, each write
+  forgets the oldest entries in the same record.
+- **Status.** `oldest, why, entries, bytes, cap, revision`. `bytes` is what
+  the keyspace holds: 54 bytes an entry (its id record and its revision
+  index record, keys with the namespace and values) plus the 59-byte state.
+- **Recovery and replicas** replay the journal's records and never run
+  its hooks: after crash recovery and `from_replica` the keyspace is
+  byte-identical to the source's and a witness extension's list of hook
+  calls is unchanged.
+- **For other extensions** (`glider::ext::changes`): `answers(g, R)`,
+  `oldest(g)`, `changed(g, R, kind, ids) -> Option<Vec<bool>>`,
+  `changed_any(g, R, kind) -> Option<bool>` (from a per-kind latest
+  revision in the state, no scan), `entry(g, kind, id)`, `since(g, R,
+  kinds, after, limit)` and `status(g)`. `None` means "cannot answer:
+  assume everything changed". `structure` uses `changed_any`: a kept
+  colouring is stale exactly when a node or an edge changed since its
+  position, when the journal answers for it; otherwise the conservative
+  answer of before (any write but its own).
+- **Check.** The journal implements `Extension::check`: records that do not
+  decode, a `put` for an id that does not exist, an entry or a floor past
+  the log's end (`log_end()`, so the open transaction's entries are not
+  faults), an entry missing from the revision index or an index entry
+  that is not its id's latest change, and, over a walk from the start in
+  one slice, a state count that differs from the entries held.
+- **Bounds (D6).** `since` returns at most 10,000 rows a call, continued
+  with `after:` (the message gives it); `release` and `cap` forget 4,096
+  entries a write. Every loop passes through `step(n)` in
+  `src/ext/changes.rs`, the one place G2 is to count. A write reads the
+  state and the entries it replaces (one to five) and writes one record.
+- **Cost** (`bench/KNOWLEDGE.md`, "Change tracking", 10k to 1M nodes,
+  both tiers): with the journal, node writes run at a third to a quarter
+  of their speed and edge writes at a quarter to a fifth; a node write
+  logs about 151 bytes instead of 20, an edge write 281-341 instead of
+  13-29. An entry holds 54 bytes. `since` reads about 7-8 million entries
+  a second, `since` for the last commit takes 0.01 ms, `changed` for 1,000
+  ids 0.3-0.5 ms. This is far above the 17% of a hook that does nothing:
+  the price is the revision index and the state rewritten per write, and
+  it is where a later slice would make it cheaper. A database without the
+  journal pays nothing.
+- Left out, as planned: old values, named consumers with cursors (a
+  consumer keeps its own revision), and vectors (G10).
 
 ## `check`: is the graph whole (*built*)
 
@@ -565,7 +661,11 @@ in `docs/EXTENSIONS.md`.
   stale. A rolled-back keep leaves nothing. A colouring kept inside an open
   transaction is fresh until something else is written in it.
 - **Decided here.** Staleness is by position, not by comparison: a
-  change that a colouring does not depend on still makes it stale. Being
+  change that a colouring does not depend on still makes it stale. Since
+  G5, when the change journal is installed and answers for the
+  colouring's position, only a change to a node or an edge makes it stale
+  (an index, another extension's writes, a write that changes nothing do
+  not); otherwise the rule above applies. Being
   stale is not a fault for `check.run`'s `derived` check (kept colourings
   are not maintained, and say when they are stale); only records that do not
   decode are. `write:` sets the colour as a text property and refuses a key
@@ -754,7 +854,7 @@ tests, and adds its section to `docs/EXTENSIONS.md` and its numbers to
 | G2 | budgets for procedures (D6) | |
 | G3 | the manufacturing generator and the harness's skeleton | |
 | G4 | edge and bulk write hooks (D5) | |
-| G5 | `changes` | G1, G4 |
+| G5 | `changes` (*built*) | G1, G4 |
 | G6 | `check` (*built*) | G1 |
 | G7 | `structure`: colours, classes (*built*) | G2 |
 | G8 | `structure`: templates, path patterns, plan, expand | G7 |
