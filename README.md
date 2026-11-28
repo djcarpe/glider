@@ -313,6 +313,11 @@ numbers. A 100 GB B+tree (`pagebench`) was built in 15 minutes at 1.1 GB of
 RAM, answered cold point lookups in 0.5 ms (1.35 disk reads each), scanned at
 450 MB/s, and recovered from 50 kill -9s in a row.
 
+[`bench/KNOWLEDGE.md`](bench/KNOWLEDGE.md) describes a generated
+manufacturing graph (plants to work instructions, stations built from a few
+designs) that comes with its own truth and questions with known answers, and
+the baseline retrieval and algorithm numbers measured on it.
+
 `glider bench <n>` runs a quick synthetic benchmark on your own hardware.
 
 ### Test data

@@ -110,6 +110,11 @@ impl R {
     fn chance(&mut self, per_mille: u64) -> bool {
         self.below(1000) < per_mille
     }
+    /// One of `xs`, by value (a named method, so that a `&str` argument
+    /// position does not leave the element type to inference).
+    fn word(&mut self, xs: &[&'static str]) -> &'static str {
+        xs[self.index(xs.len())]
+    }
     fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
         &xs[self.index(xs.len())]
     }
@@ -299,16 +304,16 @@ fn instruction(r: &mut R, topic: usize, comp: usize, spec: i64) -> (String, Stri
         let a = r.index(t.terms.len());
         let b = (a + 1 + r.index(t.terms.len() - 1)) % t.terms.len();
         let s = FRAMES[f as usize]
-            .replace("{o}", *r.pick(OPENERS))
+            .replace("{o}", r.word(OPENERS))
             .replace("{a}", t.terms[a])
             .replace("{b}", t.terms[b])
-            .replace("{t}", *r.pick(t.tools))
+            .replace("{t}", r.word(t.tools))
             .replace("{c}", c);
         text.push(' ');
         text.push_str(&s);
     }
     text.push(' ');
-    text.push_str(&cap(*r.pick(t.checks)));
+    text.push_str(&cap(r.word(t.checks)));
     text.push('.');
     (title, text)
 }
@@ -474,8 +479,8 @@ fn catalog(seed: u64, designs: usize) -> Catalog {
             r.index(TOPICS.len())
         };
         let t = &TOPICS[topic];
-        let kind = *r.pick(t.tools);
-        let maker = *r.pick(MAKERS);
+        let kind = r.word(t.tools);
+        let maker = r.word(MAKERS);
         let spec = spec_value(&mut r, topic);
         tools.push(Tool {
             id: 0,
@@ -563,7 +568,7 @@ fn catalog(seed: u64, designs: usize) -> Catalog {
             code: String::new(),
             name,
             part_number: format!("PN-{:05}-{:02}", 10_000 + (i * 7919) % 90_000, r.below(100)),
-            material: *r.pick(PART_KINDS[kind].1),
+            material: r.word(PART_KINDS[kind].1),
             size,
             comp,
             supplier: if i < n_sup { i } else { r.index(n_sup) },
@@ -1382,7 +1387,7 @@ pub fn generate(
                             .s("number", &format!("WO-{}-{:05}", lcode, w + 1))
                             .i("quantity", lr.range(1, 40) * 10)
                             .s("due", &date(DAY0 + lr.range(30, 1400)))
-                            .s("status", *lr.pick(STATUSES)),
+                            .s("status", lr.word(STATUSES)),
                     )?;
                     o.edge("FOR_MODEL", wo, cat.models[m].id, Obj::new())?;
                     o.edge("ON_LINE", wo, line, Obj::new())?;
