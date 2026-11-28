@@ -543,6 +543,7 @@ CALL vector.search(space: "text", vector: [...], top: 10)                     id
 CALL vector.search(space: "text", vector: [...], top: 10, labels: ["WorkInstruction"], min_score: 0.4)
 CALL vector.similar(space: "text", id: 12, top: 10)                          from a stored vector
 CALL vector.stale(space: "text")                                             what to put again
+CALL vector.complete(space: "text")                                          record it complete, if it is
 CALL vector.hashes(space: "text", ids: [12, 13])                             the stored source hashes
 CALL vector.get(space: "text", ids: [12])     CALL vector.delete(space: "text", ids: [12])
 CALL vector.spaces()                          CALL vector.drop(space: "text")
@@ -598,9 +599,13 @@ one record read when nothing was written since, and otherwise a walk of
 the journal's changes since P, never a count. `counts: true` counts the
 stale, missing (a node of the space's labels without one) and unknown
 vectors and puts them in the message; `fresh: "require"` is an error
-unless the space is current, counting when it has to. A count that finds
-everything fresh records that the space is current (a small write), so
-the next searches can say `yes` cheaply. `vector.spaces()` shows
+unless the space is fresh, using the record when it can and counting
+when it has to (the message says which). Only `CALL
+vector.complete(space: "text")` records a space complete: it counts and,
+if everything is fresh, writes that down, so later searches can say `yes`
+without counting; otherwise it reports what stands in the way and writes
+nothing. Run it after bringing a space up to date. Questions (`search`,
+`similar`, `spaces`, `stale`, `get`, `hashes`) never write. `vector.spaces()` shows
 `current` and `current_since` for every space, and the counts with
 `counts: true`. `vector.stale` lists them, in slices (`limit:`, then
 `after:` as its message says), with why. Install `changes` before putting

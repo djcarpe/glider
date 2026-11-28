@@ -61,8 +61,10 @@
 //! not seen: that is where the engine's knowledge stops.
 //!
 //! **Whether a space is current** ([`current`]) is answered without
-//! counting: a full count that finds everything fresh records the position
-//! it started at and where that record ends (`k<space>`). A search reports
+//! counting: `vector.complete`, and only it, counts the space and, when
+//! everything is fresh, records the position it counted at and where that
+//! record ends (`k<space>`). No question (search, similar, spaces, stale,
+//! get, hashes) writes anything. A search reports
 //! `yes` when nothing was written since that record, or when the journal
 //! shows no change since that made a vector stale or left a node missing;
 //! `no` naming one; `unknown` otherwise. `counts: true` counts, and with
@@ -157,6 +159,11 @@ const PROCEDURES: &[Spec] = &[
         name: "similar",
         args: "(space, id | key, top, in, labels, min_score, fresh, counts)",
         doc: "Search from a stored vector, in its space or in another whose dims, metric, algorithm, model and model version agree",
+    },
+    Spec {
+        name: "complete",
+        args: "(space)",
+        doc: "Count the space and, only if every vector is fresh and none is missing, record it complete at that revision, so searches can say it is current without counting; otherwise report what stands in the way and record nothing",
     },
     Spec {
         name: "stale",
@@ -1165,7 +1172,7 @@ impl Current {
                 "space current: no, established complete at revision {since}, but {why}; CALL vector.stale lists what to put again"
             ),
             Current::Unknown { why } => format!(
-                "space current: unknown, {why}; counts: true or vector.stale counts it"
+                "space current: unknown, {why}; counts: true counts it, and CALL vector.complete records it complete once it is fresh"
             ),
         }
     }
@@ -1666,17 +1673,10 @@ fn spaces_proc(g: &mut Graph, a: &Args) -> Result<QueryResult> {
     let counts = a.bool("counts", false);
     let mut rows = Vec::new();
     for s in spaces(g) {
-        let mut cur = current(g, &s)?;
+        let cur = current(g, &s)?;
         let mut tallied = [Value::Null, Value::Null, Value::Null];
         if counts {
-            let at = g.log_end();
             let t = tally(g, &s, &Judge::new(g, &s))?;
-            if t.clean() {
-                if !matches!(cur, Current::Yes { .. }) {
-                    establish(g, &s, at)?;
-                }
-                cur = Current::Yes { since: at };
-            }
             tallied = [
                 Value::Int(t.stale as i64),
                 Value::Int(t.missing as i64),
@@ -1986,7 +1986,7 @@ fn search_result(
     from: Option<(Fresh, String)>,
 ) -> Result<QueryResult> {
     let judge = Judge::new(g, s);
-    let mut cur = current(g, s)?;
+    let cur = current(g, s)?;
     let require = matches!(fresh, Freshness::Require);
     if require {
         if let Some((f, why)) = &from {
@@ -1999,17 +1999,16 @@ fn search_result(
         }
     }
     // The exact counts: asked for, or needed because the space is not
-    // known to be current and freshness is required.
+    // known to be current and freshness is required. A question never
+    // writes: a clean count is reported, not recorded.
+    let known = matches!(cur, Current::Yes { .. });
     let mut tally_note = String::new();
-    if counts || (require && !matches!(cur, Current::Yes { .. })) {
-        let at = g.log_end();
+    if require && known {
+        tally_note = "; fresh required: established from the record, without a count".into();
+    }
+    if counts || (require && !known) {
         let t = tally(g, s, &judge)?;
-        if t.clean() {
-            if !matches!(cur, Current::Yes { .. }) {
-                establish(g, s, at)?;
-            }
-            cur = Current::Yes { since: at };
-        } else if require {
+        if require && !t.clean() {
             return Err(Error::Msg(format!(
                 "space '{}' is not fresh ({}); with fresh: \"require\" that is an error. CALL vector.stale(space: '{}') lists them: put them again",
                 s.name,
@@ -2018,6 +2017,12 @@ fn search_result(
             )));
         }
         tally_note = format!("; counted: {}", t.say());
+        if require && !known {
+            tally_note.push_str(&format!(
+                "; fresh required and counted, since the space is not recorded complete: CALL vector.complete(space: '{}') records it, so that later searches need not count",
+                s.name
+            ));
+        }
     }
     let found = search(g, s, q, opts)?;
     let mut rows = Vec::with_capacity(found.rows.len());
@@ -2155,12 +2160,50 @@ fn cursor_arg(a: &Args) -> Result<Cursor> {
     Err(bad())
 }
 
+/// `vector.complete`: count the space and, only when every vector is
+/// fresh and no node of its labels lacks one, record that it is complete
+/// at the position it counted at. The one procedure that records it.
+fn complete_proc(g: &mut Graph, a: &Args) -> Result<QueryResult> {
+    let s = space_or_err(g, &name_arg(a)?)?;
+    let at = g.log_end();
+    let t = tally(g, &s, &Judge::new(g, &s))?;
+    let row = vec![
+        Value::Text(s.name.clone()),
+        Value::Bool(t.clean()),
+        Value::Int(t.fresh as i64),
+        Value::Int(t.stale as i64),
+        Value::Int(t.missing as i64),
+        Value::Int(t.unknown as i64),
+    ];
+    let mut r = QueryResult::table(
+        ["space", "complete", "fresh", "stale", "missing", "unknown"]
+            .iter()
+            .map(|c| c.to_string())
+            .collect(),
+        vec![row],
+    );
+    if t.clean() {
+        establish(g, &s, at)?;
+        r.touched = 1;
+        r.message = Some(format!(
+            "space '{}' is complete: recorded at revision {at}; searches report it current until something it follows changes",
+            s.name
+        ));
+    } else {
+        r.message = Some(format!(
+            "space '{}' is not complete ({}); nothing recorded. CALL vector.stale(space: '{}') lists what to put again",
+            s.name,
+            t.say(),
+            s.name
+        ));
+    }
+    Ok(r)
+}
+
 fn stale_proc(g: &mut Graph, a: &Args) -> Result<QueryResult> {
     let s = space_or_err(g, &name_arg(a)?)?;
     let limit = a.usize("limit", 1_000).clamp(1, MAX_ROWS);
     let cursor = cursor_arg(a)?;
-    let start = g.log_end();
-    let whole = matches!(cursor, Cursor::Vectors(None));
     let judge = Judge::new(g, &s);
     let mut rows: Vec<Vec<Value>> = Vec::new();
     let mut looked = 0u64;
@@ -2214,15 +2257,6 @@ fn stale_proc(g: &mut Graph, a: &Args) -> Result<QueryResult> {
         if !full {
             next = None;
         }
-    }
-    // One call that saw everything and found nothing: the space is
-    // established complete at the position the call started from.
-    if whole
-        && next.is_none()
-        && rows.is_empty()
-        && !matches!(current(g, &s)?, Current::Yes { .. })
-    {
-        establish(g, &s, start)?;
     }
     let mut r = QueryResult::table(
         vec![
@@ -2283,6 +2317,7 @@ impl Extension for Vector {
             "search" => search_proc(g, a),
             "similar" => similar_proc(g, a),
             "stale" => stale_proc(g, a),
+            "complete" => complete_proc(g, a),
             _ => unreachable!("dispatch checks the procedure list"),
         }
     }

@@ -1034,6 +1034,7 @@ fn staleness_is_reported_from_the_journal_and_never_hidden() {
     assert!(rows.iter().all(|r| r[1] == Value::from("unknown")));
     put(&mut g, "s", &docs[..2], &[vec![1.0, 0.0], vec![0.0, 1.0]]);
     assert_eq!(stale_all(&mut g, "s", 100).0.len(), 0);
+    q(&mut g, "CALL vector.complete(space: 's')");
     let r = q(
         &mut g,
         "CALL vector.search(space: 's', vector: [1, 0], fresh: 'require')",
@@ -1562,9 +1563,12 @@ fn a_search_says_cheaply_whether_its_space_is_current_and_never_claims_what_it_h
         "{m}"
     );
     assert_eq!(current_of(&mut g, "s"), "unknown");
-    // Counting establishes it.
+    // Counting reports it and records nothing; `complete` records it.
     let m = search_msg(&mut g, "s", ", counts: true");
     assert!(m.contains("counted: stale 0, missing 0, unknown 0"), "{m}");
+    assert!(m.contains("space current: unknown"), "{m}");
+    let r = q(&mut g, "CALL vector.complete(space: 's')");
+    assert_eq!(r.rows[0][1], Value::Bool(true));
     let m = search_msg(&mut g, "s", "");
     assert!(
         m.contains("space current: yes, established complete at revision"),
@@ -1579,6 +1583,7 @@ fn a_search_says_cheaply_whether_its_space_is_current_and_never_claims_what_it_h
         m.contains("space current: yes") && !m.contains("counted"),
         "{m}"
     );
+    assert!(m.contains("established from the record"), "{m}");
     // A write that touches nothing of it: still current, from the journal.
     let other = nodes(&mut g, "Other", 1)[0];
     g.set_node_prop(other, "x", Value::Int(1)).unwrap();
@@ -1627,9 +1632,12 @@ fn a_search_says_cheaply_whether_its_space_is_current_and_never_claims_what_it_h
     );
     assert!(e.contains("missing 1"), "{e}");
     put(&mut g, "s", &[extra], &[vec![3.0, 1.0]]);
-    // `require` counts when it must, and establishes what it finds.
+    // `require` counts when it must, says so, and records nothing.
     let m = search_msg(&mut g, "s", ", fresh: 'require'");
     assert!(m.contains("counted: stale 0, missing 0, unknown 0"), "{m}");
+    assert!(m.contains("CALL vector.complete"), "{m}");
+    assert!(search_msg(&mut g, "s", "").contains("space current: unknown"));
+    q(&mut g, "CALL vector.complete(space: 's')");
     assert!(search_msg(&mut g, "s", "").contains("space current: yes"));
     // spaces() counts on request.
     q(
@@ -1660,7 +1668,7 @@ fn the_record_that_a_space_is_current_is_not_trusted_where_it_must_not_be() {
             &docs,
             &[vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 1.0]],
         );
-        search_msg(g, "s", ", counts: true");
+        q(g, "CALL vector.complete(space: 's')");
         assert_eq!(current_of(g, "s"), "yes");
         docs
     };
@@ -1703,7 +1711,7 @@ fn the_record_that_a_space_is_current_is_not_trusted_where_it_must_not_be() {
     assert_eq!(current_of(&mut g, "s"), "unknown");
     q(&mut g, "BEGIN");
     put(&mut g, "s", &docs[2..], &[vec![1.0, 1.0]]);
-    search_msg(&mut g, "s", ", counts: true");
+    q(&mut g, "CALL vector.complete(space: 's')");
     assert_eq!(current_of(&mut g, "s"), "yes");
     err(
         &mut g,
@@ -1717,7 +1725,7 @@ fn the_record_that_a_space_is_current_is_not_trusted_where_it_must_not_be() {
     assert_eq!(current_of(&mut g, "s"), "unknown");
     // ... and one that fails on its own leaves what was established.
     put(&mut g, "s", &docs[2..], &[vec![1.0, 1.0]]);
-    search_msg(&mut g, "s", ", fresh: 'require'");
+    q(&mut g, "CALL vector.complete(space: 's')");
     err(
         &mut g,
         &format!(
@@ -1775,4 +1783,82 @@ fn the_record_that_a_space_is_current_is_not_trusted_where_it_must_not_be() {
     assert_eq!(current_of(&mut c, "s"), "no");
     drop(f);
     cleanup(&path);
+}
+
+#[test]
+fn no_question_writes_whatever_state_the_space_is_in() {
+    let mut g = Graph::memory();
+    q(&mut g, "CREATE EXTENSION changes");
+    q(&mut g, "CREATE EXTENSION vector");
+    q(
+        &mut g,
+        "CALL vector.create(space: 's', dims: 2, labels: ['Doc'])",
+    );
+    q(&mut g, "CALL vector.create(space: 't', dims: 2)");
+    let docs = nodes(&mut g, "Doc", 3);
+    let vs = [vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 1.0]];
+    put(&mut g, "s", &docs, &vs);
+    put(&mut g, "t", &docs, &vs);
+    let questions = [
+        "CALL vector.search(space: 's', vector: [1, 0])".to_string(),
+        "CALL vector.search(space: 's', vector: [1, 0], fresh: 'report')".to_string(),
+        "CALL vector.search(space: 's', vector: [1, 0], counts: true)".to_string(),
+        "CALL vector.search(space: 's', vector: [1, 0], fresh: 'require')".to_string(),
+        format!("CALL vector.similar(space: 's', id: {}, in: 't')", docs[0]),
+        format!(
+            "CALL vector.similar(space: 's', id: {}, counts: true)",
+            docs[0]
+        ),
+        format!(
+            "CALL vector.similar(space: 's', id: {}, fresh: 'require')",
+            docs[0]
+        ),
+        "CALL vector.spaces()".to_string(),
+        "CALL vector.spaces(counts: true)".to_string(),
+        "CALL vector.stale(space: 's')".to_string(),
+        "CALL vector.stale(space: 's', limit: 1)".to_string(),
+        format!("CALL vector.get(space: 's', ids: [{}])", docs[0]),
+        format!("CALL vector.hashes(space: 's', ids: [{}])", docs[0]),
+    ];
+    let ask_all = |g: &mut Graph, state: &str| {
+        assert_eq!(current_of(g, "s"), state);
+        for src in &questions {
+            let (ks, rev, end) = (keyspace(g, vector::NS), g.revision(), g.log_end());
+            // A refused `require` is still a question.
+            let _ = query::execute(g, src);
+            assert_eq!(keyspace(g, vector::NS), ks, "{state}: {src} wrote");
+            assert_eq!(
+                (g.revision(), g.log_end()),
+                (rev, end),
+                "{state}: {src} moved the revision"
+            );
+        }
+        assert_eq!(current_of(g, "s"), state);
+    };
+    // Fresh but never recorded, then current, then changed since.
+    ask_all(&mut g, "unknown");
+    q(&mut g, "CALL vector.complete(space: 's')");
+    ask_all(&mut g, "yes");
+    g.set_node_prop(docs[1], "text", Value::from("changed"))
+        .unwrap();
+    ask_all(&mut g, "no");
+    // `complete` on a space that is not complete records nothing.
+    let before = keyspace(&g, vector::NS);
+    let rev = g.revision();
+    let r = q(&mut g, "CALL vector.complete(space: 's')");
+    assert_eq!(r.rows[0][1], Value::Bool(false));
+    assert_eq!(r.rows[0][3], Value::Int(1));
+    assert!(r.message.unwrap().contains("nothing recorded"));
+    assert_eq!(keyspace(&g, vector::NS), before);
+    assert_eq!(g.revision(), rev);
+    // Puts and deletes never record completeness on their own.
+    put(&mut g, "s", &docs[1..2], &vs[1..2]);
+    assert_eq!(current_of(&mut g, "s"), "yes");
+    q(
+        &mut g,
+        &format!("CALL vector.delete(space: 's', ids: [{}])", docs[2]),
+    );
+    put(&mut g, "s", &docs[2..], &vs[2..]);
+    assert_eq!(current_of(&mut g, "s"), "unknown");
+    ask_all(&mut g, "unknown");
 }

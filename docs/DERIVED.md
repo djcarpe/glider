@@ -920,16 +920,21 @@ What is true now, and what this slice decided where the plan was open:
   named vector went stale or a node of its labels has none), or `unknown`
   (not established, or the engine cannot tell), with P where there is one.
   `yes` is never said without a count that found the space entirely
-  fresh. *Who records it and when*: a full count that finds no stale,
-  missing or unknown vector writes one record, `k<space>`, holding the
-  position the count started at (P) and the end of that record itself
+  fresh. *Who records it and when*: only `CALL vector.complete(space:)`,
+  an explicit act a maintainer runs after bringing a space up to date. It
+  counts the space and, only when no vector is stale or unknown and no
+  node of its labels lacks one, writes one record, `k<space>`, holding
+  the position the count started at (P) and the end of that record itself
   (its size is known before it is written, as `structure`'s chain is);
-  the counts are made by `search` or `similar` with `counts: true` or
-  with `fresh: "require"` when the space is not already current, by
-  `vector.spaces(counts: true)`, and by a `vector.stale` call that saw the
-  whole space in one slice and found nothing. Establishing is therefore a
-  write (a few dozen log bytes) made by a read, once per change of state;
-  it commits and rolls back with the statement. *How it is read*: when
+  otherwise it reports the counts and writes nothing. **No question
+  writes**: `search` and `similar` (whatever `fresh:` and `counts:`),
+  `spaces()` (with or without counts), `stale`, `get` and `hashes` leave
+  the keyspace and the revision as they found them, in every state of the
+  space (`no_question_writes_whatever_state_the_space_is_in`). A question
+  that writes would move the revision (D2), make other derived data judged
+  by position look stale, join and fail with a caller's transaction, and
+  be impossible with read-only access. `put` and `delete` never record
+  completeness either, even when a batch would leave a space complete. *How it is read*: when
   the log ends where that record ends (nothing at all was written since),
   `yes` at once; otherwise the journal must answer for P (installed,
   floor at or below P, not purging), and its entries of the kinds the
@@ -949,8 +954,12 @@ What is true now, and what this slice decided where the plan was open:
   The exact counts stay available: `counts: true` on `search`/`similar`
   (in the message), `vector.spaces(counts: true)` (columns `stale`,
   `missing`, `unknown`; `current` and `current_since` are always there),
-  and `vector.stale`. `fresh: "require"` refuses unless the space is
-  current, counting when it is not known to be.
+  and `vector.stale`. `fresh: "require"` uses the record when it is
+  valid ("established from the record, without a count" in the message)
+  and otherwise counts without recording, and says so, naming
+  `vector.complete`, so a caller who keeps taking the slow path knows to
+  record the space once it is up to date. It refuses unless the space is
+  fresh.
 
   The journal is read through its Rust API: `oldest` and `answers` once a
   call, then one `entry` lookup a vector; a key space reads the journal's

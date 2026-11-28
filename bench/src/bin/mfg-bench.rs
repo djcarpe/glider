@@ -1154,13 +1154,12 @@ fn vector(run: &mut Run) -> Result<(), String> {
         // Searches: every vector, then one label.
         let queries = if n > 500_000 { 5 } else { 20 };
         let space = vx::space(&run.g, &name).ok_or("space")?;
-        // Counting once establishes that the space is complete; after it, a
-        // search reports that from one record.
-        let qv = rng.vector(dims);
-        let (_, establish_ms) = run.run(
-            &format!("CALL vector.search(space: '{name}', vector: $q, top: 10, counts: true)"),
-            &[("q".to_string(), float_list(&qv))],
-        )?;
+        // `vector.complete` counts the space and records it complete; after
+        // it, a search reports that from one record.
+        let (r, establish_ms) = run.run(&format!("CALL vector.complete(space: '{name}')"), &[])?;
+        if r.rows.first().and_then(|row| row.get(1)) != Some(&Value::Bool(true)) {
+            return Err(format!("the space should be complete: {:?}", r.message));
+        }
         for labels in [None, Some("WorkInstruction")] {
             let mut counted = Vec::new();
             let mut required = Vec::new();
