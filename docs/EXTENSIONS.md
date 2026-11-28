@@ -190,9 +190,16 @@ too, and its steps count against it. A procedure that panics leaves the
 thread's budgets as they were. A procedure that carries on after
 a stop, or returns normally from one, still fails: the statement ends with
 the budget's error whatever the procedure returned, and rolls back, so a
-procedure stopped part-way has written nothing. Inside `BEGIN`, a stopped
-statement that had written anything rolls the open transaction back with it
-(the error says so); one that had written nothing leaves it open.
+procedure stopped part-way has written nothing, and nothing its write hooks
+wrote for it is left either. Inside the caller's transaction, a stopped
+statement that had written anything is a failure the engine rolls back,
+under the same rule as a failed hook: a block opened with `BEGIN` or
+`Graph::begin()` is spent (the error says the transaction was rolled back,
+later statements are refused, `COMMIT` says nothing was committed), and a
+transaction opened by assigning `autocommit` goes on in a new one. A
+stopped statement that had written nothing leaves the transaction open. A
+panic through a procedure and a hook together leaves the thread's budgets,
+the meter, autocommit and the hook state as they were.
 
 `max_millis` needs a clock, so it is not kept on wasm32, for procedures as for
 queries; `max_steps` is kept everywhere.

@@ -241,10 +241,18 @@ the paged tier took 1.3 s before the hub was cut up).
 **Leaving nothing behind.** A stopped statement rolls back like any failed
 one: a stopped `CALL pagerank(write: "rank")` has written no `rank` (tested at
 every point it can stop, computing or writing), a stopped `context.index()`
-leaves no index. Inside `BEGIN` a failed statement does not normally undo
-what it wrote; a *stopped* one that had written anything rolls the open
-transaction back and says so, so that half of a procedure cannot be
-committed. One that had written nothing leaves the transaction open. A
+leaves no index, and nothing a write hook wrote for the stopped statement
+is left (`tests/budget_blocks.rs`). Inside the caller's transaction, a
+stopped statement that had written anything is one more failure the engine
+rolls back (`Graph::abandon`, the rule G4 set for failed writes and hooks):
+a block opened with `BEGIN` or `Graph::begin()` is spent, so the error says
+the transaction was rolled back, later statements and writes are refused,
+`COMMIT` says nothing was committed, and the next block starts clean; a
+transaction opened by assigning `autocommit` goes on in a new one. Only the
+outermost statement does this: a statement a procedure runs, stopped by its
+own budget, leaves the decision to the procedure; stopped by the outer
+budget, it stops the outer statement, which then rolls back. A stopped
+statement that had written nothing leaves the transaction open. A
 stopped algorithm returns early with partial state that nothing uses; a
 stopped projection build returns an empty projection; a stopped local walk
 ends as if finished, so no whole-graph fallback starts. The memory and spill
