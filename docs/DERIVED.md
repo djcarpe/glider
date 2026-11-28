@@ -240,7 +240,22 @@ in `tests/review_g4.rs`.*
   or document relied on that. A block opened with `begin()` ends only with
   `commit()` or `rollback()` (or `COMMIT`/`ROLLBACK`), and a spent state
   belongs to that block alone: what happens depends only on what the
-  caller did, never on whether some other call ran in between. A
+  caller did, never on whether some other call ran in between. Inside such
+  a block nothing commits before its COMMIT, so "nothing was committed"
+  is true whenever it is said: every operation that has to commit on its
+  own is refused there with an error saying to end the block first, and
+  the block's pending writes stay pending. Found by reading every commit
+  path: `import_jsonl`, `import_jsonl_from`, `import_legacy` (and so
+  `glider <db> migrate` and `Graph::from_bytes` of a legacy image, which
+  use a fresh graph and never meet a block), `COMPACT` / `Graph::compact`,
+  and `execute_batch` (already refused). `Graph::checkpoint` inside a
+  transaction only flushes the log, which recovery ignores without a
+  commit marker, so it commits nothing and is allowed. In a transaction
+  opened by assigning `autocommit = false` these operations commit what is
+  pending, as they always did. Assigning `autocommit = true` in the middle
+  of a `begin()` block does not end the block, but makes the next write
+  autocommit, and that commit takes the block's earlier writes with it: a
+  caller who opens blocks with `begin()` should not assign the field. A
   transaction opened by assigning the public `autocommit` field cannot be
   seen to start or end, so it keeps the behaviour it had before this
   slice: the failing call's error says the transaction was rolled back,
@@ -249,7 +264,12 @@ in `tests/review_g4.rs`.*
   `begin()` later.
 - A hook that panics: the hook state, autocommit and the statement's
   transaction are restored on the way out (the C interface catches panics
-  and keeps the handle, which then stays writable).
+  and keeps the handle, which then stays writable). The transaction is
+  rolled back, the caller's earlier pending writes included. Inside a
+  `begin()` block the block is then spent with the reason ("a write hook
+  panicked"); in a transaction opened by assigning `autocommit = false`
+  the caller learns of the rollback only through the panic itself, and
+  its next writes start a new transaction.
 - With the revision (D2): a write that changes nothing (the same value set
   again, an unset of an absent property, a delete of what is not there) is
   not logged, does not move the revision and is reported to no hook; every

@@ -5039,6 +5039,7 @@ fn label_of(g: &Graph, id: u64) -> Value {
 
 /// Load JSON Lines: one `{"type":"node"|"edge", ...}` object per line.
 pub fn import_jsonl(g: &mut Graph, text: &str) -> Result<(usize, usize)> {
+    g.refuse_in_block("a JSON Lines import")?;
     let was_auto = g.autocommit;
     g.autocommit = false;
     let result = import_lines(g, text);

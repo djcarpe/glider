@@ -71,12 +71,20 @@ functions work in any expression as `<extension>.<function>(...)`.
   `max_memory`, a storage error). A spent state never reaches the next
   block. A transaction opened by assigning `autocommit = false` keeps the
   older behaviour: the failing call's error says the transaction was
-  rolled back, and the caller carries on in a new one. Assigning
-  `autocommit` does not end a block opened with `begin()`.
+  rolled back, and the caller carries on in a new one. Inside a `begin()`
+  block, operations that commit on their own (`import_jsonl`,
+  `import_jsonl_from`, `import_legacy`, `COMPACT`, `execute_batch`) are
+  refused until the block ends; in a field-opened transaction they commit
+  what is pending, as before. Do not assign `autocommit` inside a
+  `begin()` block: it does not end the block, but the next write then
+  autocommits, taking the block's earlier writes with it.
 
-  A hook that panics leaves the handle as it was: its statement's writes
-  are rolled back and autocommit and the hook state restored before the
-  panic goes on, so an embedder that catches panics can keep the handle.
+  A hook that panics leaves the handle usable: the open transaction is
+  rolled back (the caller's earlier pending writes too) and autocommit and
+  the hook state restored before the panic goes on, so an embedder that
+  catches panics can keep the handle. Inside a `begin()` block the block
+  is spent with the reason; in a field-opened transaction the panic is the
+  only report.
 
   An extension that does not ask is never called, and costs nothing. A
   write that changes nothing (a property set to the value it has, an unset

@@ -1279,6 +1279,7 @@ impl Graph {
     /// goes through [`apply_op`](Graph::apply_op), so installed extensions
     /// hear about it.
     pub fn import_legacy(&mut self, old: &crate::legacy::graph::Graph) -> Result<()> {
+        self.refuse_in_block("a legacy import")?;
         let auto = self.autocommit;
         self.autocommit = false;
         let r = (|| -> Result<()> {
@@ -2009,6 +2010,22 @@ impl Graph {
 
     pub fn uncommitted(&self) -> u64 {
         self.uncommitted
+    }
+
+    /// Refuse an operation that has to commit on its own while a block
+    /// opened with [`Graph::begin`] (or `BEGIN`) is open: it would commit
+    /// the block's pending writes before the block's COMMIT, and a block
+    /// that then failed would report "nothing was committed" about writes
+    /// that are durable. In a transaction opened by assigning `autocommit`
+    /// these operations commit what is pending, as they always did.
+    pub(crate) fn refuse_in_block(&self, what: &str) -> Result<()> {
+        if self.block && !self.autocommit {
+            return Err(Error::Msg(format!(
+                "{what} commits on its own, so it cannot run inside a transaction block; \
+                 end the block with COMMIT or ROLLBACK first"
+            )));
+        }
+        Ok(())
     }
 
     /// Open a transaction block: autocommit off until [`Graph::commit`] or
@@ -2944,8 +2961,10 @@ impl Graph {
     }
 
     /// Reclaim space: folds the log into the pages. (Pages freed by deletes
-    /// are reused by later writes; the file does not shrink.)
+    /// are reused by later writes; the file does not shrink.) It commits
+    /// what is pending, so it is refused inside a [`Graph::begin`] block.
     pub fn compact(&mut self) -> Result<u64> {
+        self.refuse_in_block("COMPACT")?;
         let before = self.file_len();
         self.commit_txn()?;
         self.db.checkpoint()?;

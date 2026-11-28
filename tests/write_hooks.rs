@@ -1286,3 +1286,109 @@ fn deleting_a_huge_hub_past_the_memory_limit_is_full_and_leaves_the_graph_intact
     let a = g.add_node(&[], vec![]).unwrap();
     g.add_edge(a, hub, "AFTER", vec![]).unwrap();
 }
+
+/// Inside a block opened with `begin()` or `BEGIN`, nothing commits before
+/// the block's COMMIT: every operation that has to commit on its own is
+/// refused, the block's pending writes stay pending, and COMMIT commits
+/// exactly them.
+#[test]
+fn operations_that_commit_on_their_own_are_refused_inside_a_block() {
+    let jsonl = "{\"type\":\"node\",\"labels\":[\"Imported\"]}\n";
+    let ops: [(&str, &dyn Fn(&mut Graph) -> Result<()>); 6] = [
+        ("import_jsonl", &|g| {
+            query::import_jsonl(g, jsonl).map(|_| ())
+        }),
+        ("import_jsonl_from", &|g| {
+            query::import_jsonl_from(g, &mut jsonl.as_bytes(), 1 << 20).map(|_| ())
+        }),
+        ("import_legacy", &|g| g.import_legacy(&legacy(5, 3, 2))),
+        ("COMPACT", &|g| query::execute(g, "COMPACT").map(|_| ())),
+        ("compact()", &|g| g.compact().map(|_| ())),
+        ("execute_batch", &|g| {
+            query::execute_batch(g, &[("CREATE (:Batched)".to_string(), Vec::new())]).map(|_| ())
+        }),
+    ];
+    for (name, op) in ops {
+        for by_statement in [true, false] {
+            let path = temp(&format!("block-{name}-{by_statement}"));
+            let mut g = Graph::open(&path, Sync::Always).unwrap();
+            q(&mut g, "CREATE (:Committed)");
+            if by_statement {
+                q(&mut g, "BEGIN");
+            } else {
+                g.begin().unwrap();
+            }
+            g.add_node(&["Pending".into()], vec![]).unwrap();
+            let pending = g.uncommitted();
+            let e = op(&mut g)
+                .err()
+                .unwrap_or_else(|| panic!("{name}: ran inside a block"));
+            assert!(e.to_string().contains("end the block"), "{name}: {e}");
+            assert_eq!(
+                g.uncommitted(),
+                pending,
+                "{name}: the block's writes are pending"
+            );
+            assert!(
+                !g.autocommit && g.spent().is_none(),
+                "{name}: the block is still open"
+            );
+            // Nothing is durable yet: a crash now keeps only what was
+            // committed before the block.
+            g.checkpoint().unwrap();
+            let copy = temp(&format!("block-{name}-{by_statement}-copy"));
+            std::mem::forget(g);
+            for suffix in ["", "-wal"] {
+                let (from, to) = (
+                    format!("{}{suffix}", path.display()),
+                    format!("{}{suffix}", copy.display()),
+                );
+                if suffix.is_empty() {
+                    std::fs::copy(&from, &to).unwrap();
+                } else {
+                    std::fs::create_dir_all(&to).unwrap();
+                    for f in std::fs::read_dir(&from).unwrap() {
+                        let f = f.unwrap().path();
+                        std::fs::copy(&f, std::path::Path::new(&to).join(f.file_name().unwrap()))
+                            .unwrap();
+                    }
+                }
+            }
+            let crashed = Graph::open_forced(&copy, Sync::Always).unwrap();
+            let mut labels: Vec<String> = crashed
+                .node_ids()
+                .into_iter()
+                .flat_map(|n| crashed.node_labels(n))
+                .collect();
+            assert_eq!(labels, vec!["Committed"], "{name}: durable before COMMIT");
+            drop(crashed);
+            cleanup(&copy);
+            // The block, carried on, commits exactly its own writes.
+            let mut g = Graph::open_forced(&path, Sync::Always).unwrap();
+            labels = g
+                .node_ids()
+                .into_iter()
+                .flat_map(|n| g.node_labels(n))
+                .collect();
+            assert_eq!(
+                labels,
+                vec!["Committed"],
+                "{name}: a crash lost only the open block"
+            );
+            g.begin().unwrap();
+            g.add_node(&["Pending".into()], vec![]).unwrap();
+            assert!(op(&mut g).is_err());
+            g.commit().unwrap();
+            labels = g
+                .node_ids()
+                .into_iter()
+                .flat_map(|n| g.node_labels(n))
+                .collect();
+            assert_eq!(labels, vec!["Committed", "Pending"], "{name}");
+            // Outside a block it runs as before.
+            op(&mut g).unwrap_or_else(|e| panic!("{name} outside a block: {e}"));
+            drop(g);
+            cleanup(&path);
+        }
+    }
+}
