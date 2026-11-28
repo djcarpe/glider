@@ -339,7 +339,16 @@ fn every_algorithm_stops_on_a_step_budget() {
     query::execute(&mut g, "CREATE EXTENSION context").unwrap();
     query::execute(&mut g, "CREATE EXTENSION check").unwrap();
     query::execute(&mut g, "CREATE EXTENSION structure").unwrap();
+    // the change journal, with an entry for every node
+    query::execute(&mut g, "CREATE EXTENSION changes").unwrap();
+    let since = g.revision();
+    query::execute(&mut g, "MATCH (n:N) SET n.j = 1").unwrap();
+    let now = g.revision();
     for src in [
+        format!("CALL changes.since(revision: {since})"),
+        "CALL changes.status()".to_string(),
+        format!("CALL changes.release(below: {now})"),
+        "CALL changes.cap(entries: 64)".to_string(),
         "CALL check.run()".to_string(),
         "CALL structure.colors(depth: 3)".to_string(),
         "CALL structure.classes(by: \"neighbours\")".to_string(),

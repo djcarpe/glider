@@ -316,3 +316,94 @@ fn per_thread_state_is_clean_on_both_databases() {
     .join()
     .unwrap();
 }
+
+fn hooked(n: usize) -> Graph {
+    let mut g = graph(n);
+    for s in [
+        "CREATE EXTENSION changes",
+        "CREATE EXTENSION context",
+        "CALL context.index()",
+    ] {
+        query::execute(&mut g, s).unwrap();
+    }
+    g
+}
+
+/// What the hooks keep: the journal's and the text index's keyspaces.
+fn kept(g: &Graph) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut out = Vec::new();
+    for ns in ["changes", "context"] {
+        g.ext_scan(ns, b"", &mut |k, v| {
+            out.push((k.to_vec(), v.to_vec()));
+            true
+        });
+    }
+    out
+}
+
+fn found(g: &mut Graph, word: &str) -> usize {
+    let r = query::execute(g, &format!("CALL context.search(query: \"{word}\")")).unwrap();
+    r.rows.len()
+}
+
+// The journal's and the text index's hooks, running inside a statement a
+// procedure runs (on the other database, or on the caller's own three
+// levels down), follow the same rules as in an outermost statement: what
+// a statement that commits wrote is followed, and nothing they wrote for a
+// statement that failed is left, on either database.
+#[test]
+fn hooks_inside_an_inner_statement_follow_the_outermost_rules() {
+    for flip in [false, true] {
+        let (mut a, mut b) = (hooked(300), hooked(300));
+        let (caller, other) = if flip {
+            (&mut b, &mut a)
+        } else {
+            (&mut a, &mut b)
+        };
+        PEER.with(|p| p.set(other as *mut Graph));
+        // a write on the other database, through the caller's procedure
+        let rev = other.revision();
+        let r = call(
+            caller,
+            "CALL link.run(src: \"CREATE (:Done {name: 'zebra'})\")",
+            None,
+        );
+        assert_eq!(r.as_deref(), Ok("ok"));
+        assert_eq!(found(other, "zebra"), 1, "the text index followed it");
+        let since = query::execute(other, &format!("CALL changes.since(revision: {rev})")).unwrap();
+        assert!(!since.rows.is_empty(), "the journal followed it");
+        // a failure there leaves nothing of what its hooks wrote
+        let (other_kept, caller_kept) = (kept(other), kept(caller));
+        let r = call(caller, "CALL link.run(src: \"CALL link.halferr()\")", None);
+        assert!(r.unwrap().contains("error"));
+        assert!(
+            kept(other) == other_kept,
+            "hooks' writes of a failed statement stayed"
+        );
+        // the caller's own Caller node was followed by its hooks
+        assert!(kept(caller) != caller_kept);
+        // three levels: a write on the caller's own database inside its
+        // statement is followed; a failure there fails the caller's
+        // statement as a whole and leaves none of the hooks' writes
+        let r = call(
+            caller,
+            "CALL link.run(src: \"CALL link.back(src: \\\"CREATE (:Done {name: 'yak'})\\\")\")",
+            None,
+        );
+        assert_eq!(r.as_deref(), Ok("ok"));
+        assert_eq!(found(caller, "yak"), 1);
+        let caller_kept = kept(caller);
+        let r = call(
+            caller,
+            "CALL link.run(src: \"CALL link.back(src: \\\"CALL link.halferr()\\\")\")",
+            None,
+        );
+        assert!(r.unwrap_err().contains("statement failed as a whole"));
+        assert!(
+            kept(caller) == caller_kept,
+            "hooks' writes of a failed statement stayed"
+        );
+        assert_eq!(seen(caller).0, 0);
+        assert_eq!(seen(other).0, 0);
+    }
+}
