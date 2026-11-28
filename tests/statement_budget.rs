@@ -335,6 +335,25 @@ fn every_algorithm_stops_on_a_step_budget() {
             );
         }
     }
+    // the extensions' procedures too
+    query::execute(&mut g, "CREATE EXTENSION context").unwrap();
+    query::execute(&mut g, "CREATE EXTENSION check").unwrap();
+    for src in [
+        "CALL check.run()".to_string(),
+        "CALL context.index()".to_string(),
+        "CALL context.search(query: \"pump valve\", scan: 100000)".to_string(),
+        format!("CALL context.retrieve(seeds: [{from}], budget: 100000)"),
+        format!("CALL context.paths(from: {from}, to: {to}, depth: 1000)"),
+        "CALL context.schema(sample: 10000)".to_string(),
+    ] {
+        let err = query::execute_capped(&mut g, &src, &[], budget(None, Some(500)))
+            .err()
+            .unwrap_or_else(|| panic!("{src} was not stopped"));
+        assert!(
+            err.to_string().contains("budget of 500 matching steps"),
+            "{src}: {err}"
+        );
+    }
     // one node's neighbours are one list, but a list too
     let err = query::execute_capped(
         &mut g,

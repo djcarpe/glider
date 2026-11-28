@@ -355,10 +355,11 @@ What is true now, and what this slice decided where the plan was open:
   (64 KiB at least), spilling past it. The node half of `duplicates` sorts
   again at every slice, so a slice bounds what it reports, not what it
   reads.
-- **Budgets (G2).** Every record a check looks at passes through one
+- **Budgets (G2, built).** Every record a check looks at passes through one
   function, `Run::look` in `src/ext/check.rs` (and `Probe::look` for an
-  extension's records); each already returns a `Result`, so counting a
-  statement step per record is one line in each.
+  extension's records), and each counts one statement step: `check.run`
+  stops on the statement's time and step budget like any procedure
+  (`every_algorithm_stops_on_a_step_budget` runs it too).
 - **How faults were planted in tests** (`tests/check.rs`), since the graph
   API cannot write one: a bulk load from a source that breaks its contract
   (an edge to a node it never lists) for `endpoints`; for `adjacency`,
