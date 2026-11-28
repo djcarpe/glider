@@ -470,20 +470,21 @@ What is true now, and what this slice decided where the plan was open:
   also looks up its adjacency entry; upkeep is as above. `since` scans
   the entries of the kinds asked for in key order, so a full pass in
   slices reads every entry once.
-- **Cost**: `bench/KNOWLEDGE.md`, "Change tracking", has the first
-  version and this one side by side. In transactions of 1,000 writes, node
-  writes run at about 0.3-0.45 of their speed without the journal (first
-  version: 0.2-0.3) and edge writes at about 0.45-0.6 (0.2-0.3); a node
-  write logs about 52 bytes instead of 20 (151 before), an edge add 98
-  instead of 28 (305), an edge delete 84 instead of 13 (341). What stands
-  in the way of more: a hook that does nothing already costs node writes
-  about 30% (the before and after images and the unit around each hooked
-  write, G4), and each entry is one insert into the extension tree, about
-  as dear as the node write itself. Neither goes away by writing once per
-  transaction (the second direction considered), which would only save
-  the per-write record; packing a transaction's ids into one value would,
-  but then `changed` for a set of ids becomes a scan. Edge deletes log 13
-  bytes, so even one entry of at least 15 bytes is past three times that.
+- **Cost** (`bench/KNOWLEDGE.md`, "Change tracking", the first version and
+  this one side by side, 10k to 1M nodes, both tiers). In 1,000-write
+  transactions, node writes run at 0.38-0.46 of their speed without the
+  journal (first version 0.22-0.32), edge adds at 0.48-0.69 (0.23-0.50),
+  edge deletes at 0.25-0.56 (0.15-0.33); the log grows 2.5x a node
+  write's bytes (7.5x before), 3.5x an edge add's (11x), 6x an edge
+  delete's (26x). One write a transaction is in the same range. Node
+  writes and edge delete bytes miss the targets of 0.6 and 3x. A hook that
+  does nothing already leaves node writes at about 0.70 (G4's images and
+  unit), one entry is one extension-tree insert about as dear as the node
+  write, and an edge delete logs 13 bytes against an entry's minimum of 15.
+  Writing once per transaction would not remove either of the first two, so
+  the commit path is unchanged. Reads: `since` for a recent revision now
+  scans the journal (8-11 ms at 300,000-400,000 entries, was 0.01 ms), a
+  full pass costs what it did, `changed` for 1,000 ids 0.3 ms.
   A database without the journal pays nothing.
 - Left out, as planned: old values, named consumers with cursors (a
   consumer keeps its own revision), and vectors (G10).
