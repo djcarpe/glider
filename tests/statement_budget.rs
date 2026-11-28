@@ -338,8 +338,12 @@ fn every_algorithm_stops_on_a_step_budget() {
     // the extensions' procedures too
     query::execute(&mut g, "CREATE EXTENSION context").unwrap();
     query::execute(&mut g, "CREATE EXTENSION check").unwrap();
+    query::execute(&mut g, "CREATE EXTENSION structure").unwrap();
     for src in [
         "CALL check.run()".to_string(),
+        "CALL structure.colors(depth: 3)".to_string(),
+        "CALL structure.classes(by: \"neighbours\")".to_string(),
+        "CALL structure.classes(by: \"colors\", depth: 2)".to_string(),
         "CALL context.index()".to_string(),
         "CALL context.search(query: \"pump valve\", scan: 100000)".to_string(),
         format!("CALL context.retrieve(seeds: [{from}], budget: 100000)"),
@@ -472,7 +476,12 @@ fn steps_needed(g: &mut Graph, src: &str) -> u64 {
 fn a_stopped_procedure_has_written_nothing() {
     let (mut g, ids) = dag(2_000, 4);
     let from = ids[0];
+    query::execute(&mut g, "CREATE EXTENSION structure").unwrap();
     for (src, prop) in [
+        (
+            "CALL structure.colors(depth: 2, write: \"color\", store: \"kept\")".to_string(),
+            "color",
+        ),
         ("CALL pagerank(write: \"rank\")".to_string(), "rank"),
         ("CALL levels(write: \"level\")".to_string(), "level"),
         (format!("CALL sssp(from: {from}, write: \"d\")"), "d"),
@@ -483,12 +492,18 @@ fn a_stopped_procedure_has_written_nothing() {
         while let Err(e) = query::execute_capped(&mut g, &src, &[], budget(None, Some(steps))) {
             assert!(e.to_string().contains("matching steps"), "{src}: {e}");
             assert_eq!(count(&mut g, &written), Value::Int(0), "{src} at {steps}");
+            // and kept nothing
+            let kept = query::execute(&mut g, "CALL structure.stored()").unwrap();
+            assert!(kept.rows.is_empty(), "{src} at {steps}: {:?}", kept.rows);
             stops += 1;
             steps += steps / 4;
         }
         assert!(stops > 10, "{src}: {stops}");
         // the budget that was enough wrote everything
         assert_ne!(count(&mut g, &written), Value::Int(0), "{src}");
+        if src.contains("store:") {
+            query::execute(&mut g, "CALL structure.drop(name: \"kept\")").unwrap();
+        }
     }
 }
 
@@ -534,4 +549,92 @@ fn a_stopped_write_inside_a_transaction_rolls_it_back() {
         count(&mut g, "MATCH (m:Mark) RETURN count(m)"),
         Value::Int(1)
     );
+}
+
+// The same call takes the same steps on the in-memory and the paged tier,
+// so a step budget stops it, or lets it through, on both alike.
+#[test]
+fn the_same_call_takes_the_same_steps_on_both_tiers() {
+    let (mut g, ids) = dag(300, 3);
+    let (from, to) = (ids[0], ids[ids.len() - 1]);
+    let mut calls = algorithms(from, to);
+    calls.push("pagerank(write: \"x\")".to_string());
+    for call in calls {
+        let mem = on_tier(&call, "mem");
+        let ooc = on_tier(&call, "ooc");
+        let (a, b) = (steps_needed(&mut g, &mem), steps_needed(&mut g, &ooc));
+        assert_eq!(a, b, "{call}: {a} steps in memory, {b} paged");
+    }
+}
+
+/// One hub with 1.5 million edges to 300,000 leaves (five parallel edges
+/// each) and a ring among the leaves: nothing may handle a whole neighbour
+/// list between two looks at the meter.
+#[test]
+fn fifty_milliseconds_stop_procedures_on_a_hub_well_under_a_second() {
+    let leaves_n = scale(300_000) as usize;
+    let mut g = Graph::memory();
+    g.autocommit = false;
+    let hub = g.add_node(&["Hub".into()], vec![]).unwrap();
+    let leaves: Vec<u64> = (0..leaves_n)
+        .map(|i| {
+            g.add_node(&["N".into()], vec![("i".into(), Value::Int(i as i64))])
+                .unwrap()
+        })
+        .collect();
+    for (i, &l) in leaves.iter().enumerate() {
+        for _ in 0..5 {
+            g.add_edge(hub, l, "H", vec![("w".into(), Value::Float(1.0))])
+                .unwrap();
+        }
+        g.add_edge(
+            l,
+            leaves[(i + 1) % leaves.len()],
+            "R",
+            vec![("w".into(), Value::Float(2.0))],
+        )
+        .unwrap();
+    }
+    g.commit().unwrap();
+    g.autocommit = true;
+    query::execute(&mut g, "CREATE EXTENSION context").unwrap();
+    query::execute(&mut g, "CREATE EXTENSION structure").unwrap();
+    let (a, b) = (leaves[10], leaves[leaves_n / 2]);
+    let mut worst = Vec::new();
+    for src in [
+        format!("CALL bfs(from: {hub}, dir: \"both\")"),
+        format!("CALL bfs(from: {hub}, dir: \"both\", tier: \"ooc\")"),
+        format!("CALL neighbors(from: {hub})"),
+        format!("CALL subgraph(from: {hub}, depth: 1)"),
+        format!("CALL shortestpath(from: {a}, to: {b}, dir: \"both\")"),
+        "CALL mst(weight: \"w\", top: 1)".to_string(),
+        "CALL mst(weight: \"w\", top: 1, tier: \"ooc\")".to_string(),
+        "CALL kcore(top: 1)".to_string(),
+        "CALL triangles(top: 1)".to_string(),
+        "CALL clustering(top: 1)".to_string(),
+        "CALL communities(top: 1)".to_string(),
+        "CALL pagerank(top: 1, tier: \"ooc\")".to_string(),
+        "CALL degree(top: 1)".to_string(),
+        "CALL degree(top: 1, tier: \"ooc\")".to_string(),
+        "CALL betweenness(top: 1)".to_string(),
+        format!("CALL context.retrieve(seeds: [{hub}], max_fanout: 100000000, budget: 100000)"),
+        format!("CALL context.paths(from: {a}, to: {b})"),
+        "CALL structure.colors(depth: 2)".to_string(),
+        "CALL structure.classes(by: \"neighbours\")".to_string(),
+    ] {
+        let (err, took) = timed(&mut g, &src, budget(Some(50), None));
+        eprintln!("{took:>10.1?}  {src}  -> {err:?}");
+        // stopped, or (on a fast machine) through in time and over the
+        // row cap; never anything else
+        if let Some(err) = err {
+            assert!(
+                err.contains("statement stopped") || err.contains("row/byte cap"),
+                "{src}: {err}"
+            );
+        }
+        worst.push((took, src));
+    }
+    for (took, src) in worst {
+        assert!(took < Duration::from_millis(300), "{src}: {took:?}");
+    }
 }

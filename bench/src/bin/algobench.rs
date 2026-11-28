@@ -137,6 +137,18 @@ fn core(g: &Graph, runs: usize) {
             &mut || algo::pagerank(&out, 0.85, 20, 0.0).scores.get(0),
         ),
     );
+    {
+        // through the projection a CALL uses
+        let proj = g.projection(Dir::Out, None, None, glider::graph::Tier::Mem);
+        report(
+            "pagerank proj",
+            race(
+                runs,
+                &mut || old_pagerank(&proj, 0.85, 20).get(0),
+                &mut || algo::pagerank(&proj, 0.85, 20, 0.0).scores.get(0),
+            ),
+        );
+    }
     if std::env::var("AA").is_ok() {
         // the old code against itself: how much the order of the race says
         report(
