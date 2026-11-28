@@ -190,7 +190,11 @@ too, and its steps count against it. A statement is all or nothing however
 deep it runs: if one a procedure runs fails after it has written anything,
 the outermost statement fails as a whole and is rolled back, whatever the
 procedure does with the error; one that fails before writing may be
-handled. A procedure that panics leaves the
+handled. This is per database: a statement a procedure runs on another
+database is that database's own, committed or rolled back there, and its
+failure is reported to the procedure only (the caller's budget still bounds
+it). A procedure may not run `BEGIN`, `COMMIT` or `ROLLBACK`, or call
+`begin`, `commit` or `rollback`, on the database it was called on. A procedure that panics leaves the
 thread's budgets as they were. A procedure that carries on after
 a stop, or returns normally from one, still fails: the statement ends with
 the budget's error whatever the procedure returned, and rolls back, so a

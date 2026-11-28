@@ -289,6 +289,31 @@ the panic goes on, so a caller that catches it cannot commit part of it
 that swallowed an inner failure, or a caller that caught a panic inside a
 transaction, could commit half a statement.
 
+**Two databases.** Nesting belongs to the database a statement runs on (the
+depth and the failure record are fields of the `Graph`, not of the
+thread). A statement a procedure on database A runs on database B is B's
+outermost statement: it commits or rolls back on B under B's rules for its
+kind of transaction, and its failure is B's alone, reported to the
+procedure that ran it. A's statement fails as a whole only when a statement
+on A itself, run inside it, failed after writing (a procedure on A running
+one on B running one on A again counts: that last one is inside A's
+statement). The time and step budget is the caller's patience, not a
+property of a database, so A's budget bounds the work A's statement starts
+on B too: spent on B, it stops B's statement (rolled back on B) and A's
+(rolled back on A). Of what is kept per thread, the meter (one budget for
+the whole call chain), the memory budget and spill directory (scoped to the
+procedure or algorithm running, put back on return and unwind) and the
+statement's text (for naming a failed inner statement) are rightly per
+thread; the statement nesting and the inner-failure record had to become
+per database, and the hook state, autocommit and blocks already were
+(`tests/two_databases.rs`, `tests/cross_database.rs`).
+
+**Transaction control inside a statement.** `BEGIN`, `COMMIT` and `ROLLBACK`
+run as a statement by a procedure on the database its statement runs on,
+and `Graph::begin`, `commit` and `rollback` called on it, are refused with
+an error that says so: they would split the statement, which commits or
+rolls back as a whole when it ends. On another database they run as usual.
+
 **What `max_steps` does not bound.** Building the in-memory projection
 counts only its nodes, so that both tiers count the same steps: a
 `max_steps` budget does not limit how many edges that build reads (a test
