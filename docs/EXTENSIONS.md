@@ -552,7 +552,10 @@ CALL vector.spaces()                          CALL vector.drop(space: "text")
 may be compared and where they came from: `dims`, `metric` (`cosine`,
 `dot` or `l2`; default `cosine`), `normalized` (store unit vectors; a put
 normalises them), `of` (`node`, `edge`, or `key` for vectors about a group
-or a whole graph that you name with a string; default `node`), `labels`
+or a whole graph that you name with a string; default `node`), `follows`
+(`self`, the default: a vector goes stale when its node or edge changes;
+`edges`, for node vectors computed from their surroundings: also when an
+edge at the node is added, removed or changed), `labels`
 (the nodes expected to have a vector), `algorithm`, `config`, `model`,
 `model_version`, `code` (your application's version) and `at` (a time you
 supply; the engine records none). It cannot be changed: a different
@@ -583,12 +586,23 @@ are never compared. A search returns ids and scores, never a node: ask the
 graph what a node is.
 
 **Staleness.** Each result row says whether its vector is `fresh`,
-`stale` (its node or edge changed after it was put) or `unknown` (the
-engine cannot tell: `changes` is not installed, or cannot answer for when
-the vector was put, or, for a key, anything changed since). The message
-says how many of the space's vectors are stale, missing (a node of the
-space's labels without one) or unknown; `fresh: "require"` turns any of
-them into an error. `vector.stale` lists them, in slices (`limit:`, then
+`stale` (what the space follows changed after it was put) or `unknown`
+(the engine cannot tell: `changes` is not installed, or cannot answer for
+when the vector was put, or, for a key, anything changed since). The
+message says whether the space as a whole is current: `yes` (a count
+found every vector fresh at revision P, and nothing since made one stale
+or left a node of its labels without one), `no` (something has, and it
+names one), or `unknown` (nothing has counted it since it last lost a
+vector, or the journal cannot vouch for the time since). Saying so costs
+one record read when nothing was written since, and otherwise a walk of
+the journal's changes since P, never a count. `counts: true` counts the
+stale, missing (a node of the space's labels without one) and unknown
+vectors and puts them in the message; `fresh: "require"` is an error
+unless the space is current, counting when it has to. A count that finds
+everything fresh records that the space is current (a small write), so
+the next searches can say `yes` cheaply. `vector.spaces()` shows
+`current` and `current_since` for every space, and the counts with
+`counts: true`. `vector.stale` lists them, in slices (`limit:`, then
 `after:` as its message says), with why. Install `changes` before putting
 vectors: a vector put before the journal existed stays unknown until it is
 put again. The usual round: `vector.stale`, recompute those ids'
@@ -617,8 +631,10 @@ deletes, with an edge space) look up and remove their vectors.
   approximate index yet.
 - `labels:` applies to node spaces; an edge space cannot say which edges
   should have a vector.
-- A node's vector is stale when the node's labels or properties change,
-  not when its edges do.
+- With `follows: "self"` a node's vector is stale when the node's labels
+  or properties change, not its edges; with `follows: "edges"` also when
+  an edge at it changes. A change two hops away is never seen: what
+  computes such vectors must work out its own reach.
 - A space cannot be altered, only dropped and made again.
 - Staleness needs `changes`, and is as good as what it can answer for
   (its cap and `release` push old changes out: such vectors turn unknown).

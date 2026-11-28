@@ -5,9 +5,9 @@
 
 use std::path::{Path, PathBuf};
 
+use glider::ext;
 use glider::ext::check::Probe;
 use glider::ext::vector::{self, Fresh, Target};
-use glider::ext;
 use glider::graph::Graph;
 use glider::query::{self, QueryResult};
 use glider::store::{Op, Sync};
@@ -812,7 +812,10 @@ fn similar_searches_from_a_stored_vector_and_across_spaces_only_when_they_agree(
     // Into another space that agrees; its missing vectors are counted.
     let r = q(
         &mut g,
-        &format!("CALL vector.similar(space: 'a', id: {}, in: 'b')", ids[2]),
+        &format!(
+            "CALL vector.similar(space: 'a', id: {}, in: 'b', counts: true)",
+            ids[2]
+        ),
     );
     assert_eq!(r.rows[0][0], Value::Int(ids[0] as i64));
     assert_eq!(r.rows.len(), 2);
@@ -944,7 +947,10 @@ fn clear_removes_the_vectors_and_keeps_the_spaces_which_then_hold_nothing() {
     // Ids start again at 1 after CLEAR; the new node 1 has no old vector.
     let fresh = nodes(&mut g, "N", 1);
     assert_eq!(fresh[0], ids[0]);
-    let r = q(&mut g, "CALL vector.search(space: 's', vector: [1, 0])");
+    let r = q(
+        &mut g,
+        "CALL vector.search(space: 's', vector: [1, 0], counts: true)",
+    );
     assert!(r.rows.is_empty());
     assert!(r.message.unwrap().contains("missing 1"));
     assert_eq!(check_findings(&g), Vec::<(String, String)>::new());
@@ -988,7 +994,10 @@ fn staleness_is_reported_from_the_journal_and_never_hidden() {
     let states: Vec<String> = rows.iter().map(|r| r[1].to_string()).collect();
     assert_eq!(states.iter().filter(|s| *s == "unknown").count(), 2);
     assert_eq!(states.iter().filter(|s| *s == "missing").count(), 6);
-    let r = q(&mut g, "CALL vector.search(space: 's', vector: [1, 0])");
+    let r = q(
+        &mut g,
+        "CALL vector.search(space: 's', vector: [1, 0], counts: true)",
+    );
     assert!(
         r.message
             .as_ref()
@@ -1029,7 +1038,7 @@ fn staleness_is_reported_from_the_journal_and_never_hidden() {
         &mut g,
         "CALL vector.search(space: 's', vector: [1, 0], fresh: 'require')",
     );
-    assert!(r.message.unwrap().contains("stale 0, missing 0, unknown 0"));
+    assert!(r.message.unwrap().contains("space current: yes"));
 
     // A changed node makes its vector stale; an edge does not change the
     // node itself; a new node of the labels is missing.
@@ -1060,7 +1069,7 @@ fn staleness_is_reported_from_the_journal_and_never_hidden() {
     assert!(rows[0][3].to_string().contains("changed at revision"));
     let r = q(
         &mut g,
-        "CALL vector.search(space: 's', vector: [1, 1], top: 10)",
+        "CALL vector.search(space: 's', vector: [1, 1], top: 10, counts: true)",
     );
     assert!(r
         .message
@@ -1202,7 +1211,7 @@ fn a_vector_or_space_past_the_databases_position_is_stale() {
         .all(|r| r[1] == Value::from("stale") && r[3].to_string().contains("past this database")));
     let r = q(
         &mut behind,
-        "CALL vector.search(space: 's', vector: [1, 0])",
+        "CALL vector.search(space: 's', vector: [1, 0], counts: true)",
     );
     assert!(r.message.unwrap().contains("stale 2"));
     let found = check_findings(&behind);
@@ -1444,4 +1453,326 @@ fn a_database_without_vectors_pays_nothing_and_spaces_follow_writes_only_when_th
     let (_, m) = vector::get(&g, &s, &Target::Id(id)).unwrap();
     let j = vector::Judge::new(&g, &s);
     assert_eq!(j.judge(&g, &id.to_be_bytes(), m.revision).0, Fresh::Unknown);
+}
+
+fn current_of(g: &mut Graph, space: &str) -> String {
+    field(&space_row(g, space), "current").to_string()
+}
+
+fn search_msg(g: &mut Graph, space: &str, extra: &str) -> String {
+    q(
+        g,
+        &format!("CALL vector.search(space: '{space}', vector: [1, 0]{extra})"),
+    )
+    .message
+    .unwrap()
+}
+
+#[test]
+fn a_space_of_surroundings_is_stale_when_an_edge_at_its_node_changes() {
+    let mut g = Graph::memory();
+    q(&mut g, "CREATE EXTENSION changes");
+    q(&mut g, "CREATE EXTENSION vector");
+    q(&mut g, "CALL vector.create(space: 'text', dims: 2)");
+    q(
+        &mut g,
+        "CALL vector.create(space: 'shape', dims: 2, follows: 'edges')",
+    );
+    let row = space_row(&mut g, "shape");
+    assert_eq!(field(&row, "follows"), Value::from("edges"));
+    assert_eq!(
+        field(&space_row(&mut g, "text"), "follows"),
+        Value::from("self")
+    );
+    for bad in [
+        "CALL vector.create(space: 'x', dims: 2, of: 'edge', follows: 'edges')",
+        "CALL vector.create(space: 'x', dims: 2, of: 'key', follows: 'edges')",
+        "CALL vector.create(space: 'x', dims: 2, follows: 'neighbours')",
+    ] {
+        err(&mut g, bad, &[]);
+    }
+    // The same name with another `follows` is another definition.
+    let e = err(
+        &mut g,
+        "CALL vector.create(space: 'text', dims: 2, follows: 'edges')",
+        &[],
+    );
+    assert!(e.contains("incomparable"), "{e}");
+    q(&mut g, "CREATE (:N {i: 0})-[:K {w: 1}]->(:N {i: 1})-[:K {w: 1}]->(:N {i: 2}), (:N {i: 3}), (:N {i: 4})");
+    let ids = g.node_ids();
+    let edges = g.edge_ids();
+    let vs: Vec<Vec<f64>> = (0..5).map(|i| vec![1.0, i as f64]).collect();
+    put(&mut g, "text", &ids, &vs);
+    put(&mut g, "shape", &ids, &vs);
+    assert!(stale_all(&mut g, "shape", 10).0.is_empty());
+    // An edge added between 3 and 4, one changed (0-1), one removed (1-2).
+    q(
+        &mut g,
+        "MATCH (a:N {i: 3}), (b:N {i: 4}) CREATE (a)-[:K]->(b)",
+    );
+    g.set_edge_prop(edges[0], "w", Value::Int(2)).unwrap();
+    g.delete_edge(edges[1]).unwrap();
+    let stale = |g: &mut Graph, s: &str| -> Vec<i64> {
+        stale_all(g, s, 10)
+            .0
+            .iter()
+            .map(|r| r[0].as_i64().unwrap())
+            .collect()
+    };
+    assert_eq!(stale(&mut g, "text"), Vec::<i64>::new());
+    assert_eq!(
+        stale(&mut g, "shape"),
+        ids.iter().map(|i| *i as i64).collect::<Vec<_>>()
+    );
+    let why = stale_all(&mut g, "shape", 10).0[0][3].to_string();
+    assert!(why.contains("adjacency"), "{why}");
+    // Its own properties make both stale.
+    put(&mut g, "shape", &ids, &vs);
+    g.set_node_prop(ids[2], "i", Value::Int(20)).unwrap();
+    assert_eq!(stale(&mut g, "text"), vec![ids[2] as i64]);
+    assert_eq!(stale(&mut g, "shape"), vec![ids[2] as i64]);
+}
+
+#[test]
+fn a_search_says_cheaply_whether_its_space_is_current_and_never_claims_what_it_has_not_established()
+{
+    let mut g = Graph::memory();
+    q(&mut g, "CREATE EXTENSION changes");
+    q(&mut g, "CREATE EXTENSION vector");
+    q(
+        &mut g,
+        "CALL vector.create(space: 's', dims: 2, labels: ['Doc'])",
+    );
+    let docs = nodes(&mut g, "Doc", 4);
+    put(
+        &mut g,
+        "s",
+        &docs,
+        &[
+            vec![1.0, 0.0],
+            vec![0.0, 1.0],
+            vec![1.0, 1.0],
+            vec![2.0, 1.0],
+        ],
+    );
+    // Everything is fresh, but nothing has counted it: unknown, not yes.
+    let m = search_msg(&mut g, "s", "");
+    assert!(
+        m.contains("space current: unknown") && !m.contains("counted"),
+        "{m}"
+    );
+    assert_eq!(current_of(&mut g, "s"), "unknown");
+    // Counting establishes it.
+    let m = search_msg(&mut g, "s", ", counts: true");
+    assert!(m.contains("counted: stale 0, missing 0, unknown 0"), "{m}");
+    let m = search_msg(&mut g, "s", "");
+    assert!(
+        m.contains("space current: yes, established complete at revision"),
+        "{m}"
+    );
+    let since = field(&space_row(&mut g, "s"), "current_since")
+        .as_i64()
+        .unwrap();
+    // `require` then needs no count.
+    let m = search_msg(&mut g, "s", ", fresh: 'require'");
+    assert!(
+        m.contains("space current: yes") && !m.contains("counted"),
+        "{m}"
+    );
+    // A write that touches nothing of it: still current, from the journal.
+    let other = nodes(&mut g, "Other", 1)[0];
+    g.set_node_prop(other, "x", Value::Int(1)).unwrap();
+    assert!(search_msg(&mut g, "s", "").contains("space current: yes"));
+    // A new vector is fresh: still current, and still since the same point.
+    let extra = nodes(&mut g, "Doc", 1)[0];
+    let m = search_msg(&mut g, "s", "");
+    assert!(
+        m.contains("space current: no") && m.contains(&format!("node {extra} has a label")),
+        "{m}"
+    );
+    put(&mut g, "s", &[extra], &[vec![3.0, 1.0]]);
+    assert!(search_msg(&mut g, "s", "").contains("space current: yes"));
+    assert_eq!(
+        field(&space_row(&mut g, "s"), "current_since")
+            .as_i64()
+            .unwrap(),
+        since
+    );
+    // A change to one of its nodes: no, naming it; put again: yes.
+    g.set_node_prop(docs[1], "text", Value::from("new"))
+        .unwrap();
+    let m = search_msg(&mut g, "s", "");
+    assert!(
+        m.contains("space current: no") && m.contains(&format!("node {}", docs[1])),
+        "{m}"
+    );
+    assert_eq!(current_of(&mut g, "s"), "no");
+    err(
+        &mut g,
+        "CALL vector.search(space: 's', vector: [1, 0], fresh: 'require')",
+        &[],
+    );
+    put(&mut g, "s", &docs[1..2], &[vec![0.0, 1.0]]);
+    assert!(search_msg(&mut g, "s", "").contains("space current: yes"));
+    // A vector deleted: no longer known complete.
+    q(
+        &mut g,
+        &format!("CALL vector.delete(space: 's', ids: [{extra}])"),
+    );
+    assert!(search_msg(&mut g, "s", "").contains("space current: unknown"));
+    let e = err(
+        &mut g,
+        "CALL vector.search(space: 's', vector: [1, 0], fresh: 'require')",
+        &[],
+    );
+    assert!(e.contains("missing 1"), "{e}");
+    put(&mut g, "s", &[extra], &[vec![3.0, 1.0]]);
+    // `require` counts when it must, and establishes what it finds.
+    let m = search_msg(&mut g, "s", ", fresh: 'require'");
+    assert!(m.contains("counted: stale 0, missing 0, unknown 0"), "{m}");
+    assert!(search_msg(&mut g, "s", "").contains("space current: yes"));
+    // spaces() counts on request.
+    q(
+        &mut g,
+        &format!("MATCH (n) WHERE id(n) = {} SET n.text = 'x'", docs[0]),
+    );
+    let r = q(&mut g, "CALL vector.spaces(counts: true)");
+    let row: Vec<(String, Value)> = r.columns.into_iter().zip(r.rows[0].clone()).collect();
+    assert_eq!(field(&row, "stale"), Value::Int(1));
+    assert_eq!(field(&row, "missing"), Value::Int(0));
+    assert_eq!(field(&row, "current"), Value::from("no"));
+    assert_eq!(field(&space_row(&mut g, "s"), "stale"), Value::Null);
+}
+
+#[test]
+fn the_record_that_a_space_is_current_is_not_trusted_where_it_must_not_be() {
+    let setup = |g: &mut Graph| {
+        q(g, "CREATE EXTENSION changes");
+        q(g, "CREATE EXTENSION vector");
+        q(
+            g,
+            "CALL vector.create(space: 's', dims: 2, labels: ['Doc'])",
+        );
+        let docs = nodes(g, "Doc", 3);
+        put(
+            g,
+            "s",
+            &docs,
+            &[vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 1.0]],
+        );
+        search_msg(g, "s", ", counts: true");
+        assert_eq!(current_of(g, "s"), "yes");
+        docs
+    };
+    // A floor raised past it: the journal cannot vouch any more.
+    let mut g = Graph::memory();
+    setup(&mut g);
+    nodes(&mut g, "Other", 1);
+    let now = g.revision();
+    q(&mut g, &format!("CALL changes.release(below: {now})"));
+    assert_eq!(current_of(&mut g, "s"), "unknown");
+
+    // The journal dropped, a change made, the journal installed again.
+    let mut g = Graph::memory();
+    let docs = setup(&mut g);
+    q(&mut g, "DROP EXTENSION changes");
+    g.set_node_prop(docs[0], "text", Value::from("unseen"))
+        .unwrap();
+    q(&mut g, "CREATE EXTENSION changes");
+    let m = search_msg(&mut g, "s", "");
+    assert!(m.contains("space current: unknown"), "{m}");
+    err(
+        &mut g,
+        "CALL vector.search(space: 's', vector: [1, 0], fresh: 'require')",
+        &[],
+    );
+
+    // CLEAR: the record goes with the vectors.
+    let mut g = Graph::memory();
+    setup(&mut g);
+    q(&mut g, "CLEAR");
+    assert_eq!(current_of(&mut g, "s"), "unknown");
+
+    // A put that fails inside a block: the block rolls back, record and all.
+    let mut g = Graph::memory();
+    let docs = setup(&mut g);
+    q(
+        &mut g,
+        &format!("CALL vector.delete(space: 's', ids: [{}])", docs[2]),
+    );
+    assert_eq!(current_of(&mut g, "s"), "unknown");
+    q(&mut g, "BEGIN");
+    put(&mut g, "s", &docs[2..], &[vec![1.0, 1.0]]);
+    search_msg(&mut g, "s", ", counts: true");
+    assert_eq!(current_of(&mut g, "s"), "yes");
+    err(
+        &mut g,
+        &format!(
+            "CALL vector.put(space: 's', ids: [{}], vectors: [[1, 2, 3]])",
+            docs[0]
+        ),
+        &[],
+    );
+    let _ = query::execute(&mut g, "ROLLBACK");
+    assert_eq!(current_of(&mut g, "s"), "unknown");
+    // ... and one that fails on its own leaves what was established.
+    put(&mut g, "s", &docs[2..], &[vec![1.0, 1.0]]);
+    search_msg(&mut g, "s", ", fresh: 'require'");
+    err(
+        &mut g,
+        &format!(
+            "CALL vector.put(space: 's', ids: [{}, 999], vectors: [[1, 2], [1, 2]])",
+            docs[0]
+        ),
+        &[],
+    );
+    assert_eq!(current_of(&mut g, "s"), "yes");
+
+    // Records copied from a graph further along: past this position.
+    let mut ahead = Graph::memory();
+    setup(&mut ahead);
+    let mut behind = Graph::memory();
+    q(&mut behind, "CREATE EXTENSION changes");
+    q(&mut behind, "CREATE EXTENSION vector");
+    nodes(&mut behind, "Doc", 3);
+    behind
+        .ext_write(vector::NS, keyspace(&ahead, vector::NS), Vec::new())
+        .unwrap();
+    assert!(behind.log_end() < ahead.log_end());
+    assert_eq!(current_of(&mut behind, "s"), "unknown");
+
+    // An image and a replica answer as their source: yes, then no after a
+    // change on both.
+    let path = temp("current");
+    let mut f = Graph::open(&path, Sync::Always).unwrap();
+    let docs = setup(&mut f);
+    f.checkpoint().unwrap();
+    let mut c = Graph::from_bytes(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(current_of(&mut c, "s"), current_of(&mut f, "s"));
+    g = Graph::memory_with_page_size(1024, u64::MAX);
+    g.enable_log(glider::storage::log::DEFAULT_LOG_CAP).unwrap();
+    q(&mut g, "CREATE (:Before)");
+    let snap = g.snapshot().unwrap();
+    let mut parts: Vec<Vec<u8>> = Vec::new();
+    snap.write_image(1 << 20, &mut |_, b| {
+        parts.push(b);
+        Ok(())
+    })
+    .unwrap();
+    let from = snap.lsn();
+    drop(snap);
+    let gd = setup(&mut g);
+    g.set_node_prop(gd[1], "text", Value::from("changed"))
+        .unwrap();
+    let (_, end) = g.log_span().unwrap();
+    let log = g.log_range(from, end).unwrap();
+    let refs: Vec<&[u8]> = parts.iter().map(|p| p.as_slice()).collect();
+    let (mut m, _) = Graph::from_replica(&refs, &[(from, &log)], u64::MAX, 1 << 20).unwrap();
+    assert_eq!(current_of(&mut g, "s"), "no");
+    assert_eq!(current_of(&mut m, "s"), "no");
+    c.set_node_prop(docs[0], "text", Value::from("copy"))
+        .unwrap();
+    assert_eq!(current_of(&mut c, "s"), "no");
+    drop(f);
+    cleanup(&path);
 }

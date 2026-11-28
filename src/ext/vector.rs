@@ -50,13 +50,24 @@
 //!
 //! **Staleness (D4).** A vector carries the log position it was written at
 //! ([`Graph::log_end`] before its record, as the change journal's entries
-//! do). It is *stale* when the journal holds a change to its node or edge
-//! after that position, or when that position (or its space's) lies past
-//! the database's; *unknown* when the journal is not installed, cannot
-//! answer for its position, or (for a key) when anything in the graph
-//! changed since; and *fresh* otherwise. A node of the space's labels with
-//! no vector is *missing*. Searches say how many of each the space holds,
-//! and with `fresh: "require"` any but fresh is an error.
+//! do). It is *stale* when the journal holds a change to what its space
+//! follows (`follows: "self"`: its node or edge; `"edges"`: its node and
+//! the edges at it, the journal's `adjacency` entries) after that
+//! position, or when that position (or its space's) lies past the
+//! database's; *unknown* when the journal is not installed, cannot answer
+//! for its position, or (for a key) when anything in the graph changed
+//! since; and *fresh* otherwise. A node of the space's labels with no
+//! vector is *missing*. Changes farther away than a node's own edges are
+//! not seen: that is where the engine's knowledge stops.
+//!
+//! **Whether a space is current** ([`current`]) is answered without
+//! counting: a full count that finds everything fresh records the position
+//! it started at and where that record ends (`k<space>`). A search reports
+//! `yes` when nothing was written since that record, or when the journal
+//! shows no change since that made a vector stale or left a node missing;
+//! `no` naming one; `unknown` otherwise. `counts: true` counts, and with
+//! `fresh: "require"` anything but current is an error (counting first
+//! when it is not known).
 //!
 //! Every loop over vectors passes through [`step`], the one place the
 //! statement budget (slice G2) is to be counted.
@@ -104,8 +115,8 @@ const NEXT_KEY: &[u8] = b"!n";
 const PROCEDURES: &[Spec] = &[
     Spec {
         name: "create",
-        args: "(space, dims, metric, normalized, of, labels, algorithm, config, model, model_version, code, at)",
-        doc: "Make a named space: dims, metric (cosine, dot, l2), normalized, of (node, edge, key), the labels expected to have a vector, and where its vectors come from",
+        args: "(space, dims, metric, normalized, of, follows, labels, algorithm, config, model, model_version, code, at)",
+        doc: "Make a named space: dims, metric (cosine, dot, l2), normalized, of (node, edge, key), follows (self, or edges for vectors of a node's surroundings), the labels expected to have a vector, and where its vectors come from",
     },
     Spec {
         name: "drop",
@@ -114,8 +125,8 @@ const PROCEDURES: &[Spec] = &[
     },
     Spec {
         name: "spaces",
-        args: "()",
-        doc: "Every space with its definition, vectors, bytes and the revision it last changed at",
+        args: "(counts)",
+        doc: "Every space with its definition, vectors, bytes, the revision it last changed at and whether it is current; counts: true adds stale, missing and unknown",
     },
     Spec {
         name: "put",
@@ -139,12 +150,12 @@ const PROCEDURES: &[Spec] = &[
     },
     Spec {
         name: "search",
-        args: "(space, vector, top, labels, min_score, fresh)",
-        doc: "Exact search: every candidate scored, the best returned as id, score, state, ties to the lower id; says how many vectors are stale, missing or unknown",
+        args: "(space, vector, top, labels, min_score, fresh, counts)",
+        doc: "Exact search: every candidate scored, the best returned as id, score, state, ties to the lower id; says whether the space is current (yes, no, unknown) and, with counts: true, how many vectors are stale, missing or unknown",
     },
     Spec {
         name: "similar",
-        args: "(space, id | key, top, in, labels, min_score, fresh)",
+        args: "(space, id | key, top, in, labels, min_score, fresh, counts)",
         doc: "Search from a stored vector, in its space or in another whose dims, metric, algorithm, model and model version agree",
     },
     Spec {
@@ -225,11 +236,54 @@ impl Of {
             .into_iter()
             .find(|m| m.byte() == b)
     }
-    fn kind(self) -> Option<Kind> {
+}
+
+/// What a space's vectors follow: what, when it changes, makes them stale.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Follows {
+    /// The node or edge itself: its labels, properties, existence (and an
+    /// edge's endpoints and type). A vector of a node's own text.
+    Itself,
+    /// A node and its edges: also an edge added, removed or changed at the
+    /// node. A vector computed from the node's surroundings. Node spaces
+    /// only. Changes further away are not seen (see the module docs).
+    Edges,
+}
+
+impl Follows {
+    pub fn name(self) -> &'static str {
         match self {
-            Of::Node => Some(Kind::Node),
-            Of::Edge => Some(Kind::Edge),
-            Of::Key => None,
+            Follows::Itself => "self",
+            Follows::Edges => "edges",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Follows> {
+        [Follows::Itself, Follows::Edges]
+            .into_iter()
+            .find(|m| m.name() == s)
+    }
+    fn byte(self) -> u8 {
+        match self {
+            Follows::Itself => 0,
+            Follows::Edges => 1,
+        }
+    }
+    fn from_byte(b: u8) -> Option<Follows> {
+        [Follows::Itself, Follows::Edges]
+            .into_iter()
+            .find(|m| m.byte() == b)
+    }
+}
+
+impl Space {
+    /// The journal kinds whose entries for a vector's id make it stale
+    /// (none for a key space: any node or edge change may).
+    pub fn kinds(&self) -> &'static [Kind] {
+        match (self.of, self.follows) {
+            (Of::Node, Follows::Itself) => &[Kind::Node],
+            (Of::Node, Follows::Edges) => &[Kind::Node, Kind::Adjacency],
+            (Of::Edge, _) => &[Kind::Edge],
+            (Of::Key, _) => &[],
         }
     }
 }
@@ -246,6 +300,8 @@ pub struct Space {
     /// Vectors are stored at unit length (a put normalises them).
     pub normalized: bool,
     pub of: Of,
+    /// What its vectors follow: what makes them stale.
+    pub follows: Follows,
     /// Labels whose nodes are expected to have a vector (node spaces).
     pub labels: Vec<String>,
     pub algorithm: Option<String>,
@@ -311,6 +367,7 @@ impl Space {
         out.push(self.metric.byte());
         out.push(self.normalized as u8);
         out.push(self.of.byte());
+        out.push(self.follows.byte());
         out.extend_from_slice(&self.created.to_be_bytes());
         for s in [
             self.algorithm.as_deref(),
@@ -343,6 +400,7 @@ impl Space {
             _ => return None,
         };
         let of = Of::from_byte(r.u8()?)?;
+        let follows = Follows::from_byte(r.u8()?)?;
         let created = r.u64()?;
         let algorithm = r.opt_str()?;
         let config = r.opt_str()?;
@@ -365,6 +423,7 @@ impl Space {
             metric,
             normalized,
             of,
+            follows,
             labels,
             algorithm,
             config,
@@ -828,6 +887,9 @@ pub fn delete(g: &mut Graph, s: &Space, targets: &[Target]) -> Result<u64> {
     }
     if n > 0 {
         st.changed = g.log_end();
+        // A removed vector may leave a node of the labels without one: the
+        // space is no longer known to be complete.
+        dels.push(mark_key(s.sid));
         g.ext_write(NS, vec![(stats_key(s.sid), st.encode())], dels)?;
     }
     Ok(n)
@@ -837,13 +899,13 @@ pub fn delete(g: &mut Graph, s: &Space, targets: &[Target]) -> Result<u64> {
 /// sources, from the change journal (see the module documentation).
 pub struct Judge {
     now: u64,
-    of: Of,
+    kinds: &'static [Kind],
     space_past: bool,
     /// The journal's floor, when it is installed and can answer.
     floor: Option<u64>,
-    /// For key spaces: the newest change to any node or edge since the
-    /// floor (None: the journal cannot say).
-    newest: Option<u64>,
+    /// For key spaces, read the first time it is needed: the newest change
+    /// to any node or edge since the floor (None: the journal cannot say).
+    newest: std::cell::OnceCell<Option<u64>>,
 }
 
 impl Judge {
@@ -853,16 +915,12 @@ impl Judge {
         let floor = changes::oldest(g)
             .map(|(f, _)| f)
             .filter(|&f| changes::answers(g, f));
-        let newest = match (s.of, floor) {
-            (Of::Key, Some(f)) => newest_change(g, f),
-            _ => None,
-        };
         Judge {
             now,
-            of: s.of,
+            kinds: s.kinds(),
             space_past: s.created > now || st.changed > now,
             floor,
-            newest,
+            newest: std::cell::OnceCell::new(),
         }
     }
 
@@ -887,23 +945,31 @@ impl Judge {
                 format!("written at revision {rev}, before the change journal's floor {floor}; put it again"),
             );
         }
-        match self.of.kind() {
-            Some(kind) => {
-                let id = u64::from_be_bytes(target.try_into().unwrap_or([0; 8]));
+        if !self.kinds.is_empty() {
+            let id = u64::from_be_bytes(target.try_into().unwrap_or([0; 8]));
+            for &kind in self.kinds {
                 match changes::entry(g, kind, id) {
-                    None => (Fresh::Fresh, String::new()),
-                    Some(e) if e.revision > now => (
-                        Fresh::Unknown,
-                        "the change journal holds a position past this database's; it cannot answer".into(),
-                    ),
-                    Some(e) if e.revision > rev => (
-                        Fresh::Stale,
-                        format!("its {} changed at revision {} after the vector was written at {rev}", kind.name(), e.revision),
-                    ),
-                    Some(_) => (Fresh::Fresh, String::new()),
+                    None => {}
+                    Some(e) if e.revision > now => {
+                        return (
+                            Fresh::Unknown,
+                            "the change journal holds a position past this database's; it cannot answer".into(),
+                        )
+                    }
+                    Some(e) if e.revision > rev => {
+                        return (
+                            Fresh::Stale,
+                            format!("its {} changed at revision {} after the vector was written at {rev}", kind.name(), e.revision),
+                        )
+                    }
+                    Some(_) => {}
                 }
             }
-            None => match self.newest {
+            return (Fresh::Fresh, String::new());
+        }
+        {
+            let floor = self.floor.unwrap_or(0);
+            match *self.newest.get_or_init(|| newest_change(g, floor)) {
                 Some(n) if n <= rev => (Fresh::Fresh, String::new()),
                 Some(n) => (
                     Fresh::Unknown,
@@ -913,7 +979,7 @@ impl Judge {
                     Fresh::Unknown,
                     "the change journal cannot say what changed since it was written".into(),
                 ),
-            },
+            }
         }
     }
 }
@@ -1054,6 +1120,166 @@ pub fn tally(g: &Graph, s: &Space, judge: &Judge) -> Result<Tally> {
         Ok(true)
     })?;
     Ok(t)
+}
+
+// ------------------------------------------------- whether a space is current
+
+fn mark_key(sid: u32) -> Vec<u8> {
+    rec_key(b'k', sid, &[])
+}
+
+/// Whether a space is known to be entirely fresh, answered without counting.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Current {
+    /// Established complete (every vector fresh, no node of its labels
+    /// missing) at `since`, and nothing it follows has made a vector stale
+    /// or a node missing since.
+    Yes { since: u64 },
+    /// Established at `since`, and since then a change made a vector of
+    /// it stale or a node of its labels lack one.
+    No { since: u64, why: String },
+    /// The engine has not established it, or cannot tell.
+    Unknown { why: String },
+}
+
+impl Current {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Current::Yes { .. } => "yes",
+            Current::No { .. } => "no",
+            Current::Unknown { .. } => "unknown",
+        }
+    }
+    fn since(&self) -> Option<u64> {
+        match self {
+            Current::Yes { since } | Current::No { since, .. } => Some(*since),
+            Current::Unknown { .. } => None,
+        }
+    }
+    fn say(&self) -> String {
+        match self {
+            Current::Yes { since } => format!(
+                "space current: yes, established complete at revision {since} and nothing it follows changed it since"
+            ),
+            Current::No { since, why } => format!(
+                "space current: no, established complete at revision {since}, but {why}; CALL vector.stale lists what to put again"
+            ),
+            Current::Unknown { why } => format!(
+                "space current: unknown, {why}; counts: true or vector.stale counts it"
+            ),
+        }
+    }
+}
+
+/// Whether nothing has been written since `end`, the end of the marker's
+/// own record: the log ends there (its transaction still open), or one
+/// commit marker later and that is committed.
+fn at_mark_end(g: &Graph, end: u64) -> bool {
+    let now = g.log_end();
+    now == end || (now == g.revision() && now == end + crate::storage::log::FRAME_BYTES)
+}
+
+/// Record that a full count found the space entirely fresh at `at`: one
+/// small record, which says where it ends so that a later read can see
+/// nothing was written since without asking the journal.
+fn establish(g: &mut Graph, s: &Space, at: u64) -> Result<()> {
+    let key = mark_key(s.sid);
+    let mut full = NS.as_bytes().to_vec();
+    full.push(0);
+    full.extend_from_slice(&key);
+    let op = crate::store::Op::ExtWrite {
+        puts: vec![(full, vec![0u8; 16])],
+        dels: Vec::new(),
+    };
+    let end = g.log_end() + crate::storage::log::FRAME_BYTES + op.encode_record().len() as u64;
+    let mut v = at.to_be_bytes().to_vec();
+    v.extend_from_slice(&end.to_be_bytes());
+    g.ext_write(NS, vec![(key, v)], Vec::new())
+}
+
+fn mark(g: &Graph, s: &Space) -> Option<(u64, u64)> {
+    let v = g.ext_get(NS, &mark_key(s.sid))?;
+    (v.len() == 16).then(|| {
+        (
+            u64::from_be_bytes(v[..8].try_into().unwrap()),
+            u64::from_be_bytes(v[8..].try_into().unwrap()),
+        )
+    })
+}
+
+/// Whether the space is current, without counting it: from the record a
+/// full count left when it found everything fresh, and the change journal
+/// since. Free when nothing was written since that record; otherwise it
+/// reads the journal's entries of the kinds the space follows (not the
+/// space), looking up the vector of each id changed since.
+pub fn current(g: &Graph, s: &Space) -> Result<Current> {
+    let unknown = |why: &str| Ok(Current::Unknown { why: why.into() });
+    let Some((since, end)) = mark(g, s) else {
+        return unknown("not established complete since the space last lost a vector or was made");
+    };
+    let now = g.log_end();
+    let st = stats(g, s);
+    if since > now || end > now || s.created > now || st.changed > now {
+        return unknown("its records lie past this database's position, so they cannot be trusted");
+    }
+    if at_mark_end(g, end) {
+        return Ok(Current::Yes { since });
+    }
+    if !changes::answers(g, since) {
+        return unknown("the change journal cannot answer for when it was established complete");
+    }
+    let kinds: &[Kind] = if s.of == Of::Key {
+        &[Kind::Node, Kind::Edge]
+    } else {
+        s.kinds()
+    };
+    let lset: Vec<u32> = s
+        .labels
+        .iter()
+        .filter_map(|l| g.strings.lookup(l))
+        .collect();
+    let mut after = None;
+    loop {
+        let (list, more) = changes::since(g, since, kinds, after, MAX_ROWS)?;
+        step(list.len() as u64)?;
+        for e in &list {
+            if e.revision > now {
+                return unknown("the change journal holds a position past this database's");
+            }
+            if s.of == Of::Key {
+                return unknown(&format!(
+                    "the graph changed at revision {} and the engine cannot tell what a key's vector was made from",
+                    e.revision
+                ));
+            }
+            let mk = rec_key(b'm', s.sid, &e.id.to_be_bytes());
+            match g.ext_get(NS, &mk).and_then(|b| Meta::decode(&b)) {
+                Some(m) if m.revision < e.revision => {
+                    return Ok(Current::No {
+                        since,
+                        why: format!(
+                            "the vector of {} is stale: its {} changed at revision {}",
+                            Target::Id(e.id).show(s.of),
+                            e.kind.name(),
+                            e.revision
+                        ),
+                    })
+                }
+                Some(_) => {}
+                None if e.kind == Kind::Node && lset.iter().any(|&l| g.has_label(e.id, l)) => {
+                    return Ok(Current::No {
+                        since,
+                        why: format!("node {} has a label of the space and no vector", e.id),
+                    })
+                }
+                None => {}
+            }
+        }
+        match (more, list.last()) {
+            (true, Some(e)) => after = Some((e.kind, e.id)),
+            _ => return Ok(Current::Yes { since }),
+        }
+    }
 }
 
 /// A query prepared for a space: checked and, when the metric is cosine or
@@ -1334,6 +1560,16 @@ fn create_proc(g: &mut Graph, a: &Args) -> Result<QueryResult> {
             "labels: names the labels whose nodes should have a vector, so it applies to spaces of nodes only".into(),
         ));
     }
+    let follows = match a.str("follows") {
+        None => Follows::Itself,
+        Some(f) => Follows::parse(&f.to_ascii_lowercase())
+            .ok_or_else(|| Error::Msg(format!("follows: '{f}' is not one of self, edges")))?,
+    };
+    if follows == Follows::Edges && of != Of::Node {
+        return Err(Error::Msg(
+            "follows: 'edges' says a node's vector changes with the node's edges, so it applies to spaces of nodes only".into(),
+        ));
+    }
     let mut def = Space {
         name: name.clone(),
         sid: 0,
@@ -1341,6 +1577,7 @@ fn create_proc(g: &mut Graph, a: &Args) -> Result<QueryResult> {
         metric,
         normalized: a.bool("normalized", false),
         of,
+        follows,
         labels,
         algorithm: opt_text(a, "algorithm"),
         config: opt_text(a, "config"),
@@ -1425,16 +1662,35 @@ fn opt_value(s: &Option<String>) -> Value {
     s.clone().map(Value::Text).unwrap_or(Value::Null)
 }
 
-fn spaces_proc(g: &mut Graph) -> Result<QueryResult> {
+fn spaces_proc(g: &mut Graph, a: &Args) -> Result<QueryResult> {
+    let counts = a.bool("counts", false);
     let mut rows = Vec::new();
     for s in spaces(g) {
+        let mut cur = current(g, &s)?;
+        let mut tallied = [Value::Null, Value::Null, Value::Null];
+        if counts {
+            let at = g.log_end();
+            let t = tally(g, &s, &Judge::new(g, &s))?;
+            if t.clean() {
+                if !matches!(cur, Current::Yes { .. }) {
+                    establish(g, &s, at)?;
+                }
+                cur = Current::Yes { since: at };
+            }
+            tallied = [
+                Value::Int(t.stale as i64),
+                Value::Int(t.missing as i64),
+                Value::Int(t.unknown as i64),
+            ];
+        }
         let st = stats(g, &s);
-        rows.push(vec![
+        let mut row = vec![
             Value::Text(s.name.clone()),
             Value::Int(s.dims as i64),
             Value::Text(s.metric.name().into()),
             Value::Bool(s.normalized),
             Value::Text(s.of.name().into()),
+            Value::Text(s.follows.name().into()),
             Value::List(s.labels.iter().map(|l| Value::Text(l.clone())).collect()),
             opt_value(&s.algorithm),
             opt_value(&s.config),
@@ -1446,7 +1702,11 @@ fn spaces_proc(g: &mut Graph) -> Result<QueryResult> {
             Value::Int(st.count as i64),
             Value::Int(st.bytes as i64),
             Value::Int(st.changed as i64),
-        ]);
+            Value::Text(cur.name().into()),
+            cur.since().map_or(Value::Null, |v| Value::Int(v as i64)),
+        ];
+        row.extend(tallied);
+        rows.push(row);
     }
     let cols = [
         "space",
@@ -1454,6 +1714,7 @@ fn spaces_proc(g: &mut Graph) -> Result<QueryResult> {
         "metric",
         "normalized",
         "of",
+        "follows",
         "labels",
         "algorithm",
         "config",
@@ -1465,6 +1726,11 @@ fn spaces_proc(g: &mut Graph) -> Result<QueryResult> {
         "vectors",
         "bytes",
         "revision",
+        "current",
+        "current_since",
+        "stale",
+        "missing",
+        "unknown",
     ];
     let mut r = QueryResult::table(cols.iter().map(|c| c.to_string()).collect(), rows);
     r.message = Some(format!("at revision {}", g.revision()));
@@ -1711,16 +1977,18 @@ fn search_opts(a: &Args) -> Result<Search> {
 /// and the space's counts in the message; with `fresh: "require"` anything
 /// but clean is an error.
 fn search_result(
-    g: &Graph,
+    g: &mut Graph,
     s: &Space,
     q: &[f64],
     opts: &Search,
     fresh: Freshness,
+    counts: bool,
     from: Option<(Fresh, String)>,
 ) -> Result<QueryResult> {
     let judge = Judge::new(g, s);
-    let tally = tally(g, s, &judge)?;
-    if let Freshness::Require = fresh {
+    let mut cur = current(g, s)?;
+    let require = matches!(fresh, Freshness::Require);
+    if require {
         if let Some((f, why)) = &from {
             if *f != Fresh::Fresh {
                 return Err(Error::Msg(format!(
@@ -1729,14 +1997,27 @@ fn search_result(
                 )));
             }
         }
-        if !tally.clean() {
+    }
+    // The exact counts: asked for, or needed because the space is not
+    // known to be current and freshness is required.
+    let mut tally_note = String::new();
+    if counts || (require && !matches!(cur, Current::Yes { .. })) {
+        let at = g.log_end();
+        let t = tally(g, s, &judge)?;
+        if t.clean() {
+            if !matches!(cur, Current::Yes { .. }) {
+                establish(g, s, at)?;
+            }
+            cur = Current::Yes { since: at };
+        } else if require {
             return Err(Error::Msg(format!(
                 "space '{}' is not fresh ({}); with fresh: \"require\" that is an error. CALL vector.stale(space: '{}') lists them: put them again",
                 s.name,
-                tally.say(),
+                t.say(),
                 s.name
             )));
         }
+        tally_note = format!("; counted: {}", t.say());
     }
     let found = search(g, s, q, opts)?;
     let mut rows = Vec::with_capacity(found.rows.len());
@@ -1759,13 +2040,14 @@ fn search_result(
         _ => String::new(),
     };
     r.message = Some(format!(
-        "{} of {} vectors scored in space '{}' ({}, {} dims), exact; {}{}; at revision {}",
+        "{} of {} vectors scored in space '{}' ({}, {} dims), exact; {}{}{}; at revision {}",
         found.scored,
         st.count,
         s.name,
         s.metric.name(),
         s.dims,
-        tally.say(),
+        cur.say(),
+        tally_note,
         from_note,
         g.revision()
     ));
@@ -1781,7 +2063,15 @@ fn search_proc(g: &mut Graph, a: &Args) -> Result<QueryResult> {
     )?;
     let q = prepare(&s, &q)?;
     let opts = search_opts(a)?;
-    search_result(g, &s, &q, &opts, fresh_arg(a)?, None)
+    search_result(
+        g,
+        &s,
+        &q,
+        &opts,
+        fresh_arg(a)?,
+        a.bool("counts", false),
+        None,
+    )
 }
 
 fn similar_proc(g: &mut Graph, a: &Args) -> Result<QueryResult> {
@@ -1817,7 +2107,15 @@ fn similar_proc(g: &mut Graph, a: &Args) -> Result<QueryResult> {
     if from.of == into.of {
         opts.exclude = Some(t.clone());
     }
-    search_result(g, &into, &q, &opts, fresh_arg(a)?, Some(state))
+    search_result(
+        g,
+        &into,
+        &q,
+        &opts,
+        fresh_arg(a)?,
+        a.bool("counts", false),
+        Some(state),
+    )
 }
 
 fn hex(b: &[u8]) -> String {
@@ -1861,6 +2159,8 @@ fn stale_proc(g: &mut Graph, a: &Args) -> Result<QueryResult> {
     let s = space_or_err(g, &name_arg(a)?)?;
     let limit = a.usize("limit", 1_000).clamp(1, MAX_ROWS);
     let cursor = cursor_arg(a)?;
+    let start = g.log_end();
+    let whole = matches!(cursor, Cursor::Vectors(None));
     let judge = Judge::new(g, &s);
     let mut rows: Vec<Vec<Value>> = Vec::new();
     let mut looked = 0u64;
@@ -1915,6 +2215,13 @@ fn stale_proc(g: &mut Graph, a: &Args) -> Result<QueryResult> {
             next = None;
         }
     }
+    // One call that saw everything and found nothing: the space is
+    // established complete at the position the call started from.
+    if whole && next.is_none() && rows.is_empty() {
+        if !matches!(current(g, &s)?, Current::Yes { .. }) {
+            establish(g, &s, start)?;
+        }
+    }
     let mut r = QueryResult::table(
         vec![
             target_col(&s),
@@ -1966,7 +2273,7 @@ impl Extension for Vector {
         match procedure {
             "create" => create_proc(g, a),
             "drop" => drop_proc(g, a),
-            "spaces" => spaces_proc(g),
+            "spaces" => spaces_proc(g, a),
             "put" => put_proc(g, a),
             "get" => get_proc(g, a, true),
             "hashes" => get_proc(g, a, false),
@@ -2153,6 +2460,19 @@ fn check_record(
         )
     };
     match tag {
+        b'k' if tb.is_empty() => {
+            if v.len() != 16 {
+                bad(probe, "a space's completeness record that does not decode");
+            } else if u64::from_be_bytes(v[..8].try_into().unwrap()) > end
+                || u64::from_be_bytes(v[8..].try_into().unwrap()) > end
+            {
+                probe.found(
+                    "future",
+                    format!("space {}", s.name),
+                    format!("established complete at a position past the log's end at {end}"),
+                );
+            }
+        }
         b'c' if tb.is_empty() => match Stats::decode(v) {
             None => bad(probe, "a space's count record that does not decode"),
             Some(st) if st.changed > end => probe.found(

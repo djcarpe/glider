@@ -815,6 +815,7 @@ compared and where they came from:
 |---|---|
 | `dims`, `metric`, `normalized` | the shape; `metric` is `cosine`, `dot` or `l2` |
 | `of` | what its vectors are about: `node`, `edge` or `key` (a group of nodes or a whole graph, named by the caller with a string) |
+| `follows` | what makes them stale: `self` (the node or edge itself, the default) or, for node spaces, `edges` (the node and the edges at it) |
 | `labels` | for a node space, the labels whose nodes are expected to have a vector (optional) |
 | `algorithm`, `config` | what computed them and with which settings |
 | `model`, `model_version` | for supplied vectors, the model the application used |
@@ -889,9 +890,16 @@ What is true now, and what this slice decided where the plan was open:
   configuration) and keeps the definitions; the bulk hook writes each
   space's count as zero at the clear's position.
 - **Staleness (D4).** Each vector is `fresh`, `stale` or `unknown`:
-  - *stale*: the journal holds a change to its node (kind `node`: labels,
-    properties, existence; not its edges) or its edge after the position
-    the vector was written at; or that position, the space's creation or
+  - *stale*: the journal holds a change to what the space follows after
+    the position the vector was written at: for `follows: "self"` its node
+    (kind `node`: labels, properties, existence) or its edge (kind `edge`);
+    for `follows: "edges"` its node or an edge added, removed or changed at
+    it (kinds `node` and `adjacency`). A vector computed from farther
+    away (two hops, a community) can change when nothing at its own node
+    did: **this is where the engine's knowledge stops**. The journal says
+    which nodes' own edges changed and nothing about reach; a procedure
+    that computes such vectors works out its own reach from the changed
+    ids and puts what it recomputes; or that position, the space's creation or
     its last change lies past the database's `log_end()` (never trusted,
     whatever the journal says);
   - *unknown*: `changes` is not installed or cannot answer (purging,
@@ -904,6 +912,46 @@ What is true now, and what this slice decided where the plan was open:
   - *missing* is the fourth state, for nodes of the space's `labels` that
     have no vector (a node with two of them is counted once).
 
+  **Whether a space is current, cheaply.** Counting the states reads every
+  vector, and a search is asked on behalf of a waiting user, so a search
+  does not count by default. It reports `space current: yes` (established
+  complete at revision P, and nothing it follows has made a vector stale
+  or a node missing since), `no` (established at P, and since then a
+  named vector went stale or a node of its labels has none), or `unknown`
+  (not established, or the engine cannot tell), with P where there is one.
+  `yes` is never said without a count that found the space entirely
+  fresh. *Who records it and when*: a full count that finds no stale,
+  missing or unknown vector writes one record, `k<space>`, holding the
+  position the count started at (P) and the end of that record itself
+  (its size is known before it is written, as `structure`'s chain is);
+  the counts are made by `search` or `similar` with `counts: true` or
+  with `fresh: "require"` when the space is not already current, by
+  `vector.spaces(counts: true)`, and by a `vector.stale` call that saw the
+  whole space in one slice and found nothing. Establishing is therefore a
+  write (a few dozen log bytes) made by a read, once per change of state;
+  it commits and rolls back with the statement. *How it is read*: when
+  the log ends where that record ends (nothing at all was written since),
+  `yes` at once; otherwise the journal must answer for P (installed,
+  floor at or below P, not purging), and its entries of the kinds the
+  space follows changed after P are walked: one whose vector is older
+  than the change, or a node of the labels without a vector, makes it
+  `no`; none, `yes`. A put after P writes fresh vectors and keeps it; a
+  delete of a vector (`vector.delete`, or a node's or edge's delete)
+  removes the record; `CLEAR` wipes it. *Where it is not trusted*: P, the
+  record's end, the space's creation or last change past `log_end()`
+  (an image or a copy of a later state), a floor raised past P (release,
+  the cap, a `CLEAR`), the journal dropped and installed again (its floor
+  is the reinstall), and, for a key space, any node or edge change since
+  P (`unknown`). A put that fails takes its statement back, and a failed
+  block rolls back the record with it. Shown by
+  `a_search_says_cheaply_whether_its_space_is_current_and_never_claims_what_it_has_not_established`
+  and `the_record_that_a_space_is_current_is_not_trusted_where_it_must_not_be`.
+  The exact counts stay available: `counts: true` on `search`/`similar`
+  (in the message), `vector.spaces(counts: true)` (columns `stale`,
+  `missing`, `unknown`; `current` and `current_since` are always there),
+  and `vector.stale`. `fresh: "require"` refuses unless the space is
+  current, counting when it is not known to be.
+
   The journal is read through its Rust API: `oldest` and `answers` once a
   call, then one `entry` lookup a vector; a key space reads the journal's
   node and edge entries once a call (`since` in slices) for the newest
@@ -912,12 +960,13 @@ What is true now, and what this slice decided where the plan was open:
   (`limit:` at most 10,000 rows, at most 100,000 records looked at a
   call, continued with `after:` as the message says); the slices together
   are the whole list. `search` and `similar` report each returned row's
-  state and, in the message, the space's counts (`stale S, missing M,
-  unknown U`) and the revision; with `fresh: "require"` they are an error
-  when any count is not zero, or, for `similar`, when the vector searched
-  from is not fresh. Counting reads every vector's metadata and journal
-  entry and every member of the space's labels, so a search pays about as
-  much again as its scan for being honest (measured).
+  state and, in the message, whether the space is current, the revision,
+  and the counts (`stale S, missing M, unknown U`) when asked; with
+  `fresh: "require"` they are an error unless the space is current, or,
+  for `similar`, when the vector searched from is not fresh. Counting
+  reads every vector's metadata and journal entry and every member of the
+  space's labels, about as much again as a scan; reporting currency reads
+  one record, or the journal's entries since P (measured).
 - **Positions past the database's (the journal's review).** A vector or a
   space whose position is past `log_end()` is stale; shown by copying a
   space from a graph further along into one behind
@@ -948,10 +997,8 @@ What is true now, and what this slice decided where the plan was open:
 - Left out, as planned: an approximate index (G17, only if exact search
   proves too slow), computing any vector (`embed`), seeding
   `context.retrieve` from a search (G15). Also left out: `labels:` for
-  edge spaces (edge types expected to have a vector), and a space that
-  depends on a node's edges as well as the node (a structural embedding
-  is stale when its neighbourhood changes; G11 can add a field that says
-  so, in a new space).
+  edge spaces (edge types expected to have a vector), and staleness
+  beyond a node's own edges (above).
 - A vector never stands in for a node. A search returns ids and scores;
   what the node is comes from the graph.
 

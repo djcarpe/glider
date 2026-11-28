@@ -1154,7 +1154,16 @@ fn vector(run: &mut Run) -> Result<(), String> {
         // Searches: every vector, then one label.
         let queries = if n > 500_000 { 5 } else { 20 };
         let space = vx::space(&run.g, &name).ok_or("space")?;
+        // Counting once establishes that the space is complete; after it, a
+        // search reports that from one record.
+        let qv = rng.vector(dims);
+        let (_, establish_ms) = run.run(
+            &format!("CALL vector.search(space: '{name}', vector: $q, top: 10, counts: true)"),
+            &[("q".to_string(), float_list(&qv))],
+        )?;
         for labels in [None, Some("WorkInstruction")] {
+            let mut counted = Vec::new();
+            let mut required = Vec::new();
             let mut times = Vec::new();
             let mut scan = Vec::new();
             let mut scored = 0u64;
@@ -1168,11 +1177,21 @@ fn vector(run: &mut Run) -> Result<(), String> {
                         "CALL vector.search(space: '{name}', vector: $q, top: 10, labels: ['{l}'])"
                     ),
                 };
-                let (r, ms) = run.run(&src, &[("q".to_string(), float_list(&qv))])?;
+                let qp = [("q".to_string(), float_list(&qv))];
+                let (r, ms) = run.run(&src, &qp)?;
                 if r.rows.len() != 10 {
                     return Err(format!("search gave {} rows", r.rows.len()));
                 }
+                let msg = r.message.unwrap_or_default();
+                if !msg.contains("space current: yes") {
+                    return Err(format!("the space should be current: {msg}"));
+                }
                 times.push(ms);
+                let with = |extra: &str| src.replace("top: 10", &format!("top: 10, {extra}"));
+                let (_, ms) = run.run(&with("counts: true"), &qp)?;
+                counted.push(ms);
+                let (_, ms) = run.run(&with("fresh: 'require'"), &qp)?;
+                required.push(ms);
                 let opts = vx::Search {
                     top: 10,
                     labels: labels.map(|l| vec![l.to_string()]).unwrap_or_default(),
@@ -1187,6 +1206,8 @@ fn vector(run: &mut Run) -> Result<(), String> {
             let (_, peak) = rss_mb();
             let p50 = pct(&mut times, 0.5);
             let scan50 = pct(&mut scan, 0.5);
+            let counted50 = pct(&mut counted, 0.5);
+            let required50 = pct(&mut required, 0.5);
             let max = times.iter().cloned().fold(0.0, f64::max);
             run.emit(
                 "vector.search",
@@ -1198,6 +1219,9 @@ fn vector(run: &mut Run) -> Result<(), String> {
                     .raw("ms_p50", &format!("{p50:.1}"))
                     .raw("ms_max", &format!("{max:.1}"))
                     .raw("scan_ms_p50", &format!("{scan50:.1}"))
+                    .raw("counts_ms_p50", &format!("{counted50:.1}"))
+                    .raw("require_ms_p50", &format!("{required50:.1}"))
+                    .raw("establish_ms", &format!("{establish_ms:.1}"))
                     .raw("scored_per_s", &format!("{:.0}", scored as f64 / p50 * 1e3))
                     .raw(
                         "scan_scored_per_s",
@@ -1214,6 +1238,16 @@ fn vector(run: &mut Run) -> Result<(), String> {
             run.g
                 .set_node_prop(ids[i * step], "touched", Value::Int(dims as i64))
                 .map_err(|e| e.to_string())?;
+        }
+        // A search now finds the change from the journal, without counting.
+        let qv = rng.vector(dims);
+        let (r, changed_ms) = run.run(
+            &format!("CALL vector.search(space: '{name}', vector: $q, top: 10)"),
+            &[("q".to_string(), float_list(&qv))],
+        )?;
+        let msg = r.message.unwrap_or_default();
+        if !msg.contains("space current: no") {
+            return Err(format!("the space should not be current: {msg}"));
         }
         let t = Instant::now();
         let mut after: Option<String> = None;
@@ -1241,7 +1275,8 @@ fn vector(run: &mut Run) -> Result<(), String> {
                 .u("changed", STALE_CHANGES.min(n) as u64)
                 .u("rows", rows as u64)
                 .u("calls", calls as u64)
-                .i("ms", stale_ms as i64),
+                .i("ms", stale_ms as i64)
+                .raw("search_after_change_ms", &format!("{changed_ms:.1}")),
         );
         let (_, ms) = run.run(&format!("CALL vector.drop(space: '{name}')"), &[])?;
         run.emit(
