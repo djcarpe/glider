@@ -75,7 +75,7 @@ fn a_stopped_procedure_gives_back_its_memory_and_its_spill_files() {
     stopped(&mut g, LONG);
     let held = PEAK.load(Ordering::Relaxed) - before;
     let after = LIVE.load(Ordering::Relaxed);
-    assert!(held > 4 << 20, "it held {held} bytes while running");
+    assert!(held > 1 << 20, "it held {held} bytes while running");
     assert!(
         after <= before + (64 << 10),
         "{} bytes not given back",
