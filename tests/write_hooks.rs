@@ -137,6 +137,9 @@ impl Extension for Recorder {
     fn on_bulk_write(&self, g: &mut Graph, what: BulkWrite) -> Result<()> {
         CALLS.with(|c| c.set(c.get() + 1));
         assert_eq!(what, BulkWrite::Clear);
+        if g.ext_get(NS, b"!failbulk").is_some() {
+            return Err(Error::Msg("the recorder refuses this clear".into()));
+        }
         g.ext_write(NS, vec![(b"bulk".to_vec(), Vec::new())], Vec::new())
     }
 }
@@ -262,6 +265,9 @@ fn keyspace(g: &Graph, ns: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
 fn recorded(g: &Graph) -> Recorded {
     let mut r = Recorded::default();
     for (k, v) in keyspace(g, NS) {
+        if k == b"!failbulk" {
+            panic!("the bulk failure switch survived");
+        }
         if k == b"bulk" {
             r.bulk = true;
             continue;
@@ -621,6 +627,61 @@ fn every_write_path_is_accounted_for_by_the_hooks() {
     rolled_back(&mut g, "failing statement", |g| {
         assert!(query::execute(g, "CREATE (:Fine)-[:FAIL]->(:Fine)").is_err());
         assert!(query::execute(g, "MATCH (n:Again) DETACH DELETE n").is_err());
+    });
+    // A hook that fails while autocommit is off: the write it was told
+    // about must not become durable without what the hook would have
+    // written. The open transaction is rolled back and the error says so;
+    // a COMMIT after it commits nothing of it.
+    let refused = |e: Error| {
+        let e = e.to_string();
+        assert!(e.contains("the recorder refuses"), "{e}");
+        assert!(e.contains("the transaction was rolled back"), "{e}");
+    };
+    rolled_back(&mut g, "API, autocommit off", |g| {
+        let fails: [&dyn Fn(&mut Graph) -> Result<()>; 6] = [
+            &|g| g.add_node(&["Fail".into()], vec![]).map(|_| ()),
+            &|g| g.add_label(1, "Fail"),
+            &|g| g.add_edge(1, 2, "FAIL", vec![]).map(|_| ()),
+            &|g| g.delete_edge(g.edge_ids()[0]).map(|_| ()),
+            &|g| g.delete_node(1).map(|_| ()),
+            &|g| {
+                g.ext_write(NS, vec![(b"!failbulk".to_vec(), Vec::new())], Vec::new())?;
+                g.clear()
+            },
+        ];
+        for fail in fails {
+            g.autocommit = false;
+            g.add_node(&["Earlier".into()], vec![]).unwrap();
+            refused(fail(g).unwrap_err());
+            g.commit().unwrap();
+            g.autocommit = true;
+        }
+    });
+    rolled_back(&mut g, "statements inside BEGIN", |g| {
+        for bad in [
+            "CREATE (:Fail)",
+            "CREATE (:Fine)-[:FAIL]->(:Fine)",
+            "MATCH ()-[r:AA]->() DELETE r",
+            "MATCH (n:Again) DETACH DELETE n",
+            "CLEAR",
+        ] {
+            q(g, "BEGIN");
+            q(g, "CREATE (:Earlier)-[:E]->(:Earlier)");
+            if bad == "CLEAR" {
+                g.ext_write(NS, vec![(b"!failbulk".to_vec(), Vec::new())], Vec::new())
+                    .unwrap();
+            }
+            refused(query::execute(g, bad).err().expect(bad));
+            q(g, "COMMIT");
+        }
+    });
+    rolled_back(&mut g, "CLEAR, autocommit on", |g| {
+        g.ext_write(NS, vec![(b"!failbulk".to_vec(), Vec::new())], Vec::new())
+            .unwrap();
+        let e = query::execute(g, "CLEAR").err().expect("refused");
+        assert!(e.to_string().contains("the recorder refuses"), "{e}");
+        g.ext_write(NS, Vec::new(), vec![b"!failbulk".to_vec()])
+            .unwrap();
     });
 
     let total: usize = changed.iter().map(|(_, n)| n).sum();

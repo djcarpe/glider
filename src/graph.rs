@@ -1007,6 +1007,23 @@ pub struct Graph {
 
 type Ext = std::sync::Arc<dyn crate::ext::Extension>;
 
+/// The error for a failure that took the caller's open transaction with it.
+fn rolled_back(e: Error) -> Error {
+    const NOTE: &str = "(the transaction was rolled back)";
+    let add = |m: String| {
+        if m.ends_with(NOTE) {
+            m
+        } else {
+            format!("{m} {NOTE}")
+        }
+    };
+    match e {
+        Error::Msg(m) => Error::Msg(add(m)),
+        Error::Full(m) => Error::Full(add(m)),
+        other => other,
+    }
+}
+
 /// Who follows writes in this database.
 #[derive(Clone, Default)]
 struct Hooks {
@@ -2522,20 +2539,30 @@ impl Graph {
 
     /// Several writes, and the hooks that follow them, as one unit: with
     /// autocommit on they commit together, and a failure takes all of them
-    /// back. Inside the caller's transaction, the caller decides.
+    /// back. Inside the caller's transaction a failure after something was
+    /// written rolls that whole transaction back and says so: undoing only
+    /// this unit is not possible, and a write must never become durable
+    /// without the hook writes that belong with it.
     fn unit(&mut self, f: impl FnOnce(&mut Graph) -> Result<()>) -> Result<()> {
         let auto = self.autocommit;
+        let start = self.uncommitted;
         self.autocommit = false;
         let r = f(self);
         self.autocommit = auto;
         match r {
             Ok(()) => self.maybe_commit(),
-            Err(e) => {
-                if auto {
-                    self.rollback_quietly();
-                }
+            Err(e) if auto => {
+                self.rollback_quietly();
                 Err(e)
             }
+            Err(e) if self.uncommitted > start => {
+                self.rollback_quietly();
+                Err(rolled_back(e))
+            }
+            // Nothing was written (a refused value, or a failure that
+            // already rolled the transaction back): the transaction is as
+            // the caller left it.
+            Err(e) => Err(e),
         }
     }
 
