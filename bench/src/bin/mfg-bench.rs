@@ -23,6 +23,7 @@ use std::time::Instant;
 use glider::graph::{Graph, OpenOptions};
 use glider::query::{self, QueryResult};
 use glider::value::{parse_json, Json, Value};
+use glider_bench::checks::{self, Planted, Score};
 use glider_bench::mfg::Obj;
 
 /// The measurements, in the order they run. Each sees the graph as the
@@ -33,6 +34,7 @@ const MEASURES: &[(&str, Measure)] = &[
     ("retrieve", retrieve),
     ("pagerank", pagerank),
     ("communities", communities),
+    ("check", check),
 ];
 
 type Measure = fn(&mut Run) -> Result<(), String>;
@@ -53,6 +55,8 @@ pub struct Run<'a> {
     pub questions: &'a [Question],
     pub budgets: Vec<usize>,
     pub detail: bool,
+    /// What the generator planted, from truth.jsonl.
+    pub planted: &'a Planted,
     meta: &'a Meta,
     out: &'a mut dyn Write,
 }
@@ -135,6 +139,22 @@ fn read_questions(path: &Path) -> Vec<Question> {
             }
         })
         .collect()
+}
+
+/// The planted facts of truth.jsonl, reading only the lines about them.
+fn read_planted(path: &Path) -> Planted {
+    let f = File::open(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let lines: Vec<Json> = BufReader::new(f)
+        .lines()
+        .map(|l| l.expect("reading truth"))
+        .filter(|l| {
+            l.starts_with("{\"kind\":\"fault\"")
+                || l.starts_with("{\"kind\":\"duplicate\"")
+                || l.starts_with("{\"kind\":\"lookalike\"")
+        })
+        .map(|l| parse_json(&l).expect("a truth line"))
+        .collect();
+    checks::planted(&lines)
 }
 
 fn read_meta(path: &Path, label: String) -> Meta {
@@ -432,6 +452,158 @@ fn communities(run: &mut Run) -> Result<(), String> {
     algorithm(run, "communities")
 }
 
+/// Resident memory now and its peak since the last reset, in MiB; the
+/// reset (Linux: `clear_refs` 5) makes the peak the peak of what follows.
+fn rss_mb() -> (u64, u64) {
+    let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let field = |name: &str| {
+        s.lines()
+            .find(|l| l.starts_with(name))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|kb| kb / 1024)
+            .unwrap_or(0)
+    };
+    (field("VmRSS:"), field("VmHWM:"))
+}
+
+fn reset_peak() {
+    let _ = std::fs::write("/proc/self/clear_refs", "5");
+}
+
+/// `check.run`: each database check and each data check on its own, timed,
+/// with the memory it added (peak resident during the call less resident
+/// before), and the data checks scored against what was planted; then the
+/// database checks in slices of 100,000 records.
+fn check(run: &mut Run) -> Result<(), String> {
+    run.run("CREATE EXTENSION IF NOT EXISTS check", &[])?;
+    // The generated graph has no property index; give the index checks two
+    // to read, one of them over long text that is cut to fit its keys.
+    let (_, ms) = run.run("INDEX ON :WorkElement(code)", &[])?;
+    let (_, ms2) = run.run("INDEX ON :WorkInstruction(text)", &[])?;
+    run.emit(
+        "check.indexes",
+        Obj::new()
+            .i("ms", (ms + ms2) as i64)
+            .s("indexes", ":WorkElement(code), :WorkInstruction(text)"),
+    );
+    let p = run.planted;
+    let mut cases: Vec<(String, String)> = [
+        "endpoints",
+        "adjacency",
+        "membership",
+        "counters",
+        "indexes",
+        "derived",
+    ]
+    .iter()
+    .map(|c| (c.to_string(), format!("checks: ['{c}']")))
+    .collect();
+    cases.push(("all".into(), String::new()));
+    cases.push(("orphans".into(), "checks: ['orphans']".into()));
+    cases.push(("duplicates".into(), "checks: ['duplicates']".into()));
+    for (label, (keys, _)) in &p.duplicates {
+        let keys: Vec<String> = keys.iter().map(|k| format!("'{k}'")).collect();
+        cases.push((
+            format!("duplicates:{label}"),
+            format!(
+                "checks: ['duplicates'], label: '{label}', keys: [{}]",
+                keys.join(", ")
+            ),
+        ));
+    }
+    cases.push((
+        "required".into(),
+        "checks: ['required'], label: 'Station', type: 'HAS_SIDE', dir: 'out'".into(),
+    ));
+    for (name, args) in cases {
+        let (before, _) = rss_mb();
+        reset_peak();
+        let (r, ms) = run.run(&format!("CALL check.run({args})"), &[])?;
+        let (_, peak) = rss_mb();
+        let mut records = 0u64;
+        let mut problems = 0u64;
+        for row in &r.rows {
+            if row[1] == Value::from("summary") {
+                if let Value::Text(d) = &row[4] {
+                    let j = parse_json(d).map_err(|e| e.to_string())?;
+                    records += j.get("records").and_then(|v| v.as_u64()).unwrap_or(0);
+                    problems += j.get("problems").and_then(|v| v.as_u64()).unwrap_or(0);
+                }
+            }
+        }
+        let f = checks::found(&r);
+        let mut o = Obj::new()
+            .s("check", &name)
+            .i("ms", ms as i64)
+            .u("records", records)
+            .u("problems", problems)
+            .u("faults", f.faults as u64)
+            .u("rss_before_mb", before)
+            .u("rss_added_mb", peak.saturating_sub(before));
+        let score = |o: Obj, s: Score| {
+            o.u("planted", s.planted as u64)
+                .u("found", s.found as u64)
+                .u("hit", s.hit as u64)
+                .b("exact", s.exact())
+        };
+        if name == "orphans" {
+            o = score(o, Score::of(&p.orphans, &f.orphans));
+        } else if name == "duplicates" {
+            o = score(o, Score::of(&p.parallel, &f.parallel));
+        } else if let Some(label) = name.strip_prefix("duplicates:") {
+            o = score(o, Score::of(&p.duplicates[label].1, &f.duplicates));
+            let look = p.lookalikes.get(label).cloned().unwrap_or_default();
+            o = o.u(
+                "lookalikes_reported",
+                look.intersection(&f.duplicates).count() as u64,
+            );
+        }
+        run.emit("check", o);
+    }
+    // The database checks again, in slices.
+    let (before, _) = rss_mb();
+    reset_peak();
+    let t = Instant::now();
+    let (mut calls, mut rows) = (0u64, 0u64);
+    let mut after: Option<String> = None;
+    loop {
+        let src = match &after {
+            Some(c) => format!("CALL check.run(limit: 100000, after: '{c}')"),
+            None => "CALL check.run(limit: 100000)".into(),
+        };
+        let (r, _) = run.run(&src, &[])?;
+        calls += 1;
+        rows += r
+            .rows
+            .iter()
+            .filter(|row| row[1] != Value::from("summary"))
+            .count() as u64;
+        after = r
+            .rows
+            .iter()
+            .find(|row| row[2] == Value::from("partial"))
+            .and_then(|row| match &row[3] {
+                Value::Text(c) => Some(c.clone()),
+                _ => None,
+            });
+        if after.is_none() {
+            break;
+        }
+    }
+    let (_, peak) = rss_mb();
+    run.emit(
+        "check",
+        Obj::new()
+            .s("check", "all, slices of 100000")
+            .i("ms", (t.elapsed().as_secs_f64() * 1e3) as i64)
+            .u("calls", calls)
+            .u("rows", rows)
+            .u("rss_added_mb", peak.saturating_sub(before)),
+    );
+    Ok(())
+}
+
 // -------------------------------------------------------------------- main
 
 fn main() {
@@ -467,6 +639,7 @@ fn main() {
 
     let questions = read_questions(&data.join("questions.jsonl"));
     let meta = read_meta(&data.join("truth.jsonl"), label);
+    let planted = read_planted(&data.join("truth.jsonl"));
     let mut buf: Vec<u8> = Vec::new();
     for tier in &tiers {
         let tier: &'static str = match tier.as_str() {
@@ -481,6 +654,7 @@ fn main() {
             questions: &questions,
             budgets: budgets.clone(),
             detail,
+            planted: &planted,
             meta: &meta,
             out: &mut buf,
         };

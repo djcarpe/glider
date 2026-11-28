@@ -162,7 +162,7 @@ second:
 
 ```
 mfg-bench --data DIR [--tiers memory,file] [--budgets 250,1000,4000]
-          [--only stats,retrieve,pagerank,communities] [--out FILE] [--label NAME] [--detail]
+          [--only stats,retrieve,pagerank,communities,check] [--out FILE] [--label NAME] [--detail]
 ```
 
 For each tier it imports `graph.jsonl` with the streaming importer, then runs
@@ -177,6 +177,8 @@ every measurement in `MEASURES`, appending JSON lines to
 | `context.index` | `ms` to build the text index, its message |
 | `retrieve` | per `mode` (`seeds`: the anchors; `query`: the words), `budget` and `kind` (and `all`): `questions`, mean `recall`, mean `precision` (expected ids among the cards that are not anchors; 0 when there are none), mean `tokens`, mean `shown` cards, `ms_p50`, `ms_max`. `--detail` adds a `retrieve.question` line per question |
 | `pagerank`, `communities` | `ms`, the message |
+| `check.indexes` | `ms` to create `INDEX ON :WorkElement(code)` and `:WorkInstruction(text)`, so the index checks have something to read |
+| `check` | per `check` (each database check alone, `all` of them, `orphans`, `duplicates` (parallel edges), `duplicates:<label>` on the properties the truth says that label's duplicates agree on, `required` for `Station -HAS_SIDE->`): `ms`, `records`, `problems`, `faults`, `rss_before_mb`, `rss_added_mb` (peak resident during the call less resident before, the peak reset first); for data checks `planted`, `found`, `hit`, `exact`, and `lookalikes_reported`. Then `all, slices of 100000`: `ms`, `calls`, `rows` |
 
 A later slice adds a measurement by writing `fn(&mut Run) -> Result<(),
 String>` and adding it to `MEASURES`: `Run` gives the loaded graph, the
@@ -245,3 +247,53 @@ What the baseline says, to be beaten:
 - Precision is low everywhere because the budget fills with cards near the
   anchor that are not the answer; the question set is what a compact form
   (G16) has to do better on.
+
+## Integrity: `check.run`
+
+Measured on the `--faults` graphs (`n<size>-s1-faults`), after
+`context.index`, release build, one run each on a shared machine
+(`mfg-bench --only retrieve,check --budgets 1000`; lines labelled
+`g6-check` in `bench/results/mfg.jsonl`). Times in ms, memory tier / file
+tier; records and findings are the same on both.
+
+| dataset | `endpoints` | `adjacency` | `membership` | `counters` | `indexes` | `derived` | all six | records | in slices of 100k |
+|---|---|---|---|---|---|---|---|---|---|
+| n10000-s1-faults | 12 / 21 | 34 / 54 | 28 / 44 | 7 / 9 | 16 / 26 | 286 / 463 | 467 / 567 | 450,618 | 409 / 572, 5 calls |
+| n100000-s1-faults | 168 / 176 | 461 / 495 | 447 / 349 | 93 / 64 | 263 / 207 | 3,467 / 3,649 | 5,315 / 4,876 | 4,963,690 | 4,758 / 5,015, 50 calls |
+| n1000000-s1-faults | 1,958 / 3,016 | 5,721 / 9,346 | 4,150 / 6,007 | 931 / 812 | 3,039 / 2,949 | 41,461 / 43,219 | 55,827 / 61,463 | 49,330,886 | 50,671 / 69,720, 494 calls |
+
+The database checks find no fault at any size, as they should: the planted
+faults are facts about the data. They add no measurable resident memory
+(`rss_added_mb` 0 at every size: a few batches of records). `derived`, the
+text index compared with what a rebuild would write (21.3M postings at 1M
+nodes), is three quarters of the time and costs about what
+`CALL context.index()` costs (36-42 s at 1M).
+
+The data checks, against the truth:
+
+| dataset | `orphans` ms | planted / found | `duplicates` ms | parallel edges planted / found | `Tool` pairs | `Part` pairs | `WorkInstruction` pairs | `required` ms |
+|---|---|---|---|---|---|---|---|---|
+| n10000-s1-faults | 6 / 5 | 9 / 9 | 29 / 33 | 30 / 30 | 3 / 3, 0 look-alikes | 3 / 3, 0 look-alikes | 5 of 5 among 4,000 | 0 |
+| n100000-s1-faults | 56 / 58 | 74 / 74 | 248 / 226 | 249 / 249 | 8 / 8, 0 look-alikes | 9 / 9, 0 look-alikes | 3 of 14 in the first 9,751 (row cap) | 2 |
+| n1000000-s1-faults | 835 / 787 | 720 / 720 | 2,611 / 2,345 | 2,277 / 2,277 | 11 / 11, 0 look-alikes | 13 / 13, 0 look-alikes | 0 of 18 in the first 7,723 (row cap) | 27 |
+
+What it says:
+
+- `orphans` and the parallel-edge half of `duplicates` find exactly the
+  planted faults at every size, nothing more.
+- Node duplicates of `Tool` (on `kind, maker, model, spec`) and `Part` (on
+  `part_number, material, size`) are exactly the planted pairs, and no
+  look-alike (another specification, another size) is among them. The
+  duplicates timings include the parallel-edge half, which always runs.
+- `WorkInstruction` on `text, revision, scope` cannot be told apart this
+  way: every station of a design carries the same local instruction text,
+  so thousands of pairs agree, the planted standard duplicates among them,
+  and a single call stops at the 10,000-row cap (continue with `after:`).
+  The truth calls those pairs look-alikes; deciding between them takes more
+  than equal properties, which is why `check` reports candidates and merges
+  nothing (D1). This sort is also the only check that holds memory worth
+  measuring: 12-13 MB at 100k and 114-123 MB at 1M, inside its external
+  sort's budget of half of `algorithm_memory()` (128 MB at the default
+  `work_mem`).
+- Slicing costs little: 494 calls of 100,000 records at 1M nodes take
+  about what one call takes in memory, and 13% more on the file tier.
