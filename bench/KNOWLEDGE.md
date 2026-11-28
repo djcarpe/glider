@@ -188,8 +188,8 @@ every measurement in `MEASURES`, appending JSON lines to
 | `changes.cap` | at a cap of a fifth of the writes (at least 1,000), so the journal sweeps throughout: `writes`, `per_s`, `log_bytes_per_write` for node sets in 1,000-write transactions; then 10,000 single writes: `single_per_s`, `single_slowest_us`, `single_biggest_log_bytes`; `entries` held after, `floor_rose` |
 | `vector.bytes` | per `dims`: the same vectors as a list property on 10,000 nodes (`list_log_per_vector`, `list_db_growth_per_vector`, `list_per_s`), and as a space over every node (`space_bytes_per_vector`, `space_bytes_per_dim` from `vector.spaces()`, `put_log_per_vector`, `put_db_growth_per_vector`) |
 | `vector.put` | `vectors`, `per_call` (1,000, with a source hash each), `ms`, `per_s`, through statements |
-| `vector.search` | per `candidates` (`all`, or `WorkInstruction`): `scored`, `queries`, `ms_p50`, `ms_max`, `scored_per_s` (the statement, staleness counts included), `scan_ms_p50` / `scan_scored_per_s` (the Rust `vector::search` scan alone), `rss_before_mb`, `rss_added_mb` |
-| `vector.stale` | after a property set on 100 nodes: `rows`, `calls` (slices of 1,000), `ms` for the whole list |
+| `vector.search` | per `candidates` (`all`, or `WorkInstruction`), after one `counts: true` search has established the space current (`establish_ms`): `scored`, `queries`, `ms_p50`, `ms_max`, `scored_per_s` (the statement as a caller asks it, `fresh: "report"`), `counts_ms_p50` (with `counts: true`), `require_ms_p50` (with `fresh: "require"`), `scan_ms_p50` / `scan_scored_per_s` (the Rust `vector::search` scan alone), `rss_before_mb`, `rss_added_mb`. (Lines labelled `g10-vector` predate currency: their `ms_p50` counted on every search.) |
+| `vector.stale` | after a property set on 100 nodes: `search_after_change_ms` (one search, which must report the space not current, from the journal), then `rows`, `calls` (slices of 1,000), `ms` for the whole list |
 | `vector.drop` | `ms` |
 
 A later slice adds a measurement by writing `fn(&mut Run) -> Result<(),
@@ -558,10 +558,11 @@ at 64 dimensions, 5-8k at 384, 2.5-3.6k at 768, at every size and on both
 tiers. The time goes into passing 1,000 lists of floats through a
 statement; the store itself is one extension record a call.
 
-**Search**, top 10, every vector scored. `ms` is the statement (which also
-counts the space's stale, missing and unknown vectors: one metadata read
-and one journal lookup a vector, plus the label's members); `scan` the
-Rust `vector::search` alone.
+**Search**, top 10, every vector scored, as first built (label
+`g10-vector`): every search counted the space's stale, missing and
+unknown vectors (one metadata read and one journal lookup a vector, plus
+the label's members). `ms` is the statement, `scan` the Rust
+`vector::search` alone. Superseded by "Search after currency" below.
 
 | dataset | tier | dims | ms p50 | scan ms p50 | scored/s (statement) | scored/s (scan) | `WorkInstruction` only, ms p50 |
 |---|---|---|---|---|---|---|---|
@@ -602,3 +603,47 @@ lists exactly those 100, in 1 call at 10k, 2 at 100k and 15 at 1M (it
 looks at at most 100,000 records a call): 15-20 ms at 10k, 120-210 ms at
 100k, 1.2-1.7 s for the whole list at 1M. Dropping a space of 1M vectors
 takes 1-2 s in memory and 34 s on the file tier at 384-768 dimensions.
+
+**Search after currency** (label `g10-vector-current`). A search no longer
+counts: it reports whether the space is current from the record a count
+left (`yes` here, after one `counts: true` search) and, when something was
+written since, from the journal's entries since then. Run back to back in
+one process, so the columns compare under the same load: the search as a
+caller asks it (`report`), the scan alone, the search with `counts: true`
+(what every search paid before), and `fresh: "require"` on a current
+space. `before` is the first version's statement, from its own run (above).
+All in ms, p50 of 20 queries (5 at 1M), every vector a candidate.
+
+| dataset | tier | dims | before | report | scan | report / scan | `counts: true` | `require` | after a change |
+|---|---|---|---|---|---|---|---|---|---|
+| n10000-s1 | memory | 64 | 10.3 | 1.0 | 0.9 | 1.11 | 5.9 | 1.0 | 1.3 |
+| n10000-s1 | memory | 384 | 11.9 | 5.1 | 5.0 | 1.02 | 10.6 | 5.1 | 5.3 |
+| n10000-s1 | memory | 768 | 16.0 | 9.2 | 8.9 | 1.03 | 14.8 | 9.2 | 10.2 |
+| n10000-s1 | file | 64 | 10.2 | 0.9 | 0.9 | 1.00 | 5.8 | 1.0 | 1.6 |
+| n10000-s1 | file | 384 | 18.7 | 5.1 | 5.0 | 1.02 | 10.6 | 5.2 | 5.6 |
+| n10000-s1 | file | 768 | 25.6 | 9.4 | 9.2 | 1.02 | 15.0 | 9.5 | 9.9 |
+| n100000-s1 | memory | 64 | 136.0 | 11.1 | 10.9 | 1.02 | 65.2 | 11.1 | 11.5 |
+| n100000-s1 | memory | 384 | 178.5 | 50.9 | 50.6 | 1.01 | 105.6 | 50.7 | 50.9 |
+| n100000-s1 | memory | 768 | 187.1 | 95.0 | 97.2 | 0.98 | 154.1 | 95.5 | 98.8 |
+| n100000-s1 | file | 64 | 111.7 | 14.0 | 14.0 | 1.00 | 95.3 | 14.2 | 11.9 |
+| n100000-s1 | file | 384 | 178.1 | 54.2 | 54.7 | 0.99 | 117.5 | 54.5 | 54.8 |
+| n100000-s1 | file | 768 | 166.3 | 95.1 | 95.1 | 1.00 | 154.3 | 95.3 | 101.2 |
+| n1000000-s1 | memory | 64 | 743.9 | 108.6 | 108.5 | 1.00 | 671.9 | 107.6 | 110.5 |
+| n1000000-s1 | memory | 384 | 1456.5 | 533.9 | 529.4 | 1.01 | 1229.4 | 543.7 | 506.0 |
+| n1000000-s1 | file | 64 | 692.9 | 111.5 | 111.6 | 1.00 | 684.2 | 111.3 | 112.8 |
+| n1000000-s1 | file | 384 | 2452.0 | 1584.0 | 1574.7 | 1.01 | 2262.3 | 1567.0 | 1570.9 |
+| n1000000-s1 | file | 768 | 4215.7 | 3159.0 | 3156.6 | 1.00 | 3850.1 | 3155.1 | 3151.7 |
+
+Restricted to `WorkInstruction` (454,546 of 1,023,660 at 1M), report
+against scan: 1.6 / 1.5 ms at 10k x 64, 41 / 41 ms at 100k x 384, 424 /
+424 ms at 1M x 384 in memory, 2,822 / 2,770 at 1M x 768 from a file; the
+widest gap measured was 34 / 31 ms (100k, file, 64 dims), within a tenth.
+"After a change" is one search after properties were set on 100 nodes
+with vectors: the record no longer ends the log, so the journal's entries
+since are walked until the first changed vector, and the search reports
+`no` naming it, at the scan's cost. Counting once (`establish_ms`, the
+same as `counts: true`) costs what one search used to cost, and is paid
+again only after the space changes. Resident memory did not grow during
+any search at any size. (The `before` column comes from a run some hours
+earlier under a different load; the scan itself was 0.55 s then and 0.53 s
+now at 1M x 384 in memory, 1.80 s and 1.57 s from a file.)

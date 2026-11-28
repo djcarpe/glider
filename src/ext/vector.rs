@@ -2217,10 +2217,12 @@ fn stale_proc(g: &mut Graph, a: &Args) -> Result<QueryResult> {
     }
     // One call that saw everything and found nothing: the space is
     // established complete at the position the call started from.
-    if whole && next.is_none() && rows.is_empty() {
-        if !matches!(current(g, &s)?, Current::Yes { .. }) {
-            establish(g, &s, start)?;
-        }
+    if whole
+        && next.is_none()
+        && rows.is_empty()
+        && !matches!(current(g, &s)?, Current::Yes { .. })
+    {
+        establish(g, &s, start)?;
     }
     let mut r = QueryResult::table(
         vec![
