@@ -40,7 +40,8 @@ tests cite them.
 - **D2. A database has a revision.** `revision` is a 64-bit number that grows
   with every committed transaction that changed something: it never stays
   still across a change. It does not grow with an empty commit, a write that
-  changes nothing, a checkpoint, a reopen or a restore; it may also grow when
+  changes nothing, a checkpoint, a reopen, a restore or loading an image; it
+  never goes back across saving and loading one; it may also grow when
   a transaction's operations cancel each other out. It is durable. A replica
   that has replayed the same transactions reports the same revision. With
   `generation` (the lineage) it names one state along one line of history:
@@ -126,8 +127,22 @@ stored and the file format is unchanged.
   for the same transactions, so it reports the same revision a logged graph
   or a file reports for the same history, and a log enabled later starts
   there instead of at 0, so enabling a log does not move the revision back. That number lives and dies with the graph object: it is as durable
-  as the graph is, which is not at all. A graph loaded from a file's image
-  (`Graph::from_bytes`) has no lineage and starts at 0.
+  as the graph is, which is not at all.
+- *Loading an image* (`Graph::from_bytes`, how a host without a
+  filesystem reopens a database) gives a graph with no lineage at the
+  image's revision: a file's image is its state at its last checkpoint and
+  carries that checkpoint's revision; a memory graph's snapshot image
+  carries the revision it was taken at; a memory graph without a log
+  cannot write an image, and once given one its positions carry on from
+  what it counted, so its image carries that. Writes on the copy carry on
+  above it. (The revision slice decided that such a graph starts at 0; the
+  change journal's review showed why that is wrong: a journal or a kept
+  colouring inside the image holds the source's positions, and a copy that
+  started again below them answered "nothing changed" for a change.
+  `a_database_loaded_from_an_image_carries_on_from_the_images_revision`
+  in `tests/revision.rs` failed before and passes now.) A legacy image
+  is migrated into a new database by `import_legacy`, which counts from 0
+  as any new database does.
 - *Bulk load* builds a new file without the log. It checkpoints the loaded
   pages, then logs one record (the id counters it set) and checkpoints
   again, so a loaded database is past 0. A crash between the two reopens the
@@ -339,28 +354,197 @@ The run-to-run spread on this machine was about 25% and the differences
 point both ways: no cost shows above the noise. In the quietest pair the
 difference was under 1%.
 
-## `changes`: which nodes and edges changed
+## `changes`: which nodes and edges changed (*built*)
+
+*Built (G5). Shown by `tests/changes.rs` and `bench/tests/mfg_changes.rs`;
+the user-facing description is in `docs/EXTENSIONS.md`.*
 
 `CREATE EXTENSION changes` starts a journal of *which* nodes and edges
 changed and at what revision. It does not keep old values: the graph has the
 current ones, and that is what a rebuild needs.
 
 ```
-CALL changes.since(revision: 1042, limit: 1000)   ids changed after a revision, oldest change first
-CALL changes.status()                             oldest revision still answerable, entries, bytes
+CALL changes.since(revision: 1042, limit: 1000)   ids changed after a revision, by kind then id
+CALL changes.since(revision: 1042, kinds: ["node"], after: "node:7")
+CALL changes.status()                             oldest revision still answerable, entries, bytes, cap
 CALL changes.release(below: 1500)                 forget changes at or below a revision
+CALL changes.cap(entries: 100000)                 bound the journal
 ```
 
-- An id appears once, with the latest revision at which it changed and what
-  happened to it last (`put` or `drop`). A node whose edges changed is listed
-  as well, as `adjacency`, because much derived data depends on a node's
-  surroundings and not on its properties.
-- The journal is bounded (`cap:` at install, in entries). When the bound
-  forces it to forget, `since` for a revision older than what it still holds
-  says so plainly, and the consumer rebuilds from a scan. It never returns a
-  partial list as if it were whole.
-- Its cost on a write is one extension record. It is measured in the
-  benchmark and stated here.
+What is true now, and what this slice decided where the plan was open:
+
+- **Entries.** For every committed change to a node or an edge, by every
+  path G4 lists, the journal holds one entry per (kind, id): `node`,
+  `edge` or `adjacency`, its latest change (`put`: it exists with what the
+  graph holds; `drop`: it is gone) and the revision of that change. An
+  edge write gives the edge's entry and an `adjacency` entry for each
+  endpoint before and after (four for a replayed `EdgeAdd` that moves an
+  edge). A node property or label change is not an adjacency change. An
+  adjacency entry is `put` while its node exists and `drop` once it is
+  gone: when a node is deleted or appears, its adjacency entry, if it has
+  one, is rewritten with it, so a `put` never names a node that is gone.
+- **The revision an entry carries.** A transaction's final revision is not
+  known while its hooks run, so an entry carries `Graph::log_end()` as the
+  hook saw it: the log position just past the record of the write. Every
+  record of a transaction lies after the revision committed before it and
+  before its commit marker, so a change committed by the transaction that
+  took the database from R1 to R2 carries r with R1 < r < R2. Hence, for a
+  caller reading `revision` at commit boundaries, `since(R1)` taken at R2
+  lists every id written by a transaction committed after R1, at its latest
+  change, and none written at or before R1. Rows come in (kind, id)
+  order, kinds node < edge < adjacency, the same on both tiers. (The first
+  version listed them oldest change first, through an index by revision;
+  that index was dropped for write cost, below.)
+- **The format: one record per change.** A write adds one extension record
+  with one blind put per (kind, id) it changed, and nothing else: no
+  revision index, no count, no state rewritten, no read of the entry it
+  replaces. Key `<kind><length><id, big-endian without leading zeros>`
+  (so keys sort by kind, then id), value `<change><revision, big-endian
+  without leading zeros>`: 16-21 bytes an entry stored with its namespace,
+  21 in the log for ids below 2^24 and revisions below 2^40.
+  Positions within an open transaction are positions, not revisions any
+  caller can have read; a caller that reads `log_end()` mid-transaction
+  (as `structure` does) gets the same property for that position.
+- **The proof** (`since_lists_exactly_what_changed_between_any_two_commit_boundaries`):
+  a seeded random workload of 220 steps through statements of every kind,
+  the graph API, `begin()` blocks, `BEGIN ... COMMIT`, `execute_batch`,
+  JSON Lines, `apply_op` (new ids, an edge moved to other endpoints, node
+  deletes, `Clear`), `import_legacy`, `CLEAR`, index definitions, writes
+  that change nothing, rolled-back blocks, failing hooks and releases. At
+  every boundary, for every earlier boundary, `since` either answers or
+  refuses; an answer contains every node, edge and adjacency (a node's
+  incident edges, rendered whole) whose exported state differs, nothing
+  that a witness extension did not hear of in between, each id once, in
+  order, with `put` exactly for what exists, and the Rust questions and
+  the statement in slices of 7 and by kind say the same. The same with a
+  cap of 40 entries, and on the file tier with the same revisions and a
+  byte-identical journal. Mutating the journal (its revision, an endpoint,
+  the adjacency rewrite) fails it.
+- **Rolled back.** Entries are extension records in the writing
+  transaction, so a rollback, a failing statement, a failing hook and a
+  block the engine rolled back itself (`Error::Full` past `max_memory`)
+  leave none: the journal's keyspace is byte-identical afterwards.
+- **The floor.** `since(R)` answers when R is at or above the journal's
+  floor and is otherwise an error naming why and the floor ("...; it
+  answers for revision F and later. Rebuild what was derived from a scan of
+  the graph, then ask CALL changes.since(revision: F) or later"). The
+  floor is raised by: installation (to `log_end()` at install, so a
+  `CREATE EXTENSION` in a statement of its own answers for the revision
+  before it, and one after other writes in a block does not); `release`
+  (to `below:`, clamped to the log's end, before anything is forgotten,
+  so forgetting can go in slices with `limit:`); the cap (to the newest
+  revision it forgets); and `CLEAR` or any other bulk notification (to `log_end()`
+  in its hook: everything before must be rebuilt, and the journal answers
+  exactly from there on). `CLEAR` keeps the cap.
+- **Positions past the database's.** The journal never answers while
+  anything it holds lies past `log_end()`: its state records the position
+  it was written at, and `since`, `changed` and `changed_any` refuse
+  ("cannot answer: it holds positions past this database's ...") when that
+  position, the floor or any entry they read is past it, or when the
+  revision asked about is (it belongs to another line of history). The
+  next write then starts it again: it records nothing and forgets 64
+  entries a write (`SWEEP`), answering nothing meanwhile, and once empty
+  takes the floor where it is (`why: reset`). Only that end makes it
+  answer again: every writer of the state (a write, `release`, `cap`)
+  starts from the same check and keeps a restart under way, so `cap` sets
+  the cap and `release` the floor without ending it, and every question is
+  refused meanwhile (`no_procedure_ends_a_restart_before_it_is_over`; the
+  review's `a_cap_call_does_not_end_a_restart_whose_floor_is_not_past_the_database`
+  failed before). `CLEAR`, and `DROP` with `CREATE EXTENSION`, make an
+  empty journal at the current position, which is what the end of a
+  restart is. An entry past the position, with a state that is not, begins
+  a restart when a write or call meets it: a sweep, the adjacency entry a
+  node delete or creation reads, `release` and `cap` (which walk the
+  journal); every question that reads one is refused. Until one of those
+  meets it, `changed` answers for ids whose own entries are not past. That
+  is safe as far as positions can tell: positions alone cannot tell two
+  histories apart (an entry from another database at or below this one's
+  position looks like one of its own), and the guarantee against that
+  rests on the engine, where a journal is written only by its own
+  database's hooks and an image keeps its positions; such a state arises
+  only by copying a journal between databases by hand. A kept colouring whose
+  position is past the database's is stale. With images keeping their
+  revision (D2) this needs a path that moves positions back, which the
+  engine no longer has; it is shown by copying a journal and a colouring
+  from a graph further along into one that is behind
+  (`a_journal_holding_positions_past_the_databases_refuses_and_starts_again`)
+  and by the review's image tests (`tests/review_g5_image.rs`).
+- **The cap.** In entries, default 1,000,000, at least 64. `CREATE
+  EXTENSION` takes no arguments, so "set when it is installed" means
+  `CALL changes.cap(entries:)` in the same block as the install; lowering
+  it forgets the oldest entries at once (that call does the whole
+  journal, as asked). Otherwise no single write pays more than one slice:
+  with no count kept, the state holds a log position, `look_at`. Every
+  entry costs at least 15 bytes of its own record (`MIN_ENTRY_LOG`) and
+  one write makes at most 5 (`MAX_PER_WRITE`), so after counting at most
+  n entries at position p the journal cannot pass three quarters of the
+  cap before p + 15 (3/4 cap - n - 5). From the first write at or past it,
+  each write takes one step of a *sweep*: it looks at the next 64 entries
+  (`SWEEP`) in key order, forgets those at or below the floor, counts the
+  rest into the state (with a 16-bucket histogram of their revisions),
+  and rewrites the state. A sweep over N entries takes about N/64 writes,
+  during which at most 5 entries a write are added, so it ends below the
+  cap from three quarters of it (64 is the smallest cap for which this
+  holds). At its end, if more than half the cap may be held (the count
+  plus 5 a write of the sweep), the floor rises to the histogram bucket
+  that leaves half or fewer, and a sweep starts again at once to forget
+  what is now below it; otherwise `look_at` is set again. Entries at or
+  below the floor linger until a sweep reaches them; nothing answers from
+  them. So a write pays at most: 64 entries looked at and deleted, one
+  state record (about 230 bytes of log) beside its own, and 64 + its own entries in
+  steps; the review's write that used to take 133 ms and 1.7 MB of log at
+  the default cap now takes under a millisecond and 276 bytes
+  (`tests/review_g5_cap.rs`). A write that fails or is stopped during a
+  sweep takes its step back with it; the next write takes the same
+  bounded step. `a_small_cap_...` checks the cap after every write.
+- **Status.** `oldest, why, entries, bytes, cap, revision`, counted by a
+  scan. `bytes` is what the keyspace holds: keys with the namespace, and
+  values (17.6 bytes an entry on the manufacturing graph).
+- **Recovery and replicas** replay the journal's records and never run
+  its hooks: after crash recovery and `from_replica` the keyspace is
+  byte-identical to the source's and a witness extension's list of hook
+  calls is unchanged.
+- **For other extensions** (`glider::ext::changes`): `answers(g, R)`,
+  `oldest(g)`, `changed(g, R, kind, ids) -> Option<Vec<bool>>`,
+  `changed_any(g, R, kind) -> Option<bool>` (a scan of the kind's
+  entries until one is newer than R), `entry(g, kind, id)`, `since(g, R,
+  kinds, after, limit)` and `status(g)`. `None` means "cannot answer:
+  assume everything changed". `structure` uses `changed_any`: a kept
+  colouring is stale exactly when a node or an edge changed since its
+  position, when the journal answers for it; otherwise the conservative
+  answer of before (any write but its own).
+- **Check.** The journal implements `Extension::check`: records that do not
+  decode, a `put` for an id that does not exist, an entry or a floor past
+  the log's end (`log_end()`, so the open transaction's entries are not
+  faults), and, over a walk from the start in one slice, more entries
+  than the cap. A `put` at or below the floor is not consulted and not
+  checked.
+- **Bounds (D6).** `since` returns at most 10,000 rows a call, continued
+  with `after:` (the message gives it); `release` and `cap` forget 4,096
+  entries a write. Every loop passes through `step(n)` in
+  `src/ext/changes.rs`, the one place G2 is to count. A write reads the
+  state (one lookup) and writes one record; deleting or recreating a node
+  also looks up its adjacency entry; upkeep is as above. `since` scans
+  the entries of the kinds asked for in key order, so a full pass in
+  slices reads every entry once.
+- **Cost** (`bench/KNOWLEDGE.md`, "Change tracking", the first version and
+  this one side by side, 10k to 1M nodes, both tiers). In 1,000-write
+  transactions, node writes run at 0.38-0.46 of their speed without the
+  journal (first version 0.22-0.32), edge adds at 0.48-0.69 (0.23-0.50),
+  edge deletes at 0.25-0.56 (0.15-0.33); the log grows 2.5x a node
+  write's bytes (7.5x before), 3.5x an edge add's (11x), 6x an edge
+  delete's (26x). One write a transaction is in the same range. Node
+  writes and edge delete bytes miss the targets of 0.6 and 3x. A hook that
+  does nothing already leaves node writes at about 0.70 (G4's images and
+  unit), one entry is one extension-tree insert about as dear as the node
+  write, and an edge delete logs 13 bytes against an entry's minimum of 15.
+  Writing once per transaction would not remove either of the first two, so
+  the commit path is unchanged. Reads: `since` for a recent revision now
+  scans the journal (8-11 ms at 300,000-400,000 entries, was 0.01 ms), a
+  full pass costs what it did, `changed` for 1,000 ids 0.3 ms.
+  A database without the journal pays nothing.
+- Left out, as planned: old values, named consumers with cursors (a
+  consumer keeps its own revision), and vectors (G10).
 
 ## `check`: is the graph whole (*built*)
 
@@ -565,7 +749,11 @@ in `docs/EXTENSIONS.md`.
   stale. A rolled-back keep leaves nothing. A colouring kept inside an open
   transaction is fresh until something else is written in it.
 - **Decided here.** Staleness is by position, not by comparison: a
-  change that a colouring does not depend on still makes it stale. Being
+  change that a colouring does not depend on still makes it stale. Since
+  G5, when the change journal is installed and answers for the
+  colouring's position, only a change to a node or an edge makes it stale
+  (an index, another extension's writes, a write that changes nothing do
+  not); otherwise the rule above applies. Being
   stale is not a fault for `check.run`'s `derived` check (kept colourings
   are not maintained, and say when they are stale); only records that do not
   decode are. `write:` sets the colour as a text property and refuses a key
@@ -754,7 +942,7 @@ tests, and adds its section to `docs/EXTENSIONS.md` and its numbers to
 | G2 | budgets for procedures (D6) | |
 | G3 | the manufacturing generator and the harness's skeleton | |
 | G4 | edge and bulk write hooks (D5) | |
-| G5 | `changes` | G1, G4 |
+| G5 | `changes` (*built*) | G1, G4 |
 | G6 | `check` (*built*) | G1 |
 | G7 | `structure`: colours, classes (*built*) | G2 |
 | G8 | `structure`: templates, path patterns, plan, expand | G7 |

@@ -536,6 +536,89 @@ fn a_restored_memory_replica_reports_the_revision_of_the_point_restored_to() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The image a memory graph with a log writes for a base, as one buffer.
+fn snapshot_bytes(g: &Graph) -> (Vec<u8>, u64) {
+    let snap = g.snapshot().unwrap();
+    let mut bytes = Vec::new();
+    snap.write_image(1 << 20, &mut |_, b| {
+        bytes.extend_from_slice(&b);
+        Ok(())
+    })
+    .unwrap();
+    (bytes, snap.lsn())
+}
+
+/// A database loaded from an image (`Graph::from_bytes`, how a host
+/// without a filesystem reopens one) reports the revision its source had
+/// when the image was taken, whatever kind of graph the source was, and
+/// writes on the copy carry on above it: the revision never goes back
+/// across saving and loading an image. Before, the copy started at 0.
+#[test]
+fn a_database_loaded_from_an_image_carries_on_from_the_images_revision() {
+    let check = |what: &str, bytes: &[u8], at: u64| {
+        let mut c = Graph::from_bytes(bytes).unwrap();
+        assert_eq!(
+            c.revision(),
+            at,
+            "{what}: the copy is at the image's revision"
+        );
+        assert_eq!(c.log_end(), at, "{what}");
+        assert_eq!(c.generation(), [0; 16], "{what}: a copy has no lineage");
+        q(&mut c, "CREATE (:OnTheCopy)");
+        assert!(
+            c.revision() > at,
+            "{what}: a write on the copy goes past it"
+        );
+        // Taken again from the copy (given a log), and loaded again.
+        let r = c.revision();
+        c.enable_log(log::DEFAULT_LOG_CAP).unwrap();
+        assert_eq!(c.revision(), r, "{what}: a log enabled later starts there");
+        let (again, lsn) = snapshot_bytes(&c);
+        assert_eq!(lsn, r);
+        let d = Graph::from_bytes(&again).unwrap();
+        assert_eq!(d.revision(), r, "{what}: loaded twice");
+    };
+    // A file, checkpointed: its image is its state at the checkpoint.
+    let dir = temp("image");
+    let path = dir.join("db");
+    let mut f = open_off(&path);
+    for i in 0..30 {
+        q(&mut f, &format!("CREATE (:F {{i: {i}}})"));
+    }
+    f.checkpoint().unwrap();
+    let at = f.revision();
+    assert!(at > 0);
+    check("file", &std::fs::read(&path).unwrap(), at);
+    // Written after the checkpoint: the image is still the checkpoint's
+    // state, at the checkpoint's revision, and never below it.
+    q(&mut f, "CREATE (:Later)");
+    check("file with a log tail", &std::fs::read(&path).unwrap(), at);
+    drop(f);
+    // A memory graph with a log.
+    let mut m = Graph::memory();
+    m.enable_log(log::DEFAULT_LOG_CAP).unwrap();
+    for i in 0..30 {
+        q(&mut m, &format!("CREATE (:M {{i: {i}}})"));
+    }
+    let (bytes, lsn) = snapshot_bytes(&m);
+    assert_eq!(lsn, m.revision());
+    check("memory with a log", &bytes, m.revision());
+    // A memory graph without one cannot write an image; given a log after
+    // writes, its image carries the revision it had counted.
+    let mut u = Graph::memory();
+    for i in 0..30 {
+        q(&mut u, &format!("CREATE (:U {{i: {i}}})"));
+    }
+    let counted = u.revision();
+    assert!(counted > 0);
+    assert!(u.snapshot().is_err());
+    u.enable_log(log::DEFAULT_LOG_CAP).unwrap();
+    let (bytes, lsn) = snapshot_bytes(&u);
+    assert_eq!(lsn, counted);
+    check("memory without a log, then with one", &bytes, counted);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A bulk load builds a file around the log; the loaded database is still
 /// past the empty one the file began as, and stays there on reopen.
 #[test]

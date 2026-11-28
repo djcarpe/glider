@@ -162,7 +162,7 @@ second:
 
 ```
 mfg-bench --data DIR [--tiers memory,file] [--budgets 250,1000,4000]
-          [--only stats,retrieve,pagerank,communities,check,structure] [--out FILE] [--label NAME] [--detail]
+          [--only stats,retrieve,pagerank,communities,check,structure,changes] [--out FILE] [--label NAME] [--detail]
 ```
 
 For each tier it imports `graph.jsonl` with the streaming importer, then runs
@@ -182,6 +182,9 @@ every measurement in `MEASURES`, appending JSON lines to
 
 | `structure.colors` | `what: "colours per depth"`: `depths` as `[depth, colours over every node, colours among stations]` to depth 5; `what: "design recovery"` at depths 1 to 4: the colouring kept (`kept`), read back in slices (`read_ms`, `read_slices`) and scored (`stations`, `station_colours`, `designs`, `designs_whole`, `designs_alone`, `deviated`, `deviated_apart`, `exact`); `what: "stable"`: `depth: "stable"`, its depths and message. Each with `ms`, `rss_before_mb`, `rss_added_mb` |
 | `structure.classes` | `by: "neighbours"` per catalogue label, on the properties its duplicates agree on: `classes`, `planted` / `found` / `hit` / `exact` (pairs, the truth's pairs closed under "duplicate of the same original"), `lookalikes`, `lookalikes_reported`, `sizes` (`[size, classes]`, singletons included); `by: "colors"` over the kept depth-4 colouring of stations: `sizes`. Each with `ms` and memory |
+| `changes.write` | per `write` (`node set`: a property set on node `1 + i mod nodes`; `edge add` between pseudo-random nodes; `edge delete` of those edges), `journal` (installed or not), `round`: `writes`, `per_commit`, `per_s`, `log_bytes_per_write` (revision moved / writes): 100,000 writes (or the node count when smaller) committed every 1,000, then 10,000 committed one by one. Rounds alternate without and with the journal, twice |
+| `changes.read` | after each round with the journal: `entries`, `bytes`, `bytes_per_entry` (from `changes.status`), `since_rows`, `since_calls`, `since_all_ms` (every entry since the install, by statement, 10,000 a call), `since_tail_rows` / `since_tail_ms` (the last commit), `changed_us` (`changes::changed` for 1,000 node ids), `changed_any_us` |
+| `changes.cap` | at a cap of a fifth of the writes (at least 1,000), so the journal sweeps throughout: `writes`, `per_s`, `log_bytes_per_write` for node sets in 1,000-write transactions; then 10,000 single writes: `single_per_s`, `single_slowest_us`, `single_biggest_log_bytes`; `entries` held after, `floor_rose` |
 
 A later slice adds a measurement by writing `fn(&mut Run) -> Result<(),
 String>` and adding it to `MEASURES`: `Run` gives the loaded graph, the
@@ -389,3 +392,138 @@ enterprise as its original. At 1M the 454,546 instructions fall into 18
 classes of two and 454,510 alone. A class is a candidate, as `check`'s are:
 two stations of one design are two stations, and a duplicate pair is for a
 person or a rule to decide on; nothing is merged.
+
+## Change tracking: `changes`
+
+`mfg-bench --only changes`, release build, on a shared, busy machine
+(load 5-7 on 8 cores). The first version of the journal (`before`: an
+index by revision beside every entry and a state record rewritten on
+every write) and this one (`after`: one blind put per changed id) were
+run back to back by the same harness; lines labelled
+`g5-changes-before` and `g5-changes-after` in `bench/results/mfg.jsonl`.
+(The lines labelled `g5-changes` are the first version's first
+measurement, committed every 10,000 writes.) Each cell: writes a second
+with the journal as a share of without it (median of two rounds each),
+and in brackets the log bytes a write with it as a multiple of without.
+
+Transactions of 1,000 writes (100,000 writes, or the node count):
+
+| dataset | tier | node set, before | after | edge add, before | after | edge delete, before | after |
+|---|---|---|---|---|---|---|---|
+| n10000-s1 | memory | 0.32 (7.9x) | 0.41 (2.6x) | 0.32 (11.7x) | 0.48 (3.6x) | 0.19 (26x) | 0.25 (6.1x) |
+| n10000-s1 | file | 0.26 (7.9x) | 0.41 (2.6x) | 0.23 (11.7x) | 0.48 (3.6x) | 0.15 (26x) | 0.33 (6.1x) |
+| n100000-s1 | memory | 0.26 (7.5x) | 0.38 (2.5x) | 0.36 (11.0x) | 0.56 (3.6x) | 0.24 (26x) | 0.44 (6.4x) |
+| n100000-s1 | file | 0.25 (7.5x) | 0.44 (2.5x) | 0.40 (11.0x) | 0.69 (3.6x) | 0.25 (26x) | 0.56 (6.4x) |
+| n1000000-s1 | memory | 0.22 (7.5x) | 0.44 (2.5x) | 0.42 (9.7x) | 0.65 (3.5x) | 0.31 (24x) | 0.50 (6.1x) |
+| n1000000-s1 | file | 0.31 (7.5x) | 0.46 (2.5x) | 0.50 (9.7x) | 0.67 (3.5x) | 0.33 (24x) | 0.50 (6.1x) |
+
+One write a transaction (10,000 writes):
+
+| dataset | tier | node set, before | after | edge add, before | after | edge delete, before | after |
+|---|---|---|---|---|---|---|---|
+| n10000-s1 | memory | 0.28 (6.6x) | 0.32 (2.1x) | 0.38 (9.5x) | 0.50 (2.9x) | 0.28 (16x) | 0.49 (4.0x) |
+| n10000-s1 | file | 0.35 (6.6x) | 0.52 (2.1x) | 0.44 (9.5x) | 0.63 (2.9x) | 0.40 (16x) | 0.59 (4.0x) |
+| n100000-s1 | memory | 0.27 (6.6x) | 0.39 (2.1x) | 0.39 (9.0x) | 0.60 (2.9x) | 0.38 (16x) | 0.53 (4.2x) |
+| n100000-s1 | file | 0.32 (6.6x) | 0.71 (2.1x) | 0.37 (9.0x) | 0.76 (2.9x) | 0.38 (16x) | 0.57 (4.2x) |
+| n1000000-s1 | memory | 0.27 (6.6x) | 0.25 (2.1x) | 0.51 (7.8x) | 0.61 (2.9x) | 0.45 (15x) | 0.54 (4.1x) |
+| n1000000-s1 | file | 0.32 (6.6x) | 0.43 (2.1x) | 0.47 (7.8x) | 0.63 (2.9x) | 0.39 (15x) | 0.56 (4.1x) |
+
+Log bytes a write, the same at every size: node set 20 without, 151
+before, 52 after (one write a transaction: 28, 186, 59); edge add 28,
+305, 98 (37, 331, 107); edge delete 13, 341, 84 (22, 350, 93). Without
+the journal, the 100k memory rates were 477k node sets, 119k edge adds and
+177k edge deletes a second in 1,000-write transactions, and 232k, 57k and
+61k one a transaction.
+
+Reading, after one round of 3 x N writes:
+
+| | 10k | 100k | 1M |
+|---|---|---|---|
+| entries | 39,971 | 300,815 | 408,198 |
+| bytes an entry, before / after | 54 / 16.5 | 54 / 17.6 | 54 / 17.8 |
+| `since` over every entry, 10,000 a call, before / after | 5 / 5-6 ms | 38 / 38-42 ms | 51-61 / 50-52 ms |
+| `since` for the last commit, before / after | 0.01 / 1.0-1.3 ms | 0.01 / 7.8-8.3 ms | 0.01 / 10.6-10.8 ms |
+| `changes::changed`, 1,000 ids | 0.25-0.37 ms | 0.29-0.31 ms | 0.29-0.51 ms |
+| `changes::changed_any` when nothing changed, before / after | < 1 µs / 0.5-0.7 ms | < 1 µs / 2.8-3.1 ms | ~1 µs / 2.9 ms |
+
+What it says:
+
+- **Writing less per change paid off by about half.** With one blind put
+  per changed id and nothing else, node writes run at 0.38-0.46 of their
+  speed in 1,000-write transactions (first version 0.22-0.32), edge adds
+  at 0.48-0.69 (0.23-0.50) and edge deletes at 0.25-0.56 (0.15-0.33). The
+  log grows 2.5 times a node write's bytes (7.5 before), 3.5 times an edge
+  add's (11) and 6 times an edge delete's (26).
+- **The targets were 60% for node writes, 50% for edge writes, and about 3
+  times the log bytes.** Edge adds meet them (0.48-0.69, 3.5x). Node
+  writes do not (best 0.46), nor do edge delete bytes (6x), and edge delete
+  speed is at 0.5 only from 100k nodes up. What stands in the way,
+  measured with a hook that does nothing on a 100,000-node memory graph:
+  that hook alone leaves node writes at about 0.70 of their speed (the
+  engine builds the node's before and after images and wraps every hooked
+  write in a unit, G4), and one entry is one insert into the extension tree,
+  about as dear as the node property set it describes (about 0.9 µs
+  against 1.1 µs). The read of the journal's state that keeps the cap
+  costs about 0.5 µs more. An edge delete logs 13 bytes, and the smallest
+  entry is 15 bytes in the log, three of them (the edge and both ends)
+  with namespace and lengths about 63.
+- **Why not once per transaction.** Gathering the ids a transaction
+  touched and writing them at commit would save the per-write record and
+  merge repeated ids, but not the tree insert per entry nor the hook's own
+  cost, so it cannot bring node writes to 0.6 either. Only packing a
+  transaction's ids into one value would, and then `changed` for a set of
+  ids, which the vector slice depends on, becomes a scan of the journal.
+  So this slice does not change the commit path.
+- **Reads got slower where expected.** With no index by revision, `since`
+  scans the entries of the kinds asked for whatever the revision: the
+  whole journal in slices costs what it did (about 7-8 million entries a
+  second), but the last commit's changes now take 8-11 ms at 300,000-400,000
+  entries instead of 0.01 ms, and `changed_any` with nothing changed takes
+  3 ms. `changed` for 1,000 ids is unchanged at about 0.3 ms.
+- **A database without the journal pays nothing.** The engine did not
+  change.
+
+### After the review (`g5-changes-review`)
+
+The review found that one write paid for the whole cap: at the default
+cap the write that trimmed took 133 ms and logged 1.7 MB. Now the cap is
+paid a slice at a time (docs/DERIVED.md, "The cap"), and the measurement
+was run again by the same harness (`mfg-bench --only changes --label
+g5-changes-review`, same busy machine).
+
+Ordinary writes, with the journal far from its cap, are where they were
+(share of write speed kept, log bytes as a multiple of without):
+
+| dataset | tier | per transaction | node set | edge add | edge delete |
+|---|---|---|---|---|---|
+| n10000-s1 | memory | 1,000 | 0.39 (2.6x) | 0.47 (3.9x) | 0.25 (6.9x) |
+| n100000-s1 | memory | 1,000 | 0.55 (2.5x) | 0.66 (3.8x) | 0.34 (7.2x) |
+| n100000-s1 | file | 1,000 | 0.67 (2.5x) | 0.57 (3.8x) | 0.33 (7.2x) |
+| n1000000-s1 | memory | 1,000 | 0.42 (2.5x) | 0.63 (3.8x) | 0.47 (7.1x) |
+| n1000000-s1 | file | 1,000 | 0.36 (2.5x) | 0.62 (3.8x) | 0.48 (7.1x) |
+| n100000-s1 | memory | 1 | 0.56 (2.1x) | 0.61 (2.9x) | 0.41 (4.4x) |
+| n1000000-s1 | memory | 1 | 0.25 (6.8x) | 0.59 (2.9x) | 0.51 (4.1x) |
+
+(The 1M single node sets ran while the journal was sweeping, so each
+rewrote the state: 6.8x.)
+
+Sweeping all the time (`changes.cap`, the cap a fifth of the writes):
+
+| dataset | tier | cap | node sets/s, 1,000 a transaction | log bytes a write | single writes/s | slowest single write | largest single write's log |
+|---|---|---|---|---|---|---|---|
+| n10000-s1 | memory | 2,011 | 171k | 98 | 91k | 64 µs | 1,108 B |
+| n10000-s1 | file | 2,011 | 166k | 98 | 68k | 72 µs | 1,108 B |
+| n100000-s1 | memory | 20,000 | 155k | 101 | 69k | 106 µs | 1,174 B |
+| n100000-s1 | file | 20,000 | 141k | 101 | 40k | 349 µs | 1,174 B |
+| n1000000-s1 | memory | 20,000 | 141k | 101 | 41k | 572 µs | 1,175 B |
+| n1000000-s1 | file | 20,000 | 83k | 101 | 29k | 184 µs | 1,175 B |
+
+At the default cap of 1,000,000 (`tests/review_g5_cap.rs`), the write
+that raises the floor now takes under a millisecond and logs 276 bytes
+(it was 133 ms and 1.7 MB); no write logs more than one state record and
+64 deletes beside its own. Reading is unchanged: `since` over the whole
+journal 37-98 ms at 300,000-400,000 entries, for the last commit 9-19 ms,
+`changed` for 1,000 ids 0.2-0.7 ms, `changed_any` with nothing changed
+3-5 ms (it reads every entry of the kind; knowing the newest position
+held would answer it at once, but keeping that exact means a write per
+change, which is what this slice took out).
