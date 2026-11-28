@@ -303,7 +303,7 @@ What is true now, and what this slice decided where the plan was open:
   text, which the truth lists as look-alikes. No choice of keys separates
   them; that is why these are candidates and nothing is merged.
 
-## `structure`: sameness and repetition
+## `structure`: sameness and repetition (colours and classes *built*)
 
 Graphs made by people repeat themselves. A plant has forty stations built
 the same way; each has two sides, each side its work locations, each
@@ -353,6 +353,90 @@ CALL structure.expand(of: <class, template or pattern>)
   counted and weighed by `lambda`. This is the minimum description length
   principle applied with the real serializer as the code, so the saving it
   reports is the saving a caller sees.
+
+What is true now (G7: colours and classes; templates, path patterns,
+quotient, plan and expand are G8 and G9). The user-facing description is
+in `docs/EXTENSIONS.md`.
+
+- **Procedures.** `structure.colors`, `structure.classes`,
+  `structure.read`, `structure.stored`, `structure.drop`
+  (`CREATE EXTENSION structure`).
+- **What a colour is.** Depth 0 hashes a node's label names (sorted) and,
+  for each key of `props:` (sorted by name), the key and its value in a
+  canonical encoding that equates what the engine equates (`1` and `1.0`)
+  or a mark for absent. Depth k+1 hashes the node's depth-k colour, its
+  number of followed edges, and the sum modulo 2^128 of one hash per edge
+  of (direction, the type's name, the depth-k colour at the other end). A
+  sum is a multiset hash: no sort and no memory per node, whatever its
+  degree. `dir:` is `out` by default; `both` tags the two directions
+  apart. Names and values, never ids, enter, so colours are the same for
+  the same data under other ids (D7) and are comparable across databases,
+  which G12 (`embed.wl`) can build on.
+- **The hash and its odds.** SipHash-2-4 with 128-bit output under a fixed
+  key (checked against the reference vectors). Equal surroundings always
+  have equal colours. For a billion nodes, the chance that two different
+  surroundings share a colour at one depth is under n^2/2^129, 1.5e-21;
+  the sum weakens this only for a neighbour repeated about 2^40 times and
+  more, where it is still under 1e-9. Classes by neighbours do not rely on
+  the odds: hash-equal candidates are compared in full.
+- **Depth.** A number (default 3), or `"stable"`: refine until a round
+  leaves the number of colours over the whole graph unchanged (refinement
+  only splits, so that is the fixed point), at most `max_depth:` rounds,
+  32 by default; the message says at which depth it stopped or that the cap
+  was reached, and the colours returned are those of the stopping depth,
+  the same as asking for that depth.
+- **Which nodes.** Colours are computed for every node; `labels:` chooses
+  the nodes reported, counted as "selected" and kept. A node's
+  surroundings include nodes of every label.
+- **Classes.** `by: "neighbours"`: labels, `keys:` values (absent is a
+  value) and the multiset of (direction, type, neighbour id), exact. `by:
+  "colors"`: a kept colouring or one computed in the call. Largest first;
+  ties to the smallest first member (by `identity:` value, then id) for
+  neighbours and to the smaller colour for colours, both content-only when
+  `identity:` is given, so the rows are the same in two databases holding
+  the same data, ids aside. Singletons are not listed (`min_size:` 2)
+  but are counted; `summary: true` gives the size distribution.
+- **Kept colourings (D3, D4).** Keyspace `structure`: `n<name>\0<id>` ->
+  16-byte colour, `m<name>` -> the log position it was computed at, depth,
+  depth where it was stable, nodes, colours, the code version
+  (`structure-colors/1`) and the arguments as JSON; `w` -> the stretch of
+  log that holds only this extension's writes, from its start to the end
+  of its last record. Fresh means: that stretch starts at or before the
+  colouring's position, and the log ends where the stretch does (inside the
+  open transaction) or one commit marker later. Each call that writes ends
+  with one write holding the metadata and the stretch; its record's size
+  does not depend on the stretch's value, so it can say where it itself
+  ends (`Graph::log_end`, a read accessor added here: the log position
+  counting the open transaction's records). So keeping or dropping one
+  colouring leaves the others fresh, and any other change makes all of them
+  stale. A rolled-back keep leaves nothing. A colouring kept inside an open
+  transaction is fresh until something else is written in it.
+- **Decided here.** Staleness is by position, not by comparison: a
+  change that a colouring does not depend on still makes it stale. Being
+  stale is not a fault for `check.run`'s `derived` check (kept colourings
+  are not maintained, and say when they are stale); only records that do not
+  decode are. `write:` sets the colour as a text property and refuses a key
+  of `props:`. `check`'s `duplicates` is unchanged; classes by neighbours
+  are where neighbours tell duplicates apart.
+- **Bounds (D6).** Node ids, two colour arrays and the selection (41 bytes
+  a node) are `StateVec`s within half of `algorithm_memory()`, spilling
+  past it; colours are counted and classes formed by external sorts in a
+  quarter of it, runs of a class in spilling queues. At most 10,000 rows a
+  call, continued with `after:`. A colouring computed in the call is a
+  whole-graph computation, so its slices bound what is returned; a kept
+  colouring is read in true slices.
+- **Budgets (G2).** Every loop over nodes or edges calls one function,
+  `step(n)` in `src/ext/structure.rs` (per node and per node's edges in a
+  round, per node counted, kept, written or classed); counting a statement
+  step there is a one-line change.
+- **On the manufacturing graph** (`bench/KNOWLEDGE.md`, "Structure";
+  `bench/tests/mfg_structure.rs`): with the hierarchy and catalogue edge
+  types outwards and no properties, depth 4 recovers every design and sets
+  apart every recorded deviation at 10k, 100k and 1M nodes on both tiers,
+  and depths 1 to 3 do not; classes by neighbours of `Tool`, `Part` and
+  `WorkInstruction` are exactly the planted duplicates, none of the
+  look-alikes, at every size. A colouring of the 1M-node graph at depth 4
+  takes 3.5-4 s and adds about 50 MB.
 
 Built-in algorithms gain three names beside the existing ones:
 `CALL louvain()` (communities by modularity, deterministic, with levels),
@@ -519,7 +603,7 @@ tests, and adds its section to `docs/EXTENSIONS.md` and its numbers to
 | G4 | edge and bulk write hooks (D5) | |
 | G5 | `changes` | G1, G4 |
 | G6 | `check` (*built*) | G1 |
-| G7 | `structure`: colours, classes, duplicates in `check` | G2 |
+| G7 | `structure`: colours, classes (*built*) | G2 |
 | G8 | `structure`: templates, path patterns, plan, expand | G7 |
 | G9 | `structure`: quotient; `louvain`, `ppr`, `steiner` | G2 |
 | G10 | `vector`: spaces, storage, exact search, staleness | G1, G5 |
